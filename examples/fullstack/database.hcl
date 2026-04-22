@@ -2,6 +2,7 @@ database "main" {
   engine  = "postgres"
   version = "16"
   storage = "20Gi"
+  replicas = 1
 
   backup {
     schedule  = "0 3 * * *"
