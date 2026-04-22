@@ -1,0 +1,102 @@
+# Gokku Deployment Configuration
+# This file defines your applications and environments
+
+apps:
+  speech-to-text:
+    workdir: apps/trunk
+    path: ./cmd/speech-to-text
+    ports:
+      - "5064:5064"
+    network:
+      mode: host
+    volumes:
+      - "/usr/lib/recordings:/app/recordings"  # Write RTP files here
+      - "/var/log/recordings:/app/logs"         # Log files
+    deployment:
+      keep_releases: 5
+      restart_policy: always
+      restart_delay: 5
+      post_deploy:
+        - "echo 'Hello, World!'"
+
+  voice-agent:
+    path: ./cmd/voice-agent
+    binary_name: voice-agent
+    workdir: apps/trunk
+    go_version: "1.25"
+    ports:
+      - "5064:5064"
+    network:
+      mode: host
+    deployment:
+      keep_releases: 5
+      restart_policy: always
+      restart_delay: 5
+
+  vad:
+    lang: python
+    path: ./apps/vad
+    dockerfile: ./apps/vad/Dockerfile  # optional, will generate if not exists
+    entrypoint: main.py
+    image: "python:3.11-slim"  # Base image for local build
+    volumes:
+      - "/usr/lib/recordings:/app/recordings"  # Shared recordings folder
+      - "/var/log/recordings:/app/logs"         # Shared logs folder
+    deployment:
+      keep_releases: 3
+      keep_images: 5
+      restart_policy: always
+      restart_delay: 10
+
+  # Example of pre-built image from registry (ultra-fast deployment)
+  api-prebuilt:
+    image: "ghcr.io/meu-org/api:latest"  # Pre-built image from registry
+    deployment:
+      keep_releases: 3
+      restart_policy: always
+      restart_delay: 5
+
+  # Example apps with shared volumes for RTP recording pipeline
+  rtp-recorder:
+    path: ./cmd/rtp-recorder
+    volumes:
+      - "/usr/lib/recordings:/app/recordings"  # Write RTP files here
+      - "/var/log/recordings:/app/logs"         # Log files
+    deployment:
+      keep_releases: 5
+      restart_policy: always
+      restart_delay: 5
+
+  transcoder:
+    lang: python
+    path: ./apps/transcoder
+    image: "python:3.11-slim"
+    volumes:
+      - "/usr/lib/recordings:/app/recordings"  # Read RTP files from here
+      - "/var/log/recordings:/app/logs"         # Shared logs
+    deployment:
+      keep_releases: 3
+      restart_policy: always
+      restart_delay: 10
+
+  webhook:
+    path: ./cmd/webhook
+    volumes:
+      - "/usr/lib/recordings:/app/recordings"  # Access processed files
+      - "/var/log/recordings:/app/logs"         # Shared logs
+    deployment:
+      keep_releases: 5
+      restart_policy: always
+      restart_delay: 5
+
+# Port assignment strategy: auto or manual
+# auto: automatically assigns sequential ports starting from base_port
+# manual: use ports defined in .env for each app/environment
+port_strategy: manual
+
+# Custom registries for pre-built images
+docker:
+  registry:  # Custom registries for pre-built images
+    - "self-ghrc.io"  # Your own GitHub Container Registry
+    - "registry.company.com"  # Company private registry
+    - "harbor.example.com"  # Harbor registry

@@ -1,0 +1,98 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25.0'
+
+      - name: Verify Go installation
+        run: |
+          go version
+          go env
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Extract version from main.go
+        id: version
+        run: |
+          VERSION=$(grep -E '^\s*const\s+version\s*=\s*"[^"]+"' cmd/cli/main.go | awk -F'"' '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Build binaries
+        run: |
+          chmod +x scripts/build-binaries.sh
+          ./scripts/build-binaries.sh
+
+      - name: Verify binaries
+        run: |
+          ls -la bin/
+          file bin/*
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            bin/gokku-darwin-amd64.tar.gz
+            bin/gokku-darwin-arm64.tar.gz
+            bin/gokku-linux-amd64.tar.gz
+            bin/gokku-linux-arm64.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          name: Gokku ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            ## Gokku ${{ steps.version.outputs.version }}
+
+            ### Installation
+            ```bash
+            curl -fsSL https://gokku-vm.com/install | bash
+            ```
+
+            ### Binaries
+            - **Linux AMD64**: gokku-linux-amd64
+            - **Linux ARM64**: gokku-linux-arm64
+            - **macOS Intel**: gokku-darwin-amd64
+            - **macOS Apple Silicon**: gokku-darwin-arm64
+
+            ### What's Changed
+            See the [commit history](https://github.com/thadeu/gokku/compare/${{ github.event.before }}...${{ github.sha }}) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

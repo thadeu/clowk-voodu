@@ -1,0 +1,13 @@
+# Compiled binaries
+bin/
+env-manager
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Backup files
+*.bak
+*.tmp
+gokku-cli
+dev-plugins/
