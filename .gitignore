@@ -1,13 +1,25 @@
 # Compiled binaries
 bin/
-env-manager
+dist/
 *.exe
 *.dll
 *.so
 *.dylib
 
-# Backup files
+# Test and coverage artifacts
+coverage.out
+coverage.html
+*.test
+*.prof
+
+# Editor / OS
+.DS_Store
 *.bak
 *.tmp
-gokku-cli
+*.swp
+.vscode/
+.idea/
+
+# Local development
 dev-plugins/
+.env.local

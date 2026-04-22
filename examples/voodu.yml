@@ -1,0 +1,70 @@
+# Example voodu.yml (M1 — YAML format, transitional).
+# Place this at the root of your app repo. On `git push`, voodu reads it
+# during deploy and uses it to shape the build and container.
+#
+# M4 introduces the HCL multi-kind format; this YAML shape is the M1
+# transitional format inherited from Gokku so existing apps keep running.
+
+apps:
+  api:
+    # --- source / build --------------------------------------------------
+    # `lang` is optional — voodu auto-detects from files in the release
+    # (go.mod, package.json, Gemfile, etc.). Set it to skip detection.
+    lang: go
+    # `path` is the subdir of the repo that holds the buildable code.
+    # Leave empty for single-service repos.
+    path: .
+    # `workdir` is the working directory inside the container.
+    workdir: /app
+    # `binary_name` + `go_version` apply to Go apps.
+    binary_name: api
+    go_version: "1.25"
+
+    # --- runtime ---------------------------------------------------------
+    # `command` overrides the default CMD. Leave empty to use the
+    # Dockerfile / language-default entrypoint.
+    command: ""
+    # `ports` maps host:container. Multiple entries allowed.
+    ports:
+      - "8080:8080"
+    # `volumes` are bind mounts. The `shared` directory is always mounted
+    # at /app/shared automatically.
+    volumes: []
+
+    # --- environment ------------------------------------------------------
+    # Values here are merged into the app's shared/.env during deploy.
+    # Values set via `voodu config:set` take precedence on reload.
+    env:
+      RAILS_ENV: production
+      LOG_LEVEL: info
+
+    # --- deployment policy -----------------------------------------------
+    deployment:
+      keep_releases: 5
+      keep_images: 3
+      restart_policy: unless-stopped
+      post_deploy:
+        - "echo 'Deploy finished'"
+
+    # --- network ---------------------------------------------------------
+    network:
+      mode: bridge
+
+# Global defaults applied to all apps (overridable per-app).
+defaults:
+  build_type: docker
+
+# Docker registries to authenticate against before pulling images.
+docker:
+  registry: []
+
+# Environment definitions (branch-based deploys in M2+).
+environments:
+  - name: production
+    branch: main
+    default_env_vars:
+      LOG_LEVEL: info
+  - name: staging
+    branch: develop
+    default_env_vars:
+      LOG_LEVEL: debug
