@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -29,6 +31,14 @@ type ingressTLS struct {
 	Enabled  bool   `json:"enabled,omitempty"`
 	Provider string `json:"provider,omitempty"`
 	Email    string `json:"email,omitempty"`
+
+	// OnDemand switches the plugin into on-demand issuance mode. Ask is
+	// the callback URL the router uses to gate which hostnames get a
+	// cert — typically an internal endpoint on the app itself. Both
+	// together unlock wildcard-like behaviour (e.g. *.tenant.example.com)
+	// without needing DNS-01 credentials.
+	OnDemand bool   `json:"on_demand,omitempty"`
+	Ask      string `json:"ask,omitempty"`
 }
 
 // ServiceHandler reconciles service manifests into a metadata-only
@@ -174,6 +184,10 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("ingress/%s: host and service are required", ev.Name)
 	}
 
+	if err := h.resolveUpstream(ctx, ev.Name, &spec); err != nil {
+		return err
+	}
+
 	pluginName := h.PluginName
 	if pluginName == "" {
 		pluginName = "caddy"
@@ -289,9 +303,140 @@ func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
 		if spec.TLS.Email != "" {
 			env[plugin.EnvIngressTLSEmail] = spec.TLS.Email
 		}
+
+		if spec.TLS.OnDemand {
+			env[plugin.EnvIngressTLSOnDemand] = "true"
+		}
+
+		if spec.TLS.Ask != "" {
+			env[plugin.EnvIngressTLSAsk] = spec.TLS.Ask
+		}
 	}
 
 	return env
+}
+
+// resolveUpstream validates that the target service/deployment actually
+// exists in /desired and fills in spec.Port when the operator left it
+// blank. Two goals:
+//
+//  1. Fail-fast on typos — applying an ingress that names a service
+//     nobody applied produces a clean error instead of a mystery 502
+//     at request time.
+//  2. Let manifests omit `port` when the service/deployment already
+//     declares it. Cuts redundancy from the common case.
+//
+// Precedence when port is missing:
+//
+//	spec.Port (explicit)
+//	  > service "<name>".port
+//	  > deployment "<name>".ports[0]  (container port, after `host:` split)
+//
+// Target-not-found is marked Transient: `voodu apply -f` may send
+// ingress before the deployment it references, and the reconciler
+// retries after backoff. Typos surface once the backoff log noise
+// makes them obvious — still better than 502s in prod.
+func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec *ingressSpec) error {
+	svc, err := h.lookupServiceSpec(ctx, spec.Service)
+	if err != nil {
+		return err
+	}
+
+	if svc != nil {
+		if spec.Port == 0 {
+			if svc.Port <= 0 {
+				return fmt.Errorf("ingress/%s: service %q has no port and ingress.port is unset", name, spec.Service)
+			}
+
+			spec.Port = svc.Port
+		}
+
+		return nil
+	}
+
+	dep, err := h.lookupDeploymentSpec(ctx, spec.Service)
+	if err != nil {
+		return err
+	}
+
+	if dep != nil {
+		if spec.Port == 0 {
+			port, ok := firstContainerPort(dep.Ports)
+			if !ok {
+				return fmt.Errorf("ingress/%s: deployment %q declares no ports and ingress.port is unset", name, spec.Service)
+			}
+
+			spec.Port = port
+		}
+
+		return nil
+	}
+
+	return Transient(fmt.Errorf("ingress/%s: no service or deployment named %q yet — will retry", name, spec.Service))
+}
+
+func (h *IngressHandler) lookupServiceSpec(ctx context.Context, name string) (*serviceSpec, error) {
+	m, err := h.Store.Get(ctx, KindService, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if m == nil {
+		return nil, nil
+	}
+
+	var spec serviceSpec
+	if err := json.Unmarshal(m.Spec, &spec); err != nil {
+		return nil, fmt.Errorf("decode service/%s: %w", name, err)
+	}
+
+	return &spec, nil
+}
+
+func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, name string) (*deploymentSpec, error) {
+	m, err := h.Store.Get(ctx, KindDeployment, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if m == nil {
+		return nil, nil
+	}
+
+	var spec deploymentSpec
+	if err := json.Unmarshal(m.Spec, &spec); err != nil {
+		return nil, fmt.Errorf("decode deployment/%s: %w", name, err)
+	}
+
+	return &spec, nil
+}
+
+// firstContainerPort pulls the first numeric port out of a deployment's
+// `ports` slice. Accepts "3000", "8080:3000", and "3000/udp" — for the
+// "host:container" form we take the container side, since ingress
+// traffic stays inside the docker network and the host-published port
+// is irrelevant there.
+func firstContainerPort(ports []string) (int, bool) {
+	for _, raw := range ports {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+
+		if slash := strings.IndexByte(p, '/'); slash >= 0 {
+			p = p[:slash]
+		}
+
+		if colon := strings.LastIndexByte(p, ':'); colon >= 0 {
+			p = p[colon+1:]
+		}
+
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			return n, true
+		}
+	}
+
+	return 0, false
 }
 
 func (h *IngressHandler) logf(format string, args ...any) {

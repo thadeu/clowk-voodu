@@ -10,6 +10,27 @@ import (
 	"go.voodu.clowk.in/pkg/plugin"
 )
 
+// seedManifest persists a Manifest in the store. Used by ingress tests
+// to satisfy the upstream-existence check that IngressHandler now
+// enforces (an ingress that names a service/deployment nobody applied
+// is rejected at reconcile time).
+func seedManifest(t *testing.T, store Store, kind Kind, name string, spec any) {
+	t.Helper()
+
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Put(context.Background(), &Manifest{
+		Kind: kind,
+		Name: name,
+		Spec: json.RawMessage(raw),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServiceHandler_PersistsMetadata(t *testing.T) {
 	store := newMemStore()
 
@@ -89,6 +110,10 @@ func TestServiceHandler_DeleteClearsStatus(t *testing.T) {
 func TestIngressHandler_ApplyDispatchesToPlugin(t *testing.T) {
 	store := newMemStore()
 
+	// The ingress references service "api" — resolveUpstream now requires
+	// the target to exist, so seed it first.
+	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api", Port: 8080})
+
 	inv := &fakeInvoker{
 		results: map[string]*plugins.Result{
 			"caddy.apply": envelopeResult(map[string]any{
@@ -149,6 +174,47 @@ func TestIngressHandler_ApplyDispatchesToPlugin(t *testing.T) {
 	}
 }
 
+func TestIngressHandler_ApplyForwardsOnDemandTLS(t *testing.T) {
+	store := newMemStore()
+
+	seedManifest(t, store, KindService, "app", serviceSpec{Target: "app", Port: 3000})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://*.clowk.in"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "wildcard", ingressSpec{
+		Host:    "*.clowk.in",
+		Service: "app",
+		Port:    3000,
+		TLS: &ingressTLS{
+			Enabled:  true,
+			Provider: "letsencrypt",
+			Email:    "ssl@clowk.dev",
+			OnDemand: true,
+			Ask:      "http://app:3000/internal/allow_domain",
+		},
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	call := inv.calls[0]
+
+	if call.Env[plugin.EnvIngressTLSOnDemand] != "true" {
+		t.Errorf("on_demand flag not forwarded: %+v", call.Env)
+	}
+
+	if call.Env[plugin.EnvIngressTLSAsk] != "http://app:3000/internal/allow_domain" {
+		t.Errorf("ask URL not forwarded: %q", call.Env[plugin.EnvIngressTLSAsk])
+	}
+}
+
 func TestIngressHandler_RemoveCallsPluginAndClearsStatus(t *testing.T) {
 	store := newMemStore()
 
@@ -195,5 +261,162 @@ func TestRefLookupResolvesServiceAndIngressStatus(t *testing.T) {
 
 	if v, ok := lookup("ingress", "public", "url"); !ok || v != "https://x" {
 		t.Errorf("ingress ref: got (%q, %v)", v, ok)
+	}
+}
+
+func TestIngressHandler_PortResolvedFromService(t *testing.T) {
+	store := newMemStore()
+
+	// Service declares port 8080; ingress omits it. The handler should
+	// fill in 8080 before dispatching to the plugin.
+	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api", Port: 8080})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://api.x"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+		// Port intentionally omitted.
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(inv.calls) != 1 {
+		t.Fatalf("expected 1 plugin call, got %d", len(inv.calls))
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressPort]; got != "8080" {
+		t.Errorf("port not resolved from service: env=%q", got)
+	}
+}
+
+func TestIngressHandler_PortResolvedFromDeployment(t *testing.T) {
+	store := newMemStore()
+
+	// No service with this name — fall back to a deployment that
+	// happens to share the name. "8080:3000" is the docker port map
+	// syntax; we want the container side (3000).
+	seedManifest(t, store, KindDeployment, "api", deploymentSpec{
+		Image: "example/api:latest",
+		Ports: []string{"8080:3000"},
+	})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://api.x"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressPort]; got != "3000" {
+		t.Errorf("port not resolved from deployment container side: env=%q", got)
+	}
+}
+
+func TestIngressHandler_MissingTargetIsTransient(t *testing.T) {
+	store := newMemStore()
+
+	h := &IngressHandler{Store: store, Invoker: &fakeInvoker{}, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+		Port:    8080,
+	})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil {
+		t.Fatal("expected error when target does not exist")
+	}
+
+	// Must be Transient so the reconciler retries once the operator
+	// applies the deployment/service. A hard error would require manual
+	// re-apply of the ingress.
+	if !isTransient(err) {
+		t.Errorf("expected transient error, got %T: %v", err, err)
+	}
+}
+
+func TestIngressHandler_ExplicitPortStillRequiresTarget(t *testing.T) {
+	store := newMemStore()
+
+	h := &IngressHandler{Store: store, Invoker: &fakeInvoker{}, Log: quietLogger()}
+
+	// Even with an explicit port, routing to a non-existent target just
+	// yields a 502 later. Reject at reconcile time instead.
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+		Port:    9999,
+	})
+
+	if err := h.Handle(context.Background(), ev); err == nil {
+		t.Fatal("expected error for missing target even with explicit port")
+	}
+}
+
+func TestIngressHandler_PortUnsetAndTargetHasNoPortIsHardError(t *testing.T) {
+	store := newMemStore()
+
+	// Service exists but declares no port; ingress also omits one —
+	// nothing to resolve, and retrying won't fix it. Hard error (not
+	// transient) so the operator gets a clear signal.
+	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api"})
+
+	h := &IngressHandler{Store: store, Invoker: &fakeInvoker{}, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+	})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil {
+		t.Fatal("expected error when both service and ingress lack a port")
+	}
+
+	if isTransient(err) {
+		t.Errorf("unresolvable port should be hard error, not transient: %v", err)
+	}
+}
+
+func TestFirstContainerPort(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want int
+		ok   bool
+	}{
+		{nil, 0, false},
+		{[]string{""}, 0, false},
+		{[]string{"3000"}, 3000, true},
+		{[]string{"8080:3000"}, 3000, true},
+		{[]string{"3000/udp"}, 3000, true},
+		{[]string{"8080:3000/tcp"}, 3000, true},
+		{[]string{"not-a-port", "4000"}, 4000, true},
+	}
+
+	for _, c := range cases {
+		got, ok := firstContainerPort(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("firstContainerPort(%v) = (%d, %v); want (%d, %v)", c.in, got, ok, c.want, c.ok)
+		}
 	}
 }

@@ -131,6 +131,14 @@ const (
 	EnvIngressTLS         = "VOODU_INGRESS_TLS"
 	EnvIngressTLSProvider = "VOODU_INGRESS_TLS_PROVIDER"
 	EnvIngressTLSEmail    = "VOODU_INGRESS_TLS_EMAIL"
+
+	// On-demand TLS knobs. When OnDemand is "true", the ingress plugin
+	// enables Caddy-style on-demand certificate issuance: no host list
+	// up-front, cert minted on the fly when a request arrives. Ask is
+	// the URL the router hits before issuing (the "is this tenant
+	// allowed?" callback) — matches Caddy's on_demand_tls.ask directive.
+	EnvIngressTLSOnDemand = "VOODU_INGRESS_TLS_ON_DEMAND"
+	EnvIngressTLSAsk      = "VOODU_INGRESS_TLS_ASK"
 )
 
 // Database-kind plugin contract.

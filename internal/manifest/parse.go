@@ -230,13 +230,21 @@ type hclIngressTLS struct {
 	Enabled  bool   `hcl:"enabled,optional"`
 	Provider string `hcl:"provider,optional"`
 	Email    string `hcl:"email,optional"`
+	OnDemand bool   `hcl:"on_demand,optional"`
+	Ask      string `hcl:"ask,optional"`
 }
 
 func (b hclIngress) spec() IngressSpec {
 	out := IngressSpec{Host: b.Host, Service: b.Service, Port: b.Port}
 
 	if b.TLS != nil {
-		out.TLS = &IngressTLS{Enabled: b.TLS.Enabled, Provider: b.TLS.Provider, Email: b.TLS.Email}
+		out.TLS = &IngressTLS{
+			Enabled:  b.TLS.Enabled,
+			Provider: b.TLS.Provider,
+			Email:    b.TLS.Email,
+			OnDemand: b.TLS.OnDemand,
+			Ask:      b.TLS.Ask,
+		}
 	}
 
 	return out

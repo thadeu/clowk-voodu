@@ -14,7 +14,6 @@ deployment "api" {
 }
 
 ingress "api" {
-  # hosts = []
   host    = "api.clowk.in"
   service = "api"
   port    = 8080

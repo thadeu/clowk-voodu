@@ -67,4 +67,9 @@ type IngressTLS struct {
 	Enabled  bool   `yaml:"enabled,omitempty"  json:"enabled,omitempty"`
 	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
 	Email    string `yaml:"email,omitempty"    json:"email,omitempty"`
+
+	// On-demand TLS (wildcard multi-tenant). OnDemand turns on Caddy's
+	// issue-cert-on-request behaviour; Ask is the gating callback URL.
+	OnDemand bool   `yaml:"on_demand,omitempty" json:"on_demand,omitempty"`
+	Ask      string `yaml:"ask,omitempty"       json:"ask,omitempty"`
 }
