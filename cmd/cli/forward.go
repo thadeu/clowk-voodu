@@ -15,7 +15,7 @@ import (
 
 const (
 	envControllerURL     = "VOODU_CONTROLLER_URL"
-	defaultControllerURL = "http://127.0.0.1:8080"
+	defaultControllerURL = "http://127.0.0.1:8686"
 	forwardTimeout       = 30 * time.Second
 )
 

@@ -1,0 +1,28 @@
+[Unit]
+Description=Voodu Controller (embedded etcd + HTTP API)
+Documentation=https://github.com/thadeu/clowk-voodu
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=VOODU_ROOT=/opt/voodu
+ExecStart=/usr/local/bin/voodu-controller \
+  --http=:8686 \
+  --etcd-client=http://127.0.0.1:2379 \
+  --etcd-peer=http://127.0.0.1:2380 \
+  --data=/opt/voodu/state
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+# etcd needs its data dir persisted; sandboxing kept light so bind mounts work.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/voodu
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
