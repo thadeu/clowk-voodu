@@ -7,6 +7,10 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"go.voodu.clowk.in/internal/envfile"
+	"go.voodu.clowk.in/internal/paths"
+	"go.voodu.clowk.in/internal/secrets"
 )
 
 // Config is everything the controller needs to start. All fields have
@@ -18,6 +22,7 @@ type Config struct {
 	EtcdClient   string // http://127.0.0.1:2379
 	EtcdPeer     string // http://127.0.0.1:2380
 	NodeName     string // voodu-0
+	PluginsRoot  string // /opt/voodu/plugins
 	Version      string
 	Logger       *log.Logger
 	QuietEtcd    bool
@@ -81,14 +86,76 @@ func (s *Server) Start(ctx context.Context) error {
 
 	store := NewEtcdStore(etcd.Client)
 
-	s.api = &API{Store: store, Version: s.cfg.Version}
-
 	recCtx, cancel := context.WithCancel(context.Background())
 	s.cancelRec = cancel
+
+	// Single invoker shared by /exec and the reconciler's handlers —
+	// one env-injection path, one plugin-resolution path.
+	invoker := &DirInvoker{
+		PluginsRoot: s.cfg.PluginsRoot,
+		NodeName:    s.cfg.NodeName,
+		EtcdClient:  s.cfg.EtcdClient,
+	}
+
+	s.api = &API{
+		Store:       store,
+		Version:     s.cfg.Version,
+		PluginsRoot: s.cfg.PluginsRoot,
+		NodeName:    s.cfg.NodeName,
+		EtcdClient:  s.cfg.EtcdClient,
+		Invoker:     invoker,
+	}
+
+	dbHandler := &DatabaseHandler{
+		Store:   store,
+		Invoker: invoker,
+		Log:     s.cfg.Logger,
+	}
+
+	depHandler := &DeploymentHandler{
+		Store: store,
+		Log:   s.cfg.Logger,
+		WriteEnv: func(app string, pairs []string) (bool, error) {
+			envFile := paths.AppEnvFile(app)
+			// Load pre-image first so we can diff against the merged
+			// result and decide whether to restart the container. A
+			// missing file is fine — treat as empty.
+			before, _ := envfile.Load(envFile)
+
+			after, err := secrets.Set(app, pairs)
+			if err != nil {
+				return false, err
+			}
+
+			return !stringMapsEqual(before, after), nil
+		},
+		EnvFilePath: paths.AppEnvFile,
+		Containers:  DockerContainerManager{},
+	}
+
+	svcHandler := &ServiceHandler{
+		Store: store,
+		Log:   s.cfg.Logger,
+	}
+
+	ingHandler := &IngressHandler{
+		Store:   store,
+		Invoker: invoker,
+		Log:     s.cfg.Logger,
+		// PluginName left empty → defaults to "caddy". Operators with a
+		// non-Caddy router install their own plugin and set this via a
+		// future Config field.
+	}
 
 	s.rec = &Reconciler{
 		Store:  store,
 		Logger: s.cfg.Logger,
+		Handlers: map[Kind]HandlerFunc{
+			KindDatabase:   dbHandler.Handle,
+			KindDeployment: depHandler.Handle,
+			KindService:    svcHandler.Handle,
+			KindIngress:    ingHandler.Handle,
+		},
 	}
 
 	s.recDone = make(chan struct{})
@@ -200,3 +267,4 @@ func (l *loggingResponseWriter) WriteHeader(code int) {
 	l.status = code
 	l.ResponseWriter.WriteHeader(code)
 }
+

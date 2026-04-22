@@ -16,20 +16,6 @@ func stubRunE(milestone, hint string) func(*cobra.Command, []string) error {
 	}
 }
 
-func newApplyCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "apply",
-		Short: "Apply HCL manifests (deployment/database/ingress/service)",
-		Long:  "Applies one or more HCL manifest files to the controller. Supports -f <file> and -f <dir>.",
-		RunE:  stubRunE("M4", "HCL config parser + apply -f arrives in M4."),
-	}
-
-	cmd.Flags().StringArrayP("file", "f", nil, "manifest file or directory (repeatable)")
-	cmd.Flags().BoolP("dry-run", "n", false, "show the changes without applying")
-
-	return cmd
-}
-
 func newStatusCmd() *cobra.Command {
 	var app string
 
@@ -116,37 +102,3 @@ func newServerCmd() *cobra.Command {
 	return cmd
 }
 
-func newPluginsCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "plugins",
-		Short: "Manage Voodu plugins (Caddy, Postgres, Mongo, ...)",
-	}
-
-	cmd.AddCommand(
-		&cobra.Command{
-			Use:   "install SOURCE",
-			Short: "Install a plugin from a git repo, URL or local path",
-			Args:  cobra.ExactArgs(1),
-			RunE:  stubRunE("M5", "The plugin system arrives in M5."),
-		},
-		&cobra.Command{
-			Use:   "list",
-			Short: "List installed plugins",
-			RunE:  stubRunE("M5", "The plugin system arrives in M5."),
-		},
-		&cobra.Command{
-			Use:   "remove NAME",
-			Short: "Remove an installed plugin",
-			Args:  cobra.ExactArgs(1),
-			RunE:  stubRunE("M5", "The plugin system arrives in M5."),
-		},
-		&cobra.Command{
-			Use:   "update [NAME]",
-			Short: "Update one or all plugins",
-			Args:  cobra.MaximumNArgs(1),
-			RunE:  stubRunE("M5", "The plugin system arrives in M5."),
-		},
-	)
-
-	return cmd
-}

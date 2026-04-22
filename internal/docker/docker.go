@@ -186,6 +186,25 @@ func ContainerExists(name string) bool {
 	return false
 }
 
+// GetContainerImage returns the image tag of the named container via
+// `docker inspect`. Empty string + nil error means no such container;
+// callers distinguish "not running" from "unreadable" by checking the
+// error.
+func GetContainerImage(name string) (string, error) {
+	if !ContainerExists(name) {
+		return "", nil
+	}
+
+	cmd := exec.Command("docker", "inspect", name, "--format", "{{.Config.Image}}")
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
 // ContainerIsRunning checks if a container is currently running.
 func ContainerIsRunning(name string) bool {
 	cmd := exec.Command("docker", "ps", "--format", "{{.Names}}", "--filter", fmt.Sprintf("name=%s", name))

@@ -28,7 +28,8 @@ Use ":" syntax as shorthand for subcommands:
 	root.SetVersionTemplate("voodu {{.Version}}\n")
 
 	root.PersistentFlags().String("controller-url", "", "controller HTTP endpoint (env: VOODU_CONTROLLER_URL)")
-	root.PersistentFlags().String("output", "text", "output format: text|json")
+	root.PersistentFlags().StringP("output", "o", "text", "output format: text|json|yaml")
+	root.PersistentFlags().String("remote", "", "voodu remote name to forward to (client mode only)")
 
 	root.AddCommand(
 		newVersionCmd(),
@@ -37,11 +38,14 @@ Use ":" syntax as shorthand for subcommands:
 		newDeployCmd(),
 		newConfigCmd(),
 		newApplyCmd(),
+		newDiffCmd(),
+		newDeleteCmd(),
 		newStatusCmd(),
 		newLogsCmd(),
 		newExecCmd(),
 		newScaleCmd(),
 		newServerCmd(),
+		newRemoteCmd(),
 		newPluginsCmd(),
 	)
 

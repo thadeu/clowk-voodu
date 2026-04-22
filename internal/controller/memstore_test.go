@@ -11,15 +11,51 @@ import (
 // this package. It lets us exercise API handlers and the reconciler
 // without paying the embedded-etcd startup cost.
 type memStore struct {
-	mu  sync.Mutex
-	kv  map[string]*Manifest
-	rev int64
+	mu     sync.Mutex
+	kv     map[string]*Manifest
+	status map[string][]byte
+	rev    int64
 
 	watchers []chan WatchEvent
 }
 
 func newMemStore() *memStore {
-	return &memStore{kv: map[string]*Manifest{}}
+	return &memStore{kv: map[string]*Manifest{}, status: map[string][]byte{}}
+}
+
+func (m *memStore) PutStatus(ctx context.Context, kind Kind, name string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	m.status[StatusKey(kind, name)] = cp
+
+	return nil
+}
+
+func (m *memStore) GetStatus(ctx context.Context, kind Kind, name string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	v, ok := m.status[StatusKey(kind, name)]
+	if !ok {
+		return nil, nil
+	}
+
+	cp := make([]byte, len(v))
+	copy(cp, v)
+
+	return cp, nil
+}
+
+func (m *memStore) DeleteStatus(ctx context.Context, kind Kind, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.status, StatusKey(kind, name))
+
+	return nil
 }
 
 func (m *memStore) Put(ctx context.Context, man *Manifest) (*Manifest, error) {

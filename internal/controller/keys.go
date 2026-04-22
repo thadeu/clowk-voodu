@@ -17,6 +17,7 @@ const (
 	prefixActual  = "/actual/"
 	prefixConfig  = "/config/"
 	prefixPlugins = "/plugins/"
+	prefixStatus  = "/status/"
 )
 
 // Kind is the type of a declared resource. New kinds added in later
@@ -39,14 +40,21 @@ var validKinds = map[Kind]bool{
 
 // ParseKind returns the canonical Kind for either the singular or plural
 // form (deployment / deployments). Unknown kinds return an error.
+//
+// Singular is tried first so kinds whose name ends in "s" (ingress) are
+// not mangled into "ingres" by an unconditional trailing-s strip.
 func ParseKind(s string) (Kind, error) {
-	k := Kind(strings.TrimSuffix(strings.ToLower(s), "s"))
+	k := Kind(strings.ToLower(s))
 
-	if !validKinds[k] {
-		return "", fmt.Errorf("unknown kind %q (valid: deployment, database, service, ingress)", s)
+	if validKinds[k] {
+		return k, nil
 	}
 
-	return k, nil
+	if trimmed := Kind(strings.TrimSuffix(string(k), "s")); validKinds[trimmed] {
+		return trimmed, nil
+	}
+
+	return "", fmt.Errorf("unknown kind %q (valid: deployment, database, service, ingress)", s)
 }
 
 // DesiredPrefix returns "/desired/<kind>s/".
@@ -79,3 +87,11 @@ func PluginManifestKey(name string) string {
 
 // PluginsPrefix returns "/plugins/" for listing.
 func PluginsPrefix() string { return prefixPlugins }
+
+// StatusKey returns "/status/<kind>s/<name>" — where the reconciler stores
+// the runtime data a plugin returned (credentials, URLs, container ids).
+// Kept separate from /desired/ so re-applying a manifest doesn't clobber
+// state the plugin generated.
+func StatusKey(kind Kind, name string) string {
+	return prefixStatus + string(kind) + "s/" + name
+}

@@ -97,19 +97,22 @@ func forwardToController(root *cobra.Command, args []string) error {
 		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, string(raw))
 	}
 
-	return renderForwardResponse(raw)
+	return renderForwardResponse(root, raw)
 }
 
 // renderForwardResponse handles the plugin JSON protocol. Plain stdout
 // (non-JSON) is printed as-is so shell plugins that don't produce JSON
-// still work.
-func renderForwardResponse(raw []byte) error {
+// still work. When --output is json|yaml the envelope is serialised
+// verbatim; otherwise the default "text" rendering hides the protocol.
+func renderForwardResponse(root *cobra.Command, raw []byte) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return nil
 	}
 
 	if trimmed[0] != '{' {
+		// Pre-envelope plugin output (legacy Gokku shell plugins that
+		// print raw text directly). Surface it untouched.
 		fmt.Print(string(raw))
 
 		if !bytes.HasSuffix(raw, []byte("\n")) {
@@ -125,22 +128,7 @@ func renderForwardResponse(raw []byte) error {
 		return nil
 	}
 
-	if r.Status == "error" {
-		return fmt.Errorf("%s", r.Error)
-	}
-
-	if len(r.Data) > 0 {
-		var pretty bytes.Buffer
-
-		if err := json.Indent(&pretty, r.Data, "", "  "); err == nil {
-			fmt.Println(pretty.String())
-			return nil
-		}
-
-		fmt.Println(string(r.Data))
-	}
-
-	return nil
+	return renderEnvelope(root, r, raw)
 }
 
 // filterFlags returns only the flag tokens from args, so we can feed them

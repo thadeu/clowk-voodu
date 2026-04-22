@@ -26,6 +26,7 @@ func main() {
 		etcdClient  = flag.String("etcd-client", "http://127.0.0.1:2379", "etcd client URL")
 		etcdPeer    = flag.String("etcd-peer", "http://127.0.0.1:2380", "etcd peer URL")
 		dataDir     = flag.String("data", "", "etcd data directory (default: <VOODU_ROOT>/state)")
+		pluginsDir  = flag.String("plugins", "", "plugin root directory (default: <VOODU_ROOT>/plugins)")
 		nodeName    = flag.String("name", "voodu-0", "etcd cluster member name")
 		quietEtcd   = flag.Bool("quiet-etcd", true, "suppress etcd info logging")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -42,17 +43,22 @@ func main() {
 		*dataDir = paths.StateDir()
 	}
 
+	if *pluginsDir == "" {
+		*pluginsDir = paths.PluginsDir()
+	}
+
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
 
 	srv := controller.NewServer(controller.Config{
-		DataDir:    *dataDir,
-		HTTPAddr:   *httpAddr,
-		EtcdClient: *etcdClient,
-		EtcdPeer:   *etcdPeer,
-		NodeName:   *nodeName,
-		Version:    fmt.Sprintf("%s (commit: %s)", version, commit),
-		Logger:     logger,
-		QuietEtcd:  *quietEtcd,
+		DataDir:     *dataDir,
+		HTTPAddr:    *httpAddr,
+		EtcdClient:  *etcdClient,
+		EtcdPeer:    *etcdPeer,
+		NodeName:    *nodeName,
+		PluginsRoot: *pluginsDir,
+		Version:     fmt.Sprintf("%s (commit: %s)", version, commit),
+		Logger:      logger,
+		QuietEtcd:   *quietEtcd,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

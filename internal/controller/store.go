@@ -20,6 +20,15 @@ type Store interface {
 	ListAll(ctx context.Context) ([]*Manifest, error)
 	Watch(ctx context.Context) <-chan WatchEvent
 	Close() error
+
+	// Status I/O — stored under /status/<kind>s/<name> separately from
+	// /desired so re-applying a manifest doesn't erase what the plugin
+	// produced (credentials, container ids, etc.). GetStatus returns
+	// (nil, nil) when no status exists — callers treat it as "not yet
+	// reconciled", not an error.
+	PutStatus(ctx context.Context, kind Kind, name string, data []byte) error
+	GetStatus(ctx context.Context, kind Kind, name string) ([]byte, error)
+	DeleteStatus(ctx context.Context, kind Kind, name string) error
 }
 
 // WatchEvent is a single change observed on /desired/*.
@@ -130,6 +139,35 @@ func (s *EtcdStore) listPrefix(ctx context.Context, prefix string) ([]*Manifest,
 	}
 
 	return out, nil
+}
+
+func (s *EtcdStore) PutStatus(ctx context.Context, kind Kind, name string, data []byte) error {
+	if _, err := s.client.Put(ctx, StatusKey(kind, name), string(data)); err != nil {
+		return fmt.Errorf("etcd put status: %w", err)
+	}
+
+	return nil
+}
+
+func (s *EtcdStore) GetStatus(ctx context.Context, kind Kind, name string) ([]byte, error) {
+	resp, err := s.client.Get(ctx, StatusKey(kind, name))
+	if err != nil {
+		return nil, fmt.Errorf("etcd get status: %w", err)
+	}
+
+	if resp.Count == 0 {
+		return nil, nil
+	}
+
+	return resp.Kvs[0].Value, nil
+}
+
+func (s *EtcdStore) DeleteStatus(ctx context.Context, kind Kind, name string) error {
+	if _, err := s.client.Delete(ctx, StatusKey(kind, name)); err != nil {
+		return fmt.Errorf("etcd delete status: %w", err)
+	}
+
+	return nil
 }
 
 // Watch returns a channel of events on /desired/*. The channel is closed

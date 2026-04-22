@@ -16,6 +16,10 @@ func main() {
 
 	root := newRootCmd()
 
+	if code, forwarded := maybeForwardRemote(root, os.Args[1:]); forwarded {
+		os.Exit(code)
+	}
+
 	if err := dispatch(root, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

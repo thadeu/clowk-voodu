@@ -109,6 +109,8 @@ func takesValue(flag string) bool {
 		"-r": true, "--replicas": true,
 		"-o": true, "--output": true,
 		"--controller-url": true,
+		"--remote":         true,
+		"--format":         true,
 	}
 
 	if strings.Contains(flag, "=") {

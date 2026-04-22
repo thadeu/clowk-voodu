@@ -9,6 +9,7 @@ import (
 	"go.voodu.clowk.in/internal/deploy"
 	"go.voodu.clowk.in/internal/git"
 	"go.voodu.clowk.in/internal/paths"
+	"go.voodu.clowk.in/internal/remote"
 	"go.voodu.clowk.in/internal/secrets"
 )
 
@@ -45,7 +46,12 @@ func newSetupCmd() *cobra.Command {
 				}
 			}
 
+			if err := remote.WriteRCMode(remote.ModeServer); err != nil {
+				return fmt.Errorf("write ~/.voodurc: %w", err)
+			}
+
 			fmt.Printf("Voodu root initialized at %s\n", paths.Root())
+			fmt.Println("marked this host as mode=server in ~/.voodurc")
 
 			return nil
 		},

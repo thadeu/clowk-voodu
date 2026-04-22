@@ -155,7 +155,7 @@ func TestApplyDelete404OnMissing(t *testing.T) {
 	}
 }
 
-func TestExecReturns404BecausePluginsAreM5(t *testing.T) {
+func TestExecReturns404WhenPluginSystemDisabled(t *testing.T) {
 	api, _ := newTestAPI(t)
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
@@ -176,8 +176,8 @@ func TestExecReturns404BecausePluginsAreM5(t *testing.T) {
 
 	_ = json.NewDecoder(resp.Body).Decode(&env)
 
-	if env.Status != "error" || !strings.Contains(env.Error, "M5") {
-		t.Errorf("expected M5 pointer, got %+v", env)
+	if env.Status != "error" || !strings.Contains(env.Error, "no plugin registered") {
+		t.Errorf("expected no-plugin error, got %+v", env)
 	}
 }
 

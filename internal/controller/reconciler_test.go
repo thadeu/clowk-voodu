@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 )
+
+var errTestRefMissing = errors.New("ref.database.main.url not yet reconciled")
 
 func TestReconcilerReplaysExistingManifests(t *testing.T) {
 	store := newMemStore()
@@ -19,11 +22,13 @@ func TestReconcilerReplaysExistingManifests(t *testing.T) {
 	)
 
 	record := func(kind Kind) HandlerFunc {
-		return func(_ context.Context, _ WatchEvent) {
+		return func(_ context.Context, _ WatchEvent) error {
 			mu.Lock()
 			defer mu.Unlock()
 
 			seen[kind]++
+
+			return nil
 		}
 	}
 
@@ -73,8 +78,9 @@ func TestReconcilerDispatchesLiveEvents(t *testing.T) {
 	rec := &Reconciler{
 		Store: store,
 		Handlers: map[Kind]HandlerFunc{
-			KindDeployment: func(_ context.Context, ev WatchEvent) {
+			KindDeployment: func(_ context.Context, ev WatchEvent) error {
 				events <- ev
+				return nil
 			},
 		},
 	}
@@ -103,6 +109,131 @@ func TestReconcilerDispatchesLiveEvents(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestReconcilerRetriesTransientErrors(t *testing.T) {
+	store := newMemStore()
+
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+
+	var (
+		mu       sync.Mutex
+		attempts int
+		done     = make(chan struct{}, 1)
+	)
+
+	handler := func(_ context.Context, _ WatchEvent) error {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+
+		// Fail twice, then succeed — matches the "DB not ready yet, now
+		// ready" pattern that motivates this whole mechanism.
+		if n < 3 {
+			return Transient(errTestRefMissing)
+		}
+
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+
+		return nil
+	}
+
+	rec := &Reconciler{
+		Store:    store,
+		Handlers: map[Kind]HandlerFunc{KindDeployment: handler},
+		sleep:    func(time.Duration) {}, // zero-delay backoff in tests
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		_ = rec.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(800 * time.Millisecond):
+		t.Fatalf("handler never succeeded, attempts=%d", attempts)
+	}
+
+	cancel()
+	<-runDone
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts (2 fail + 1 ok), got %d", attempts)
+	}
+}
+
+func TestReconcilerGivesUpAfterMaxAttempts(t *testing.T) {
+	store := newMemStore()
+
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+
+	var (
+		mu       sync.Mutex
+		attempts int
+	)
+
+	handler := func(_ context.Context, _ WatchEvent) error {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+
+		return Transient(errTestRefMissing)
+	}
+
+	rec := &Reconciler{
+		Store:    store,
+		Handlers: map[Kind]HandlerFunc{KindDeployment: handler},
+		sleep:    func(time.Duration) {},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = rec.Run(ctx)
+		close(done)
+	}()
+
+	// Wait for attempts to plateau: loop reads under lock, gives up when
+	// counter stabilises (= retry chain exhausted).
+	var last int
+
+	for i := 0; i < 50; i++ {
+		time.Sleep(20 * time.Millisecond)
+
+		mu.Lock()
+		cur := attempts
+		mu.Unlock()
+
+		if cur == last && cur > 0 {
+			break
+		}
+
+		last = cur
+	}
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if attempts != maxRetryAttempts {
+		t.Errorf("expected exactly %d attempts before give-up, got %d", maxRetryAttempts, attempts)
+	}
 }
 
 func TestReconcilerNilHandlerIsNoop(t *testing.T) {

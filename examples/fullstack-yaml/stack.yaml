@@ -1,0 +1,38 @@
+---
+kind: deployment
+name: api
+spec:
+  image: ghcr.io/clowk/api:${VERSION:-latest}
+  replicas: 2
+  env:
+    PORT: "8080"
+    DATABASE: postgres://main:5432/app
+  ports:
+    - "8080"
+  restart: always
+  health_check: /healthz
+---
+kind: database
+name: main
+spec:
+  engine: postgres
+  version: "16"
+  storage: 20Gi
+  backup:
+    schedule: "0 3 * * *"
+    retention: 14d
+    target: s3://clowk-backups/voodu/main
+  params:
+    max_connections: "200"
+    shared_buffers: 512MB
+---
+kind: ingress
+name: api
+spec:
+  host: api.clowk.in
+  service: api
+  port: 8080
+  tls:
+    enabled: true
+    provider: letsencrypt
+    email: ops@clowk.in

@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"go.voodu.clowk.in/internal/plugins"
+	"go.voodu.clowk.in/pkg/plugin"
 )
 
 // API is the HTTP surface of the controller. Handlers are thin: decode,
@@ -15,6 +18,23 @@ type API struct {
 	Store Store
 	// Version is reported by /health.
 	Version string
+
+	// PluginsRoot is the filesystem directory where plugins live. When
+	// empty, /exec and /plugins endpoints return "no plugin system"
+	// errors — used by unit tests that don't care about plugins.
+	PluginsRoot string
+
+	// NodeName and EtcdClient are passed to plugins via environment so
+	// plugin authors can reach back into the cluster if they need to.
+	NodeName   string
+	EtcdClient string
+
+	// Invoker is the shared plugin-execution seam — the reconciler uses
+	// the same interface for its handlers, so /exec and reconcile-time
+	// calls go through one code path (env injection, plugin resolution,
+	// envelope parsing). Nil means /exec falls back to loading plugins
+	// directly from PluginsRoot; production wires DirInvoker.
+	Invoker PluginInvoker
 }
 
 // Handler returns an http.Handler with all endpoints registered.
@@ -27,6 +47,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/exec", a.handleExec)
 	mux.HandleFunc("/logs", a.handleLogs)
 	mux.HandleFunc("/plugins", a.handlePlugins)
+	mux.HandleFunc("POST /plugins/install", a.handlePluginInstall)
+	mux.HandleFunc("DELETE /plugins/{name}", a.handlePluginRemove)
 
 	return logRequests(mux)
 }
@@ -190,9 +212,13 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExec is the endpoint the CLI forwards unknown commands to. In M3
-// there is no plugin system yet, so every call returns 404 with a clear
-// pointer to M5.
+// handleExec dispatches unknown CLI commands to a plugin. Body is
+// {"args": ["<plugin>", "<cmd>", ...]} plus optional env. The CLI's
+// colon rewriter already split "postgres:create" into two args.
+//
+// Response is the plugin JSON envelope when the plugin emitted one,
+// or a synthetic envelope wrapping plain-text stdout so the CLI can
+// render with -o text|json|yaml uniformly.
 func (a *API) handleExec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -202,7 +228,8 @@ func (a *API) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Args []string `json:"args"`
+		Args []string          `json:"args"`
+		Env  map[string]string `json:"env,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -210,10 +237,79 @@ func (a *API) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeErr(w, http.StatusNotFound, fmt.Errorf(
-		"no builtin and no plugin registered for %q (plugin system lands in M5)",
-		strings.Join(req.Args, " "),
-	))
+	if len(req.Args) < 2 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("need at least <plugin> <command>"))
+		return
+	}
+
+	if a.PluginsRoot == "" {
+		writeErr(w, http.StatusNotFound, fmt.Errorf(
+			"no builtin and no plugin registered for %q",
+			strings.Join(req.Args, " "),
+		))
+
+		return
+	}
+
+	pluginName, cmd, cmdArgs := req.Args[0], req.Args[1], req.Args[2:]
+
+	res, err := a.invoker().Invoke(r.Context(), pluginName, cmd, cmdArgs, req.Env)
+	if err != nil {
+		// LoadFromDir failure maps to 404 — everything else is 500.
+		// A dedicated error type would be cleaner, but string matching
+		// on the DirInvoker's wrapped error is good enough for one site.
+		if strings.Contains(err.Error(), "plugin ") && strings.Contains(err.Error(), pluginName) {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("plugin %q not installed", pluginName))
+			return
+		}
+
+		writeErr(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	if res.Envelope != nil {
+		writeJSON(w, pluginExitToHTTP(res.ExitCode), res.Envelope)
+		return
+	}
+
+	// Plain-text plugins: wrap stdout in an envelope so downstream
+	// formatters have a consistent shape. Exit != 0 becomes error.
+	if res.ExitCode != 0 {
+		writeErr(w, pluginExitToHTTP(res.ExitCode), fmt.Errorf("%s", strings.TrimSpace(res.CombinedOutput())))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]string{"stdout": string(res.Raw)},
+	})
+}
+
+// invoker returns the configured PluginInvoker, falling back to a
+// DirInvoker built from the API's plugins root. Lazy so callers that
+// explicitly wire Invoker don't pay for the DirInvoker allocation.
+func (a *API) invoker() PluginInvoker {
+	if a.Invoker != nil {
+		return a.Invoker
+	}
+
+	return &DirInvoker{
+		PluginsRoot: a.PluginsRoot,
+		NodeName:    a.NodeName,
+		EtcdClient:  a.EtcdClient,
+	}
+}
+
+// pluginExitToHTTP maps a plugin exit code to an HTTP status. Zero is
+// 200, anything else is 500 — plugins should use the envelope's Error
+// field for structured failure, not HTTP semantics.
+func pluginExitToHTTP(code int) int {
+	if code == 0 {
+		return http.StatusOK
+	}
+
+	return http.StatusInternalServerError
 }
 
 // handleLogs is a placeholder for M4+. We reserve the shape now so the
@@ -222,8 +318,9 @@ func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeErr(w, http.StatusNotImplemented, fmt.Errorf("log streaming arrives with the reconciler in M4"))
 }
 
-// handlePlugins lists plugin manifests currently stored at /plugins/*.
-// The real install/uninstall flow lives in M5.
+// handlePlugins lists plugins currently installed under PluginsRoot.
+// Plugins that fail to load are reported as errors alongside the list —
+// the controller does not hide a broken plugin from the operator.
 func (a *API) handlePlugins(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -232,7 +329,93 @@ func (a *API) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: []any{}})
+	if a.PluginsRoot == "" {
+		writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: []any{}})
+		return
+	}
+
+	loaded, loadErrs := plugins.LoadAll(a.PluginsRoot)
+
+	manifests := make([]plugin.Manifest, 0, len(loaded))
+	for _, p := range loaded {
+		manifests = append(manifests, p.Manifest)
+	}
+
+	errs := make([]string, 0, len(loadErrs))
+	for _, e := range loadErrs {
+		errs = append(errs, e.Error())
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"plugins": manifests,
+			"errors":  errs,
+		},
+	})
+}
+
+// handlePluginInstall materialises a plugin from the given source (local
+// path or git URL). Body: {"source": "owner/repo"} or {"source": "/path"}.
+func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
+	if a.PluginsRoot == "" {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("plugin system not configured"))
+		return
+	}
+
+	var req struct {
+		Source string `json:"source"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+
+	if strings.TrimSpace(req.Source) == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("source is required"))
+		return
+	}
+
+	inst := &plugins.Installer{Root: a.PluginsRoot}
+
+	loaded, err := inst.Install(r.Context(), req.Source)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: loaded.Manifest})
+}
+
+// handlePluginRemove deletes the plugin directory. 404 if the plugin
+// isn't installed; the DELETE is otherwise idempotent.
+func (a *API) handlePluginRemove(w http.ResponseWriter, r *http.Request) {
+	if a.PluginsRoot == "" {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("plugin system not configured"))
+		return
+	}
+
+	name := r.PathValue("name")
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("plugin name is required"))
+		return
+	}
+
+	inst := &plugins.Installer{Root: a.PluginsRoot}
+
+	ok, err := inst.Remove(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("plugin %q not installed", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
 }
 
 // decodeManifests accepts either a single-object or array-of-objects body.
