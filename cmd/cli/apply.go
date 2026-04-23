@@ -127,7 +127,25 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	}
 
 	for _, m := range mans {
-		fmt.Printf("%s/%s applied\n", m.Kind, m.Name)
+		if m.Scope != "" {
+			fmt.Printf("%s/%s/%s applied\n", m.Kind, m.Scope, m.Name)
+		} else {
+			fmt.Printf("%s/%s applied\n", m.Kind, m.Name)
+		}
+	}
+
+	// The controller returns {"data": {"applied": [...], "pruned": [...]}}.
+	// Surface prune results so operators can see what a re-apply removed.
+	var env struct {
+		Data struct {
+			Pruned []string `json:"pruned"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(raw, &env); err == nil {
+		for _, p := range env.Data.Pruned {
+			fmt.Printf("%s pruned (removed from manifests)\n", p)
+		}
 	}
 
 	return nil
@@ -142,29 +160,41 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	root := cmd.Root()
 
 	for _, m := range local {
-		remote, err := fetchRemote(root, m.Kind, m.Name)
+		remote, err := fetchRemote(root, m.Kind, m.Scope, m.Name)
 		if err != nil {
 			return err
 		}
 
+		label := formatRef(m.Kind, m.Scope, m.Name)
+
 		if remote == nil {
-			fmt.Printf("+ %s/%s (new)\n", m.Kind, m.Name)
+			fmt.Printf("+ %s (new)\n", label)
 			continue
 		}
 
 		if bytes.Equal(canonicalJSON(m.Spec), canonicalJSON(remote.Spec)) {
-			fmt.Printf("= %s/%s (unchanged)\n", m.Kind, m.Name)
+			fmt.Printf("= %s (unchanged)\n", label)
 			continue
 		}
 
-		fmt.Printf("~ %s/%s\n  local : %s\n  remote: %s\n",
-			m.Kind, m.Name,
+		fmt.Printf("~ %s\n  local : %s\n  remote: %s\n",
+			label,
 			string(canonicalJSON(m.Spec)),
 			string(canonicalJSON(remote.Spec)),
 		)
 	}
 
 	return nil
+}
+
+// formatRef prints "kind/scope/name" when scoped, "kind/name" otherwise.
+// Kept in one place so diff / apply / prune output stays consistent.
+func formatRef(kind controller.Kind, scope, name string) string {
+	if scope != "" {
+		return fmt.Sprintf("%s/%s/%s", kind, scope, name)
+	}
+
+	return fmt.Sprintf("%s/%s", kind, name)
 }
 
 func runDelete(cmd *cobra.Command, f applyFlags) error {
@@ -183,6 +213,10 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 		q := url.Values{}
 		q.Set("kind", string(m.Kind))
 		q.Set("name", m.Name)
+
+		if m.Scope != "" {
+			q.Set("scope", m.Scope)
+		}
 
 		resp, err := controllerDo(root, http.MethodDelete, "/apply", q.Encode(), nil)
 		if err != nil {
@@ -329,11 +363,12 @@ func controllerDo(root *cobra.Command, method, path, rawQuery string, body io.Re
 }
 
 // fetchRemote GETs /apply?kind=&name= and returns the manifest or nil
-// if the controller does not know about it.
-func fetchRemote(root *cobra.Command, kind controller.Kind, name string) (*controller.Manifest, error) {
+// if the controller does not know about it. Scoped kinds are narrowed to
+// a single scope; an empty scope for a scoped kind matches across scopes
+// (used by helpers like `voodu scale` that auto-resolve).
+func fetchRemote(root *cobra.Command, kind controller.Kind, scope, name string) (*controller.Manifest, error) {
 	q := url.Values{}
 	q.Set("kind", string(kind))
-	q.Set("name", name)
 
 	resp, err := controllerDo(root, http.MethodGet, "/apply", q.Encode(), nil)
 	if err != nil {
@@ -360,9 +395,17 @@ func fetchRemote(root *cobra.Command, kind controller.Kind, name string) (*contr
 	}
 
 	for i := range env.Data {
-		if env.Data[i].Kind == kind && env.Data[i].Name == name {
-			return &env.Data[i], nil
+		m := env.Data[i]
+
+		if m.Kind != kind || m.Name != name {
+			continue
 		}
+
+		if scope != "" && m.Scope != scope {
+			continue
+		}
+
+		return &m, nil
 	}
 
 	return nil, nil

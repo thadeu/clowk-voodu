@@ -22,7 +22,7 @@ func TestApplyPostSingleManifest(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	body := `{"kind":"deployment","name":"api","spec":{"image":"x:1"}}`
+	body := `{"kind":"deployment","scope":"test","name":"api","spec":{"image":"x:1"}}`
 
 	resp, err := http.Post(ts.URL+"/apply", "application/json", strings.NewReader(body))
 	if err != nil {
@@ -34,7 +34,7 @@ func TestApplyPostSingleManifest(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 
-	got, err := store.Get(t.Context(), KindDeployment, "api")
+	got, err := store.Get(t.Context(), KindDeployment, "test", "api")
 	if err != nil || got == nil {
 		t.Fatalf("manifest not stored: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestApplyPostArrayOfManifests(t *testing.T) {
 	defer ts.Close()
 
 	body := `[
-		{"kind":"deployment","name":"api","spec":{}},
+		{"kind":"deployment","scope":"test","name":"api","spec":{}},
 		{"kind":"database","name":"main","spec":{"engine":"postgres"}}
 	]`
 
@@ -91,7 +91,7 @@ func TestApplyGetListsAll(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "main"})
 
 	resp, err := http.Get(ts.URL + "/apply")
@@ -117,7 +117,7 @@ func TestApplyDeleteRemovesManifest(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/apply?kind=deployment&name=api", nil)
 
@@ -131,9 +131,88 @@ func TestApplyDeleteRemovesManifest(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 
-	got, _ := store.Get(t.Context(), KindDeployment, "api")
+	got, _ := store.Get(t.Context(), KindDeployment, "test", "api")
 	if got != nil {
 		t.Errorf("manifest still present after delete: %+v", got)
+	}
+}
+
+// TestApplyPruneRemovesMissing verifies that resources present under a
+// (scope, kind) in etcd but absent from the input array get pruned, while
+// resources in other scopes or other kinds are left untouched.
+func TestApplyPruneRemovesMissing(t *testing.T) {
+	api, store := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	seed := []*Manifest{
+		{Kind: KindDeployment, Scope: "app-a", Name: "web"},
+		{Kind: KindDeployment, Scope: "app-a", Name: "worker"},
+		{Kind: KindDeployment, Scope: "app-b", Name: "api"},
+		{Kind: KindIngress, Scope: "app-a", Name: "lb"},
+	}
+
+	for _, m := range seed {
+		if _, err := store.Put(t.Context(), m); err != nil {
+			t.Fatalf("seed %s/%s/%s: %v", m.Kind, m.Scope, m.Name, err)
+		}
+	}
+
+	// Apply only `deployment app-a/web`. Expectation:
+	//   - app-a/worker is pruned (same kind+scope, missing from input)
+	//   - app-b/api is kept (different scope entirely — not touched)
+	//   - app-a/lb is kept (different kind; prune is per-(scope,kind))
+	body := `[{"kind":"deployment","scope":"app-a","name":"web","spec":{}}]`
+
+	resp, err := http.Post(ts.URL+"/apply", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	// Assert the surviving set.
+	got, _ := store.Get(t.Context(), KindDeployment, "app-a", "web")
+	if got == nil {
+		t.Error("app-a/web should still exist (it was in the input)")
+	}
+
+	if gone, _ := store.Get(t.Context(), KindDeployment, "app-a", "worker"); gone != nil {
+		t.Error("app-a/worker should have been pruned")
+	}
+
+	if kept, _ := store.Get(t.Context(), KindDeployment, "app-b", "api"); kept == nil {
+		t.Error("app-b/api should have been kept (different scope)")
+	}
+
+	if kept, _ := store.Get(t.Context(), KindIngress, "app-a", "lb"); kept == nil {
+		t.Error("app-a/lb should have been kept (different kind; per-(scope,kind) prune)")
+	}
+}
+
+// TestApplyRejectsCrossScopeCollision ensures two scopes can't share a
+// deployment name — the reconciler would otherwise fight over the same
+// container slot.
+func TestApplyRejectsCrossScopeCollision(t *testing.T) {
+	api, store := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "app-a", Name: "web"})
+
+	body := `[{"kind":"deployment","scope":"app-b","name":"web","spec":{}}]`
+
+	resp, err := http.Post(ts.URL+"/apply", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", resp.StatusCode)
 	}
 }
 
@@ -206,7 +285,7 @@ func TestStatusReturnsDesiredAndActual(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 
 	resp, err := http.Get(ts.URL + "/status")
 	if err != nil {

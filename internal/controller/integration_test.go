@@ -65,7 +65,7 @@ func TestControllerPersistsAcrossRestart(t *testing.T) {
 
 	srv := startServer(t, dataDir)
 
-	body := `{"kind":"deployment","name":"api","spec":{"image":"nginx:1"}}`
+	body := `{"kind":"deployment","scope":"test","name":"api","spec":{"image":"nginx:1"}}`
 
 	resp, err := http.Post(
 		"http://"+srv.HTTPAddr()+"/apply",

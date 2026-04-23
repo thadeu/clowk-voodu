@@ -71,7 +71,7 @@ func TestRewriteForStdinStream_ReadsFileAndEmitsJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stack.hcl")
 
-	stack := `deployment "api" {
+	stack := `deployment "test" "api" {
   image = "nginx:1.27"
   replicas = 2
 }
@@ -125,12 +125,12 @@ func TestRewriteForStdinStream_BuildModeFlagsSourcePush(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stack.hcl")
 
-	stack := `deployment "web" {
+	stack := `deployment "prod" "web" {
   image    = "nginx:1.27"
   replicas = 1
 }
 
-deployment "api" {
+deployment "prod" "api" {
   workdir    = "apps/api"
   lang       = "go"
   go_version = "1.25"

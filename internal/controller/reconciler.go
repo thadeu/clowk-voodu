@@ -74,6 +74,7 @@ func (r *Reconciler) replay(ctx context.Context) error {
 		r.handle(ctx, WatchEvent{
 			Type:     WatchPut,
 			Kind:     m.Kind,
+			Scope:    m.Scope,
 			Name:     m.Name,
 			Manifest: m,
 			Revision: m.Metadata.Revision,
@@ -134,7 +135,7 @@ func (r *Reconciler) scheduleRetry(ctx context.Context, ev WatchEvent, attempt i
 			return
 		}
 
-		m, err := r.Store.Get(ctx, ev.Kind, ev.Name)
+		m, err := r.Store.Get(ctx, ev.Kind, ev.Scope, ev.Name)
 		if err != nil {
 			r.Logger.Printf("reconcile %s/%s retry lookup failed: %v", ev.Kind, ev.Name, err)
 			return
@@ -150,6 +151,7 @@ func (r *Reconciler) scheduleRetry(ctx context.Context, ev WatchEvent, attempt i
 		fresh := WatchEvent{
 			Type:     WatchPut,
 			Kind:     m.Kind,
+			Scope:    m.Scope,
 			Name:     m.Name,
 			Manifest: m,
 			Revision: m.Metadata.Revision,

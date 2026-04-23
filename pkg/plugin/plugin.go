@@ -149,6 +149,34 @@ const (
 	// preserved). Caddy's native path-matcher precedence (most-specific
 	// wins) is what orders overlapping entries.
 	EnvIngressLocations = "VOODU_INGRESS_LOCATIONS"
+
+	// EnvIngressUpstreams is the JSON array of "host:port" strings the
+	// router should balance across. It supersedes the single-upstream
+	// derivation from VOODU_INGRESS_SERVICE/PORT: when present, the
+	// plugin MUST ignore SERVICE/PORT and use this list verbatim. The
+	// controller emits one entry per replica (`app-0:80, app-1:80, ...`).
+	// Older plugins that don't understand this variable still work
+	// against single-replica deployments via the legacy pair.
+	EnvIngressUpstreams = "VOODU_INGRESS_UPSTREAMS"
+
+	// EnvIngressLBPolicy selects the load-balancing algorithm Caddy uses
+	// to pick an upstream for each request. Values match Caddy's
+	// `load_balancing.selection_policy` ("round_robin", "random",
+	// "least_conn", "ip_hash"). Unset → "round_robin".
+	EnvIngressLBPolicy = "VOODU_INGRESS_LB_POLICY"
+
+	// EnvIngressLBInterval enables Caddy's active health check when set
+	// to a Caddy-compatible duration (e.g. "5s", "500ms"). The probe path
+	// is the deployment's health_check; an unhealthy upstream is taken
+	// out of rotation until it recovers. Unset disables active HC
+	// (passive observation still applies).
+	EnvIngressLBInterval = "VOODU_INGRESS_LB_INTERVAL"
+
+	// EnvIngressHealthCheckPath is the HTTP path Caddy GETs when active
+	// HC is enabled — propagated from the deployment's health_check field
+	// so a single "/healthz" declaration drives both the Docker-level
+	// healthcheck and the ingress-level probe. Unset falls back to "/".
+	EnvIngressHealthCheckPath = "VOODU_INGRESS_HC_PATH"
 )
 
 // Database-kind plugin contract.

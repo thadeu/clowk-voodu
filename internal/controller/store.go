@@ -12,20 +12,32 @@ import (
 // Store is the persistence contract for desired state. Defined as an
 // interface so tests can substitute an in-memory implementation without
 // spinning up etcd.
+//
+// Scoped kinds (deployment, ingress) must carry a non-empty scope;
+// unscoped kinds ignore the scope argument. The split lives on the
+// manifest type (see IsScoped) so the store stays kind-agnostic.
 type Store interface {
 	Put(ctx context.Context, m *Manifest) (*Manifest, error)
-	Get(ctx context.Context, kind Kind, name string) (*Manifest, error)
-	Delete(ctx context.Context, kind Kind, name string) (bool, error)
+	Get(ctx context.Context, kind Kind, scope, name string) (*Manifest, error)
+	Delete(ctx context.Context, kind Kind, scope, name string) (bool, error)
+
+	// List returns every manifest of kind across all scopes. Useful for
+	// the reconciler and the collision check in /apply.
 	List(ctx context.Context, kind Kind) ([]*Manifest, error)
+
+	// ListByScope returns the manifests of kind filed under scope. This
+	// is the set /apply diff-uses to compute prune candidates.
+	ListByScope(ctx context.Context, kind Kind, scope string) ([]*Manifest, error)
+
 	ListAll(ctx context.Context) ([]*Manifest, error)
 	Watch(ctx context.Context) <-chan WatchEvent
 	Close() error
 
 	// Status I/O — stored under /status/<kind>s/<name> separately from
 	// /desired so re-applying a manifest doesn't erase what the plugin
-	// produced (credentials, container ids, etc.). GetStatus returns
-	// (nil, nil) when no status exists — callers treat it as "not yet
-	// reconciled", not an error.
+	// produced (credentials, container ids, etc.). Status is keyed by
+	// name only: the /apply layer guarantees (kind, name) uniqueness
+	// across scopes, so no scope segment is needed here.
 	PutStatus(ctx context.Context, kind Kind, name string, data []byte) error
 	GetStatus(ctx context.Context, kind Kind, name string) ([]byte, error)
 	DeleteStatus(ctx context.Context, kind Kind, name string) error
@@ -35,6 +47,7 @@ type Store interface {
 type WatchEvent struct {
 	Type     WatchEventType
 	Kind     Kind
+	Scope    string
 	Name     string
 	Manifest *Manifest // populated for Put; nil for Delete
 	Revision int64
@@ -81,7 +94,7 @@ func (s *EtcdStore) Put(ctx context.Context, m *Manifest) (*Manifest, error) {
 		return nil, fmt.Errorf("marshal manifest: %w", err)
 	}
 
-	resp, err := s.client.Put(ctx, DesiredKey(m.Kind, m.Name), string(data))
+	resp, err := s.client.Put(ctx, DesiredKey(m.Kind, m.Scope, m.Name), string(data))
 	if err != nil {
 		return nil, fmt.Errorf("etcd put: %w", err)
 	}
@@ -91,8 +104,8 @@ func (s *EtcdStore) Put(ctx context.Context, m *Manifest) (*Manifest, error) {
 	return m, nil
 }
 
-func (s *EtcdStore) Get(ctx context.Context, kind Kind, name string) (*Manifest, error) {
-	resp, err := s.client.Get(ctx, DesiredKey(kind, name))
+func (s *EtcdStore) Get(ctx context.Context, kind Kind, scope, name string) (*Manifest, error) {
+	resp, err := s.client.Get(ctx, DesiredKey(kind, scope, name))
 	if err != nil {
 		return nil, fmt.Errorf("etcd get: %w", err)
 	}
@@ -104,8 +117,8 @@ func (s *EtcdStore) Get(ctx context.Context, kind Kind, name string) (*Manifest,
 	return decodeManifest(resp.Kvs[0].Value, resp.Kvs[0].ModRevision)
 }
 
-func (s *EtcdStore) Delete(ctx context.Context, kind Kind, name string) (bool, error) {
-	resp, err := s.client.Delete(ctx, DesiredKey(kind, name))
+func (s *EtcdStore) Delete(ctx context.Context, kind Kind, scope, name string) (bool, error) {
+	resp, err := s.client.Delete(ctx, DesiredKey(kind, scope, name))
 	if err != nil {
 		return false, fmt.Errorf("etcd delete: %w", err)
 	}
@@ -115,6 +128,14 @@ func (s *EtcdStore) Delete(ctx context.Context, kind Kind, name string) (bool, e
 
 func (s *EtcdStore) List(ctx context.Context, kind Kind) ([]*Manifest, error) {
 	return s.listPrefix(ctx, DesiredPrefix(kind))
+}
+
+func (s *EtcdStore) ListByScope(ctx context.Context, kind Kind, scope string) ([]*Manifest, error) {
+	if !IsScoped(kind) {
+		return s.List(ctx, kind)
+	}
+
+	return s.listPrefix(ctx, ScopedPrefix(kind, scope))
 }
 
 func (s *EtcdStore) ListAll(ctx context.Context) ([]*Manifest, error) {
@@ -188,12 +209,13 @@ func (s *EtcdStore) Watch(ctx context.Context) <-chan WatchEvent {
 			for _, ev := range wresp.Events {
 				evt := WatchEvent{Revision: ev.Kv.ModRevision}
 
-				kind, name, ok := parseDesiredKey(string(ev.Kv.Key))
+				kind, scope, name, ok := parseDesiredKey(string(ev.Kv.Key))
 				if !ok {
 					continue
 				}
 
 				evt.Kind = kind
+				evt.Scope = scope
 				evt.Name = name
 
 				switch ev.Type.String() {
@@ -237,10 +259,13 @@ func decodeManifest(data []byte, rev int64) (*Manifest, error) {
 	return &m, nil
 }
 
-// parseDesiredKey turns "/desired/deployments/api" into (deployment, api).
-func parseDesiredKey(key string) (Kind, string, bool) {
+// parseDesiredKey splits an etcd key back into its kind / scope / name
+// parts. Scoped kinds match "/desired/<kind>s/<scope>/<name>"; unscoped
+// kinds match "/desired/<kind>s/<name>" with an empty scope in the
+// return value.
+func parseDesiredKey(key string) (Kind, string, string, bool) {
 	if len(key) <= len(prefixDesired) {
-		return "", "", false
+		return "", "", "", false
 	}
 
 	rest := key[len(prefixDesired):]
@@ -255,16 +280,34 @@ func parseDesiredKey(key string) (Kind, string, bool) {
 	}
 
 	if slash <= 0 || slash >= len(rest)-1 {
-		return "", "", false
+		return "", "", "", false
 	}
 
 	kindPlural := rest[:slash]
-	name := rest[slash+1:]
+	tail := rest[slash+1:]
 
 	kind, err := ParseKind(kindPlural)
 	if err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
 
-	return kind, name, true
+	if !IsScoped(kind) {
+		return kind, "", tail, true
+	}
+
+	// Scoped: tail is "<scope>/<name>".
+	next := -1
+
+	for i, c := range tail {
+		if c == '/' {
+			next = i
+			break
+		}
+	}
+
+	if next <= 0 || next >= len(tail)-1 {
+		return "", "", "", false
+	}
+
+	return kind, tail[:next], tail[next+1:], true
 }

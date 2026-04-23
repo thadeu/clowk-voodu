@@ -13,7 +13,7 @@ var errTestRefMissing = errors.New("ref.database.main.url not yet reconciled")
 func TestReconcilerReplaysExistingManifests(t *testing.T) {
 	store := newMemStore()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "main"})
 
 	var (
@@ -94,7 +94,7 @@ func TestReconcilerDispatchesLiveEvents(t *testing.T) {
 		close(done)
 	}()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 
 	select {
 	case ev := <-events:
@@ -105,7 +105,7 @@ func TestReconcilerDispatchesLiveEvents(t *testing.T) {
 		t.Fatal("no event delivered")
 	}
 
-	_, _ = store.Delete(t.Context(), KindDeployment, "api")
+	_, _ = store.Delete(t.Context(), KindDeployment, "test", "api")
 
 	cancel()
 	<-done
@@ -114,7 +114,7 @@ func TestReconcilerDispatchesLiveEvents(t *testing.T) {
 func TestReconcilerRetriesTransientErrors(t *testing.T) {
 	store := newMemStore()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 
 	var (
 		mu       sync.Mutex
@@ -177,7 +177,7 @@ func TestReconcilerRetriesTransientErrors(t *testing.T) {
 func TestReconcilerGivesUpAfterMaxAttempts(t *testing.T) {
 	store := newMemStore()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Name: "api"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
 
 	var (
 		mu       sync.Mutex

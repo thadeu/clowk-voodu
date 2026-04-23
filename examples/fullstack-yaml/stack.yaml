@@ -1,5 +1,10 @@
+# YAML equivalent of examples/fullstack/deployment.hcl. Scoped kinds
+# (`deployment`, `ingress`) require `scope` — the organizational tag that
+# groups manifests and defines the uniqueness boundary for names. See the
+# HCL version for the full semantics walkthrough.
 ---
 kind: deployment
+scope: clowk
 name: api
 spec:
   image: ghcr.io/clowk/api:${VERSION:-latest}
@@ -27,6 +32,7 @@ spec:
     shared_buffers: 512MB
 ---
 kind: ingress
+scope: clowk
 name: api
 spec:
   host: api.clowk.in

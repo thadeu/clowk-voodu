@@ -69,9 +69,9 @@ func (m *memStore) Put(ctx context.Context, man *Manifest) (*Manifest, error) {
 	man.Metadata = &Metadata{UpdatedAt: time.Now().UTC(), Revision: m.rev}
 
 	copy := cloneManifest(man)
-	m.kv[DesiredKey(man.Kind, man.Name)] = copy
+	m.kv[DesiredKey(man.Kind, man.Scope, man.Name)] = copy
 
-	ev := WatchEvent{Type: WatchPut, Kind: man.Kind, Name: man.Name, Manifest: copy, Revision: m.rev}
+	ev := WatchEvent{Type: WatchPut, Kind: man.Kind, Scope: man.Scope, Name: man.Name, Manifest: copy, Revision: m.rev}
 	watchers := append([]chan WatchEvent(nil), m.watchers...)
 	m.mu.Unlock()
 
@@ -85,11 +85,11 @@ func (m *memStore) Put(ctx context.Context, man *Manifest) (*Manifest, error) {
 	return cloneManifest(copy), nil
 }
 
-func (m *memStore) Get(ctx context.Context, kind Kind, name string) (*Manifest, error) {
+func (m *memStore) Get(ctx context.Context, kind Kind, scope, name string) (*Manifest, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	v, ok := m.kv[DesiredKey(kind, name)]
+	v, ok := m.kv[DesiredKey(kind, scope, name)]
 	if !ok {
 		return nil, nil
 	}
@@ -97,10 +97,10 @@ func (m *memStore) Get(ctx context.Context, kind Kind, name string) (*Manifest, 
 	return cloneManifest(v), nil
 }
 
-func (m *memStore) Delete(ctx context.Context, kind Kind, name string) (bool, error) {
+func (m *memStore) Delete(ctx context.Context, kind Kind, scope, name string) (bool, error) {
 	m.mu.Lock()
 
-	key := DesiredKey(kind, name)
+	key := DesiredKey(kind, scope, name)
 	_, ok := m.kv[key]
 
 	if ok {
@@ -108,7 +108,7 @@ func (m *memStore) Delete(ctx context.Context, kind Kind, name string) (bool, er
 		m.rev++
 	}
 
-	ev := WatchEvent{Type: WatchDelete, Kind: kind, Name: name, Revision: m.rev}
+	ev := WatchEvent{Type: WatchDelete, Kind: kind, Scope: scope, Name: name, Revision: m.rev}
 	watchers := append([]chan WatchEvent(nil), m.watchers...)
 	m.mu.Unlock()
 
@@ -129,6 +129,27 @@ func (m *memStore) List(ctx context.Context, kind Kind) ([]*Manifest, error) {
 	defer m.mu.Unlock()
 
 	prefix := DesiredPrefix(kind)
+
+	out := []*Manifest{}
+
+	for k, v := range m.kv {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			out = append(out, cloneManifest(v))
+		}
+	}
+
+	return out, nil
+}
+
+func (m *memStore) ListByScope(ctx context.Context, kind Kind, scope string) ([]*Manifest, error) {
+	if !IsScoped(kind) {
+		return m.List(ctx, kind)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prefix := ScopedPrefix(kind, scope)
 
 	out := []*Manifest{}
 

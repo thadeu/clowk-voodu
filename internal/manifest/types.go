@@ -55,6 +55,33 @@ type DeploymentSpec struct {
 	PostDeploy  []string          `yaml:"post_deploy,omitempty"  json:"post_deploy,omitempty"`
 }
 
+// applyDefaults fills implicit values so the minimal HCL
+//
+//	deployment "scope" "web" {}
+//
+// means "build the repo root with ./Dockerfile, health-check /".
+// Build-mode fields (Path/Dockerfile) only fire when Image is empty —
+// registry-mode deployments should not carry build metadata they
+// won't use. HealthCheck defaults in both modes because the ingress
+// probe needs a path regardless of how the image was produced.
+func (s *DeploymentSpec) applyDefaults() {
+	if s.HealthCheck == "" {
+		s.HealthCheck = "/"
+	}
+
+	if s.Image != "" {
+		return
+	}
+
+	if s.Path == "" {
+		s.Path = "."
+	}
+
+	if s.Dockerfile == "" {
+		s.Dockerfile = "Dockerfile"
+	}
+}
+
 // DatabaseSpec is a managed data service. The Engine field selects which
 // plugin materialises the instance (M7 lands postgres, M9 lands mongo).
 type DatabaseSpec struct {
@@ -103,6 +130,24 @@ type IngressSpec struct {
 	Port      int               `yaml:"port,omitempty"      json:"port,omitempty"`
 	TLS       *IngressTLS       `yaml:"tls,omitempty"       json:"tls,omitempty"`
 	Locations []IngressLocation `yaml:"locations,omitempty" json:"locations,omitempty"`
+	LB        *IngressLB        `yaml:"lb,omitempty"        json:"lb,omitempty"`
+}
+
+// IngressLB configures how the ingress balances traffic across replicas
+// of the target deployment. With a single replica it's effectively a
+// no-op (Caddy still picks the only upstream). Two meaningful knobs:
+//
+//   - Policy: load-balancing algorithm. Values match Caddy's
+//     `load_balancing.selection_policy` ("round_robin", "random",
+//     "least_conn", "ip_hash"). Empty defaults to "round_robin".
+//   - Interval: when non-empty, enables Caddy's active health check —
+//     each upstream is probed at this cadence against the deployment's
+//     health_check path, and an unhealthy upstream is taken out of
+//     rotation until it recovers. Empty disables active probing
+//     (Caddy still observes live requests for passive health).
+type IngressLB struct {
+	Policy   string `yaml:"policy,omitempty"   json:"policy,omitempty"`
+	Interval string `yaml:"interval,omitempty" json:"interval,omitempty"`
 }
 
 // IngressLocation is a single path match rule. Multiple entries per

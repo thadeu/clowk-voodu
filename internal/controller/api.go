@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +12,11 @@ import (
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
+
+// errScopeNotFound is returned by resolveScope when no manifest matches
+// (kind, name) in any scope. applyDelete maps it to 404; ambiguous
+// matches get a different error and map to 400.
+var errScopeNotFound = errors.New("not found in any scope")
 
 // API is the HTTP surface of the controller. Handlers are thin: decode,
 // call into Store or a subsystem, encode. Business logic lives in the
@@ -113,6 +120,24 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject cross-scope name collisions before writing anything. Two
+	// scopes claiming the same deployment name would both try to own the
+	// same container slot at reconcile time — refusing at this boundary
+	// is safer than letting the reconciler thrash.
+	if err := a.checkCrossScopeCollisions(r.Context(), manifests); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Two ingresses pointing at the same Host produce duplicate caddy
+	// automation policies, which caddy rejects at /load with an opaque
+	// error. Refuse here so the operator sees a clean "host already in
+	// use" message instead of a reconcile-time cascade.
+	if err := a.checkIngressHostCollisions(r.Context(), manifests); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
 	applied := make([]*Manifest, 0, len(manifests))
 
 	for _, m := range manifests {
@@ -125,7 +150,192 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		applied = append(applied, stored)
 	}
 
-	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: applied})
+	pruned, err := a.pruneMissing(r.Context(), manifests)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune: %w", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"applied": applied,
+			"pruned":  pruned,
+		},
+	})
+}
+
+// checkCrossScopeCollisions refuses any apply where a (kind, name)
+// already exists under a different scope. The reconciler maps a name
+// to a container slot — two scopes sharing a name would fight over
+// `web-0`, so the only safe time to catch it is here, before any Put.
+func (a *API) checkCrossScopeCollisions(ctx context.Context, manifests []*Manifest) error {
+	for _, m := range manifests {
+		if !IsScoped(m.Kind) {
+			continue
+		}
+
+		existing, err := a.Store.List(ctx, m.Kind)
+		if err != nil {
+			return err
+		}
+
+		for _, e := range existing {
+			if e.Name == m.Name && e.Scope != m.Scope {
+				return fmt.Errorf(
+					"%s/%s already exists under scope %q — rename one or use the existing scope",
+					m.Kind, m.Name, e.Scope,
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+// checkIngressHostCollisions rejects any apply that would leave two
+// ingresses sharing the same Host. Caddy treats host as the
+// automation-policy key, so duplicates produce "cannot apply more than
+// one automation policy to host" at /load time. Enforcing uniqueness
+// here trades a fuzzy reconcile error for a crisp validation error.
+//
+// The check covers both intra-request duplicates (two ingresses in the
+// same body) and cross-request ones (the body's hosts against what's
+// already in etcd, minus any ingress being re-applied under the same
+// (scope, name) — that's an update, not a collision).
+func (a *API) checkIngressHostCollisions(ctx context.Context, manifests []*Manifest) error {
+	incoming := map[string]string{}
+
+	for _, m := range manifests {
+		if m.Kind != KindIngress {
+			continue
+		}
+
+		host, err := ingressHost(m)
+		if err != nil {
+			return err
+		}
+
+		if host == "" {
+			continue
+		}
+
+		ref := fmt.Sprintf("%s/%s", m.Scope, m.Name)
+
+		if prev, dup := incoming[host]; dup {
+			return fmt.Errorf("ingress host %q claimed by both %s and %s in this apply", host, prev, ref)
+		}
+
+		incoming[host] = ref
+	}
+
+	existing, err := a.Store.List(ctx, KindIngress)
+	if err != nil {
+		return err
+	}
+
+	replacing := map[string]struct{}{}
+
+	for _, m := range manifests {
+		if m.Kind == KindIngress {
+			replacing[m.Scope+"/"+m.Name] = struct{}{}
+		}
+	}
+
+	for _, e := range existing {
+		if _, updating := replacing[e.Scope+"/"+e.Name]; updating {
+			continue
+		}
+
+		host, err := ingressHost(e)
+		if err != nil {
+			return err
+		}
+
+		if host == "" {
+			continue
+		}
+
+		if claimant, dup := incoming[host]; dup {
+			return fmt.Errorf(
+				"ingress host %q already owned by %s/%s — delete it or rename %s",
+				host, e.Scope, e.Name, claimant,
+			)
+		}
+	}
+
+	return nil
+}
+
+// ingressHost pulls the `host` field out of the ingress spec JSON. Kept
+// local to the validator so the API layer doesn't depend on the typed
+// manifest package just for a single field read.
+func ingressHost(m *Manifest) (string, error) {
+	if len(m.Spec) == 0 {
+		return "", nil
+	}
+
+	var spec struct {
+		Host string `json:"host"`
+	}
+
+	if err := json.Unmarshal(m.Spec, &spec); err != nil {
+		return "", fmt.Errorf("ingress/%s: decode spec: %w", m.Name, err)
+	}
+
+	return spec.Host, nil
+}
+
+// pruneMissing deletes every resource in etcd that (a) shares a
+// (scope, kind) with something in the input and (b) is absent from the
+// input's name set for that (scope, kind). The per-(scope, kind)
+// granularity is deliberate: an apply of `deployments.hcl` won't touch
+// ingresses in the same scope, so callers can decompose by kind without
+// losing the pair they didn't include. Returns the list of deleted
+// references so the CLI can surface "pruned: deployment/foo" lines.
+func (a *API) pruneMissing(ctx context.Context, manifests []*Manifest) ([]string, error) {
+	keep := map[string]map[string]struct{}{}
+
+	for _, m := range manifests {
+		if !IsScoped(m.Kind) {
+			continue
+		}
+
+		bucket := string(m.Kind) + "/" + m.Scope
+
+		if _, ok := keep[bucket]; !ok {
+			keep[bucket] = map[string]struct{}{}
+		}
+
+		keep[bucket][m.Name] = struct{}{}
+	}
+
+	var pruned []string
+
+	for bucket, names := range keep {
+		i := strings.Index(bucket, "/")
+		kind := Kind(bucket[:i])
+		scope := bucket[i+1:]
+
+		existing, err := a.Store.ListByScope(ctx, kind, scope)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, e := range existing {
+			if _, kept := names[e.Name]; kept {
+				continue
+			}
+
+			if _, err := a.Store.Delete(ctx, e.Kind, e.Scope, e.Name); err != nil {
+				return nil, err
+			}
+
+			pruned = append(pruned, fmt.Sprintf("%s/%s/%s", e.Kind, e.Scope, e.Name))
+		}
+	}
+
+	return pruned, nil
 }
 
 func (a *API) applyGet(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +370,7 @@ func (a *API) applyGet(w http.ResponseWriter, r *http.Request) {
 func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 	kindStr := r.URL.Query().Get("kind")
 	name := r.URL.Query().Get("name")
+	scope := r.URL.Query().Get("scope")
 
 	if kindStr == "" || name == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("kind and name are required"))
@@ -172,7 +383,24 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deleted, err := a.Store.Delete(r.Context(), kind, name)
+	if IsScoped(kind) && scope == "" {
+		// For scoped kinds the CLI must provide scope. Scan and return a
+		// clear error if there's a single match, or ask for disambiguation.
+		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+
+		scope = resolved
+	}
+
+	deleted, err := a.Store.Delete(r.Context(), kind, scope, name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -184,6 +412,35 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+// resolveScope finds the single scope that owns (kind, name) when the
+// caller didn't provide one. Used by DELETE/GET convenience paths so
+// `voodu scale -a web` keeps working without forcing the operator to
+// remember which scope `web` lives in. Ambiguous matches return an
+// error listing the candidates — there's no safe default to pick.
+func resolveScope(ctx context.Context, store Store, kind Kind, name string) (string, error) {
+	all, err := store.List(ctx, kind)
+	if err != nil {
+		return "", err
+	}
+
+	var matches []string
+
+	for _, m := range all {
+		if m.Name == name {
+			matches = append(matches, m.Scope)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%s/%s: %w", kind, name, errScopeNotFound)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("%s/%s is ambiguous across scopes %v — pass ?scope=...", kind, name, matches)
+	}
 }
 
 // handleStatus is a union of /desired and (later) /actual. In M3 we only

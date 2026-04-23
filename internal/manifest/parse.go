@@ -160,6 +160,7 @@ type hclRoot struct {
 }
 
 type hclDeployment struct {
+	Scope       string            `hcl:"scope,label"`
 	Name        string            `hcl:"name,label"`
 	Image       string            `hcl:"image,optional"`
 	Workdir     string            `hcl:"workdir,optional"`
@@ -181,7 +182,7 @@ type hclDeployment struct {
 }
 
 func (b hclDeployment) spec() DeploymentSpec {
-	return DeploymentSpec{
+	s := DeploymentSpec{
 		Image:       b.Image,
 		Workdir:     b.Workdir,
 		Dockerfile:  b.Dockerfile,
@@ -200,6 +201,10 @@ func (b hclDeployment) spec() DeploymentSpec {
 		HealthCheck: b.HealthCheck,
 		PostDeploy:  b.PostDeploy,
 	}
+
+	s.applyDefaults()
+
+	return s
 }
 
 type hclDatabase struct {
@@ -241,12 +246,19 @@ func (b hclService) spec() ServiceSpec {
 }
 
 type hclIngress struct {
+	Scope     string              `hcl:"scope,label"`
 	Name      string              `hcl:"name,label"`
 	Host      string              `hcl:"host"`
 	Service   string              `hcl:"service,optional"`
 	Port      int                 `hcl:"port,optional"`
 	TLS       *hclIngressTLS      `hcl:"tls,block"`
 	Locations []hclIngressLocation `hcl:"location,block"`
+	LB        *hclIngressLB       `hcl:"lb,block"`
+}
+
+type hclIngressLB struct {
+	Policy   string `hcl:"policy,optional"`
+	Interval string `hcl:"interval,optional"`
 }
 
 type hclIngressTLS struct {
@@ -285,6 +297,10 @@ func (b hclIngress) spec() IngressSpec {
 		}
 	}
 
+	if b.LB != nil {
+		out.LB = &IngressLB{Policy: b.LB.Policy, Interval: b.LB.Interval}
+	}
+
 	return out
 }
 
@@ -306,7 +322,7 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 	var out []controller.Manifest
 
 	for _, b := range root.Deployments {
-		m, err := encode(controller.KindDeployment, b.Name, b.spec())
+		m, err := encode(controller.KindDeployment, b.Scope, b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -315,7 +331,7 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 	}
 
 	for _, b := range root.Databases {
-		m, err := encode(controller.KindDatabase, b.Name, b.spec())
+		m, err := encode(controller.KindDatabase, "", b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -324,7 +340,7 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 	}
 
 	for _, b := range root.Services {
-		m, err := encode(controller.KindService, b.Name, b.spec())
+		m, err := encode(controller.KindService, "", b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -333,7 +349,7 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 	}
 
 	for _, b := range root.Ingresses {
-		m, err := encode(controller.KindIngress, b.Name, b.spec())
+		m, err := encode(controller.KindIngress, b.Scope, b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -346,11 +362,15 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 
 // yamlDoc mirrors the controller wire shape so users can hand-roll
 // manifests that match what the API already consumes. Multi-doc files
-// are supported via `---` separators.
+// are supported via `---` separators. Scope is optional in the YAML
+// surface — HCL is the preferred syntax for scoped kinds and is where
+// the 2-label shape becomes natural; YAML users who need scope can
+// still set it via the explicit `scope:` field.
 type yamlDoc struct {
-	Kind string    `yaml:"kind"`
-	Name string    `yaml:"name"`
-	Spec yaml.Node `yaml:"spec"`
+	Kind  string    `yaml:"kind"`
+	Scope string    `yaml:"scope,omitempty"`
+	Name  string    `yaml:"name"`
+	Spec  yaml.Node `yaml:"spec"`
 }
 
 func parseYAML(raw []byte) ([]controller.Manifest, error) {
@@ -384,7 +404,7 @@ func parseYAML(raw []byte) ([]controller.Manifest, error) {
 			return nil, fmt.Errorf("%s/%s: %w", doc.Kind, doc.Name, err)
 		}
 
-		m, err := encode(kind, doc.Name, spec)
+		m, err := encode(kind, doc.Scope, doc.Name, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -402,7 +422,13 @@ func decodeYAMLSpec(kind controller.Kind, node yaml.Node) (any, error) {
 	switch kind {
 	case controller.KindDeployment:
 		var s DeploymentSpec
-		return s, node.Decode(&s)
+		if err := node.Decode(&s); err != nil {
+			return s, err
+		}
+
+		s.applyDefaults()
+
+		return s, nil
 
 	case controller.KindDatabase:
 		var s DatabaseSpec
@@ -423,9 +449,13 @@ func decodeYAMLSpec(kind controller.Kind, node yaml.Node) (any, error) {
 
 // encode marshals a typed spec into the JSON-valued Manifest shape the
 // controller expects, and applies minimum validation.
-func encode(kind controller.Kind, name string, spec any) (controller.Manifest, error) {
+func encode(kind controller.Kind, scope, name string, spec any) (controller.Manifest, error) {
 	if name == "" {
 		return controller.Manifest{}, fmt.Errorf("%s: missing name", kind)
+	}
+
+	if controller.IsScoped(kind) && scope == "" {
+		return controller.Manifest{}, fmt.Errorf("%s/%s: scope is required (use `%s \"scope\" \"%s\" { ... }`)", kind, name, kind, name)
 	}
 
 	b, err := json.Marshal(spec)
@@ -434,8 +464,9 @@ func encode(kind controller.Kind, name string, spec any) (controller.Manifest, e
 	}
 
 	return controller.Manifest{
-		Kind: kind,
-		Name: name,
-		Spec: json.RawMessage(b),
+		Kind:  kind,
+		Scope: scope,
+		Name:  name,
+		Spec:  json.RawMessage(b),
 	}, nil
 }

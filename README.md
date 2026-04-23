@@ -54,22 +54,17 @@ From your laptop — declare the app with an HCL manifest:
 
 ```hcl
 # voodu.hcl
-deployment "api" {
-  path     = "."
+deployment "prod" "api" {
   replicas = 2
   ports    = ["8080"]
 
   env = {
     PORT = "8080"
   }
-
-  health_check = "/healthz"
-  restart      = "always"
 }
 
-ingress "api" {
+ingress "prod" "api" {
   host = "api.example.com"
-  port = 8080
 
   tls {
     enabled  = true
@@ -79,21 +74,28 @@ ingress "api" {
 }
 ```
 
-`service` inside `ingress` defaults to the ingress name, so the
-overwhelmingly common 1-to-1 shape (`deployment "api"` ↔ `ingress
-"api"`) is declaration-only — no boilerplate `service = "api"` required.
-Port defaults to 80 when the referenced service/deployment declares one.
+Scoped kinds (`deployment`, `ingress`) take **two labels**: `<scope>` and
+`<name>`. Scope is a free-form organizational tag (app, team,
+environment); it groups manifests, selects what prune touches, and is
+the uniqueness boundary for names. `service` inside `ingress` defaults
+to the ingress name, so the 1-to-1 shape (`deployment "prod" "api"` ↔
+`ingress "prod" "api"`) is declaration-only. Path, Dockerfile, port, and
+health_check all have sensible defaults (`.`, `Dockerfile`, the
+deployment's declared port, `/`) — set them only when you need to
+override.
 
 Apply it:
 
 ```sh
-voodu apply -f api -a prod
+voodu apply -f voodu.hcl
 ```
 
-`voodu apply` is the single user-facing entrypoint. It parses the manifest,
-pushes the current `HEAD` to the server when the deployment is build-mode
-(no `image` field), POSTs the manifests to the controller, and reconciles
-ingress/services in one shot.
+`voodu apply` is the single user-facing entrypoint and the source of
+truth: the invocation (one file, many `-f`, or a directory) is the
+desired state. The controller diffs against etcd and **prunes per
+(scope, kind)** automatically — no confirm, no prompt. Applying only
+`deployments.hcl` won't touch ingresses in the same scope, so you can
+decompose by kind without cross-kind deletion.
 
 For a deployment that already has a published image, drop `path` and set
 `image = "ghcr.io/you/api:1.2.3"` — no `git push` happens, the controller
@@ -112,7 +114,7 @@ More examples live in [`examples/`](examples/):
 One host, many paths, one service:
 
 ```hcl
-ingress "api" {
+ingress "acme" "api" {
   host = "api.example.com"
 
   location { path = "/api/v1" }
@@ -120,16 +122,19 @@ ingress "api" {
 }
 ```
 
-One host, different services per path (classic versioned API):
+One host, different services per path (classic versioned API). The
+`/apply` boundary rejects two ingresses claiming the same host **unless**
+they declare distinct `location {}` blocks — one host, many paths, many
+services is legal fan-out:
 
 ```hcl
-ingress "api-v1" {
+ingress "acme" "api-v1" {
   host    = "api.example.com"
   service = "api-v1"
   location { path = "/api/v1" }
 }
 
-ingress "api-v2" {
+ingress "acme" "api-v2" {
   host    = "api.example.com"
   service = "api-v2"
   location { path = "/api/v2" }

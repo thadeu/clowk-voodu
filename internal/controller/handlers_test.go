@@ -267,6 +267,7 @@ type fakeContainers struct {
 	ensures   []ContainerSpec
 	restarts  []string
 	recreates []ContainerSpec
+	removes   []string
 
 	// containerImageIDs maps container name → the image ID the container
 	// was frozen against at create time. tagImageIDs maps tag → the image
@@ -332,6 +333,56 @@ func (f *fakeContainers) Restart(name string) error {
 	return nil
 }
 
+func (f *fakeContainers) Remove(name string) error {
+	f.removes = append(f.removes, name)
+
+	if f.exists != nil {
+		delete(f.exists, name)
+	}
+
+	if f.images != nil {
+		delete(f.images, name)
+	}
+
+	return nil
+}
+
+func (f *fakeContainers) ListByAppPrefix(app string) ([]string, error) {
+	out := []string{}
+
+	for name, present := range f.exists {
+		if !present {
+			continue
+		}
+
+		if name == app {
+			out = append(out, name)
+			continue
+		}
+
+		rest, ok := strings.CutPrefix(name, app+"-")
+		if !ok {
+			continue
+		}
+
+		allDigits := rest != ""
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+
+		if allDigits {
+			out = append(out, name)
+		}
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
 func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	store := newMemStore()
 
@@ -368,7 +419,7 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	}
 
 	got := cm.ensures[0]
-	if got.Name != "api" || got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/api.env" {
+	if got.Name != "api-0" || got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/api.env" {
 		t.Errorf("unexpected ensure spec: %+v", got)
 	}
 
@@ -643,9 +694,10 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 	store := newMemStore()
 
 	cm := &fakeContainers{
-		// Pretend the container already exists (e.g. git-push spawn, or a
-		// previous reconcile) so Ensure returns created=false.
-		exists: map[string]bool{"api": true},
+		// Pretend the indexed slot already exists (e.g. a previous
+		// reconcile) so Ensure returns created=false and the restart
+		// branch fires for an env change.
+		exists: map[string]bool{"api-0": true},
 	}
 
 	h := &DeploymentHandler{
@@ -663,8 +715,8 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 
 	h.Handle(context.Background(), ev)
 
-	if got, want := cm.restarts, []string{"api"}; len(got) != len(want) || got[0] != want[0] {
-		t.Errorf("expected restart of api, got %+v", got)
+	if got, want := cm.restarts, []string{"api-0"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected restart of api-0, got %+v", got)
 	}
 }
 
@@ -679,8 +731,8 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"api": true},
-		images: map[string]string{"api": "ghcr.io/acme/api:1.0.0"},
+		exists: map[string]bool{"api-0": true},
+		images: map[string]string{"api-0": "ghcr.io/acme/api:1.0.0"},
 	}
 
 	h := &DeploymentHandler{
@@ -735,8 +787,8 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindDeployment, "web", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"web": true},
-		images: map[string]string{"web": "nginx:latest"},
+		exists: map[string]bool{"web-0": true},
+		images: map[string]string{"web-0": "nginx:latest"},
 	}
 
 	h := &DeploymentHandler{
@@ -780,10 +832,11 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"vd-web": true},
-		// Container is still running the layer sha it was created with,
-		// but the tag "vd-web:latest" now points at a freshly-built layer.
-		containerImageIDs: map[string]string{"vd-web": "sha256:oldlayer"},
+		exists: map[string]bool{"vd-web-0": true},
+		// Slot 0 is still running the layer sha it was created with, but
+		// the tag "vd-web:latest" now points at a freshly-built layer.
+		// The reconciler checks slot 0 as the canary for image-id drift.
+		containerImageIDs: map[string]string{"vd-web-0": "sha256:oldlayer"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:newlayer"},
 	}
 
@@ -822,8 +875,8 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
 
 	cm := &fakeContainers{
-		exists:            map[string]bool{"vd-web": true},
-		containerImageIDs: map[string]string{"vd-web": "sha256:same"},
+		exists:            map[string]bool{"vd-web-0": true},
+		containerImageIDs: map[string]string{"vd-web-0": "sha256:same"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:same"},
 	}
 
@@ -858,8 +911,8 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"api": true},
-		images: map[string]string{"api": "img:1"},
+		exists: map[string]bool{"api-0": true},
+		images: map[string]string{"api-0": "img:1"},
 	}
 
 	h := &DeploymentHandler{
@@ -891,10 +944,10 @@ func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) 
 	store := newMemStore()
 
 	cm := &fakeContainers{
-		// Container already exists (imagine: controller upgrade onto a
-		// server where deployments ran under the pre-hash code path).
-		exists: map[string]bool{"api": true},
-		images: map[string]string{"api": "img:old"},
+		// Slot already exists (imagine: controller upgrade onto a server
+		// where deployments ran under the pre-hash code path).
+		exists: map[string]bool{"api-0": true},
+		images: map[string]string{"api-0": "img:old"},
 	}
 
 	h := &DeploymentHandler{
@@ -1022,6 +1075,153 @@ func TestDeploymentHandler_EmptyImageDefaultsToAppLatest(t *testing.T) {
 	}
 }
 
+func TestDeploymentHandler_ReplicasSpawnsEveryIndexedSlot(t *testing.T) {
+	// A deployment with replicas=3 must yield exactly three Ensure calls,
+	// one per `<app>-<N>` slot, in index order. Without this the ingress
+	// would only have slot 0 to dial, defeating the point of replicas.
+	store := newMemStore()
+
+	cm := &fakeContainers{}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
+		Image:    "img:1",
+		Replicas: 3,
+	})
+
+	h.Handle(context.Background(), ev)
+
+	if len(cm.ensures) != 3 {
+		t.Fatalf("expected 3 ensures for replicas=3, got %d", len(cm.ensures))
+	}
+
+	for i, e := range cm.ensures {
+		want := fmt.Sprintf("api-%d", i)
+
+		if e.Name != want {
+			t.Errorf("ensure[%d] name: got %q want %q", i, e.Name, want)
+		}
+	}
+}
+
+func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
+	// replicas went 3 → 1. The two extra slots must be Removed; the
+	// surviving slot stays untouched. Runs before any spec-drift work
+	// so the rollout loop doesn't churn slots that are already gone.
+	store := newMemStore()
+
+	cm := &fakeContainers{
+		exists: map[string]bool{
+			"api-0": true,
+			"api-1": true,
+			"api-2": true,
+		},
+		images: map[string]string{
+			"api-0": "img:1",
+			"api-1": "img:1",
+			"api-2": "img:1",
+		},
+	}
+
+	// Baseline status so no spec-drift recreate triggers.
+	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{Image: "img:1", Replicas: 1})
+
+	h.Handle(context.Background(), ev)
+
+	sort.Strings(cm.removes)
+
+	if want := []string{"api-1", "api-2"}; len(cm.removes) != len(want) ||
+		cm.removes[0] != want[0] || cm.removes[1] != want[1] {
+		t.Errorf("scale-down removes: got %+v want %+v", cm.removes, want)
+	}
+
+	if len(cm.recreates) != 0 {
+		t.Errorf("scale-down must not recreate surviving slots, got %+v", cm.recreates)
+	}
+}
+
+func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
+	// A pre-slot deployment left behind a bare-name `<app>` container.
+	// The new reconciler must remove it (port/volume collisions with
+	// `<app>-0` are inevitable) and spawn the indexed slot cleanly.
+	store := newMemStore()
+
+	cm := &fakeContainers{
+		exists: map[string]bool{"api": true},
+	}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{Image: "img:1"})
+
+	h.Handle(context.Background(), ev)
+
+	if len(cm.removes) != 1 || cm.removes[0] != "api" {
+		t.Errorf("expected legacy removal of %q, got %+v", "api", cm.removes)
+	}
+
+	if len(cm.ensures) != 1 || cm.ensures[0].Name != "api-0" {
+		t.Errorf("expected ensure of api-0 after legacy prune, got %+v", cm.ensures)
+	}
+}
+
+func TestIngressApplyEnv_EmitsMultiUpstreamAndLB(t *testing.T) {
+	env := ingressApplyEnv(
+		"api",
+		ingressSpec{
+			Host:    "api.example.com",
+			Service: "api",
+			Port:    3000,
+			LB:      &ingressLB{Policy: "least_conn", Interval: "5s"},
+		},
+		upstreamResolution{
+			Upstreams:       []string{"api-0:3000", "api-1:3000"},
+			HealthCheckPath: "/healthz",
+		},
+	)
+
+	if got := env[plugin.EnvIngressUpstreams]; got != `["api-0:3000","api-1:3000"]` {
+		t.Errorf("UPSTREAMS: got %q", got)
+	}
+
+	if got := env[plugin.EnvIngressLBPolicy]; got != "least_conn" {
+		t.Errorf("LB_POLICY: got %q", got)
+	}
+
+	if got := env[plugin.EnvIngressLBInterval]; got != "5s" {
+		t.Errorf("LB_INTERVAL: got %q", got)
+	}
+
+	if got := env[plugin.EnvIngressHealthCheckPath]; got != "/healthz" {
+		t.Errorf("HC_PATH: got %q", got)
+	}
+}
+
 func putEvent(t *testing.T, kind Kind, name string, spec any) WatchEvent {
 	t.Helper()
 
@@ -1030,14 +1230,21 @@ func putEvent(t *testing.T, kind Kind, name string, spec any) WatchEvent {
 		t.Fatal(err)
 	}
 
+	scope := ""
+	if IsScoped(kind) {
+		scope = "test"
+	}
+
 	return WatchEvent{
-		Type: WatchPut,
-		Kind: kind,
-		Name: name,
+		Type:  WatchPut,
+		Kind:  kind,
+		Scope: scope,
+		Name:  name,
 		Manifest: &Manifest{
-			Kind: kind,
-			Name: name,
-			Spec: json.RawMessage(raw),
+			Kind:  kind,
+			Scope: scope,
+			Name:  name,
+			Spec:  json.RawMessage(raw),
 		},
 	}
 }

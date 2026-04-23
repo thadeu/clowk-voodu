@@ -26,11 +26,17 @@ type ingressSpec struct {
 	Port      int               `json:"port,omitempty"`
 	TLS       *ingressTLS       `json:"tls,omitempty"`
 	Locations []ingressLocation `json:"locations,omitempty"`
+	LB        *ingressLB        `json:"lb,omitempty"`
 }
 
 type ingressLocation struct {
 	Path  string `json:"path"`
 	Strip bool   `json:"strip,omitempty"`
+}
+
+type ingressLB struct {
+	Policy   string `json:"policy,omitempty"`
+	Interval string `json:"interval,omitempty"`
 }
 
 type ingressTLS struct {
@@ -201,7 +207,8 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("ingress/%s: host is required", ev.Name)
 	}
 
-	if err := h.resolveUpstream(ctx, ev.Name, &spec); err != nil {
+	up, err := h.resolveUpstream(ctx, ev.Scope, ev.Name, &spec)
+	if err != nil {
 		return err
 	}
 
@@ -210,7 +217,7 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		pluginName = "caddy"
 	}
 
-	env := ingressApplyEnv(ev.Name, spec)
+	env := ingressApplyEnv(ev.Name, spec, up)
 
 	res, err := h.Invoker.Invoke(ctx, pluginName, "apply", []string{ev.Name}, env)
 	if err != nil {
@@ -294,10 +301,19 @@ func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 	return nil
 }
 
+// upstreamResolution is what resolveUpstream hands back: the list of
+// `host:port` pairs caddy should balance across, plus any health-check
+// path the deployment declared. Split out so ingressApplyEnv can be
+// called from tests without reconstituting a full Store.
+type upstreamResolution struct {
+	Upstreams       []string
+	HealthCheckPath string
+}
+
 // ingressApplyEnv packs the spec into the env the plugin receives. As
 // with database, we favour env over positional args so new spec fields
 // land without breaking older plugins that ignore them.
-func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
+func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[string]string {
 	env := map[string]string{
 		plugin.EnvApp:            name,
 		plugin.EnvIngressHost:    spec.Host,
@@ -306,6 +322,31 @@ func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
 
 	if spec.Port > 0 {
 		env[plugin.EnvIngressPort] = fmt.Sprintf("%d", spec.Port)
+	}
+
+	// Multi-upstream path: when the deployment has replicas > 1 (or we
+	// indexed a single-slot deployment), hand caddy the explicit list
+	// so it load-balances instead of dialing a stale bare-name DNS.
+	// Older plugin versions ignore this var and still work against the
+	// SERVICE/PORT pair.
+	if len(up.Upstreams) > 0 {
+		if b, err := json.Marshal(up.Upstreams); err == nil {
+			env[plugin.EnvIngressUpstreams] = string(b)
+		}
+	}
+
+	if spec.LB != nil {
+		if spec.LB.Policy != "" {
+			env[plugin.EnvIngressLBPolicy] = spec.LB.Policy
+		}
+
+		if spec.LB.Interval != "" {
+			env[plugin.EnvIngressLBInterval] = spec.LB.Interval
+		}
+	}
+
+	if up.HealthCheckPath != "" {
+		env[plugin.EnvIngressHealthCheckPath] = up.HealthCheckPath
 	}
 
 	if spec.TLS != nil {
@@ -377,10 +418,26 @@ func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
 // retries after backoff. Typos surface once the backoff log noise
 // makes them obvious — still better than 502s in prod.
 const defaultIngressPort = 80
-func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec *ingressSpec) error {
+
+// resolveUpstream validates the target exists and builds the upstream
+// list for caddy. Two sources feed the list:
+//
+//   - service: serviceSpec has no replicas concept; it's a single
+//     target (or an explicit list, if Ports was set). We return the
+//     single `target:port` pair.
+//   - deployment: we look up the deployment spec to read its replica
+//     count and health_check path, then emit one upstream per slot:
+//     `<app>-0:<port>, <app>-1:<port>, ...`. Caddy does not resolve
+//     stale bare-name DNS anymore; it sees exactly the set of running
+//     containers.
+//
+// spec.Port is filled in from whichever source provides it (explicit >
+// service.port > deployment.ports[0] > 80). See the port-fallback
+// rationale on the old implementation.
+func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string, spec *ingressSpec) (upstreamResolution, error) {
 	svc, err := h.lookupServiceSpec(ctx, spec.Service)
 	if err != nil {
-		return err
+		return upstreamResolution{}, err
 	}
 
 	if svc != nil {
@@ -392,12 +449,17 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec 
 			}
 		}
 
-		return nil
+		return upstreamResolution{
+			Upstreams: []string{fmt.Sprintf("%s:%d", svc.Target, spec.Port)},
+		}, nil
 	}
 
-	dep, err := h.lookupDeploymentSpec(ctx, spec.Service)
+	// Deployments are scope-local: an ingress in scope X only resolves
+	// deployments declared under scope X. Same-named deployments in a
+	// different scope are deliberately invisible here.
+	dep, err := h.lookupDeploymentSpec(ctx, scope, spec.Service)
 	if err != nil {
-		return err
+		return upstreamResolution{}, err
 	}
 
 	if dep != nil {
@@ -409,14 +471,25 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec 
 			}
 		}
 
-		return nil
+		replicas := effectiveReplicas(*dep)
+		slots := slotNames(spec.Service, replicas)
+		upstreams := make([]string, len(slots))
+
+		for i, slot := range slots {
+			upstreams[i] = fmt.Sprintf("%s:%d", slot, spec.Port)
+		}
+
+		return upstreamResolution{
+			Upstreams:       upstreams,
+			HealthCheckPath: dep.HealthCheck,
+		}, nil
 	}
 
-	return Transient(fmt.Errorf("ingress/%s: no service or deployment named %q yet — will retry", name, spec.Service))
+	return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no service or deployment named %q yet — will retry", name, spec.Service))
 }
 
 func (h *IngressHandler) lookupServiceSpec(ctx context.Context, name string) (*serviceSpec, error) {
-	m, err := h.Store.Get(ctx, KindService, name)
+	m, err := h.Store.Get(ctx, KindService, "", name)
 	if err != nil {
 		return nil, err
 	}
@@ -433,8 +506,8 @@ func (h *IngressHandler) lookupServiceSpec(ctx context.Context, name string) (*s
 	return &spec, nil
 }
 
-func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, name string) (*deploymentSpec, error) {
-	m, err := h.Store.Get(ctx, KindDeployment, name)
+func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, scope, name string) (*deploymentSpec, error) {
+	m, err := h.Store.Get(ctx, KindDeployment, scope, name)
 	if err != nil {
 		return nil, err
 	}

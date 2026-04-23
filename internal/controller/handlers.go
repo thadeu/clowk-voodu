@@ -10,10 +10,19 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
+
+// slotRolloutPause is the fixed sleep between sequential slot
+// recreates / restarts during a rollout. It is a blunt instrument —
+// just enough time for docker to wire the new container onto voodu0
+// so ingress traffic keeps landing on at least one healthy replica.
+// A real "wait for /healthz 200" probe can replace this once the
+// deployment spec carries a liveness endpoint the reconciler trusts.
+const slotRolloutPause = 2 * time.Second
 
 // pluginErrorDetail extracts the most informative error string from a
 // non-zero plugin exit. Plugins emit structured errors via their JSON
@@ -59,6 +68,7 @@ type databaseSpec struct {
 
 type deploymentSpec struct {
 	Image       string            `json:"image,omitempty"`
+	Replicas    int               `json:"replicas,omitempty"`
 	Command     []string          `json:"command,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Ports       []string          `json:"ports,omitempty"`
@@ -67,6 +77,40 @@ type deploymentSpec struct {
 	Networks    []string          `json:"networks,omitempty"`
 	NetworkMode string            `json:"network_mode,omitempty"`
 	Restart     string            `json:"restart,omitempty"`
+	HealthCheck string            `json:"health_check,omitempty"`
+}
+
+// effectiveReplicas normalizes the replica count: manifest omits
+// `replicas` → 1 (the overwhelmingly common shape). Negative values
+// are clamped to 1 because zero-replica deployments have no meaning in
+// the current architecture (we don't pause/drain; removing the manifest
+// is how you scale to zero).
+func effectiveReplicas(spec deploymentSpec) int {
+	if spec.Replicas < 1 {
+		return 1
+	}
+
+	return spec.Replicas
+}
+
+// slotName turns (app, index) into the container name Docker sees.
+// Indexing is zero-based and always applied — even `replicas = 1`
+// produces `<app>-0` — so the reconciler has one uniform code path.
+// Legacy non-indexed containers (created before this was introduced)
+// are detected and removed at reconcile time; see pruneLegacy().
+func slotName(app string, index int) string {
+	return fmt.Sprintf("%s-%d", app, index)
+}
+
+// slotNames returns every slot name for a given replica count.
+func slotNames(app string, replicas int) []string {
+	out := make([]string, replicas)
+
+	for i := 0; i < replicas; i++ {
+		out[i] = slotName(app, i)
+	}
+
+	return out
 }
 
 // DatabaseHandler reconciles database manifests by dispatching to the
@@ -486,67 +530,253 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		h.logf("deployment/%s no env to link", ev.Name)
 	}
 
-	created, err := h.ensureContainer(ev.Name, spec)
-	if err != nil {
-		return err
-	}
-
 	if h.Containers == nil {
 		return nil
 	}
 
-	if created {
-		// Baseline the spec hash so the next reconcile has something to
-		// compare against. Without this, the very next apply would see
-		// no persisted status and treat a real drift as first-seen.
+	replicas := effectiveReplicas(spec)
+	slots := slotNames(ev.Name, replicas)
+
+	// Prune the legacy bare-name container (pre-slot era) before
+	// anything else. Leaving it around collides on ports/volumes with
+	// the new `<app>-0` slot and leaks a detached process that ingress
+	// has no way to reach.
+	if spec.Image != "" {
+		if err := h.pruneLegacyContainer(ev.Name); err != nil {
+			h.logf("deployment/%s legacy prune failed: %v", ev.Name, err)
+		}
+	}
+
+	createdSlots, err := h.ensureSlots(ev.Name, slots, spec)
+	if err != nil {
+		return err
+	}
+
+	createdAny := len(createdSlots) > 0
+
+	// Scale-down: anything above the desired replica count is a slot
+	// from a previous apply that must go. Runs before drift detection
+	// so the rollout loop doesn't churn through containers that are
+	// about to be removed anyway.
+	if err := h.pruneExtraSlots(ev.Name, replicas); err != nil {
+		h.logf("deployment/%s scale-down failed: %v", ev.Name, err)
+	}
+
+	if createdAny {
+		// Baseline the spec hash so the next reconcile has something
+		// to compare against. Without this, the very next apply would
+		// see no persisted status and treat a real drift as first-seen.
 		if err := h.putDeploymentStatus(ctx, ev.Name, spec); err != nil {
 			h.logf("deployment/%s status persist failed: %v", ev.Name, err)
 		}
-
-		return nil
 	}
 
 	// Spec drift trumps restart: any change in runtime-relevant fields
 	// (image, ports, volumes, network, restart policy, command) means
-	// the running container has the wrong shape — Recreate absorbs env
-	// changes, so no follow-up restart either.
+	// the running containers have the wrong shape — Recreate absorbs
+	// env changes, so no follow-up restart either. Rollout is
+	// sequential, one slot at a time, with a short pause so ingress
+	// always has at least one healthy replica to route to.
+	recreatedAny := false
+
 	if spec.Image != "" {
-		recreated, err := h.recreateIfSpecChanged(ctx, ev.Name, spec)
+		r, err := h.recreateSlotsIfSpecChanged(ctx, ev.Name, slots, spec)
 		if err != nil {
 			return err
 		}
 
-		if recreated {
-			return nil
+		recreatedAny = r
+	}
+
+	// Fresh/recreated containers come up with the current .env already
+	// mounted, so restarting right after is redundant churn. Only
+	// cycle the slots that were neither freshly created this reconcile
+	// nor just recreated (recreate already absorbed the env), and only
+	// when env actually moved.
+	if envChanged && !recreatedAny {
+		h.restartSlots(ev.Name, excludeSlots(slots, createdSlots))
+	}
+
+	return nil
+}
+
+// excludeSlots returns `all` minus anything in `skip`. Preserves the
+// order of `all` so restart logs read in slot-index order.
+func excludeSlots(all, skip []string) []string {
+	if len(skip) == 0 {
+		return all
+	}
+
+	skipSet := make(map[string]struct{}, len(skip))
+	for _, s := range skip {
+		skipSet[s] = struct{}{}
+	}
+
+	out := make([]string, 0, len(all))
+
+	for _, s := range all {
+		if _, ok := skipSet[s]; ok {
+			continue
+		}
+
+		out = append(out, s)
+	}
+
+	return out
+}
+
+// ensureSlots creates every missing slot container and returns the
+// names of the ones that were actually freshly created. Slots are
+// created in index order so on first apply the logs read top-down;
+// for existing deployments the loop is effectively free (Ensure
+// short-circuits). The caller uses the returned list to skip redundant
+// restarts — fresh containers pick up the current .env at spawn time.
+func (h *DeploymentHandler) ensureSlots(app string, slots []string, spec deploymentSpec) ([]string, error) {
+	var created []string
+
+	for _, slot := range slots {
+		wasCreated, err := h.ensureSlot(app, slot, spec)
+		if err != nil {
+			return created, err
+		}
+
+		if wasCreated {
+			created = append(created, slot)
 		}
 	}
 
-	// Fresh containers come up with the current .env already mounted,
-	// so restarting right after Ensure is redundant churn. Only cycle
-	// when env moved and the container was already there.
-	if envChanged {
-		if err := h.Containers.Restart(ev.Name); err != nil {
-			// Restart failure doesn't unwind the reconcile — env is on
-			// disk, the next deploy or manual restart picks it up.
-			h.logf("deployment/%s restart failed (env already written): %v", ev.Name, err)
-		} else {
-			h.logf("deployment/%s restarted (env changed)", ev.Name)
+	return created, nil
+}
+
+// ensureSlot is the single-slot version of the old ensureContainer.
+// Returns whether this call actually spawned a container (vs. found
+// one already present).
+func (h *DeploymentHandler) ensureSlot(app, slot string, spec deploymentSpec) (bool, error) {
+	if spec.Image == "" || h.Containers == nil {
+		return false, nil
+	}
+
+	envFile := ""
+	if h.EnvFilePath != nil {
+		envFile = h.EnvFilePath(app)
+	}
+
+	created, err := h.Containers.Ensure(ContainerSpec{
+		Name:        slot,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Ports:       spec.Ports,
+		Volumes:     spec.Volumes,
+		Networks:    spec.Networks,
+		NetworkMode: spec.NetworkMode,
+		Restart:     spec.Restart,
+		EnvFile:     envFile,
+	})
+	if err != nil {
+		return false, fmt.Errorf("ensure %s: %w", slot, err)
+	}
+
+	if created {
+		h.logf("deployment/%s slot %s created (image=%s)", app, slot, spec.Image)
+	}
+
+	return created, nil
+}
+
+// pruneLegacyContainer removes a pre-slot `<app>` container if one
+// survived the switch to indexed names. Silently no-ops on fresh
+// deployments (nothing to prune). We don't scan via ListByAppPrefix
+// here — Exists is enough and cheaper.
+func (h *DeploymentHandler) pruneLegacyContainer(app string) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	exists, err := h.Containers.Exists(app)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		return nil
+	}
+
+	h.logf("deployment/%s removing legacy non-indexed container %s", app, app)
+
+	return h.Containers.Remove(app)
+}
+
+// pruneExtraSlots removes any indexed slot whose index is >= replicas.
+// Called after ensureSlots so the list of existing containers already
+// reflects the just-added slots (if any); we just filter out the ones
+// that belong and Remove the rest.
+func (h *DeploymentHandler) pruneExtraSlots(app string, replicas int) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	existing, err := h.Containers.ListByAppPrefix(app)
+	if err != nil {
+		return fmt.Errorf("list slots: %w", err)
+	}
+
+	keep := make(map[string]struct{}, replicas)
+	for _, s := range slotNames(app, replicas) {
+		keep[s] = struct{}{}
+	}
+
+	for _, name := range existing {
+		if _, ok := keep[name]; ok {
+			continue
+		}
+
+		// Bare-name legacy containers are handled by pruneLegacyContainer
+		// at the top of apply(); skipping here avoids a double-remove
+		// race if the reconciler runs twice before status updates.
+		if name == app {
+			continue
+		}
+
+		h.logf("deployment/%s scale-down: removing %s", app, name)
+
+		if err := h.Containers.Remove(name); err != nil {
+			return fmt.Errorf("remove %s: %w", name, err)
 		}
 	}
 
 	return nil
 }
 
-// recreateIfSpecChanged compares the sha256 of the runtime-relevant
-// fields of the desired spec against the hash persisted at last
-// reconcile. A mismatch triggers Recreate and a fresh status write.
+// restartSlots cycles each slot in sequence with a short pause between
+// cycles so ingress load-balances onto the still-running peers during
+// the rollout. Restart errors are logged but do not abort the loop —
+// env is already on disk, the next apply or manual restart recovers.
+func (h *DeploymentHandler) restartSlots(app string, slots []string) {
+	for i, slot := range slots {
+		if err := h.Containers.Restart(slot); err != nil {
+			h.logf("deployment/%s slot %s restart failed (env already written): %v", app, slot, err)
+			continue
+		}
+
+		h.logf("deployment/%s slot %s restarted (env changed)", app, slot)
+
+		if i < len(slots)-1 {
+			time.Sleep(slotRolloutPause)
+		}
+	}
+}
+
+// recreateSlotsIfSpecChanged detects drift against the persisted spec
+// hash and image ID, then rolls the fleet one slot at a time when drift
+// is real. Single shared hash across slots — slots are siblings, their
+// runtime spec is identical by construction.
 //
-// When no status exists yet (first reconcile after a controller
-// upgrade that introduced status persistence) we baseline the hash
-// without recreating: the running container may well match the spec,
-// and churning every pre-existing deploy on upgrade is exactly the
-// kind of surprise this handler is meant to avoid.
-func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app string, spec deploymentSpec) (bool, error) {
+// When no status exists yet (first reconcile after a controller upgrade
+// that introduced status persistence) we baseline the hash without
+// recreating: the running containers may well match the spec, and
+// churning every pre-existing deploy on upgrade is exactly the kind of
+// surprise this handler is meant to avoid.
+func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app string, slots []string, spec deploymentSpec) (bool, error) {
 	hash := deploymentSpecHash(spec)
 
 	raw, err := h.Store.GetStatus(ctx, KindDeployment, app)
@@ -578,14 +808,20 @@ func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app strin
 		return false, nil
 	}
 
-	if prev.SpecHash == hash {
+	recreateNeeded := prev.SpecHash != hash
+	reason := ""
+
+	if recreateNeeded {
+		reason = fmt.Sprintf("spec drift (hash %s → %s)", shortHash(prev.SpecHash), shortHash(hash))
+	} else if len(slots) > 0 {
 		// Spec text is stable, but build-mode rebuilds `<app>:latest` on
 		// every git push — the tag string is identical yet the underlying
 		// image ID changes. Containers freeze the image ID at create
 		// time, so the running process stays on the old layers until we
 		// explicitly recreate. Spec-hash can't catch this (manifest text
-		// didn't move); only an image-ID comparison can.
-		differ, err := h.Containers.ImageIDsDiffer(app, spec.Image)
+		// didn't move); only an image-ID comparison can. Slot 0 is the
+		// canary — all slots share the image, so checking one is enough.
+		differ, err := h.Containers.ImageIDsDiffer(slots[0], spec.Image)
 		if err != nil {
 			// Treat ID-check errors as "no drift" to avoid unnecessary
 			// recreates on transient docker CLI failures. The next apply
@@ -594,32 +830,43 @@ func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app strin
 			return false, nil
 		}
 
-		if !differ {
-			return false, nil
+		if differ {
+			recreateNeeded = true
+			reason = fmt.Sprintf("image id drift (tag %s rebuilt under same name)", spec.Image)
 		}
-
-		h.logf("deployment/%s image id drift (tag %s rebuilt under same name), recreating", app, spec.Image)
-	} else {
-		h.logf("deployment/%s spec drift (hash %s → %s), recreating", app, shortHash(prev.SpecHash), shortHash(hash))
 	}
+
+	if !recreateNeeded {
+		return false, nil
+	}
+
+	h.logf("deployment/%s %s, recreating %d slot(s)", app, reason, len(slots))
 
 	envFile := ""
 	if h.EnvFilePath != nil {
 		envFile = h.EnvFilePath(app)
 	}
 
-	if err := h.Containers.Recreate(ContainerSpec{
-		Name:        app,
-		Image:       spec.Image,
-		Command:     spec.Command,
-		Ports:       spec.Ports,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
-		Restart:     spec.Restart,
-		EnvFile:     envFile,
-	}); err != nil {
-		return false, fmt.Errorf("recreate container: %w", err)
+	for i, slot := range slots {
+		if err := h.Containers.Recreate(ContainerSpec{
+			Name:        slot,
+			Image:       spec.Image,
+			Command:     spec.Command,
+			Ports:       spec.Ports,
+			Volumes:     spec.Volumes,
+			Networks:    spec.Networks,
+			NetworkMode: spec.NetworkMode,
+			Restart:     spec.Restart,
+			EnvFile:     envFile,
+		}); err != nil {
+			return false, fmt.Errorf("recreate %s: %w", slot, err)
+		}
+
+		h.logf("deployment/%s slot %s recreated", app, slot)
+
+		if i < len(slots)-1 {
+			time.Sleep(slotRolloutPause)
+		}
 	}
 
 	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
@@ -659,43 +906,6 @@ func (h *DeploymentHandler) linkEnv(ctx context.Context, app string, env map[str
 	h.logf("deployment/%s env linked (%d keys, changed=%v)", app, len(pairs), changed)
 
 	return changed, nil
-}
-
-// ensureContainer delegates to the container manager when the manifest
-// opts into reconciler-owned spawn (Image set) and a manager is wired.
-// Returns whether a container was created this call — false means the
-// container already existed (so restart logic can kick in) or the
-// manifest is env-only.
-func (h *DeploymentHandler) ensureContainer(app string, spec deploymentSpec) (bool, error) {
-	if spec.Image == "" || h.Containers == nil {
-		return false, nil
-	}
-
-	envFile := ""
-	if h.EnvFilePath != nil {
-		envFile = h.EnvFilePath(app)
-	}
-
-	created, err := h.Containers.Ensure(ContainerSpec{
-		Name:        app,
-		Image:       spec.Image,
-		Command:     spec.Command,
-		Ports:       spec.Ports,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
-		Restart:     spec.Restart,
-		EnvFile:     envFile,
-	})
-	if err != nil {
-		return false, fmt.Errorf("ensure container: %w", err)
-	}
-
-	if created {
-		h.logf("deployment/%s container created (image=%s)", app, spec.Image)
-	}
-
-	return created, nil
 }
 
 // refLookup closes over the store so InterpolateRefsMap can resolve

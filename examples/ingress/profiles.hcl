@@ -1,12 +1,13 @@
 // Four ingress profiles supported by voodu-caddy. Pick the block that
 // matches your case; they can coexist in the same file.
 //
-// `service` is optional — if omitted, it defaults to the ingress name.
-// These examples keep it explicit because ingress names (api_http,
-// api_public, ...) do NOT match the service name "api" — i.e. this is
-// cross-app routing by design. For the common 1-to-1 shape see
-// examples/fullstack/deployment.hcl. For path-based routing and
-// location {} blocks see examples/ingress/paths.hcl.
+// Scoped kinds take two labels: <scope> <name>. Scope here is "public"
+// to group externally-facing ingresses. `service` defaults to the
+// ingress name when omitted; these examples set it explicitly because
+// the ingress names (api_http, api_public, ...) do NOT match the
+// target deployment name "api" — i.e. cross-app routing by design.
+// For the 1-to-1 shape see examples/fullstack/deployment.hcl. For
+// path-based routing see examples/ingress/paths.hcl.
 //
 // Detailed semantics live in the plugin README:
 //   https://github.com/thadeu/voodu-caddy#tls-profiles
@@ -14,7 +15,7 @@
 // 1) HTTP only — no TLS block. Plain :80 proxy, upstream service:port.
 // `port` may be omitted when the referenced service or deployment
 // declares one; the controller resolves it before dispatch.
-ingress "api_http" {
+ingress "public" "api_http" {
   host    = "api.internal"
   service = "api"
   port    = 3000
@@ -23,7 +24,7 @@ ingress "api_http" {
 // 2) Public TLS via Let's Encrypt (ACME HTTP-01). Finite, known hosts.
 // Does NOT support wildcards — HTTP-01 cannot validate *.example.com.
 // Multiple ingresses sharing `email` reuse the same ACME account.
-ingress "api_public" {
+ingress "public" "api_public" {
   host    = "api.clowk.in"
   service = "api"
   port    = 3000
@@ -37,7 +38,7 @@ ingress "api_public" {
 
 // 3) Internal CA (Caddy self-signed). Dev/staging without a public
 // domain — browsers warn until the CA is trusted.
-ingress "api_internal" {
+ingress "public" "api_internal" {
   host    = "api.dev.local"
   service = "api"
   port    = 3000
@@ -54,7 +55,7 @@ ingress "api_internal" {
 //
 // `ask` is REQUIRED when on_demand = true. Without it the plugin would
 // be an open cert-issuance proxy.
-ingress "tenants_wildcard" {
+ingress "public" "tenants_wildcard" {
   host    = "*.clowk.in"
   service = "app"
   port    = 3000

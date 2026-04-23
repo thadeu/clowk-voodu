@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"strings"
+
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/paths"
 )
@@ -45,6 +47,20 @@ type ContainerManager interface {
 	// starts a fresh one from spec. Distinct from Ensure because we
 	// want a *different* image/runtime config, not a no-op.
 	Recreate(spec ContainerSpec) error
+
+	// Remove stops and deletes the named container. Used by the
+	// reconciler on scale-down (slots above the desired replica count)
+	// and to prune legacy non-indexed containers after the switch to
+	// `<app>-<index>` naming. Safe to call on a non-existent name.
+	Remove(name string) error
+
+	// ListByAppPrefix returns every voodu-managed container name whose
+	// name is exactly `<app>` or `<app>-<N>` — i.e. the legacy flat
+	// name plus the new indexed slots. Any other container (e.g.
+	// `<app>-foo` for a sidecar that shares the prefix accidentally)
+	// is filtered out, so callers can scale down / prune without fear
+	// of touching unrelated containers.
+	ListByAppPrefix(app string) ([]string, error)
 }
 
 // ContainerSpec is the subset of a deployment manifest the manager
@@ -141,6 +157,70 @@ func (DockerContainerManager) ImageIDsDiffer(container, tag string) (bool, error
 	}
 
 	return containerID != tagID, nil
+}
+
+func (DockerContainerManager) Remove(name string) error {
+	if !docker.ContainerExists(name) {
+		return nil
+	}
+
+	if err := docker.StopContainer(name); err != nil {
+		return err
+	}
+
+	return docker.RemoveContainer(name, true)
+}
+
+// ListByAppPrefix scans voodu-labeled containers and returns those whose
+// docker name is either the bare app name (legacy pre-slot) or the
+// indexed `<app>-<N>` shape. Names are normalised to drop the leading
+// '/' docker prepends in its JSON output.
+func (DockerContainerManager) ListByAppPrefix(app string) ([]string, error) {
+	containers, err := docker.ListContainers(true)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+
+	for _, c := range containers {
+		raw := c.Names
+		if raw == "" {
+			raw = c.Name
+		}
+
+		name := strings.TrimPrefix(strings.TrimSpace(raw), "/")
+		if name == "" {
+			continue
+		}
+
+		if name == app {
+			out = append(out, name)
+			continue
+		}
+
+		if rest, ok := strings.CutPrefix(name, app+"-"); ok {
+			if isAllDigits(rest) {
+				out = append(out, name)
+			}
+		}
+	}
+
+	return out, nil
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (DockerContainerManager) Recreate(spec ContainerSpec) error {

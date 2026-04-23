@@ -4,6 +4,7 @@ package envfile
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -54,6 +55,13 @@ func Save(path string, vars map[string]string) error {
 
 	for _, k := range keys {
 		b.WriteString(fmt.Sprintf("%s=%s\n", k, vars[k]))
+	}
+
+	// `voodu apply` can fire before any git push, so /opt/voodu/apps/<app>/shared
+	// may not exist yet. MkdirAll instead of expecting the deploy flow
+	// to have prepared the tree.
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
 	}
 
 	return os.WriteFile(path, []byte(b.String()), 0600)

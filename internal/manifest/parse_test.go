@@ -12,7 +12,7 @@ import (
 
 func TestParseHCLDeployment(t *testing.T) {
 	src := `
-deployment "api" {
+deployment "test" "api" {
   image = "nginx:${TAG:-1}"
   replicas = 3
   ports = ["8080", "8443"]
@@ -59,7 +59,7 @@ func TestParseHCLDeploymentBuildMode(t *testing.T) {
 	// build) is enforced by the handler — the parser just has to carry
 	// every field through cleanly.
 	src := `
-deployment "api" {
+deployment "test" "api" {
   workdir      = "apps/esl"
   dockerfile   = "Dockerfile.api"
   path         = "cmd/api"
@@ -113,9 +113,11 @@ deployment "api" {
 }
 
 func TestParseHCLDeploymentImageOptional(t *testing.T) {
-	// Minimal build-mode deployment: no image, no path either. Handler
-	// will treat this as "build from repo root" (legacy gokku deploy).
-	src := `deployment "api" {}`
+	// Minimal build-mode deployment: no image, no path either. Parser
+	// fills in `path="."` / `dockerfile="Dockerfile"` so `deployment {}`
+	// means "build the repo root with ./Dockerfile" without requiring
+	// the operator to spell it out.
+	src := `deployment "test" "api" {}`
 
 	tmp := writeTemp(t, "bare.hcl", src)
 
@@ -134,20 +136,32 @@ func TestParseHCLDeploymentImageOptional(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if spec.Image != "" || spec.Path != "" || spec.Workdir != "" {
-		t.Errorf("bare deployment should have empty source fields: %+v", spec)
+	if spec.Image != "" {
+		t.Errorf("image should stay empty: %+v", spec)
+	}
+
+	if spec.Path != "." {
+		t.Errorf("path default not applied: got %q, want %q", spec.Path, ".")
+	}
+
+	if spec.Dockerfile != "Dockerfile" {
+		t.Errorf("dockerfile default not applied: got %q, want %q", spec.Dockerfile, "Dockerfile")
+	}
+
+	if spec.Workdir != "" {
+		t.Errorf("workdir should stay empty (no default): %+v", spec)
 	}
 }
 
 func TestParseHCLMultiKind(t *testing.T) {
 	src := `
-deployment "api" {
+deployment "test" "api" {
   image = "a:1"
 }
 database "main" {
   engine = "postgres"
 }
-ingress "api" {
+ingress "test" "api" {
   host    = "api.example.com"
   service = "api"
 }
@@ -171,6 +185,7 @@ func TestParseYAMLMultiDoc(t *testing.T) {
 	src := `
 ---
 kind: deployment
+scope: test
 name: api
 spec:
   image: nginx:1
@@ -200,7 +215,7 @@ spec:
 func TestParseDirMixedFormats(t *testing.T) {
 	dir := t.TempDir()
 
-	writeAt(t, filepath.Join(dir, "a.hcl"), `deployment "api" { image = "x:1" }`)
+	writeAt(t, filepath.Join(dir, "a.hcl"), `deployment "test" "api" { image = "x:1" }`)
 	writeAt(t, filepath.Join(dir, "b.yaml"), "kind: database\nname: main\nspec:\n  engine: postgres\n")
 	writeAt(t, filepath.Join(dir, "README.md"), "ignored")
 
@@ -222,7 +237,7 @@ func TestParseDirMixedFormats(t *testing.T) {
 }
 
 func TestParseReaderStdin(t *testing.T) {
-	src := `deployment "api" { image = "nginx:1" }`
+	src := `deployment "test" "api" { image = "nginx:1" }`
 
 	mans, err := ParseReader(strings.NewReader(src), FormatHCL, nil)
 	if err != nil {
@@ -236,7 +251,7 @@ func TestParseReaderStdin(t *testing.T) {
 
 func TestParseJSONRoundTrip(t *testing.T) {
 	src := `
-deployment "api" {
+deployment "test" "api" {
   image = "nginx:1.27"
   replicas = 2
 }
@@ -272,7 +287,7 @@ func TestParseJSONSkipsInterpolation(t *testing.T) {
 	// JSON payloads are already-parsed manifests; ${VAR} inside a string
 	// value must be preserved verbatim (it's legitimate content, not a
 	// variable reference).
-	src := `[{"kind":"deployment","name":"api","spec":{"image":"nginx","env":{"URL":"${STILL_HERE}"}}}]`
+	src := `[{"kind":"deployment","scope":"test","name":"api","spec":{"image":"nginx","env":{"URL":"${STILL_HERE}"}}}]`
 
 	got, err := ParseReader(strings.NewReader(src), FormatJSON, map[string]string{"STILL_HERE": "expanded"})
 	if err != nil {

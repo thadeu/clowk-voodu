@@ -5,13 +5,17 @@ import (
 	"strings"
 )
 
-// KV layout in etcd — must match PLAN.md.
+// KV layout in etcd.
 //
-//	/desired/<kind>s/<name>        # desired state for a resource
-//	/actual/nodes/<node>/health    # health beacons per node
+//	/desired/<kind>s/<scope>/<name>  # scoped kinds (deployment, ingress)
+//	/desired/<kind>s/<name>          # unscoped kinds (database, service)
+//	/actual/nodes/<node>/health      # health beacons per node
 //	/actual/nodes/<node>/containers/<id>
-//	/config/<app>/<key>            # per-app config (optional; CLI writes .env directly)
+//	/config/<app>/<key>              # per-app config (optional; CLI writes .env directly)
 //	/plugins/<name>/manifest
+//	/status/<kind>s/<name>           # plugin-produced status (always keyed by
+//	                                 # name; uniqueness of (kind, name) across
+//	                                 # scopes is enforced at the /apply layer)
 const (
 	prefixDesired = "/desired/"
 	prefixActual  = "/actual/"
@@ -57,13 +61,25 @@ func ParseKind(s string) (Kind, error) {
 	return "", fmt.Errorf("unknown kind %q (valid: deployment, database, service, ingress)", s)
 }
 
-// DesiredPrefix returns "/desired/<kind>s/".
+// DesiredPrefix returns "/desired/<kind>s/" — the prefix covering every
+// manifest of a kind across all scopes.
 func DesiredPrefix(kind Kind) string {
 	return prefixDesired + string(kind) + "s/"
 }
 
-// DesiredKey returns "/desired/<kind>s/<name>".
-func DesiredKey(kind Kind, name string) string {
+// ScopedPrefix returns "/desired/<kind>s/<scope>/" — used to list a
+// single (kind, scope) bucket when computing a prune diff.
+func ScopedPrefix(kind Kind, scope string) string {
+	return DesiredPrefix(kind) + scope + "/"
+}
+
+// DesiredKey returns the etcd key for a manifest. Scoped kinds get the
+// extra path segment; unscoped kinds keep the original flat layout.
+func DesiredKey(kind Kind, scope, name string) string {
+	if IsScoped(kind) {
+		return ScopedPrefix(kind, scope) + name
+	}
+
 	return DesiredPrefix(kind) + name
 }
 

@@ -20,7 +20,7 @@ func TestApplyEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 
 	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
-deployment "api" {
+deployment "test" "api" {
   image = "nginx:${TAG:-1}"
 }
 `)
@@ -32,7 +32,7 @@ database "main" {
 `)
 
 	mustWrite(t, filepath.Join(dir, "ingress.hcl"), `
-ingress "api" {
+ingress "test" "api" {
   host    = "api.example.com"
   service = "api"
 }
@@ -116,10 +116,10 @@ func TestResolveManifestPath(t *testing.T) {
 	exact := filepath.Join(dir, "exact.hcl")
 	subdir := filepath.Join(dir, "stack")
 
-	mustWrite(t, hcl, `deployment "api" { image = "x" }`+"\n")
+	mustWrite(t, hcl, `deployment "test" "api" { image = "x" }`+"\n")
 	mustWrite(t, yml, "apps:\n  - name: legacy\n")
 	mustWrite(t, yaml, "apps:\n  - name: old\n")
-	mustWrite(t, exact, `deployment "exact" { image = "x" }`+"\n")
+	mustWrite(t, exact, `deployment "test" "exact" { image = "x" }`+"\n")
 
 	if err := os.Mkdir(subdir, 0755); err != nil {
 		t.Fatal(err)

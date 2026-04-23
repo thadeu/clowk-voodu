@@ -22,10 +22,16 @@ func seedManifest(t *testing.T, store Store, kind Kind, name string, spec any) {
 		t.Fatal(err)
 	}
 
+	scope := ""
+	if IsScoped(kind) {
+		scope = "test"
+	}
+
 	if _, err := store.Put(context.Background(), &Manifest{
-		Kind: kind,
-		Name: name,
-		Spec: json.RawMessage(raw),
+		Kind:  kind,
+		Scope: scope,
+		Name:  name,
+		Spec:  json.RawMessage(raw),
 	}); err != nil {
 		t.Fatal(err)
 	}
