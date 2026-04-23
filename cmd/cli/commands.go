@@ -143,12 +143,30 @@ func appsListCmd() *cobra.Command {
 	}
 }
 
+// newDeployCmd registers the build-and-release pipeline that runs on the
+// server side of a git push. It is intentionally hidden from `voodu --help`
+// because the user-facing entry point is `voodu apply` — when a manifest
+// has a build-mode deployment, apply fires `git push` under the hood, and
+// the bare repo's post-receive hook invokes this command. Keeping it as a
+// subcommand (rather than a private binary) means the hook can stay a
+// one-line shell script and ops can still run it by hand when debugging.
 func newDeployCmd() *cobra.Command {
 	var app string
 
 	cmd := &cobra.Command{
-		Use:   "deploy",
-		Short: "Deploy the latest push for an app",
+		Use:    "deploy",
+		Short:  "Internal: release pipeline invoked by the post-receive hook",
+		Long: `Extracts the pushed commit, builds the image, swaps the current
+symlink, runs post-deploy hooks, and starts the container.
+
+This command is plumbing — the supported user entrypoint is:
+
+    voodu apply -f voodu.hcl -a <app>
+
+Apply auto-detects build-mode deployments (no 'image' field) and fires a
+git push, which triggers this pipeline on the server. You only run this
+by hand when reproducing a deploy step-by-step for debugging.`,
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if app == "" {
 				return fmt.Errorf("--app/-a is required")

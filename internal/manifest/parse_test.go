@@ -52,6 +52,93 @@ deployment "api" {
 	}
 }
 
+func TestParseHCLDeploymentBuildMode(t *testing.T) {
+	// Mirrors the flat "voodu.yml-style" attribute set: no image, a
+	// workdir/dockerfile/path pointing at a subtree, lang hints, and a
+	// post_deploy hook. The resolution rule (image → registry vs. path →
+	// build) is enforced by the handler — the parser just has to carry
+	// every field through cleanly.
+	src := `
+deployment "api" {
+  workdir      = "apps/esl"
+  dockerfile   = "Dockerfile.api"
+  path         = "cmd/api"
+  lang         = "go"
+  go_version   = "1.25"
+  ports        = ["127.0.0.1:9092:9092"]
+  volumes      = ["/opt/gokku/volumes/rtp:/app/recordings"]
+  network      = "bridge"
+  restart      = "unless-stopped"
+  env          = { RAILS_ENV = "production" }
+  post_deploy  = ["./bin/migrate"]
+  health_check = "/healthz"
+}
+`
+	tmp := writeTemp(t, "build.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Image != "" {
+		t.Errorf("image should be empty in build mode, got %q", spec.Image)
+	}
+
+	if spec.Workdir != "apps/esl" || spec.Dockerfile != "Dockerfile.api" || spec.Path != "cmd/api" {
+		t.Errorf("source fields not carried: %+v", spec)
+	}
+
+	if spec.Lang != "go" || spec.GoVersion != "1.25" {
+		t.Errorf("lang hints lost: lang=%q go_version=%q", spec.Lang, spec.GoVersion)
+	}
+
+	if len(spec.PostDeploy) != 1 || spec.PostDeploy[0] != "./bin/migrate" {
+		t.Errorf("post_deploy: %+v", spec.PostDeploy)
+	}
+
+	if spec.HealthCheck != "/healthz" || spec.Restart != "unless-stopped" || spec.Network != "bridge" {
+		t.Errorf("runtime fields: %+v", spec)
+	}
+}
+
+func TestParseHCLDeploymentImageOptional(t *testing.T) {
+	// Minimal build-mode deployment: no image, no path either. Handler
+	// will treat this as "build from repo root" (legacy gokku deploy).
+	src := `deployment "api" {}`
+
+	tmp := writeTemp(t, "bare.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("image should be optional for build mode: %v", err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Image != "" || spec.Path != "" || spec.Workdir != "" {
+		t.Errorf("bare deployment should have empty source fields: %+v", spec)
+	}
+}
+
 func TestParseHCLMultiKind(t *testing.T) {
 	src := `
 deployment "api" {

@@ -13,18 +13,33 @@
 package manifest
 
 // DeploymentSpec is an app the controller should run as a container.
-// Minimal in M4 — the full lifecycle (health checks, replicas, volumes)
-// fills out over M4/M5.
+//
+// Source resolution is intentionally implicit (mirrors legacy voodu.yml —
+// no `source {}` block). The handler picks a mode from which fields are
+// set at reconcile time:
+//
+//   - Image non-empty        → pull from registry and run (no build)
+//   - Image empty + Path set → docker build using <Workdir>/<Path> as context
+//   - Image empty + no Path  → docker build at repo root (same as `gokku deploy`)
+//
+// Workdir narrows the repo subtree (monorepo case); Dockerfile picks a
+// non-default filename. Both are ignored when Image is set.
 type DeploymentSpec struct {
-	Image       string            `yaml:"image"                 json:"image"`
-	Replicas    int               `yaml:"replicas,omitempty"    json:"replicas,omitempty"`
-	Command     []string          `yaml:"command,omitempty"     json:"command,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty"         json:"env,omitempty"`
-	Ports       []string          `yaml:"ports,omitempty"       json:"ports,omitempty"`
-	Volumes     []string          `yaml:"volumes,omitempty"     json:"volumes,omitempty"`
-	Network     string            `yaml:"network,omitempty"     json:"network,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"     json:"restart,omitempty"`
+	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
+	Workdir     string            `yaml:"workdir,omitempty"      json:"workdir,omitempty"`
+	Dockerfile  string            `yaml:"dockerfile,omitempty"   json:"dockerfile,omitempty"`
+	Path        string            `yaml:"path,omitempty"         json:"path,omitempty"`
+	Lang        string            `yaml:"lang,omitempty"         json:"lang,omitempty"`
+	GoVersion   string            `yaml:"go_version,omitempty"   json:"go_version,omitempty"`
+	Replicas    int               `yaml:"replicas,omitempty"     json:"replicas,omitempty"`
+	Command     []string          `yaml:"command,omitempty"      json:"command,omitempty"`
+	Env         map[string]string `yaml:"env,omitempty"          json:"env,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"        json:"ports,omitempty"`
+	Volumes     []string          `yaml:"volumes,omitempty"      json:"volumes,omitempty"`
+	Network     string            `yaml:"network,omitempty"      json:"network,omitempty"`
+	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
 	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
+	PostDeploy  []string          `yaml:"post_deploy,omitempty"  json:"post_deploy,omitempty"`
 }
 
 // DatabaseSpec is a managed data service. The Engine field selects which

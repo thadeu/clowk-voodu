@@ -322,10 +322,19 @@ func (h *DatabaseHandler) logf(format string, args ...any) {
 //     pick up the new env), cycle the container so the process sees
 //     the new values.
 //
-// When spec.Image is empty, the handler assumes git-push owns the
-// container lifecycle (the legacy Gokku-style path) and only touches
-// env + restart. That split lets manifest-driven apps coexist with
-// code-pushed apps on the same host.
+// Registry-mode vs build-mode split:
+//
+//   - spec.Image != "" (registry-mode): the manifest names a pullable
+//     image; the handler owns the full container lifecycle.
+//   - spec.Image == "" (build-mode): the image comes from a git push.
+//     `voodu apply` fires the push automatically before POSTing the
+//     manifests, and the bare repo's post-receive hook runs the legacy
+//     `voodu deploy` pipeline (extract → build → start container).
+//     The handler here still runs linkEnv so ${ref.*} resolves to the
+//     on-disk .env file the hook's deploy will mount, but it leaves
+//     container orchestration to that path. A future refactor can
+//     collapse both modes under the handler once the hook is demoted
+//     to a pure build step.
 type DeploymentHandler struct {
 	Store Store
 	Log   *log.Logger

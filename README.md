@@ -27,7 +27,7 @@ M8  Migração primeiro app
 - `voodu setup` — prepara `/opt/voodu` no servidor
 - `voodu apps create <name>` — cria diretórios, bare repo e post-receive hook
 - `voodu apps list`
-- `voodu deploy -a <app>` — pipeline completo (extract → build → swap → post-deploy → restart)
+- `voodu deploy -a <app>` — **plumbing interno** do post-receive hook (extract → build → swap → post-deploy → restart). Use `voodu apply` como entrada do usuário; o apply dispara git push automaticamente pra build-mode, que chama este pipeline no servidor.
 - `voodu config set|get|list|unset|reload -a <app>` — gerencia `.env`
 - Exemplo de configuração em [examples/voodu.yml](examples/voodu.yml)
 - Pacotes internos portados de Gokku: `config`, `envfile`, `paths`, `util`, `docker`, `containers`, `lang` (go/python/nodejs/ruby/rails/generic), `git`, `ssh`, `secrets`, `deploy`.

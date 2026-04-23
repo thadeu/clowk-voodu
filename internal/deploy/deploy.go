@@ -20,6 +20,7 @@ import (
 	"go.voodu.clowk.in/internal/config"
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/envfile"
+	"go.voodu.clowk.in/internal/lang"
 	"go.voodu.clowk.in/internal/paths"
 )
 
@@ -66,7 +67,7 @@ func Run(app string, opts Options) error {
 		opts.log("Warning: could not process voodu.yml: %v", err)
 	}
 
-	if err := buildRelease(releaseDir, &opts); err != nil {
+	if err := buildRelease(app, releaseDir, &opts); err != nil {
 		return fmt.Errorf("build release: %w", err)
 	}
 
@@ -172,11 +173,34 @@ func loadServerConfig(path string) (*config.ServerConfig, error) {
 	return &srv, nil
 }
 
-func buildRelease(releaseDir string, opts *Options) error {
+// buildRelease turns the extracted release directory into a Docker image
+// tagged `<app>:latest`. Dispatch goes through the language-specific
+// handlers in internal/lang — they own Dockerfile generation, build-args,
+// and the `docker build` invocation itself (BuildKit enabled, labelled
+// with Voodu metadata via internal/docker.GetVooduLabels).
+//
+// Resolution order:
+//   - No voodu.yml → auto-detect language from the release contents.
+//   - App.Image set to a registry image → pull + retag instead of build.
+//   - Otherwise → generate or honour Dockerfile, run `docker build`.
+func buildRelease(appName, releaseDir string, opts *Options) error {
 	opts.log("-----> Building release...")
 
-	if _, err := os.Stat(filepath.Join(releaseDir, "Dockerfile")); err == nil {
-		opts.log("-----> Found Dockerfile")
+	appCfg, err := config.LoadAppConfig(appName)
+	if err != nil || appCfg == nil {
+		// No voodu.yml on disk yet (common for a brand-new app — the
+		// first push creates it). Fall back to an empty app spec so
+		// lang.NewLang runs pure auto-detection on the release dir.
+		appCfg = &config.App{Name: appName}
+	}
+
+	handler, err := lang.NewLang(appCfg, releaseDir)
+	if err != nil {
+		return fmt.Errorf("select language handler: %w", err)
+	}
+
+	if err := handler.Build(appName, appCfg, releaseDir); err != nil {
+		return err
 	}
 
 	opts.log("-----> Build completed")

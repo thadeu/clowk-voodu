@@ -161,7 +161,12 @@ type hclRoot struct {
 
 type hclDeployment struct {
 	Name        string            `hcl:"name,label"`
-	Image       string            `hcl:"image"`
+	Image       string            `hcl:"image,optional"`
+	Workdir     string            `hcl:"workdir,optional"`
+	Dockerfile  string            `hcl:"dockerfile,optional"`
+	Path        string            `hcl:"path,optional"`
+	Lang        string            `hcl:"lang,optional"`
+	GoVersion   string            `hcl:"go_version,optional"`
 	Replicas    int               `hcl:"replicas,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
@@ -170,13 +175,26 @@ type hclDeployment struct {
 	Network     string            `hcl:"network,optional"`
 	Restart     string            `hcl:"restart,optional"`
 	HealthCheck string            `hcl:"health_check,optional"`
+	PostDeploy  []string          `hcl:"post_deploy,optional"`
 }
 
 func (b hclDeployment) spec() DeploymentSpec {
 	return DeploymentSpec{
-		Image: b.Image, Replicas: b.Replicas, Command: b.Command,
-		Env: b.Env, Ports: b.Ports, Volumes: b.Volumes,
-		Network: b.Network, Restart: b.Restart, HealthCheck: b.HealthCheck,
+		Image:       b.Image,
+		Workdir:     b.Workdir,
+		Dockerfile:  b.Dockerfile,
+		Path:        b.Path,
+		Lang:        b.Lang,
+		GoVersion:   b.GoVersion,
+		Replicas:    b.Replicas,
+		Command:     b.Command,
+		Env:         b.Env,
+		Ports:       b.Ports,
+		Volumes:     b.Volumes,
+		Network:     b.Network,
+		Restart:     b.Restart,
+		HealthCheck: b.HealthCheck,
+		PostDeploy:  b.PostDeploy,
 	}
 }
 

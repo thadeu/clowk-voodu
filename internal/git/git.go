@@ -56,6 +56,30 @@ func (c *Client) RemoveRemote(name string) error {
 	return nil
 }
 
+// PushHead pushes the current HEAD to <remote>:refs/heads/<branch>. Used
+// by `voodu apply` to ship source for build-mode deployments before
+// POSTing manifests — the post-receive hook on the bare repo is what
+// turns the push into a built image. Output streams to the caller's
+// stdout/stderr so the user sees hook progress live.
+func PushHead(ctx context.Context, remote, branch string) error {
+	if remote == "" || branch == "" {
+		return fmt.Errorf("git push: remote and branch are required")
+	}
+
+	refspec := fmt.Sprintf("HEAD:refs/heads/%s", branch)
+
+	cmd := exec.CommandContext(ctx, "git", "push", remote, refspec)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git push %s %s: %w", remote, refspec, err)
+	}
+
+	return nil
+}
+
 // SetupBareRepo initializes the server-side bare repository for an app
 // at <root>/repos/<app>.git. Idempotent: re-running on an existing repo
 // is a no-op.
