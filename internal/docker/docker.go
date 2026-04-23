@@ -47,11 +47,23 @@ type ContainerInfo struct {
 }
 
 type ContainerConfig struct {
-	Name          string
-	Image         string
-	Ports         []string
-	EnvFile       string
-	NetworkMode   string
+	Name    string
+	Image   string
+	Ports   []string
+	EnvFile string
+
+	// NetworkMode is the legacy single-network knob — kept for the
+	// build-driven deploy path (DeploymentConfig) which only ever joins
+	// one network. Controller-managed deployments set Networks instead.
+	NetworkMode string
+
+	// Networks, when non-empty, wins over NetworkMode. The first entry
+	// becomes --network at `docker run`; additional entries are attached
+	// to the running container via `docker network connect`. This is the
+	// only way to get a container onto more than one bridge (docker
+	// doesn't accept --network multiple times).
+	Networks []string
+
 	RestartPolicy string
 	Volumes       []string
 	WorkingDir    string
@@ -83,12 +95,34 @@ func CreateContainer(cfg ContainerConfig) error {
 		args = append(args, "--restart", cfg.RestartPolicy)
 	}
 
+	// NetworkMode (host/none) wins when explicitly set — it bypasses
+	// docker's bridge stack entirely, so Networks is irrelevant. The
+	// handler validates mutual exclusivity before we get here; this
+	// branch just picks which field to trust. Otherwise fall through
+	// to the bridge path: first Networks entry becomes --network, and
+	// extras are attached post-run via docker network connect.
+	primaryNet := ""
 	if cfg.NetworkMode != "" {
-		args = append(args, "--network", cfg.NetworkMode)
+		primaryNet = cfg.NetworkMode
+	} else if len(cfg.Networks) > 0 {
+		primaryNet = cfg.Networks[0]
 	}
 
-	for _, port := range cfg.Ports {
-		args = append(args, "-p", port)
+	if primaryNet != "" {
+		args = append(args, "--network", primaryNet)
+	}
+
+	// Port publishing is meaningless (and rejected with a warning by
+	// modern docker) when the container shares the host's net stack:
+	// in host mode the container's listening ports ARE the host's
+	// ports, so there's no NAT rule to install. Same for `none` mode
+	// where the container has no network namespace at all. Gokku had
+	// this same guard (legacy/pkg/docker.go) — keep it to avoid the
+	// "Published ports are discarded" warning + confused operators.
+	if cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
+		for _, port := range cfg.Ports {
+			args = append(args, "-p", port)
+		}
 	}
 
 	if cfg.EnvFile != "" {
@@ -117,6 +151,43 @@ func CreateContainer(cfg ContainerConfig) error {
 
 	if err != nil {
 		return fmt.Errorf("failed to create container %s: %v, output: %s", cfg.Name, err, string(output))
+	}
+
+	// Attach any secondary networks. Docker only accepts one --network
+	// at create time, so fanning out here is the only path to multi-
+	// homed containers. If a connect fails we roll the container back —
+	// a half-joined container is worse than no container because it
+	// silently misses whichever network the operator declared.
+	//
+	// Skip entirely in host/none mode: attaching a bridge to a
+	// host-networked container is either rejected by docker or silently
+	// ignored, and either way it's operator confusion we don't want.
+	if cfg.NetworkMode == "" && len(cfg.Networks) > 1 {
+		for _, net := range cfg.Networks[1:] {
+			if net == "" || net == primaryNet {
+				continue
+			}
+
+			if err := ConnectNetwork(cfg.Name, net); err != nil {
+				_ = RemoveContainer(cfg.Name, true)
+				return fmt.Errorf("failed to connect container %s to network %s: %w", cfg.Name, net, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ConnectNetwork attaches an existing container to an additional docker
+// network. Used by CreateContainer to fan out multi-network specs, but
+// exported so the reconciler (or future drift logic) can rewire
+// membership without recreating the container.
+func ConnectNetwork(container, network string) error {
+	cmd := exec.Command("docker", "network", "connect", network, container)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker network connect %s %s: %v, output: %s", network, container, err, string(output))
 	}
 
 	return nil
@@ -200,6 +271,53 @@ func GetContainerImage(name string) (string, error) {
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// GetContainerImageID returns the image ID (sha256) the container was
+// created from. Distinct from GetContainerImage (which returns the tag)
+// because tags are mutable: `vd-web:latest` today is a different image
+// than `vd-web:latest` after a rebuild. The ID is the stable identity
+// and the only reliable way to detect "tag got rewritten, container
+// needs to restart from the new image".
+//
+// Empty string + nil error means no such container.
+func GetContainerImageID(name string) (string, error) {
+	if !ContainerExists(name) {
+		return "", nil
+	}
+
+	cmd := exec.Command("docker", "inspect", name, "--format", "{{.Image}}")
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// GetImageID resolves a tag (or any image reference) to its current
+// sha256 ID. Pair with GetContainerImageID to detect build-mode drift:
+// after `docker build -t vd-web:latest`, the tag points at a new ID
+// but existing containers still reference the old one.
+//
+// Empty string + nil error means the image doesn't exist locally.
+func GetImageID(ref string) (string, error) {
+	cmd := exec.Command("docker", "inspect", ref, "--format", "{{.Id}}")
+
+	out, err := cmd.Output()
+	if err != nil {
+		// Exit code 1 with "No such object" on stderr is the common
+		// "image not pulled/built yet" case — treat it as non-fatal so
+		// the caller can transient-retry.
+		if strings.Contains(string(out), "No such") {
+			return "", nil
+		}
+
+		return "", nil
 	}
 
 	return strings.TrimSpace(string(out)), nil

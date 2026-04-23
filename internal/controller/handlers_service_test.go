@@ -215,6 +215,182 @@ func TestIngressHandler_ApplyForwardsOnDemandTLS(t *testing.T) {
 	}
 }
 
+func TestIngressHandler_ServiceDefaultsToIngressName(t *testing.T) {
+	// The overwhelming common case is `ingress "api" {}` paired with a
+	// `deployment "api"` — service name matches ingress name. Requiring
+	// `service = "api"` every time is pure boilerplate, so an omitted
+	// service defaults to the ingress's own name. Explicit service
+	// (cross-app routing) still wins.
+	store := newMemStore()
+
+	// Seed a deployment named "vd-web" so resolveUpstream's fail-fast
+	// check passes. That's the app the ingress implicitly targets.
+	seedManifest(t, store, KindDeployment, "vd-web", deploymentSpec{Image: "vd-web:latest"})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://vd-web.lvh.me"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	// No `Service` field — expect handler to substitute ev.Name ("vd-web").
+	ev := putEvent(t, KindIngress, "vd-web", ingressSpec{
+		Host: "vd-web.lvh.me",
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("ingress with defaulted service should succeed: %v", err)
+	}
+
+	if len(inv.calls) != 1 {
+		t.Fatalf("expected 1 caddy.apply, got %d", len(inv.calls))
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressService]; got != "vd-web" {
+		t.Errorf("defaulted service not forwarded to plugin: got %q, want %q", got, "vd-web")
+	}
+}
+
+func TestIngressHandler_ExplicitServiceOverridesDefault(t *testing.T) {
+	// Cross-app routing: ingress "public" exposes service "api". The
+	// default-to-ingress-name shortcut must not clobber an explicit
+	// service field, otherwise declarative intent gets silently lost.
+	store := newMemStore()
+
+	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api", Port: 8080})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://api.example.com"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("explicit service should still work: %v", err)
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressService]; got != "api" {
+		t.Errorf("explicit service got clobbered: got %q, want %q", got, "api")
+	}
+}
+
+func TestIngressHandler_ForwardsLocations(t *testing.T) {
+	// Path-based routing: the operator declares multiple `location` blocks
+	// so one ingress can serve different path prefixes (classic case: API
+	// v1 + v2 both hitting the same backend, or docs under /docs pointing
+	// at a static-site container). Handler must forward them as a JSON
+	// array in VOODU_INGRESS_LOCATIONS so the caddy plugin can generate
+	// the matchers.
+	store := newMemStore()
+
+	seedManifest(t, store, KindService, "voodu-docs", serviceSpec{Target: "voodu-docs", Port: 80})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://clowk.in"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "voodu-docs", ingressSpec{
+		Host:    "clowk.in",
+		Service: "voodu-docs",
+		Locations: []ingressLocation{
+			{Path: "/docs/voodu", Strip: false},
+			{Path: "/api/v1", Strip: true},
+		},
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("ingress with locations should succeed: %v", err)
+	}
+
+	raw := inv.calls[0].Env[plugin.EnvIngressLocations]
+	if raw == "" {
+		t.Fatal("VOODU_INGRESS_LOCATIONS not forwarded")
+	}
+
+	var got []ingressLocation
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("locations env not valid JSON: %v (raw=%q)", err, raw)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 locations, got %d", len(got))
+	}
+
+	if got[0].Path != "/docs/voodu" || got[0].Strip {
+		t.Errorf("first location wrong: %+v", got[0])
+	}
+
+	if got[1].Path != "/api/v1" || !got[1].Strip {
+		t.Errorf("second location wrong (strip should propagate): %+v", got[1])
+	}
+}
+
+func TestIngressHandler_OmitsLocationsEnvWhenEmpty(t *testing.T) {
+	// Backward compat: older caddy plugin versions parse
+	// VOODU_INGRESS_LOCATIONS as JSON unconditionally. An empty key would
+	// make them fail on "" → unmarshal error. Skip the key entirely when
+	// no locations are declared so those plugins see no difference.
+	store := newMemStore()
+
+	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api", Port: 8080})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "https://api.example.com"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{
+		Host:    "api.example.com",
+		Service: "api",
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := inv.calls[0].Env[plugin.EnvIngressLocations]; ok {
+		t.Errorf("VOODU_INGRESS_LOCATIONS must be absent when no location blocks declared")
+	}
+}
+
+func TestIngressHandler_HostStillRequired(t *testing.T) {
+	// Host has no sensible default — an ingress without host can't be
+	// routed to. Handler must reject it with a clear error instead of
+	// silently accepting a broken manifest.
+	h := &IngressHandler{
+		Store:   newMemStore(),
+		Invoker: &fakeInvoker{},
+		Log:     quietLogger(),
+	}
+
+	ev := putEvent(t, KindIngress, "vd-web", ingressSpec{})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil {
+		t.Fatal("expected error for ingress missing host")
+	}
+
+	if !strings.Contains(err.Error(), "host is required") {
+		t.Errorf("error message should mention host requirement, got: %v", err)
+	}
+}
+
 func TestIngressHandler_RemoveCallsPluginAndClearsStatus(t *testing.T) {
 	store := newMemStore()
 
@@ -373,28 +549,62 @@ func TestIngressHandler_ExplicitPortStillRequiresTarget(t *testing.T) {
 	}
 }
 
-func TestIngressHandler_PortUnsetAndTargetHasNoPortIsHardError(t *testing.T) {
-	store := newMemStore()
-
-	// Service exists but declares no port; ingress also omits one —
-	// nothing to resolve, and retrying won't fix it. Hard error (not
-	// transient) so the operator gets a clear signal.
-	seedManifest(t, store, KindService, "api", serviceSpec{Target: "api"})
-
-	h := &IngressHandler{Store: store, Invoker: &fakeInvoker{}, Log: quietLogger()}
-
-	ev := putEvent(t, KindIngress, "public", ingressSpec{
-		Host:    "api.example.com",
-		Service: "api",
-	})
-
-	err := h.Handle(context.Background(), ev)
-	if err == nil {
-		t.Fatal("expected error when both service and ingress lack a port")
+func TestIngressHandler_PortDefaultsTo80(t *testing.T) {
+	// Ingress is always HTTP routing (caddy-only) and every common
+	// base image that fronts web traffic — caddy, nginx, httpd,
+	// kestrel — listens on 80. So when nothing else resolves a port,
+	// 80 is the sane default. Apps on weird ports (rails:3000,
+	// flask:5000) declare port explicitly; default-wrong is loud
+	// (502 / connection refused on first request) so this isn't a
+	// silent misroute hazard.
+	cases := []struct {
+		name string
+		seed func(t *testing.T, store Store)
+	}{
+		{
+			name: "service exists with no port",
+			seed: func(t *testing.T, s Store) {
+				seedManifest(t, s, KindService, "api", serviceSpec{Target: "api"})
+			},
+		},
+		{
+			name: "deployment exists with no ports",
+			seed: func(t *testing.T, s Store) {
+				seedManifest(t, s, KindDeployment, "api", deploymentSpec{Image: "img:1"})
+			},
+		},
 	}
 
-	if isTransient(err) {
-		t.Errorf("unresolvable port should be hard error, not transient: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemStore()
+			tc.seed(t, store)
+
+			inv := &fakeInvoker{
+				results: map[string]*plugins.Result{
+					"caddy.apply": envelopeResult(map[string]any{"url": "http://api.example.com"}),
+				},
+			}
+
+			h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+			ev := putEvent(t, KindIngress, "public", ingressSpec{
+				Host:    "api.example.com",
+				Service: "api",
+			})
+
+			if err := h.Handle(context.Background(), ev); err != nil {
+				t.Fatalf("expected default port fallback, got error: %v", err)
+			}
+
+			if len(inv.calls) != 1 {
+				t.Fatalf("expected plugin call, got %d", len(inv.calls))
+			}
+
+			if got := inv.calls[0].Env[plugin.EnvIngressPort]; got != "80" {
+				t.Errorf("ingress port should default to 80, got %q", got)
+			}
+		})
 	}
 }
 

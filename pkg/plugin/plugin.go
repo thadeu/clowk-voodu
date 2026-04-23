@@ -139,6 +139,16 @@ const (
 	// allowed?" callback) — matches Caddy's on_demand_tls.ask directive.
 	EnvIngressTLSOnDemand = "VOODU_INGRESS_TLS_ON_DEMAND"
 	EnvIngressTLSAsk      = "VOODU_INGRESS_TLS_ASK"
+
+	// EnvIngressLocations carries path-based routing as a JSON array of
+	// {"path": "...", "strip": bool} objects. An empty or unset value
+	// means "match all paths for this host" — the simple/common case.
+	// When populated, the plugin generates one caddy matcher per entry;
+	// `strip: true` maps to `handle_path` (prefix removed before hitting
+	// upstream), `strip: false` (default) maps to `handle` (prefix
+	// preserved). Caddy's native path-matcher precedence (most-specific
+	// wins) is what orders overlapping entries.
+	EnvIngressLocations = "VOODU_INGRESS_LOCATIONS"
 )
 
 // Database-kind plugin contract.

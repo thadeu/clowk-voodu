@@ -7,10 +7,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 	"sort"
+	"strings"
 
+	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
+
+// pluginErrorDetail extracts the most informative error string from a
+// non-zero plugin exit. Plugins emit structured errors via their JSON
+// envelope on stdout (envelope.Error), not stderr — voodu-caddy's
+// `emit(envelope{Status: "error", ...}); os.Exit(1)` is the canonical
+// shape. Without looking at the envelope first, the controller reports
+// a bare "exited 1" with an empty stderr and operators are left
+// guessing. Fallbacks preserve visibility for non-envelope plugins:
+// stderr, then raw stdout, then "no output".
+func pluginErrorDetail(res *plugins.Result) string {
+	if res == nil {
+		return "no output"
+	}
+
+	if res.Envelope != nil && res.Envelope.Error != "" {
+		return res.Envelope.Error
+	}
+
+	if s := strings.TrimSpace(string(res.Stderr)); s != "" {
+		return s
+	}
+
+	if s := strings.TrimSpace(string(res.Raw)); s != "" {
+		return s
+	}
+
+	return "no output"
+}
 
 // databaseSpec / deploymentSpec are minimal, package-local mirrors of
 // internal/manifest types. We duplicate a handful of JSON tags rather
@@ -27,13 +58,15 @@ type databaseSpec struct {
 }
 
 type deploymentSpec struct {
-	Image   string            `json:"image,omitempty"`
-	Command []string          `json:"command,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Ports   []string          `json:"ports,omitempty"`
-	Volumes []string          `json:"volumes,omitempty"`
-	Network string            `json:"network,omitempty"`
-	Restart string            `json:"restart,omitempty"`
+	Image       string            `json:"image,omitempty"`
+	Command     []string          `json:"command,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	Ports       []string          `json:"ports,omitempty"`
+	Volumes     []string          `json:"volumes,omitempty"`
+	Network     string            `json:"network,omitempty"`
+	Networks    []string          `json:"networks,omitempty"`
+	NetworkMode string            `json:"network_mode,omitempty"`
+	Restart     string            `json:"restart,omitempty"`
 }
 
 // DatabaseHandler reconciles database manifests by dispatching to the
@@ -127,7 +160,7 @@ func (h *DatabaseHandler) create(ctx context.Context, ev WatchEvent) error {
 	}
 
 	if res.ExitCode != 0 {
-		return fmt.Errorf("%s create exited %d: %s", spec.Engine, res.ExitCode, string(res.Stderr))
+		return fmt.Errorf("%s create exited %d: %s", spec.Engine, res.ExitCode, pluginErrorDetail(res))
 	}
 
 	status := DatabaseStatus{
@@ -190,7 +223,7 @@ func (h *DatabaseHandler) destroy(ctx context.Context, ev WatchEvent) error {
 	}
 
 	if res.ExitCode != 0 {
-		return fmt.Errorf("%s destroy exited %d: %s", status.Engine, res.ExitCode, string(res.Stderr))
+		return fmt.Errorf("%s destroy exited %d: %s", status.Engine, res.ExitCode, pluginErrorDetail(res))
 	}
 
 	if err := h.Store.DeleteStatus(ctx, KindDatabase, ev.Name); err != nil {
@@ -394,6 +427,52 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		spec.Image = ev.Name + ":latest"
 	}
 
+	// Network shaping. Two disjoint modes:
+	//
+	//   host/none mode: container shares the host's net stack (host) or
+	//     gets none at all. Mutually exclusive with any bridge — no
+	//     voodu0, no custom networks. Use for WebRTC/SIP/RTP/socket apps
+	//     that need the host ports directly and can't live behind docker's
+	//     userland NAT. Caveat: caddy ingress can't reach these by
+	//     container name — the operator wires the host port into
+	//     ingress.service manually.
+	//
+	//   bridge mode (default): voodu0 is the platform's plumbing bus —
+	//     voodu-caddy and managed plugins live there — so every bridge-
+	//     mode container MUST join it. `networks = [...]` opts INTO
+	//     additional bridges (db, cache, whatever) but never removes
+	//     voodu0. Append (not prepend) when auto-adding voodu0 so the
+	//     operator's chosen primary stays the docker DNS default.
+	switch spec.NetworkMode {
+	case "":
+		// Bridge path — fall through to networks normalization below.
+	case "host", "none":
+		if len(spec.Networks) > 0 || spec.Network != "" {
+			return fmt.Errorf("deployment/%s: network_mode=%q is mutually exclusive with network/networks", ev.Name, spec.NetworkMode)
+		}
+	default:
+		return fmt.Errorf("deployment/%s: network_mode=%q not supported (want \"host\" or \"none\"; omit for bridge mode)", ev.Name, spec.NetworkMode)
+	}
+
+	if spec.NetworkMode == "" {
+		if len(spec.Networks) == 0 && spec.Network != "" {
+			spec.Networks = []string{spec.Network}
+		}
+
+		if !slices.Contains(spec.Networks, "voodu0") {
+			spec.Networks = append(spec.Networks, "voodu0")
+		}
+	}
+
+	// Private-by-default port publishing. Bare container ports and
+	// host:container specs get localhost-bound so they're reachable
+	// from the VM (ssh tunnel, curl from inside) but invisible to the
+	// internet. Caddy still reaches the container via voodu0 bridge
+	// DNS — `-p` is only for host-to-container access, so this doesn't
+	// affect ingress. Operators who actually want world-exposure
+	// (postgres pinned to 0.0.0.0:5432, say) declare the IP explicitly.
+	spec.Ports = normalizePorts(spec.Ports)
+
 	envChanged := false
 
 	if len(spec.Env) > 0 {
@@ -500,10 +579,29 @@ func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app strin
 	}
 
 	if prev.SpecHash == hash {
-		return false, nil
-	}
+		// Spec text is stable, but build-mode rebuilds `<app>:latest` on
+		// every git push — the tag string is identical yet the underlying
+		// image ID changes. Containers freeze the image ID at create
+		// time, so the running process stays on the old layers until we
+		// explicitly recreate. Spec-hash can't catch this (manifest text
+		// didn't move); only an image-ID comparison can.
+		differ, err := h.Containers.ImageIDsDiffer(app, spec.Image)
+		if err != nil {
+			// Treat ID-check errors as "no drift" to avoid unnecessary
+			// recreates on transient docker CLI failures. The next apply
+			// will try again.
+			h.logf("deployment/%s image id check failed: %v", app, err)
+			return false, nil
+		}
 
-	h.logf("deployment/%s spec drift (hash %s → %s), recreating", app, shortHash(prev.SpecHash), shortHash(hash))
+		if !differ {
+			return false, nil
+		}
+
+		h.logf("deployment/%s image id drift (tag %s rebuilt under same name), recreating", app, spec.Image)
+	} else {
+		h.logf("deployment/%s spec drift (hash %s → %s), recreating", app, shortHash(prev.SpecHash), shortHash(hash))
+	}
 
 	envFile := ""
 	if h.EnvFilePath != nil {
@@ -511,14 +609,15 @@ func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app strin
 	}
 
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:    app,
-		Image:   spec.Image,
-		Command: spec.Command,
-		Ports:   spec.Ports,
-		Volumes: spec.Volumes,
-		Network: spec.Network,
-		Restart: spec.Restart,
-		EnvFile: envFile,
+		Name:        app,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Ports:       spec.Ports,
+		Volumes:     spec.Volumes,
+		Networks:    spec.Networks,
+		NetworkMode: spec.NetworkMode,
+		Restart:     spec.Restart,
+		EnvFile:     envFile,
 	}); err != nil {
 		return false, fmt.Errorf("recreate container: %w", err)
 	}
@@ -578,14 +677,15 @@ func (h *DeploymentHandler) ensureContainer(app string, spec deploymentSpec) (bo
 	}
 
 	created, err := h.Containers.Ensure(ContainerSpec{
-		Name:    app,
-		Image:   spec.Image,
-		Command: spec.Command,
-		Ports:   spec.Ports,
-		Volumes: spec.Volumes,
-		Network: spec.Network,
-		Restart: spec.Restart,
-		EnvFile: envFile,
+		Name:        app,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Ports:       spec.Ports,
+		Volumes:     spec.Volumes,
+		Networks:    spec.Networks,
+		NetworkMode: spec.NetworkMode,
+		Restart:     spec.Restart,
+		EnvFile:     envFile,
 	})
 	if err != nil {
 		return false, fmt.Errorf("ensure container: %w", err)
@@ -666,26 +766,35 @@ type DeploymentStatus struct {
 // so adding new irrelevant fields to deploymentSpec doesn't silently
 // change the hash and trigger spurious recreates.
 func deploymentSpecHash(spec deploymentSpec) string {
+	// Networks membership is what the runtime sees — order inside
+	// `networks = [...]` is not semantic (docker's join order doesn't
+	// affect reachability), so we sort a copy before hashing to avoid
+	// spurious Recreates when the operator reshuffles the list.
+	nets := append([]string(nil), spec.Networks...)
+	sort.Strings(nets)
+
 	input := struct {
-		Image   string   `json:"image"`
-		Command []string `json:"command"`
-		Ports   []string `json:"ports"`
-		Volumes []string `json:"volumes"`
-		Network string   `json:"network"`
-		Restart string   `json:"restart"`
+		Image       string   `json:"image"`
+		Command     []string `json:"command"`
+		Ports       []string `json:"ports"`
+		Volumes     []string `json:"volumes"`
+		Networks    []string `json:"networks"`
+		NetworkMode string   `json:"network_mode"`
+		Restart     string   `json:"restart"`
 	}{
-		Image:   spec.Image,
-		Command: spec.Command,
-		Ports:   spec.Ports,
-		Volumes: spec.Volumes,
-		Network: spec.Network,
-		Restart: spec.Restart,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Ports:       spec.Ports,
+		Volumes:     spec.Volumes,
+		Networks:    nets,
+		NetworkMode: spec.NetworkMode,
+		Restart:     spec.Restart,
 	}
 
 	// json.Marshal emits slice elements in declared order and struct
 	// fields in declaration order, so the output is deterministic for
-	// a given spec. No need to sort slices — user-specified port order
-	// is semantic (first entry maps to the ingress default, etc.).
+	// a given spec. Ports/Volumes stay in user order — semantic there
+	// (first port entry often maps to the ingress default).
 	b, _ := json.Marshal(input)
 	sum := sha256.Sum256(b)
 
@@ -711,6 +820,62 @@ func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, imag
 	}
 
 	return h.Store.PutStatus(ctx, KindDeployment, app, blob)
+}
+
+// normalizePorts applies voodu's "private by default" posture to
+// docker port specs. Input follows docker's shape — one of:
+//
+//	"80"                    bare container port
+//	"80/udp"                bare, non-default proto
+//	"3000:80"               host:container
+//	"3000:80/udp"           host:container with proto
+//	"127.0.0.1:3000:80"     ip:host:container (already explicit)
+//	"0.0.0.0:3000:80"       bind-all, operator opted into exposure
+//	"[::1]:3000:80"         IPv6 literal (pass-through)
+//
+// When the spec does NOT carry an IP prefix we wedge `127.0.0.1:` in
+// front so the publish only reaches the host's loopback. Specs that
+// already name an IP (including `0.0.0.0`) are the operator's
+// declaration of intent — we pass them through untouched. Docker
+// itself then does the right thing: `-p 127.0.0.1::80` maps a random
+// host port on loopback, `-p 0.0.0.0:5432:5432` exposes publicly.
+//
+// This is the only gate between "deploy with ports = [...]" and "your
+// service is on the open internet". Caddy ingress is unaffected:
+// caddy dials by container name over the voodu0 bridge, which
+// bypasses host-side port publishing entirely.
+func normalizePorts(ports []string) []string {
+	if len(ports) == 0 {
+		return ports
+	}
+
+	out := make([]string, 0, len(ports))
+
+	for _, p := range ports {
+		out = append(out, normalizePort(p))
+	}
+
+	return out
+}
+
+func normalizePort(p string) string {
+	// IPv6 literal wrapped in brackets — docker's own syntax, pass through.
+	if strings.HasPrefix(p, "[") {
+		return p
+	}
+
+	switch strings.Count(p, ":") {
+	case 0:
+		// "80" or "80/udp" — random host port, loopback-only.
+		return "127.0.0.1::" + p
+	case 1:
+		// "3000:80" or "3000:80/udp" — explicit host port, loopback-only.
+		return "127.0.0.1:" + p
+	default:
+		// 2+ colons means the first field is an IP (0.0.0.0, 127.0.0.1,
+		// a pinned interface IP). Operator was explicit — respect it.
+		return p
+	}
 }
 
 // envMapToPairs flattens {K: V} into ["K=V", ...] with deterministic

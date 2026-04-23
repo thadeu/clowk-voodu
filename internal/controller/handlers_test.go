@@ -267,12 +267,33 @@ type fakeContainers struct {
 	ensures   []ContainerSpec
 	restarts  []string
 	recreates []ContainerSpec
+
+	// containerImageIDs maps container name → the image ID the container
+	// was frozen against at create time. tagImageIDs maps tag → the image
+	// ID that tag currently resolves to. Together they simulate the
+	// docker invariant the real ImageIDsDiffer relies on: a container
+	// keeps its original ID even if the tag is rebuilt under it.
+	containerImageIDs map[string]string
+	tagImageIDs       map[string]string
 }
 
 func (f *fakeContainers) Exists(name string) (bool, error) { return f.exists[name], nil }
 
 func (f *fakeContainers) Image(name string) (string, error) {
 	return f.images[name], nil
+}
+
+func (f *fakeContainers) ImageIDsDiffer(container, tag string) (bool, error) {
+	cid := f.containerImageIDs[container]
+	tid := f.tagImageIDs[tag]
+
+	// Match production's "unknown → no drift" contract: if we can't
+	// resolve either side, fall back to the spec-hash path.
+	if cid == "" || tid == "" {
+		return false, nil
+	}
+
+	return cid != tid, nil
 }
 
 func (f *fakeContainers) Recreate(spec ContainerSpec) error {
@@ -330,12 +351,12 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	}
 
 	spec := deploymentSpec{
-		Image:   "ghcr.io/acme/api:1.2.3",
-		Command: []string{"serve"},
-		Env:     map[string]string{"FOO": "bar"},
-		Ports:   []string{"8080:8080"},
-		Network: "voodu0",
-		Restart: "unless-stopped",
+		Image:    "ghcr.io/acme/api:1.2.3",
+		Command:  []string{"serve"},
+		Env:      map[string]string{"FOO": "bar"},
+		Ports:    []string{"8080:8080"},
+		Networks: []string{"voodu0"},
+		Restart:  "unless-stopped",
 	}
 
 	ev := putEvent(t, KindDeployment, "api", spec)
@@ -351,13 +372,230 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 		t.Errorf("unexpected ensure spec: %+v", got)
 	}
 
-	if got.Restart != "unless-stopped" || got.Network != "voodu0" {
+	if got.Restart != "unless-stopped" || len(got.Networks) != 1 || got.Networks[0] != "voodu0" {
 		t.Errorf("runtime flags not forwarded: %+v", got)
 	}
 
 	// Env write still happens alongside the container ensure.
 	if len(writes) != 1 || writes[0].Pairs[0] != "FOO=bar" {
 		t.Errorf("env write missing or wrong: %+v", writes)
+	}
+}
+
+func TestDeploymentHandler_AlwaysJoinsVoodu0(t *testing.T) {
+	// voodu0 is the platform's plumbing bridge — caddy and plugins live
+	// there, so the handler MUST ensure every container joins it, even
+	// when the operator declares a different primary network. Without
+	// this invariant, `networks = ["db"]` would produce an app that's
+	// invisible to ingress, which is almost never what the operator meant.
+	cases := []struct {
+		name string
+		spec deploymentSpec
+		want []string
+	}{
+		{
+			name: "omitted → voodu0",
+			spec: deploymentSpec{Image: "img:1"},
+			want: []string{"voodu0"},
+		},
+		{
+			name: "legacy singular network → [network, voodu0]",
+			spec: deploymentSpec{Image: "img:1", Network: "db"},
+			want: []string{"db", "voodu0"},
+		},
+		{
+			name: "explicit networks → voodu0 appended",
+			spec: deploymentSpec{Image: "img:1", Networks: []string{"db"}},
+			want: []string{"db", "voodu0"},
+		},
+		{
+			name: "operator already included voodu0 → deduped, order preserved",
+			spec: deploymentSpec{Image: "img:1", Networks: []string{"voodu0", "db"}},
+			want: []string{"voodu0", "db"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := &fakeContainers{}
+
+			h := &DeploymentHandler{
+				Store:       newMemStore(),
+				Log:         quietLogger(),
+				WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+				EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+				Containers:  cm,
+			}
+
+			ev := putEvent(t, KindDeployment, "app", tc.spec)
+			h.Handle(context.Background(), ev)
+
+			if len(cm.ensures) != 1 {
+				t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+			}
+
+			got := cm.ensures[0].Networks
+			if len(got) != len(tc.want) {
+				t.Fatalf("networks mismatch: want %v, got %v", tc.want, got)
+			}
+
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("networks[%d]: want %q, got %q (full: %v)", i, tc.want[i], got[i], got)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizePorts(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bare container port gets loopback + random host", "80", "127.0.0.1::80"},
+		{"bare port with proto", "53/udp", "127.0.0.1::53/udp"},
+		{"host:container gets loopback prefix", "3000:80", "127.0.0.1:3000:80"},
+		{"host:container with proto", "3000:80/udp", "127.0.0.1:3000:80/udp"},
+		{"explicit 127.0.0.1 passes through", "127.0.0.1:3000:80", "127.0.0.1:3000:80"},
+		{"explicit 0.0.0.0 = operator opted into exposure", "0.0.0.0:5432:5432", "0.0.0.0:5432:5432"},
+		{"pinned interface IP passes through", "192.168.1.5:3000:80", "192.168.1.5:3000:80"},
+		{"ipv6 literal passes through", "[::1]:3000:80", "[::1]:3000:80"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizePort(tc.in); got != tc.want {
+				t.Errorf("normalizePort(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeploymentHandler_DefaultsToLoopbackPorts(t *testing.T) {
+	// End-to-end: handler normalizes Ports before handing them to the
+	// container manager, so a naive `ports = ["3000:80"]` manifest
+	// never produces a world-exposed container.
+	cm := &fakeContainers{}
+
+	h := &DeploymentHandler{
+		Store:       newMemStore(),
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "web", deploymentSpec{
+		Image: "img:1",
+		Ports: []string{"3000:80", "0.0.0.0:5432:5432"},
+	})
+
+	h.Handle(context.Background(), ev)
+
+	got := cm.ensures[0].Ports
+	if len(got) != 2 {
+		t.Fatalf("ports: want 2, got %d (%+v)", len(got), got)
+	}
+
+	if got[0] != "127.0.0.1:3000:80" {
+		t.Errorf("default port should be loopback-bound, got %q", got[0])
+	}
+
+	if got[1] != "0.0.0.0:5432:5432" {
+		t.Errorf("explicit 0.0.0.0 must pass through verbatim, got %q", got[1])
+	}
+}
+
+func TestDeploymentHandler_HostNetworkMode(t *testing.T) {
+	// network_mode = "host" is the escape hatch for apps that need the
+	// host's net stack directly (WebRTC/SIP/RTP/raw sockets). It's
+	// mutually exclusive with bridges — no voodu0 auto-append, no
+	// `networks = [...]` join. The handler forwards NetworkMode and
+	// leaves Networks empty so the docker layer uses `--network host`.
+	cm := &fakeContainers{}
+
+	h := &DeploymentHandler{
+		Store:       newMemStore(),
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "sip", deploymentSpec{
+		Image:       "sip-gw:1",
+		NetworkMode: "host",
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("host mode should be accepted: %v", err)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+	}
+
+	got := cm.ensures[0]
+	if got.NetworkMode != "host" {
+		t.Errorf("NetworkMode not forwarded: want \"host\", got %q", got.NetworkMode)
+	}
+
+	if len(got.Networks) != 0 {
+		t.Errorf("host mode must skip bridge networks, got %v", got.Networks)
+	}
+}
+
+func TestDeploymentHandler_NetworkModeExclusivity(t *testing.T) {
+	// host/none + networks must error loud — silently dropping one side
+	// produces surprising runtime behaviour.
+	cases := []struct {
+		name string
+		spec deploymentSpec
+	}{
+		{"host + networks", deploymentSpec{Image: "x:1", NetworkMode: "host", Networks: []string{"db"}}},
+		{"host + network",  deploymentSpec{Image: "x:1", NetworkMode: "host", Network:  "db"}},
+		{"none + networks", deploymentSpec{Image: "x:1", NetworkMode: "none", Networks: []string{"voodu0"}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &DeploymentHandler{
+				Store:       newMemStore(),
+				Log:         quietLogger(),
+				WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+				EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+				Containers:  &fakeContainers{},
+			}
+
+			ev := putEvent(t, KindDeployment, "app", tc.spec)
+			if err := h.Handle(context.Background(), ev); err == nil {
+				t.Errorf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestDeploymentHandler_UnknownNetworkModeRejected(t *testing.T) {
+	// Accept only "host" / "none" explicitly. "bridge" = omit; anything
+	// else is a typo we want to flag early instead of passing through
+	// to docker where the error message is worse.
+	h := &DeploymentHandler{
+		Store:       newMemStore(),
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  &fakeContainers{},
+	}
+
+	ev := putEvent(t, KindDeployment, "app", deploymentSpec{
+		Image:       "x:1",
+		NetworkMode: "bridge",
+	})
+
+	if err := h.Handle(context.Background(), ev); err == nil {
+		t.Errorf("expected rejection of network_mode=\"bridge\"")
 	}
 }
 
@@ -521,8 +759,88 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 		t.Fatalf("expected 1 recreate on ports drift, got %d", len(cm.recreates))
 	}
 
-	if got := cm.recreates[0].Ports; len(got) != 1 || got[0] != "80:80" {
+	// Port is normalized to loopback-bound by the handler's private-by-
+	// default policy — raw "80:80" becomes "127.0.0.1:80:80" in the
+	// spec that reaches the container manager.
+	if got := cm.recreates[0].Ports; len(got) != 1 || got[0] != "127.0.0.1:80:80" {
 		t.Errorf("recreate spec ports: got %+v", got)
+	}
+}
+
+func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
+	// Build-mode scenario: manifest text is identical across pushes
+	// (image = "vd-web:latest"), but each git push rebuilds the tag so
+	// the image ID underneath flips. Spec-hash can't see this — only an
+	// ID comparison can — and without catching it, the container keeps
+	// serving yesterday's code.
+	store := newMemStore()
+
+	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
+
+	cm := &fakeContainers{
+		exists: map[string]bool{"vd-web": true},
+		// Container is still running the layer sha it was created with,
+		// but the tag "vd-web:latest" now points at a freshly-built layer.
+		containerImageIDs: map[string]string{"vd-web": "sha256:oldlayer"},
+		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:newlayer"},
+	}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "vd-web", deploymentSpec{Image: "vd-web:latest"})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 recreate on image-id drift, got %d", len(cm.recreates))
+	}
+
+	if cm.recreates[0].Image != "vd-web:latest" {
+		t.Errorf("recreate image: got %q", cm.recreates[0].Image)
+	}
+}
+
+func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
+	// Steady state: same tag, same underlying ID — replay must be a
+	// no-op even though the tag happens to be a mutable `<app>:latest`.
+	// Without this test, a naive implementation that always recreates on
+	// build-mode tags would churn the container on every reconcile.
+	store := newMemStore()
+
+	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
+
+	cm := &fakeContainers{
+		exists:            map[string]bool{"vd-web": true},
+		containerImageIDs: map[string]string{"vd-web": "sha256:same"},
+		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:same"},
+	}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "vd-web", deploymentSpec{Image: "vd-web:latest"})
+
+	h.Handle(context.Background(), ev)
+
+	if len(cm.recreates) != 0 {
+		t.Errorf("matching image IDs must not recreate, got %+v", cm.recreates)
 	}
 }
 
@@ -532,7 +850,10 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	// Pre-seed status that matches the manifest we're about to apply.
 	// This mirrors the steady-state: status was persisted on first
 	// create, now the controller is replaying the same manifest.
-	spec := deploymentSpec{Image: "img:1"}
+	// Networks is explicit (matches the handler's default normalization
+	// of empty → [voodu0]) so the hash we pre-seed matches the hash the
+	// handler will recompute after apply() runs its normalization.
+	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
 

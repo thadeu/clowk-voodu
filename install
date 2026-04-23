@@ -200,6 +200,22 @@ ensure_docker() {
   ensure_docker_running
   add_user_to_docker_group
   wait_for_docker_ready
+  ensure_voodu_network
+}
+
+# ensure_voodu_network creates the shared docker bridge that voodu-caddy
+# and every managed app join. Caddy needs the same network as upstreams
+# so it can resolve container names via docker's embedded DNS — without
+# this, ingress would fail with "dial tcp: lookup <app>: no such host".
+# Idempotent: docker network create errors "already exists", we swallow.
+ensure_voodu_network() {
+  if sudo_ docker network inspect voodu0 >/dev/null 2>&1; then
+    log "docker network voodu0 already exists"
+    return
+  fi
+
+  log "creating docker network voodu0"
+  sudo_ docker network create --driver bridge voodu0 >/dev/null
 }
 
 install_docker_debian() {

@@ -21,10 +21,16 @@ type serviceSpec struct {
 }
 
 type ingressSpec struct {
-	Host    string       `json:"host"`
-	Service string       `json:"service"`
-	Port    int          `json:"port,omitempty"`
-	TLS     *ingressTLS  `json:"tls,omitempty"`
+	Host      string            `json:"host"`
+	Service   string            `json:"service,omitempty"`
+	Port      int               `json:"port,omitempty"`
+	TLS       *ingressTLS       `json:"tls,omitempty"`
+	Locations []ingressLocation `json:"locations,omitempty"`
+}
+
+type ingressLocation struct {
+	Path  string `json:"path"`
+	Strip bool   `json:"strip,omitempty"`
 }
 
 type ingressTLS struct {
@@ -180,8 +186,19 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("decode ingress spec: %w", err)
 	}
 
-	if spec.Host == "" || spec.Service == "" {
-		return fmt.Errorf("ingress/%s: host and service are required", ev.Name)
+	// ingress-per-app is the overwhelmingly common shape: one
+	// `deployment "api"` paired with one `ingress "api"`. When the
+	// ingress name matches the target service, the HCL is pure
+	// boilerplate — so we default Service to the ingress name. Operators
+	// who actually want a cross-app route (ingress "public" → service
+	// "api") still declare `service = "..."` explicitly; we only fill the
+	// blank, never override.
+	if spec.Service == "" {
+		spec.Service = ev.Name
+	}
+
+	if spec.Host == "" {
+		return fmt.Errorf("ingress/%s: host is required", ev.Name)
 	}
 
 	if err := h.resolveUpstream(ctx, ev.Name, &spec); err != nil {
@@ -201,7 +218,7 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 	}
 
 	if res.ExitCode != 0 {
-		return fmt.Errorf("%s apply exited %d: %s", pluginName, res.ExitCode, string(res.Stderr))
+		return fmt.Errorf("%s apply exited %d: %s", pluginName, res.ExitCode, pluginErrorDetail(res))
 	}
 
 	status := IngressStatus{Plugin: pluginName}
@@ -265,7 +282,7 @@ func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 	}
 
 	if res.ExitCode != 0 {
-		return fmt.Errorf("%s remove exited %d: %s", pluginName, res.ExitCode, string(res.Stderr))
+		return fmt.Errorf("%s remove exited %d: %s", pluginName, res.ExitCode, pluginErrorDetail(res))
 	}
 
 	if err := h.Store.DeleteStatus(ctx, KindIngress, ev.Name); err != nil {
@@ -313,6 +330,20 @@ func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
 		}
 	}
 
+	// Path routing is opt-in; only set the env var when the operator
+	// actually declared `location` blocks. An empty map entry would make
+	// old plugin versions parse "" and error needlessly — skipping the
+	// key preserves backward-compat with plugins predating locations.
+	if len(spec.Locations) > 0 {
+		// Marshal error is unreachable: spec.Locations is a slice of
+		// primitive-typed structs. Ignore the error defensively rather
+		// than propagate — the invoker would surface any real problem on
+		// the plugin side when it fails to parse.
+		if b, err := json.Marshal(spec.Locations); err == nil {
+			env[plugin.EnvIngressLocations] = string(b)
+		}
+	}
+
 	return env
 }
 
@@ -331,11 +362,21 @@ func ingressApplyEnv(name string, spec ingressSpec) map[string]string {
 //	spec.Port (explicit)
 //	  > service "<name>".port
 //	  > deployment "<name>".ports[0]  (container port, after `host:` split)
+//	  > 80 (default)
+//
+// The 80 fallback keys off the fact that ingress is always HTTP
+// routing (caddy-only) and every common base image that fronts a web
+// app — caddy, nginx, httpd — listens there. Apps that actually use
+// a different port (rails:3000, flask:5000) declare it explicitly.
+// Getting 80 wrong doesn't fail silently — caddy-ingress surfaces
+// `connection refused` immediately on the first request, which is
+// faster to debug than a manifest that refuses to apply.
 //
 // Target-not-found is marked Transient: `voodu apply -f` may send
 // ingress before the deployment it references, and the reconciler
 // retries after backoff. Typos surface once the backoff log noise
 // makes them obvious — still better than 502s in prod.
+const defaultIngressPort = 80
 func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec *ingressSpec) error {
 	svc, err := h.lookupServiceSpec(ctx, spec.Service)
 	if err != nil {
@@ -344,11 +385,11 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec 
 
 	if svc != nil {
 		if spec.Port == 0 {
-			if svc.Port <= 0 {
-				return fmt.Errorf("ingress/%s: service %q has no port and ingress.port is unset", name, spec.Service)
+			if svc.Port > 0 {
+				spec.Port = svc.Port
+			} else {
+				spec.Port = defaultIngressPort
 			}
-
-			spec.Port = svc.Port
 		}
 
 		return nil
@@ -361,12 +402,11 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, name string, spec 
 
 	if dep != nil {
 		if spec.Port == 0 {
-			port, ok := firstContainerPort(dep.Ports)
-			if !ok {
-				return fmt.Errorf("ingress/%s: deployment %q declares no ports and ingress.port is unset", name, spec.Service)
+			if port, ok := firstContainerPort(dep.Ports); ok {
+				spec.Port = port
+			} else {
+				spec.Port = defaultIngressPort
 			}
-
-			spec.Port = port
 		}
 
 		return nil

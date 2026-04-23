@@ -24,6 +24,17 @@ package manifest
 //
 // Workdir narrows the repo subtree (monorepo case); Dockerfile picks a
 // non-default filename. Both are ignored when Image is set.
+//
+// Networking:
+//   - `network_mode = "host" | "none"` escapes docker bridge entirely.
+//     Mutually exclusive with network/networks (container uses the host's
+//     net stack directly). Use for apps with raw TCP/UDP needs (WebRTC,
+//     SIP, RTP, socket servers) that can't live behind a bridge.
+//   - `networks = [...]` — list of extra bridges to join. voodu0 is
+//     always appended (it's the platform's plumbing bus for caddy +
+//     plugins); operators can't opt out.
+//   - `network = "..."` — legacy singular shorthand, treated as networks=[X].
+//   - All empty → `[voodu0]`.
 type DeploymentSpec struct {
 	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
 	Workdir     string            `yaml:"workdir,omitempty"      json:"workdir,omitempty"`
@@ -37,6 +48,8 @@ type DeploymentSpec struct {
 	Ports       []string          `yaml:"ports,omitempty"        json:"ports,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"      json:"volumes,omitempty"`
 	Network     string            `yaml:"network,omitempty"      json:"network,omitempty"`
+	Networks    []string          `yaml:"networks,omitempty"     json:"networks,omitempty"`
+	NetworkMode string            `yaml:"network_mode,omitempty" json:"network_mode,omitempty"`
 	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
 	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
 	PostDeploy  []string          `yaml:"post_deploy,omitempty"  json:"post_deploy,omitempty"`
@@ -71,11 +84,40 @@ type ServiceSpec struct {
 // plugin reconciles these into a running Caddy config. Route rewriting
 // and advanced matchers are out of scope for M4 — the caddy plugin will
 // grow that vocabulary.
+//
+// `service` is optional: when omitted, the controller defaults it to the
+// ingress name (so `ingress "api" { host = "api.example.com" }` just
+// works). Explicit `service = "..."` still wins — use it for cross-app
+// routing (ingress "public" → service "api").
+//
+// Path-based routing is expressed as zero-or-more `location {}` blocks.
+// An empty Locations means "match everything for this host", which is
+// the overwhelmingly common shape. Multiple entries let one ingress
+// serve multiple path prefixes (e.g. `/api/v1` + `/api/v2` to the same
+// backend). Strip controls whether the prefix is removed before the
+// request reaches the container; default is preserve so the backend
+// sees the original URI.
 type IngressSpec struct {
-	Host    string      `yaml:"host"            json:"host"`
-	Service string      `yaml:"service"         json:"service"`
-	Port    int         `yaml:"port,omitempty"  json:"port,omitempty"`
-	TLS     *IngressTLS `yaml:"tls,omitempty"   json:"tls,omitempty"`
+	Host      string            `yaml:"host"                json:"host"`
+	Service   string            `yaml:"service,omitempty"   json:"service,omitempty"`
+	Port      int               `yaml:"port,omitempty"      json:"port,omitempty"`
+	TLS       *IngressTLS       `yaml:"tls,omitempty"       json:"tls,omitempty"`
+	Locations []IngressLocation `yaml:"locations,omitempty" json:"locations,omitempty"`
+}
+
+// IngressLocation is a single path match rule. Multiple entries per
+// ingress are independent (caddy generates one route per location) and
+// ordered by specificity at match time, not declaration order.
+type IngressLocation struct {
+	// Path is a URI prefix. Matching is prefix-based (caddy's `path`
+	// matcher). Must start with `/`.
+	Path string `yaml:"path" json:"path"`
+
+	// Strip removes the matched prefix before forwarding to the
+	// upstream. Default false (preserve) — common for apps that know
+	// they live under a basePath. Set true when routing a generic image
+	// (static nginx, arbitrary upstream) that expects root-relative URIs.
+	Strip bool `yaml:"strip,omitempty" json:"strip,omitempty"`
 }
 
 type IngressTLS struct {

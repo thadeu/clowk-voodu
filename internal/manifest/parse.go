@@ -173,6 +173,8 @@ type hclDeployment struct {
 	Ports       []string          `hcl:"ports,optional"`
 	Volumes     []string          `hcl:"volumes,optional"`
 	Network     string            `hcl:"network,optional"`
+	Networks    []string          `hcl:"networks,optional"`
+	NetworkMode string            `hcl:"network_mode,optional"`
 	Restart     string            `hcl:"restart,optional"`
 	HealthCheck string            `hcl:"health_check,optional"`
 	PostDeploy  []string          `hcl:"post_deploy,optional"`
@@ -192,6 +194,8 @@ func (b hclDeployment) spec() DeploymentSpec {
 		Ports:       b.Ports,
 		Volumes:     b.Volumes,
 		Network:     b.Network,
+		Networks:    b.Networks,
+		NetworkMode: b.NetworkMode,
 		Restart:     b.Restart,
 		HealthCheck: b.HealthCheck,
 		PostDeploy:  b.PostDeploy,
@@ -237,11 +241,12 @@ func (b hclService) spec() ServiceSpec {
 }
 
 type hclIngress struct {
-	Name    string         `hcl:"name,label"`
-	Host    string         `hcl:"host"`
-	Service string         `hcl:"service"`
-	Port    int            `hcl:"port,optional"`
-	TLS     *hclIngressTLS `hcl:"tls,block"`
+	Name      string              `hcl:"name,label"`
+	Host      string              `hcl:"host"`
+	Service   string              `hcl:"service,optional"`
+	Port      int                 `hcl:"port,optional"`
+	TLS       *hclIngressTLS      `hcl:"tls,block"`
+	Locations []hclIngressLocation `hcl:"location,block"`
 }
 
 type hclIngressTLS struct {
@@ -250,6 +255,11 @@ type hclIngressTLS struct {
 	Email    string `hcl:"email,optional"`
 	OnDemand bool   `hcl:"on_demand,optional"`
 	Ask      string `hcl:"ask,optional"`
+}
+
+type hclIngressLocation struct {
+	Path  string `hcl:"path"`
+	Strip bool   `hcl:"strip,optional"`
 }
 
 func (b hclIngress) spec() IngressSpec {
@@ -262,6 +272,16 @@ func (b hclIngress) spec() IngressSpec {
 			Email:    b.TLS.Email,
 			OnDemand: b.TLS.OnDemand,
 			Ask:      b.TLS.Ask,
+		}
+	}
+
+	if len(b.Locations) > 0 {
+		out.Locations = make([]IngressLocation, 0, len(b.Locations))
+		for _, loc := range b.Locations {
+			out.Locations = append(out.Locations, IngressLocation{
+				Path:  loc.Path,
+				Strip: loc.Strip,
+			})
 		}
 	}
 

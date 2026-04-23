@@ -28,6 +28,19 @@ type ContainerManager interface {
 	// Image differs, the handler asks for a Recreate.
 	Image(name string) (string, error)
 
+	// ImageIDsDiffer reports whether the container was created from a
+	// different image ID than the tag currently resolves to. Build-mode
+	// rewrites `<app>:latest` on every push; the tag stays the same
+	// but the image ID underneath changes. Comparing IDs is the only
+	// way to detect "rebuild happened, container still on old image"
+	// — spec-hash drift can't see it because the manifest text is
+	// identical.
+	//
+	// Returns (false, nil) for any ambiguous state (container missing,
+	// image not locally resolvable) so the caller can fall back to
+	// the spec-hash path without special-casing "unknown".
+	ImageIDsDiffer(container, tag string) (bool, error)
+
 	// Recreate stops-and-removes the existing container (if any) and
 	// starts a fresh one from spec. Distinct from Ensure because we
 	// want a *different* image/runtime config, not a no-op.
@@ -43,7 +56,20 @@ type ContainerSpec struct {
 	Command []string
 	Ports   []string
 	Volumes []string
-	Network string
+
+	// Networks is the set of docker bridges the container joins. The
+	// first entry is used as the creation-time --network (docker run
+	// only accepts one); subsequent entries are attached post-create
+	// via `docker network connect`. Handler guarantees at least one in
+	// bridge mode.
+	Networks []string
+
+	// NetworkMode, when set to "host" or "none", bypasses docker's
+	// bridge stack entirely and takes precedence over Networks. The
+	// handler validates mutual exclusivity so the manager can trust
+	// the two fields to be consistent.
+	NetworkMode string
+
 	Restart string
 
 	// EnvFile points at the app's .env file written by secrets.Set.
@@ -75,7 +101,8 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		Command:       spec.Command,
 		Ports:         spec.Ports,
 		Volumes:       spec.Volumes,
-		NetworkMode:   spec.Network,
+		NetworkMode:   spec.NetworkMode,
+		Networks:      spec.Networks,
 		RestartPolicy: spec.Restart,
 		EnvFile:       spec.EnvFile,
 	}
@@ -99,6 +126,23 @@ func (DockerContainerManager) Image(name string) (string, error) {
 	return docker.GetContainerImage(name)
 }
 
+func (DockerContainerManager) ImageIDsDiffer(container, tag string) (bool, error) {
+	containerID, err := docker.GetContainerImageID(container)
+	if err != nil || containerID == "" {
+		return false, err
+	}
+
+	tagID, err := docker.GetImageID(tag)
+	if err != nil || tagID == "" {
+		// Image not locally resolvable (not yet pulled/built). Caller
+		// falls back to spec-hash — treating "can't check" as "no
+		// drift" avoids spurious recreates on startup races.
+		return false, nil
+	}
+
+	return containerID != tagID, nil
+}
+
 func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 	if docker.ContainerExists(spec.Name) {
 		if err := docker.StopContainer(spec.Name); err != nil {
@@ -116,7 +160,8 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		Command:       spec.Command,
 		Ports:         spec.Ports,
 		Volumes:       spec.Volumes,
-		NetworkMode:   spec.Network,
+		NetworkMode:   spec.NetworkMode,
+		Networks:      spec.Networks,
 		RestartPolicy: spec.Restart,
 		EnvFile:       spec.EnvFile,
 	}
