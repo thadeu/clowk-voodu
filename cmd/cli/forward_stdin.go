@@ -21,15 +21,26 @@ var manifestStreamCmds = map[string]bool{
 	"delete": true,
 }
 
+// buildModeDep captures the minimum a source-push step needs: which
+// scope/name the server stores this deployment under, and which
+// directory on the dev machine is the build context. Populated from
+// the parsed manifest on the client side — that way ${VAR} expansion
+// happens before scope/name reach the server.
+type buildModeDep struct {
+	Scope string
+	Name  string
+	Path  string
+}
+
 // streamResult is what rewriteForStdinStream returns: the rewritten
-// argv, the serialized manifests ready for SSH stdin, and a flag saying
-// whether the invocation needs a git push before the manifests flow
-// (true when it's an `apply` that references a build-mode deployment —
-// source has to reach the server before the controller reconciles).
+// argv, the serialized manifests ready for SSH stdin, and the list of
+// build-mode deployments whose source must reach the server before the
+// controller reconciles (empty when every deployment in the apply is
+// image-mode).
 type streamResult struct {
-	args           []string
-	stdin          io.Reader
-	needsSourcePush bool
+	args             []string
+	stdin            io.Reader
+	buildModeDeploys []buildModeDep
 }
 
 // rewriteForStdinStream inspects argv for a manifest-consuming command;
@@ -88,34 +99,54 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 
 	rest = append(rest, "-f", "-", "--format", "json")
 
-	return streamResult{
-		args:            rest,
-		stdin:           bytes.NewReader(body),
-		needsSourcePush: cmdName == "apply" && hasBuildModeDeployment(mans),
-	}, nil
+	result := streamResult{
+		args:  rest,
+		stdin: bytes.NewReader(body),
+	}
+
+	if cmdName == "apply" {
+		result.buildModeDeploys = extractBuildModeDeploys(mans)
+	}
+
+	return result, nil
 }
 
-// hasBuildModeDeployment returns true when any deployment in the list
-// is build-mode: the `image` field is empty, so the handler will have
-// to build from source on the server. Source transport is a `git push`
-// to the app's bare repo, fired by the caller before the apply POST.
-func hasBuildModeDeployment(mans []controller.Manifest) bool {
+// extractBuildModeDeploys returns one entry per deployment whose Image
+// field is empty — those are the manifests that need source on the
+// server before the controller can reconcile. The returned Path is
+// already defaulted ("." for root), so callers don't repeat the
+// defaulting logic.
+func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
+	var out []buildModeDep
+
 	for _, m := range mans {
 		if m.Kind != controller.KindDeployment {
 			continue
 		}
 
 		var spec manifest.DeploymentSpec
+
 		if err := json.Unmarshal(m.Spec, &spec); err != nil {
 			continue
 		}
 
-		if spec.Image == "" {
-			return true
+		if spec.Image != "" {
+			continue
 		}
+
+		path := spec.Path
+		if path == "" {
+			path = "."
+		}
+
+		out = append(out, buildModeDep{
+			Scope: m.Scope,
+			Name:  m.Name,
+			Path:  path,
+		})
 	}
 
-	return false
+	return out
 }
 
 // findPrimaryCommand returns the index of the first non-flag token, the

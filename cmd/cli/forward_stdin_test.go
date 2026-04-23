@@ -27,7 +27,7 @@ func TestRewriteForStdinStream_NoRewriteForNonManifestCmd(t *testing.T) {
 		t.Errorf("args mutated: got %v, want %v", got.args, args)
 	}
 
-	if got.needsSourcePush {
+	if len(got.buildModeDeploys) > 0 {
 		t.Errorf("non-manifest command must never flag a source push")
 	}
 }
@@ -113,7 +113,7 @@ func TestRewriteForStdinStream_ReadsFileAndEmitsJSON(t *testing.T) {
 
 	// Deployment declares `image = "nginx:1.27"` — registry mode, so no
 	// source push should be signalled.
-	if got.needsSourcePush {
+	if len(got.buildModeDeploys) > 0 {
 		t.Errorf("registry-mode deployment must not trigger source push")
 	}
 }
@@ -147,8 +147,17 @@ deployment "prod" "api" {
 		t.Fatal(err)
 	}
 
-	if !got.needsSourcePush {
-		t.Errorf("manifest with a build-mode deployment must flag source push")
+	if len(got.buildModeDeploys) != 1 {
+		t.Fatalf("expected 1 build-mode deploy, got %d: %+v", len(got.buildModeDeploys), got.buildModeDeploys)
+	}
+
+	bm := got.buildModeDeploys[0]
+	if bm.Scope != "prod" || bm.Name != "api" {
+		t.Errorf("build-mode deploy ref = %s/%s, want prod/api", bm.Scope, bm.Name)
+	}
+
+	if bm.Path != "." {
+		t.Errorf("build-mode deploy path = %q, want %q (default for root-context)", bm.Path, ".")
 	}
 
 	// diff and delete must NEVER trigger a push, even if the manifest is
@@ -159,7 +168,7 @@ deployment "prod" "api" {
 			t.Fatal(err)
 		}
 
-		if r.needsSourcePush {
+		if len(r.buildModeDeploys) > 0 {
 			t.Errorf("%s must never flag source push", cmd)
 		}
 	}

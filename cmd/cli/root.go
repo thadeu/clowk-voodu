@@ -36,6 +36,7 @@ Use ":" syntax as shorthand for subcommands:
 		newSetupCmd(),
 		newAppsCmd(),
 		newDeployCmd(),
+		newReceivePackCmd(),
 		newConfigCmd(),
 		newApplyCmd(),
 		newDiffCmd(),

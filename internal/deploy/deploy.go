@@ -28,6 +28,12 @@ import (
 type Options struct {
 	// LogWriter receives human-readable progress lines. Defaults to os.Stdout.
 	LogWriter io.Writer
+
+	// Force bypasses content-hash dedup in tarball mode: even if a release
+	// with the incoming build-id already exists, rebuild from scratch.
+	// Has no effect on the git-driven Run path (each push always produces
+	// a fresh timestamp-based release).
+	Force bool
 }
 
 func (o *Options) log(format string, args ...any) {
@@ -63,11 +69,17 @@ func Run(app string, opts Options) error {
 		return fmt.Errorf("extract code: %w", err)
 	}
 
-	if err := applyConfigEnv(app, releaseDir, &opts); err != nil {
+	return runPipeline(app, releaseDir, &opts)
+}
+
+// runPipeline executes every stage *after* source has landed in releaseDir.
+// Shared by Run (git push → clone) and RunFromTarball (ssh stream → untar).
+func runPipeline(app, releaseDir string, opts *Options) error {
+	if err := applyConfigEnv(app, releaseDir, opts); err != nil {
 		opts.log("Warning: could not process voodu.yml: %v", err)
 	}
 
-	if err := buildRelease(app, releaseDir, &opts); err != nil {
+	if err := buildRelease(app, releaseDir, opts); err != nil {
 		return fmt.Errorf("build release: %w", err)
 	}
 
@@ -75,11 +87,11 @@ func Run(app string, opts Options) error {
 		return fmt.Errorf("swap current symlink: %w", err)
 	}
 
-	if err := runPostDeploy(app, releaseDir, &opts); err != nil {
+	if err := runPostDeploy(app, releaseDir, opts); err != nil {
 		opts.log("Warning: post-deploy hook failed: %v", err)
 	}
 
-	if err := startContainers(app, releaseDir, &opts); err != nil {
+	if err := startContainers(app, releaseDir, opts); err != nil {
 		return fmt.Errorf("start containers: %w", err)
 	}
 
