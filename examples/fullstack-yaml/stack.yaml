@@ -30,7 +30,10 @@ kind: ingress
 name: api
 spec:
   host: api.clowk.in
-  service: api
+  # `service` omitted — defaults to the ingress name ("api"). Set it
+  # explicitly only for cross-app routing (ingress "public" → service
+  # "api"). Use `locations` (list of {path, strip}) for path-based
+  # routing; omit for a catch-all on the host.
   port: 8080
   tls:
     enabled: true

@@ -1,6 +1,13 @@
 // Four ingress profiles supported by voodu-caddy. Pick the block that
 // matches your case; they can coexist in the same file.
 //
+// `service` is optional — if omitted, it defaults to the ingress name.
+// These examples keep it explicit because ingress names (api_http,
+// api_public, ...) do NOT match the service name "api" — i.e. this is
+// cross-app routing by design. For the common 1-to-1 shape see
+// examples/fullstack/deployment.hcl. For path-based routing and
+// location {} blocks see examples/ingress/paths.hcl.
+//
 // Detailed semantics live in the plugin README:
 //   https://github.com/thadeu/voodu-caddy#tls-profiles
 

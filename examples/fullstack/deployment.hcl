@@ -13,10 +13,12 @@ deployment "api" {
   health_check = "/healthz"
 }
 
+// `service` defaults to the ingress name when omitted, so the 1-to-1
+// case (ingress "api" ↔ deployment "api") is pure declaration. Use
+// `service = "other"` only when the ingress routes to a different app.
 ingress "api" {
-  host    = "api.clowk.in"
-  service = "api"
-  port    = 8080
+  host = "api.clowk.in"
+  port = 8080
 
   tls {
     enabled  = true

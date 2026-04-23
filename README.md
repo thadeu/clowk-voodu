@@ -68,9 +68,8 @@ deployment "api" {
 }
 
 ingress "api" {
-  host    = "api.example.com"
-  service = "api"
-  port    = 8080
+  host = "api.example.com"
+  port = 8080
 
   tls {
     enabled  = true
@@ -79,6 +78,11 @@ ingress "api" {
   }
 }
 ```
+
+`service` inside `ingress` defaults to the ingress name, so the
+overwhelmingly common 1-to-1 shape (`deployment "api"` ↔ `ingress
+"api"`) is declaration-only — no boilerplate `service = "api"` required.
+Port defaults to 80 when the referenced service/deployment declares one.
 
 Apply it:
 
@@ -95,10 +99,58 @@ For a deployment that already has a published image, drop `path` and set
 `image = "ghcr.io/you/api:1.2.3"` — no `git push` happens, the controller
 pulls from the registry.
 
-More examples live in [`examples/`](examples/) — a full deployment +
-ingress pair in [`fullstack/`](examples/fullstack/) and four TLS profiles
-(HTTP, Let's Encrypt, internal CA, on-demand wildcard) in
-[`ingress/profiles.hcl`](examples/ingress/profiles.hcl).
+More examples live in [`examples/`](examples/):
+
+- [`fullstack/`](examples/fullstack/) — deployment + database + ingress
+- [`ingress/profiles.hcl`](examples/ingress/profiles.hcl) — four TLS
+  profiles (HTTP, Let's Encrypt, internal CA, on-demand wildcard)
+- [`ingress/paths.hcl`](examples/ingress/paths.hcl) — path-based
+  routing with `location {}` blocks
+
+## Ingress routing
+
+One host, many paths, one service:
+
+```hcl
+ingress "api" {
+  host = "api.example.com"
+
+  location { path = "/api/v1" }
+  location { path = "/api/v2" }
+}
+```
+
+One host, different services per path (classic versioned API):
+
+```hcl
+ingress "api-v1" {
+  host    = "api.example.com"
+  service = "api-v1"
+  location { path = "/api/v1" }
+}
+
+ingress "api-v2" {
+  host    = "api.example.com"
+  service = "api-v2"
+  location { path = "/api/v2" }
+}
+```
+
+`strip = true` on a location removes the prefix before forwarding — use
+it when routing a generic image (static nginx, arbitrary upstream) that
+expects root-relative URIs:
+
+```hcl
+location {
+  path  = "/docs/voodu"
+  strip = true   # backend sees /getting-started, not /docs/voodu/getting-started
+}
+```
+
+Omitting `location {}` entirely is the catch-all for a host.
+Everything inside the app itself (404 pages, rewrites, SPA fallback,
+compression) stays in your Dockerfile's web server — the platform
+terminates at `host → container:port`.
 
 ## Configuration
 
