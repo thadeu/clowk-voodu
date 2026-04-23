@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -383,6 +385,15 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return err
 	}
 
+	// Build-mode (no image, source pushed via git) produces an image
+	// tagged <app>:latest. The controller never sees the build itself —
+	// the post-receive hook runs it — so we resolve the resulting image
+	// here by convention. Without this default, ensureContainer's
+	// `Image == ""` early return swallows every build-mode reconcile.
+	if spec.Image == "" {
+		spec.Image = ev.Name + ":latest"
+	}
+
 	envChanged := false
 
 	if len(spec.Env) > 0 {
@@ -405,12 +416,23 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return nil
 	}
 
-	// Image drift trumps restart: if the manifest points at a different
-	// image than what's running, a plain restart wouldn't pick it up.
-	// Recreate also absorbs any env change — no need for a separate
-	// restart after.
-	if !created && spec.Image != "" {
-		recreated, err := h.recreateIfImageChanged(ev.Name, spec)
+	if created {
+		// Baseline the spec hash so the next reconcile has something to
+		// compare against. Without this, the very next apply would see
+		// no persisted status and treat a real drift as first-seen.
+		if err := h.putDeploymentStatus(ctx, ev.Name, spec); err != nil {
+			h.logf("deployment/%s status persist failed: %v", ev.Name, err)
+		}
+
+		return nil
+	}
+
+	// Spec drift trumps restart: any change in runtime-relevant fields
+	// (image, ports, volumes, network, restart policy, command) means
+	// the running container has the wrong shape — Recreate absorbs env
+	// changes, so no follow-up restart either.
+	if spec.Image != "" {
+		recreated, err := h.recreateIfSpecChanged(ctx, ev.Name, spec)
 		if err != nil {
 			return err
 		}
@@ -423,7 +445,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// Fresh containers come up with the current .env already mounted,
 	// so restarting right after Ensure is redundant churn. Only cycle
 	// when env moved and the container was already there.
-	if envChanged && !created {
+	if envChanged {
 		if err := h.Containers.Restart(ev.Name); err != nil {
 			// Restart failure doesn't unwind the reconcile — env is on
 			// disk, the next deploy or manual restart picks it up.
@@ -436,23 +458,52 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	return nil
 }
 
-// recreateIfImageChanged inspects the running container and recreates
-// it when the desired Image differs. Returns whether a recreate
-// happened so the caller can skip the env-only restart path.
-func (h *DeploymentHandler) recreateIfImageChanged(app string, spec deploymentSpec) (bool, error) {
-	current, err := h.Containers.Image(app)
+// recreateIfSpecChanged compares the sha256 of the runtime-relevant
+// fields of the desired spec against the hash persisted at last
+// reconcile. A mismatch triggers Recreate and a fresh status write.
+//
+// When no status exists yet (first reconcile after a controller
+// upgrade that introduced status persistence) we baseline the hash
+// without recreating: the running container may well match the spec,
+// and churning every pre-existing deploy on upgrade is exactly the
+// kind of surprise this handler is meant to avoid.
+func (h *DeploymentHandler) recreateIfSpecChanged(ctx context.Context, app string, spec deploymentSpec) (bool, error) {
+	hash := deploymentSpecHash(spec)
+
+	raw, err := h.Store.GetStatus(ctx, KindDeployment, app)
 	if err != nil {
-		// Image lookup failures are surprising but non-fatal: leave the
-		// container alone, surface the error to the operator via logs.
-		h.logf("deployment/%s image lookup failed: %v", app, err)
+		return false, fmt.Errorf("read deployment status: %w", err)
+	}
+
+	if raw == nil {
+		// Baseline — no recreate, just record what's running so the
+		// next apply has a reference point.
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+			h.logf("deployment/%s status persist failed: %v", app, err)
+		}
+
 		return false, nil
 	}
 
-	if current == "" || current == spec.Image {
+	var prev DeploymentStatus
+	if err := json.Unmarshal(raw, &prev); err != nil {
+		// Corrupt status: treat as missing and re-baseline. Alternative
+		// would be erroring out, but that traps the user — they'd have
+		// to hand-edit etcd to unblock a reconcile.
+		h.logf("deployment/%s status decode failed, re-baselining: %v", app, err)
+
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+			h.logf("deployment/%s status persist failed: %v", app, err)
+		}
+
 		return false, nil
 	}
 
-	h.logf("deployment/%s image drift: %s → %s, recreating", app, current, spec.Image)
+	if prev.SpecHash == hash {
+		return false, nil
+	}
+
+	h.logf("deployment/%s spec drift (hash %s → %s), recreating", app, shortHash(prev.SpecHash), shortHash(hash))
 
 	envFile := ""
 	if h.EnvFilePath != nil {
@@ -470,6 +521,10 @@ func (h *DeploymentHandler) recreateIfImageChanged(app string, spec deploymentSp
 		EnvFile: envFile,
 	}); err != nil {
 		return false, fmt.Errorf("recreate container: %w", err)
+	}
+
+	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+		h.logf("deployment/%s status persist failed: %v", app, err)
 	}
 
 	return true, nil
@@ -591,6 +646,71 @@ func decodeDeploymentSpec(m *Manifest) (deploymentSpec, error) {
 	}
 
 	return spec, nil
+}
+
+// DeploymentStatus is persisted at /status/deployments/<name> after
+// every successful Ensure or Recreate. SpecHash is the sha256 of the
+// runtime-relevant fields of the spec (see deploymentSpecHash) and is
+// how the handler detects drift across reconciles.
+//
+// Env is deliberately excluded from the hash: env changes are handled
+// by Restart (env file is mounted at runtime, no recreate needed), so
+// hashing it would cause unnecessary Recreate churn on every config set.
+type DeploymentStatus struct {
+	Image    string `json:"image,omitempty"`
+	SpecHash string `json:"spec_hash,omitempty"`
+}
+
+// deploymentSpecHash canonicalises the runtime-shaping fields and
+// hashes them. The hash input is a struct (not the raw deploymentSpec)
+// so adding new irrelevant fields to deploymentSpec doesn't silently
+// change the hash and trigger spurious recreates.
+func deploymentSpecHash(spec deploymentSpec) string {
+	input := struct {
+		Image   string   `json:"image"`
+		Command []string `json:"command"`
+		Ports   []string `json:"ports"`
+		Volumes []string `json:"volumes"`
+		Network string   `json:"network"`
+		Restart string   `json:"restart"`
+	}{
+		Image:   spec.Image,
+		Command: spec.Command,
+		Ports:   spec.Ports,
+		Volumes: spec.Volumes,
+		Network: spec.Network,
+		Restart: spec.Restart,
+	}
+
+	// json.Marshal emits slice elements in declared order and struct
+	// fields in declaration order, so the output is deterministic for
+	// a given spec. No need to sort slices — user-specified port order
+	// is semantic (first entry maps to the ingress default, etc.).
+	b, _ := json.Marshal(input)
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
+}
+
+func shortHash(h string) string {
+	if len(h) <= 8 {
+		return h
+	}
+
+	return h[:8]
+}
+
+func (h *DeploymentHandler) putDeploymentStatus(ctx context.Context, app string, spec deploymentSpec) error {
+	return h.writeDeploymentStatus(ctx, app, spec.Image, deploymentSpecHash(spec))
+}
+
+func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, image, hash string) error {
+	blob, err := json.Marshal(DeploymentStatus{Image: image, SpecHash: hash})
+	if err != nil {
+		return err
+	}
+
+	return h.Store.PutStatus(ctx, KindDeployment, app, blob)
 }
 
 // envMapToPairs flattens {K: V} into ["K=V", ...] with deterministic

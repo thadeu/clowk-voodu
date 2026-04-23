@@ -244,6 +244,21 @@ func runPostDeploy(app, releaseDir string, opts *Options) error {
 }
 
 func startContainers(app, releaseDir string, opts *Options) error {
+	// HCL-managed apps don't have voodu.yml — the controller owns
+	// container lifecycle via `voodu apply`, which runs right after
+	// this hook completes. Trying the legacy recreate path here would
+	// fail on the missing config and pollute the push output with a
+	// red herring.
+	vooduYml := filepath.Join(releaseDir, paths.VooduYAML)
+	legacyYml := filepath.Join(releaseDir, paths.GokkuYAML)
+
+	if _, err := os.Stat(vooduYml); os.IsNotExist(err) {
+		if _, err := os.Stat(legacyYml); os.IsNotExist(err) {
+			opts.log("-----> Skipping container start (no voodu.yml — controller-managed)")
+			return nil
+		}
+	}
+
 	opts.log("-----> Starting containers...")
 
 	if err := docker.RecreateActiveContainer(app, paths.AppEnvFile(app), releaseDir); err != nil {

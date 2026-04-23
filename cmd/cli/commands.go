@@ -99,6 +99,10 @@ func appsCreateCmd() *cobra.Command {
 				return err
 			}
 
+			if err := git.SetupHomeRepoSymlink(app); err != nil {
+				return err
+			}
+
 			envFile := paths.AppEnvFile(app)
 
 			if _, err := os.Stat(envFile); os.IsNotExist(err) {

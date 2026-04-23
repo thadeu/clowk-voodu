@@ -104,6 +104,41 @@ func SetupBareRepo(app string) error {
 	return nil
 }
 
+// SetupHomeRepoSymlink creates $HOME/<app> pointing at the bare repo
+// at <root>/repos/<app>.git. This is what makes the scp-style URL
+// user@host:<app> actually resolvable — SSH runs git-receive-pack with
+// CWD=$HOME, and without the symlink the bare repo at /opt/voodu/...
+// is unreachable without an absolute path in the remote URL.
+//
+// Idempotent: re-running rewrites the symlink to the correct target.
+// Safe when $HOME/<app> already exists as a symlink (replaced) but
+// errors if it exists as a regular file/dir (don't clobber user data).
+func SetupHomeRepoSymlink(app string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve $HOME: %w", err)
+	}
+
+	link := filepath.Join(home, app)
+	target := paths.AppRepoDir(app)
+
+	if info, err := os.Lstat(link); err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("refuse to replace %s: exists and is not a symlink", link)
+		}
+
+		if err := os.Remove(link); err != nil {
+			return fmt.Errorf("remove stale symlink %s: %w", link, err)
+		}
+	}
+
+	if err := os.Symlink(target, link); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", link, target, err)
+	}
+
+	return nil
+}
+
 // SetupPostReceiveHook writes <repo>/hooks/post-receive that triggers
 // `voodu deploy -a <app>` on push. Hook is idempotent — overwrites any
 // existing hook.

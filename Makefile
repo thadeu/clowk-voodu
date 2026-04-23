@@ -1,4 +1,4 @@
-.PHONY: help build build-cli build-controller test lint fmt vet clean install tidy check
+.PHONY: help build build-cli build-controller build-linux build-linux-arm64 build-linux-amd64 test lint fmt vet clean install tidy check
 
 BINARY_CLI        := voodu
 BINARY_CONTROLLER := voodu-controller
@@ -37,6 +37,18 @@ build-controller: ## Build voodu-controller daemon
 	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY_CONTROLLER) ./cmd/controller
 
 build: build-cli build-controller ## Build all binaries
+
+build-linux-arm64: ## Cross-compile both binaries for linux/arm64 into bin/linux-arm64/
+	mkdir -p bin/linux-arm64
+	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/linux-arm64/$(BINARY_CLI) ./cmd/cli
+	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/linux-arm64/$(BINARY_CONTROLLER) ./cmd/controller
+
+build-linux-amd64: ## Cross-compile both binaries for linux/amd64 into bin/linux-amd64/
+	mkdir -p bin/linux-amd64
+	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/linux-amd64/$(BINARY_CLI) ./cmd/cli
+	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/linux-amd64/$(BINARY_CONTROLLER) ./cmd/controller
+
+build-linux: build-linux-arm64 build-linux-amd64 ## Cross-compile both binaries for linux (arm64 + amd64)
 
 install: build-cli ## Install voodu to /usr/local/bin (with vd symlink)
 	sudo cp bin/$(BINARY_CLI) /usr/local/bin/

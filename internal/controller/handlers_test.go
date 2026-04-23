@@ -433,6 +433,13 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	store := newMemStore()
 
+	// Pre-seed status as if a prior reconcile had run with v1.0.0.
+	// Without this, the no-status baseline path would mask the drift
+	// on first reconcile after upgrade — by design.
+	prevHash := deploymentSpecHash(deploymentSpec{Image: "ghcr.io/acme/api:1.0.0"})
+	pre, _ := json.Marshal(DeploymentStatus{Image: "ghcr.io/acme/api:1.0.0", SpecHash: prevHash})
+	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
+
 	cm := &fakeContainers{
 		exists: map[string]bool{"api": true},
 		images: map[string]string{"api": "ghcr.io/acme/api:1.0.0"},
@@ -467,10 +474,67 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	if len(cm.restarts) != 0 {
 		t.Errorf("recreate path must not trigger restart, got %+v", cm.restarts)
 	}
+
+	// Status must be re-baselined to the new image so subsequent
+	// replays with the same manifest don't trigger another recreate.
+	raw, _ := store.GetStatus(context.Background(), KindDeployment, "api")
+
+	var st DeploymentStatus
+	_ = json.Unmarshal(raw, &st)
+
+	if st.Image != "ghcr.io/acme/api:2.0.0" {
+		t.Errorf("status image not updated post-recreate: %+v", st)
+	}
+}
+
+func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
+	store := newMemStore()
+
+	// Prior reconcile ran with no port bindings.
+	prevSpec := deploymentSpec{Image: "nginx:latest", Ports: []string{"80"}}
+	prevHash := deploymentSpecHash(prevSpec)
+	pre, _ := json.Marshal(DeploymentStatus{Image: prevSpec.Image, SpecHash: prevHash})
+	_ = store.PutStatus(context.Background(), KindDeployment, "web", pre)
+
+	cm := &fakeContainers{
+		exists: map[string]bool{"web": true},
+		images: map[string]string{"web": "nginx:latest"},
+	}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	// Same image, but ports change — should recreate.
+	ev := putEvent(t, KindDeployment, "web", deploymentSpec{
+		Image: "nginx:latest",
+		Ports: []string{"80:80"},
+	})
+
+	h.Handle(context.Background(), ev)
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 recreate on ports drift, got %d", len(cm.recreates))
+	}
+
+	if got := cm.recreates[0].Ports; len(got) != 1 || got[0] != "80:80" {
+		t.Errorf("recreate spec ports: got %+v", got)
+	}
 }
 
 func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	store := newMemStore()
+
+	// Pre-seed status that matches the manifest we're about to apply.
+	// This mirrors the steady-state: status was persisted on first
+	// create, now the controller is replaying the same manifest.
+	spec := deploymentSpec{Image: "img:1"}
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
 
 	cm := &fakeContainers{
 		exists: map[string]bool{"api": true},
@@ -499,6 +563,50 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	// Env changed, container existed → plain restart picks up the env.
 	if len(cm.restarts) != 1 {
 		t.Errorf("expected 1 restart for env change, got %+v", cm.restarts)
+	}
+}
+
+func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) {
+	store := newMemStore()
+
+	cm := &fakeContainers{
+		// Container already exists (imagine: controller upgrade onto a
+		// server where deployments ran under the pre-hash code path).
+		exists: map[string]bool{"api": true},
+		images: map[string]string{"api": "img:old"},
+	}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{Image: "img:new"})
+
+	h.Handle(context.Background(), ev)
+
+	// First-time reconcile with no status must not recreate — the
+	// running container might predate status persistence entirely, and
+	// churning every pre-existing deploy on upgrade is a surprise.
+	if len(cm.recreates) != 0 {
+		t.Errorf("first reconcile without status must not recreate, got %+v", cm.recreates)
+	}
+
+	// But it MUST persist a baseline hash so the next real drift gets
+	// caught. Without this write, every reconcile would re-baseline.
+	raw, _ := store.GetStatus(context.Background(), KindDeployment, "api")
+	if raw == nil {
+		t.Fatal("expected status baseline to be persisted on first reconcile")
+	}
+
+	var st DeploymentStatus
+	_ = json.Unmarshal(raw, &st)
+
+	if st.SpecHash == "" {
+		t.Errorf("persisted status missing hash: %+v", st)
 	}
 }
 
@@ -561,7 +669,7 @@ func TestDeploymentHandler_DoesNotRestartFreshContainer(t *testing.T) {
 	}
 }
 
-func TestDeploymentHandler_NoImageSkipsContainers(t *testing.T) {
+func TestDeploymentHandler_EmptyImageDefaultsToAppLatest(t *testing.T) {
 	store := newMemStore()
 
 	cm := &fakeContainers{}
@@ -574,15 +682,22 @@ func TestDeploymentHandler_NoImageSkipsContainers(t *testing.T) {
 		Containers:  cm,
 	}
 
-	// No Image → env-only path, git-push owns the container.
-	ev := putEvent(t, KindDeployment, "legacy", deploymentSpec{
+	// Build-mode (no image, source pushed via git) produces <app>:latest.
+	// The controller never sees the build, so it resolves the image by
+	// convention. Without this default, the build-mode reconcile is a
+	// no-op and the container never starts.
+	ev := putEvent(t, KindDeployment, "vd-web", deploymentSpec{
 		Env: map[string]string{"X": "1"},
 	})
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.ensures) != 0 {
-		t.Errorf("ensure should not fire when spec.Image is empty, got %+v", cm.ensures)
+	if len(cm.ensures) != 1 {
+		t.Fatalf("ensure should fire once with defaulted image, got %d calls", len(cm.ensures))
+	}
+
+	if cm.ensures[0].Image != "vd-web:latest" {
+		t.Errorf("expected image vd-web:latest, got %q", cm.ensures[0].Image)
 	}
 }
 
