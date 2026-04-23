@@ -11,19 +11,42 @@ requiring the plugin sprawl of a full Kubernetes stack.
 ## Install
 
 ```sh
-curl -fsSL https://clowk.in/install | bash
+curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash
 ```
 
-This drops the `voodu` and `voodu-controller` binaries into `/usr/local/bin`.
-Pre-built releases for Linux and macOS (amd64/arm64) are published on the
+On a Linux host this is a full **server install**: drops `voodu` and
+`voodu-controller` into `/usr/local/bin`, seeds `/opt/voodu/`, installs
+the `voodu-controller.service` systemd unit, and starts the daemon on
+`127.0.0.1:8686`. On macOS the same line installs only the CLI
+(**client mode**), for laptops that deploy to remote servers.
+
+Force mode explicitly:
+
+```sh
+curl -fsSL ...install | bash -s -- --client
+curl -fsSL ...install | bash -s -- --server
+```
+
+Useful env knobs:
+
+| Var | Default | What it does |
+|---|---|---|
+| `VERSION` | latest release | pin a tag, e.g. `v0.1.0` |
+| `VOODU_ROOT` | `/opt/voodu` | server state directory |
+| `VOODU_HTTP_ADDR` | `127.0.0.1:8686` | controller HTTP bind |
+| `VOODU_INSTALL_REPO` | `thadeu/clowk-voodu` | source repo (for forks) |
+
+Pre-built releases for Linux and macOS (amd64/arm64) live on the
 [releases page](https://github.com/thadeu/clowk-voodu/releases).
+Re-running the installer upgrades both binaries and restarts the
+controller — it is idempotent.
 
 ## Quick start
 
-On the server:
+After installing in server mode, `/opt/voodu/` is already seeded and the
+controller is running. Create your first app:
 
 ```sh
-voodu setup                     # initialise /opt/voodu
 voodu apps create prod           # creates dirs, bare repo, post-receive hook
 ```
 

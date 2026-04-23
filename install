@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# voodu — universal installer.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash
+#   curl -fsSL ...install | bash -s -- --client
+#   curl -fsSL ...install | bash -s -- --server
+#
+# Server mode (default on Linux): installs base deps + Docker, drops the
+# `voodu` and `voodu-controller` binaries, seeds /opt/voodu, enables the
+# voodu-controller.service systemd unit, and adds the deploy user to the
+# docker group. Truly turnkey — a fresh Ubuntu/Debian/RHEL/Alpine box
+# ends ready to deploy.
+#
+# Client mode (default on macOS, forced on Linux with --client): just
+# the CLI — meant for laptops that deploy to remote servers.
+#
+# Env knobs:
+#   VERSION               pin a release (default: latest from GitHub)
+#   VOODU_INSTALL_REPO    source repo (default: thadeu/clowk-voodu)
+#   VOODU_ROOT            server state dir (default: /opt/voodu)
+#   VOODU_HTTP_ADDR       controller HTTP bind (default: 127.0.0.1:8686)
+#   SKIP_DOCKER=1         skip Docker install (server mode only)
+
+set -euo pipefail
+
+REPO="${VOODU_INSTALL_REPO:-thadeu/clowk-voodu}"
+VERSION="${VERSION:-}"
+VOODU_ROOT="${VOODU_ROOT:-/opt/voodu}"
+VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-127.0.0.1:8686}"
+SKIP_DOCKER="${SKIP_DOCKER:-0}"
+BIN_DIR="/usr/local/bin"
+UNIT_PATH="/etc/systemd/system/voodu-controller.service"
+MODE=""
+OS=""
+ARCH=""
+DISTRO=""
+TARGET_USER=""
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+
+log()     { printf '%s[voodu/install]%s %s\n' "$CYAN" "$NC" "$*"; }
+success() { printf '%s[voodu/install]%s %s\n' "$GREEN" "$NC" "$*"; }
+warn()    { printf '%s[voodu/install]%s %s\n' "$YELLOW" "$NC" "$*"; }
+fail()    { printf '%s[voodu/install]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+sudo_() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# run_as_target runs a command as $TARGET_USER. When the script itself
+# is already running as TARGET_USER (unprivileged install with sudo
+# password prompts), no privilege change is needed. When running as
+# root (cloud-init / sudo bash), drop to TARGET_USER with -H so $HOME
+# resolves to the user's home and `voodu setup` writes the right rc file.
+run_as_target() {
+  if [ "$(id -u)" -eq 0 ] && [ "$TARGET_USER" != "root" ]; then
+    sudo -u "$TARGET_USER" -H "$@"
+  else
+    "$@"
+  fi
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --server) MODE=server; shift ;;
+      --client) MODE=client; shift ;;
+      --help|-h)
+        cat <<EOF
+voodu installer
+
+Usage: install [--server | --client]
+
+Default mode:
+  Linux  → server  (auto-installs Docker + voodu + controller + systemd unit)
+  macOS  → client  (CLI only)
+
+Environment:
+  VERSION               pin a release, e.g. v0.1.0 (default: latest)
+  VOODU_INSTALL_REPO    default thadeu/clowk-voodu
+  VOODU_ROOT            default /opt/voodu
+  VOODU_HTTP_ADDR       controller bind, default 127.0.0.1:8686
+  SKIP_DOCKER=1         skip Docker install (server mode only)
+EOF
+        exit 0
+        ;;
+      *) fail "unknown option: $1 (try --help)" ;;
+    esac
+  done
+}
+
+detect_platform() {
+  case "$(uname -s)" in
+    Linux)  OS=linux ;;
+    Darwin) OS=darwin ;;
+    *) fail "unsupported OS: $(uname -s)" ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64)  ARCH=amd64 ;;
+    arm64|aarch64) ARCH=arm64 ;;
+    *) fail "unsupported arch: $(uname -m)" ;;
+  esac
+
+  if [ -z "$MODE" ]; then
+    case "$OS" in
+      linux)  MODE=server ;;
+      darwin) MODE=client ;;
+    esac
+  fi
+
+  if [ "$MODE" = "server" ] && [ "$OS" != "linux" ]; then
+    fail "server mode requires Linux (detected $OS). Re-run with --client."
+  fi
+
+  if [ "$OS" = "linux" ] && [ -r /etc/os-release ]; then
+    DISTRO="$(. /etc/os-release && echo "${ID:-unknown}")"
+  else
+    DISTRO="$OS"
+  fi
+
+  # The user that will own bare repos and push to them. When the script
+  # runs as a regular user with sudo, that user is the deploy user. When
+  # run as root (cloud-init), fall back to SUDO_USER if present, else root.
+  if [ "$(id -u)" -eq 0 ]; then
+    TARGET_USER="${SUDO_USER:-root}"
+  else
+    TARGET_USER="$USER"
+  fi
+
+  log "platform: $OS/$ARCH ($DISTRO)   mode: $MODE   deploy user: $TARGET_USER"
+}
+
+ensure_base_packages() {
+  local missing=()
+
+  command -v curl >/dev/null || missing+=("curl")
+  command -v tar  >/dev/null || missing+=("tar")
+  command -v git  >/dev/null || missing+=("git")
+
+  if [ "$MODE" = "server" ]; then
+    command -v systemctl >/dev/null 2>&1 || [ "$DISTRO" = "alpine" ] || missing+=("systemd")
+  fi
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    return
+  fi
+
+  log "installing base packages: ${missing[*]}"
+
+  case "$DISTRO" in
+    ubuntu|debian)
+      sudo_ apt-get update -qq
+      sudo_ apt-get install -y --no-install-recommends "${missing[@]}"
+      ;;
+    centos|rhel|fedora|rocky|almalinux|amzn)
+      sudo_ yum install -y "${missing[@]}"
+      ;;
+    alpine)
+      sudo_ apk add --no-cache "${missing[@]}"
+      ;;
+    darwin)
+      fail "missing on macOS: ${missing[*]} — install with brew or Xcode CLT and re-run."
+      ;;
+    *)
+      fail "missing packages on unsupported distro ($DISTRO): ${missing[*]}.
+  Install them with your package manager and re-run."
+      ;;
+  esac
+}
+
+ensure_docker() {
+  if [ "$SKIP_DOCKER" = "1" ]; then
+    warn "SKIP_DOCKER=1 — skipping Docker install (you must install it before deploying)"
+    return
+  fi
+
+  if command -v docker >/dev/null; then
+    log "docker already installed: $(docker --version)"
+  else
+    log "installing Docker..."
+    case "$DISTRO" in
+      ubuntu|debian) install_docker_debian ;;
+      centos|rhel|fedora|rocky|almalinux|amzn) install_docker_rhel ;;
+      alpine) install_docker_alpine ;;
+      *) fail "automatic Docker install not supported for $DISTRO.
+  Install Docker manually (https://docs.docker.com/engine/install/) and re-run, or pass SKIP_DOCKER=1 to skip." ;;
+    esac
+  fi
+
+  ensure_docker_running
+  add_user_to_docker_group
+  wait_for_docker_ready
+}
+
+install_docker_debian() {
+  sudo_ apt-get update -qq
+  sudo_ apt-get install -y --no-install-recommends \
+    apt-transport-https ca-certificates gnupg lsb-release
+
+  local distro_id
+  distro_id="$(. /etc/os-release && echo "$ID")"
+
+  sudo_ install -m 0755 -d /etc/apt/keyrings
+
+  curl -fsSL "https://download.docker.com/linux/${distro_id}/gpg" \
+    | sudo_ gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo_ chmod a+r /etc/apt/keyrings/docker.gpg
+
+  local arch_dpkg
+  arch_dpkg="$(dpkg --print-architecture)"
+
+  local codename
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-$(lsb_release -cs)}")"
+
+  echo "deb [arch=${arch_dpkg} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${distro_id} ${codename} stable" \
+    | sudo_ tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+  sudo_ apt-get update -qq
+  sudo_ apt-get install -y --no-install-recommends \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+install_docker_rhel() {
+  sudo_ yum install -y yum-utils
+  sudo_ yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  sudo_ yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+install_docker_alpine() {
+  sudo_ apk add --no-cache docker docker-cli docker-compose docker-cli-buildx
+}
+
+ensure_docker_running() {
+  if [ "$DISTRO" = "alpine" ]; then
+    sudo_ rc-update add docker default >/dev/null 2>&1 || true
+    sudo_ service docker start >/dev/null 2>&1 || true
+  else
+    sudo_ systemctl enable docker >/dev/null 2>&1 || true
+    sudo_ systemctl start docker
+  fi
+}
+
+wait_for_docker_ready() {
+  local i=0
+  while [ $i -lt 15 ]; do
+    if sudo_ docker ps >/dev/null 2>&1; then
+      success "docker is ready: $(docker --version)"
+      return
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  warn "docker daemon did not become ready in 15s — check 'systemctl status docker'"
+}
+
+add_user_to_docker_group() {
+  if [ "$TARGET_USER" = "root" ]; then
+    return
+  fi
+
+  if id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    log "$TARGET_USER already in docker group"
+    return
+  fi
+
+  log "adding $TARGET_USER to docker group"
+  sudo_ groupadd -f docker
+  sudo_ usermod -aG docker "$TARGET_USER"
+
+  warn "$TARGET_USER must log out and back in (or run 'newgrp docker') for group membership to take effect"
+}
+
+resolve_version() {
+  if [ -n "$VERSION" ]; then
+    log "version: $VERSION (pinned)"
+    return
+  fi
+
+  log "resolving latest release from GitHub API..."
+
+  local api="https://api.github.com/repos/${REPO}/releases/latest"
+
+  VERSION="$(curl -fsSL "$api" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+
+  if [ -z "$VERSION" ]; then
+    fail "could not resolve latest release from $api. Set VERSION=vX.Y.Z to pin."
+  fi
+
+  log "version: $VERSION (latest)"
+}
+
+download_and_install_binary() {
+  local binary="$1"
+
+  local num_version="${VERSION#v}"
+  local archive="${binary}_${num_version}_${OS}_${ARCH}.tar.gz"
+  local url="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
+
+  log "downloading $archive"
+
+  local tmp
+  tmp="$(mktemp -d)"
+
+  if ! curl -fsSL "$url" -o "$tmp/$archive"; then
+    rm -rf "$tmp"
+    fail "download failed: $url"
+  fi
+
+  (cd "$tmp" && tar -xzf "$archive")
+
+  if [ ! -x "$tmp/$binary" ]; then
+    rm -rf "$tmp"
+    fail "archive $archive did not contain an executable named $binary"
+  fi
+
+  sudo_ install -m 0755 "$tmp/$binary" "$BIN_DIR/$binary"
+  rm -rf "$tmp"
+
+  success "installed $BIN_DIR/$binary"
+}
+
+server_setup() {
+  # Pre-create and chown the root so the target user can run `voodu
+  # setup` themselves. Doing the setup AS the user (not root) matters
+  # for two reasons:
+  #   1. bare repos live under $VOODU_ROOT/repos/ and must be owned by
+  #      the user who pushes to them — otherwise `git push` hits
+  #      permission errors on the post-receive hook.
+  #   2. `voodu setup` writes mode=server to ~/.voodurc — we want that
+  #      file in the deploy user's home, not /root/.
+  log "creating $VOODU_ROOT owned by $TARGET_USER"
+  sudo_ install -m 0755 -d "$VOODU_ROOT"
+
+  if [ "$TARGET_USER" != "root" ]; then
+    sudo_ chown "$TARGET_USER":"$TARGET_USER" "$VOODU_ROOT"
+  fi
+
+  log "running 'voodu setup' as $TARGET_USER (creates layout + marks ~/.voodurc mode=server)"
+  run_as_target env VOODU_ROOT="$VOODU_ROOT" "$BIN_DIR/voodu" setup
+
+  write_systemd_unit
+  enable_controller
+}
+
+write_systemd_unit() {
+  log "writing $UNIT_PATH"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  cat >"$tmp" <<UNIT
+[Unit]
+Description=Voodu controller (etcd + HTTP API)
+Documentation=https://github.com/${REPO}
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Environment=VOODU_ROOT=${VOODU_ROOT}
+ExecStart=${BIN_DIR}/voodu-controller -http ${VOODU_HTTP_ADDR}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  sudo_ install -m 0644 "$tmp" "$UNIT_PATH"
+  rm -f "$tmp"
+
+  sudo_ systemctl daemon-reload
+}
+
+enable_controller() {
+  sudo_ systemctl enable voodu-controller.service >/dev/null
+  sudo_ systemctl restart voodu-controller.service
+  sleep 1
+
+  if sudo_ systemctl is-active --quiet voodu-controller.service; then
+    success "voodu-controller running (HTTP ${VOODU_HTTP_ADDR})"
+  else
+    warn "voodu-controller failed to start — inspect: sudo journalctl -u voodu-controller -n 50"
+  fi
+}
+
+print_next_steps() {
+  echo
+  if [ "$MODE" = "server" ]; then
+    local host
+    host="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname)"
+
+    cat <<EOF
+${GREEN}Voodu server ready.${NC}
+
+  State:        $VOODU_ROOT (owned by $TARGET_USER)
+  Controller:   http://${VOODU_HTTP_ADDR}   (unit: voodu-controller.service)
+  Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller
+  Docker:       $(docker --version 2>/dev/null || echo "not installed")
+
+${CYAN}Next steps:${NC}
+  1. (if you weren't root) log out and back in so docker group membership applies
+  2. On this server:      voodu apps create api
+  3. On your laptop:      git remote add voodu ${TARGET_USER}@${host}:api
+  4. Write voodu.hcl, then: voodu apply -f voodu.hcl -a api
+
+EOF
+  else
+    cat <<EOF
+${GREEN}Voodu CLI installed.${NC}
+
+  Binary:  $BIN_DIR/voodu
+
+${CYAN}Next steps:${NC}
+  1. Install voodu on a Linux server (same installer, --server is default there).
+  2. Add a git remote:         git remote add voodu user@server:<app>
+  3. Write voodu.hcl, then:    voodu apply -f voodu.hcl -a <app>
+
+EOF
+  fi
+
+  "$BIN_DIR/voodu" version || true
+}
+
+main() {
+  parse_args "$@"
+  detect_platform
+  ensure_base_packages
+
+  if [ "$MODE" = "server" ]; then
+    ensure_docker
+  fi
+
+  resolve_version
+  download_and_install_binary voodu
+
+  if [ "$MODE" = "server" ]; then
+    download_and_install_binary voodu-controller
+    server_setup
+  fi
+
+  print_next_steps
+  success "installation complete"
+}
+
+main "$@"
