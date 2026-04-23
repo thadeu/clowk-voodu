@@ -23,4 +23,3 @@ coverage.html
 # Local development
 dev-plugins/
 .env.local
-cli
