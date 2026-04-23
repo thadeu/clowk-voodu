@@ -199,7 +199,8 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep) er
 	// side via CloseWithError and surfaces when SSH hits EOF.
 	go func() {
 		_, err := tarball.Stream(pw, d.Path, tarball.Options{
-			MaxSize: buildContextMaxSize(),
+			MaxSize:  buildContextMaxSize(),
+			Progress: os.Stderr,
 		})
 
 		// CloseWithError(nil) behaves like Close — no error propagates

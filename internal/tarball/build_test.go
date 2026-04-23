@@ -261,6 +261,169 @@ func TestStreamMaxSizeEnforced(t *testing.T) {
 	}
 }
 
+func TestStreamFallsBackToGitignoreWhenDockerignoreMissing(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "app.go", []byte("package main\n"), 0644)
+	writeFile(t, src, "secret.env", []byte("KEY=x\n"), 0644)
+	writeFile(t, src, "dist/app.js", []byte("x\n"), 0644)
+	// No .dockerignore. A .gitignore that excludes secrets + build
+	// artifacts. That's what the tarball should honor.
+	writeFile(t, src, ".gitignore", []byte("secret.env\ndist/\n"), 0644)
+
+	var buf bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	names := listTar(t, &buf)
+
+	for _, n := range names {
+		if n == "secret.env" {
+			t.Errorf("secret.env leaked despite .gitignore: %v", names)
+		}
+
+		if n == "dist/" || n == "dist/app.js" {
+			t.Errorf("dist/ leaked despite .gitignore: %v", names)
+		}
+	}
+}
+
+func TestStreamDockerignoreWinsOverGitignore(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "keep.txt", []byte("keep\n"), 0644)
+	writeFile(t, src, "drop-by-docker.txt", []byte("x\n"), 0644)
+	writeFile(t, src, "drop-by-git.txt", []byte("x\n"), 0644)
+	// Both files exist. .dockerignore drops only the docker one; if
+	// .gitignore were also honored, the git one would disappear too.
+	// Docker-style resolution says .dockerignore wins outright.
+	writeFile(t, src, ".dockerignore", []byte("drop-by-docker.txt\n"), 0644)
+	writeFile(t, src, ".gitignore", []byte("drop-by-git.txt\n"), 0644)
+
+	var buf bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	names := listTar(t, &buf)
+
+	hasGit := false
+	hasDocker := false
+
+	for _, n := range names {
+		if n == "drop-by-git.txt" {
+			hasGit = true
+		}
+
+		if n == "drop-by-docker.txt" {
+			hasDocker = true
+		}
+	}
+
+	if hasDocker {
+		t.Errorf(".dockerignore pattern ignored: %v", names)
+	}
+
+	if !hasGit {
+		t.Errorf(".gitignore should be ignored when .dockerignore exists, but drop-by-git.txt was excluded: %v", names)
+	}
+}
+
+func TestStreamNoIgnoreFilesShipsEverythingExceptBuiltins(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "README.md", []byte("# hi\n"), 0644)
+	writeFile(t, src, "app/index.js", []byte("x\n"), 0644)
+	// .git and node_modules are built-in excluded even without any
+	// ignore file — the floor that prevents pushing history/OS-specific
+	// junk when the user forgot to write their ignore.
+	writeFile(t, src, ".git/config", []byte("x\n"), 0644)
+	writeFile(t, src, "node_modules/a/index.js", []byte("x\n"), 0644)
+
+	var buf bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	names := listTar(t, &buf)
+
+	hasDockerfile, hasReadme, hasApp := false, false, false
+
+	for _, n := range names {
+		if n == "Dockerfile" {
+			hasDockerfile = true
+		}
+
+		if n == "README.md" {
+			hasReadme = true
+		}
+
+		if n == "app/index.js" {
+			hasApp = true
+		}
+
+		if n == ".git/" || n == ".git/config" {
+			t.Errorf("built-in .git filter bypassed: %v", names)
+		}
+
+		if n == "node_modules/" {
+			t.Errorf("built-in node_modules filter bypassed: %v", names)
+		}
+	}
+
+	if !hasDockerfile || !hasReadme || !hasApp {
+		t.Errorf("expected Dockerfile+README.md+app/index.js to ship, got %v", names)
+	}
+}
+
+func TestStreamGitignoreStripsLeadingSlash(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "a.log", []byte("root\n"), 0644)
+	writeFile(t, src, "sub/a.log", []byte("nested\n"), 0644)
+	// Git syntax: `/a.log` means "root-only, don't touch sub/a.log".
+	// Our matcher reinterprets it as `a.log` (root-relative). Good
+	// enough for 95% of patterns; document the divergence rather
+	// than reimplement git's rules.
+	writeFile(t, src, ".gitignore", []byte("/a.log\n"), 0644)
+
+	var buf bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	names := listTar(t, &buf)
+
+	hasRoot, hasNested := false, false
+
+	for _, n := range names {
+		if n == "a.log" {
+			hasRoot = true
+		}
+
+		if n == "sub/a.log" {
+			hasNested = true
+		}
+	}
+
+	if hasRoot {
+		t.Errorf("root a.log should have been filtered: %v", names)
+	}
+
+	if !hasNested {
+		t.Errorf("sub/a.log should have shipped: %v", names)
+	}
+}
+
 func TestStreamExtraIgnores(t *testing.T) {
 	src := t.TempDir()
 
