@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"go.voodu.clowk.in/internal/progress"
 	"go.voodu.clowk.in/internal/remote"
 	"go.voodu.clowk.in/internal/tarball"
 )
@@ -255,21 +256,34 @@ func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildMod
 // stream reaches the user's terminal untouched. Default (verbose
 // false) collapses the noisy middle of the build into a spinner.
 func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, force, verbose bool) error {
-	// Filter is built up front so the client-side "-----> Shipping …"
-	// banner flows through the same pipeline as the server-emitted
-	// phases (Receiving, Creating release, Building release). In
-	// non-verbose TTY mode that means Shipping opens the first spinner
-	// step and commits as `✓ Shipping … (Ns)` when Receiving arrives.
-	// In verbose / non-TTY modes the filter passes through, so the
-	// banner still shows up — just with its raw `----->` prefix.
-	filter := newProgressFilter(os.Stdout, verbose)
-
-	// Record the deploy name BEFORE the filter sees Shipping, so the
-	// step's openStep() reads the right lastShippedTag for the
-	// eventual `✓ Built <tag> in Ns` summary.
+	// Record the deploy name so both renderers (legacy progressFilter
+	// and NDJSON eventRenderer) produce the right `✓ Built <tag> in Ns`
+	// summary regardless of which path the negotiation picks.
 	rememberShippedTag(d.Name)
 
-	fmt.Fprintf(filter, "-----> Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
+	// The Shipping banner is a client-only note (the server has not
+	// even been contacted yet). Print it straight to stdout, outside
+	// any filter — otherwise it would race with the server's first
+	// line for the negotiator's "line one" peek.
+	//
+	// We commit it as a green ✓ right away instead of opening a spinner:
+	// from the client's point of view Shipping is a one-shot act ("we
+	// kicked off the tar stream"), and visually it now aligns with the
+	// ✓ cascade that follows (Receiving, Creating, Building, Built).
+	// Printing `----->` here would leave an orphan banner without the
+	// leading checkmark, which reads as "this line didn't finish."
+	fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
+
+	// Two renderers are pre-built and handed to a negotiatingWriter
+	// that picks between them based on the server's first stdout line.
+	// NDJSON-speaking servers emit a hello frame and eventRenderer
+	// takes over; legacy servers emit `-----> Receiving ...` banners
+	// and progressFilter handles them. The client is therefore
+	// version-agnostic: it speaks the latest protocol, falls back
+	// gracefully otherwise.
+	legacy := newProgressFilter(os.Stdout, verbose)
+	nd := newEventRenderer(os.Stdout, verbose)
+	filter := newNegotiatingWriter(legacy, nd)
 
 	pr, pw := io.Pipe()
 
@@ -337,19 +351,29 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 }
 
 // remoteEnv builds the env map inlined into the SSH command so the
-// remote voodu can emit colorized output. Why this exists: the server
-// process writes to a pipe (sshd), so its lipgloss renderer would
-// otherwise pick the no-color profile. The user's *local* stdout is
-// the real tty — we detect here, propagate FORCE_COLOR=1 across the
-// wire, and let the bytes stream back to the actual terminal intact.
+// remote voodu can emit colorized output and speak the NDJSON
+// progress protocol. Why this exists: the server process writes to a
+// pipe (sshd), so its lipgloss renderer would otherwise pick the
+// no-color profile. The user's *local* stdout is the real tty — we
+// detect here, propagate FORCE_COLOR=1 across the wire, and let the
+// bytes stream back to the actual terminal intact.
 //
-// Precedence mirrors no-color.org:
+// Precedence mirrors no-color.org for color flags:
 //   - NO_COLOR (non-empty local) → forwarded as-is, disables everything
 //   - FORCE_COLOR (non-empty local) → forwarded as-is, user's override wins
 //   - Else if local stdout is a tty → synthesize FORCE_COLOR=1
-//   - Else → empty map, remote stays plain (pipes, CI, redirects)
+//   - Else → no color flag set, remote stays plain (pipes, CI, redirects)
+//
+// VOODU_PROTOCOL is always set: the client speaks the latest wire
+// version, and servers that don't know it will silently ignore the
+// env var and fall back to their legacy text format. The client's
+// negotiatingWriter sniffs the server's first stdout line to decide
+// which renderer to use — if no hello arrives, the legacy
+// progressFilter takes over transparently.
 func remoteEnv() map[string]string {
-	env := map[string]string{}
+	env := map[string]string{
+		progress.EnvProtocol: progress.ProtocolVersion,
+	}
 
 	if v := os.Getenv("NO_COLOR"); v != "" {
 		env["NO_COLOR"] = v

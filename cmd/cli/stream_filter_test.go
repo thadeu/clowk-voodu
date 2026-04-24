@@ -96,7 +96,7 @@ func TestProgressFilterCollapsesBuildBlock(t *testing.T) {
 		"#2 DONE 0.1s",
 		"-----> Node.js build complete!",
 		"-----> Build completed",
-		"Deploy completed successfully for 'softphone-web'",
+		"-----> Deploy completed successfully for 'softphone-web'",
 		"-----> Pruned 1 old release(s)",
 		"",
 	}, "\n")

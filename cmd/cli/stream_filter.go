@@ -25,9 +25,17 @@ const phasePrefix = "-----> "
 // image-pull deploys) where "Build completed" never fires. Either
 // one landing first wins; duplicates are harmless because f.active
 // is already false on the second.
+//
+// Both entries carry the leading `-----> ` because that's how a text-
+// mode server actually emits them: progress.TextReporter.Summary
+// prefixes every summary with `-----> `. Matching without the prefix
+// would never fire for a server that went through the Reporter API
+// (post-Camada-3), which is every modern server build. Trimming in
+// the classifier doesn't help — `strings.HasPrefix` on a `----->`-
+// prefixed line against a bare "Deploy completed …" needle is a miss.
 var endMarkers = []string{
 	"-----> Build completed",
-	"Deploy completed successfully",
+	"-----> Deploy completed successfully",
 }
 
 // stepBanners are the curated `-----> ` phases that open a new
@@ -36,6 +44,21 @@ var endMarkers = []string{
 // is a conscious DX decision. All other `-----> ` banners that aren't
 // in passthroughBanners are treated as sub-details and swallowed; the
 // spinner keeps showing the active step while the build churns.
+//
+// Since the NDJSON protocol shipped, most of these banners are only
+// seen on the legacy fallback path (old server that hasn't been
+// upgraded yet) — the modern NDJSON path routes typed step_start
+// events through eventRenderer instead. The exception is "Checking " —
+// that banner is emitted client-side in runApplyForwarded to drive
+// the phase-1 diff spinner and has no server equivalent, so it
+// belongs here regardless of negotiation outcome.
+//
+// "Shipping " used to be client-emitted as a `----->` banner too, but
+// since the Camada 3 integration it's committed directly as a `✓`
+// line to stdout (outside any filter) to avoid racing with the
+// negotiator's first-line peek. Kept in the table anyway as a safety
+// net — a future caller that writes `-----> Shipping …` through
+// progressFilter should still see the spinner.
 var stepBanners = []string{
 	"Checking ",
 	"Shipping ",
@@ -65,6 +88,27 @@ const spinnerFrames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 // docker buildx chatter are swallowed; the spinner's advancing timer
 // is the progress signal during a step. This is pure presentation —
 // bytes on the SSH pipe are unchanged.
+//
+// Role after the NDJSON protocol (Camada 3) shipped:
+//
+//   - Phase 1 of a forwarded apply still uses progressFilter directly
+//     for the client-side `-----> Checking remote state...` spinner.
+//     That banner is entirely client-driven and never crosses the wire.
+//
+//   - For server-driven streams (build push via receive-pack, apply
+//     phase 3) progressFilter is now the *legacy fallback* branch of
+//     the negotiatingWriter. When the server speaks NDJSON,
+//     eventRenderer takes over and progressFilter sees no bytes at
+//     all. When the server is still on the text format (older deploy,
+//     transition period), progressFilter handles it exactly as it did
+//     before.
+//
+// The long-term sunset plan is: once every deployed server speaks
+// NDJSON (tracked in the Voodu upgrade notes), progressFilter
+// collapses into a buildx-noise-only classifier — no step state
+// machine, no banner tables, just `#<digits> ... → swallow`. Until
+// that milestone passes (and it's an opt-in, per-deploy decision),
+// the full state machine stays.
 //
 // Visual model:
 //
@@ -543,16 +587,19 @@ var applyResultTokens = []string{
 	" pruned",
 }
 
-// applyResultFilter styles the phase-2 `voodu apply` output so the
+// applyResultFilter styles the phase-3 `voodu apply` output so the
 // server's plain status lines ("<kind>/<scope>/<name> applied",
 // "<ref> pruned (removed from manifests)") gain the same green ✓
 // treatment as the build-phase steps. Non-matching lines pass
 // through unchanged — this is pure presentation, not content.
 //
-// Used only on the forwarded apply orchestrator's phase 2 SSH call.
-// Phase 1 (diff) uses the structured JSON capture, which doesn't
-// flow through here. Escape hatches mirror progressFilter: verbose
-// or non-TTY → raw passthrough.
+// Used only on the forwarded apply orchestrator's phase 3 SSH call,
+// and only when the server speaks the legacy text format. Modern
+// NDJSON servers emit typed result events that eventRenderer handles
+// directly; the negotiatingWriter picks between the two at runtime
+// based on the server's hello frame. Phase 1 (diff) uses the
+// structured JSON capture, which doesn't flow through here. Escape
+// hatches mirror progressFilter: verbose or non-TTY → raw passthrough.
 type applyResultFilter struct {
 	out     io.Writer
 	verbose bool

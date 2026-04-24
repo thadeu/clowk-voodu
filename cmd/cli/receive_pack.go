@@ -9,6 +9,7 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/deploy"
+	"go.voodu.clowk.in/internal/progress"
 )
 
 // newReceivePackCmd is the server-side entry point for commitless
@@ -69,8 +70,19 @@ for a brand-new app) the pipeline falls back to auto-detection.`,
 				return fmt.Errorf("fetch deployment spec from controller: %w", err)
 			}
 
+			// Reporter picks JSON iff the client set VOODU_PROTOCOL to
+			// the current wire version in the SSH env. Hello() lands
+			// as the first line — NDJSON clients confirm the handshake
+			// and pivot to structured rendering; legacy clients stay
+			// on the existing text banner path (Hello is a no-op there).
+			reporter := progress.NewReporterFromEnv(os.Stdout)
+			reporter.Hello()
+
+			defer reporter.Close()
+
 			return deploy.RunFromTarball(controller.AppID(scope, name), os.Stdin, deploy.Options{
 				LogWriter: os.Stdout,
+				Reporter:  reporter,
 				Force:     force,
 				Spec:      spec,
 			})

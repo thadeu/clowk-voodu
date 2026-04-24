@@ -16,6 +16,7 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/manifest"
+	"go.voodu.clowk.in/internal/progress"
 )
 
 const applyTimeout = 30 * time.Second
@@ -194,12 +195,19 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
+	// Route per-resource verdicts through progress.Reporter so NDJSON
+	// clients see typed result events (kind/scope/name/action as
+	// distinct fields) while legacy / local callers keep the plain
+	// "deployment/softphone/web applied" wire format. The reporter
+	// kind is picked from VOODU_PROTOCOL env — set by forwarded apply
+	// clients speaking NDJSON, unset in local / legacy flows.
+	reporter := progress.NewReporterFromEnv(os.Stdout)
+	reporter.Hello()
+
+	defer reporter.Close()
+
 	for _, m := range mans {
-		if m.Scope != "" {
-			fmt.Printf("%s/%s/%s applied\n", m.Kind, m.Scope, m.Name)
-		} else {
-			fmt.Printf("%s/%s applied\n", m.Kind, m.Name)
-		}
+		reporter.Result(string(m.Kind), m.Scope, m.Name, "applied")
 	}
 
 	// The controller returns {"data": {"applied": [...], "pruned": [...]}}.
@@ -212,11 +220,33 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 
 	if err := json.Unmarshal(raw, &env); err == nil {
 		for _, p := range env.Data.Pruned {
-			fmt.Printf("%s pruned (removed from manifests)\n", p)
+			// p is a pre-formatted "kind/scope/name" string from the
+			// controller. Split back into parts so the typed Result
+			// event carries structured fields — the text action is
+			// the full "pruned (removed from manifests)" phrase to
+			// match what the legacy client rendered.
+			kind, scope, name := splitManifestRef(p)
+			reporter.Result(kind, scope, name, "pruned (removed from manifests)")
 		}
 	}
 
 	return nil
+}
+
+// splitManifestRef decomposes "kind/name" or "kind/scope/name" into
+// parts. Mirrors formatRef's output shape so Result events carry the
+// same identifiers the text path was concatenating.
+func splitManifestRef(ref string) (kind, scope, name string) {
+	parts := strings.SplitN(ref, "/", 3)
+
+	switch len(parts) {
+	case 2:
+		return parts[0], "", parts[1]
+	case 3:
+		return parts[0], parts[1], parts[2]
+	}
+
+	return "", "", ref
 }
 
 func runDiff(cmd *cobra.Command, f applyFlags) error {

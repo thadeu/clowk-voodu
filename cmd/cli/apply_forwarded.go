@@ -173,12 +173,25 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		fmt.Fprintln(os.Stdout)
 	}
 
-	// Phase 3: the actual `voodu apply` on the server. The server emits
-	// one status line per manifest ("<kind>/<scope>/<name> applied").
-	// We wrap its stdout through applyResultFilter to get a matching
-	// green ✓ for each, keeping the DX consistent with the build steps
-	// above. --verbose is the escape hatch: no styling, raw stream.
-	resultFilter := newApplyResultFilter(os.Stdout, flags.verbose)
+	// Phase 3: the actual `voodu apply` on the server. Two possible
+	// wire formats:
+	//
+	//   - Legacy: one plain status line per manifest, e.g.
+	//     "deployment/softphone/web applied". applyResultFilter
+	//     styles each with a green ✓.
+	//
+	//   - NDJSON (ndjson/1): a hello frame first, then one result
+	//     event per manifest. eventRenderer styles them identically
+	//     to the legacy output but via typed decoding.
+	//
+	// negotiatingWriter sniffs the first server line and routes to
+	// whichever filter matches. --verbose bypasses both renderers
+	// (raw stream pass-through), which is what we want for debugging
+	// whichever side — NDJSON frames are human-readable JSON, and
+	// the legacy format is already plain text.
+	legacy := newApplyResultFilter(os.Stdout, flags.verbose)
+	nd := newEventRenderer(os.Stdout, flags.verbose)
+	resultFilter := newNegotiatingWriter(legacy, nd)
 
 	code, err = remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,

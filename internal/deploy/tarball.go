@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"go.voodu.clowk.in/internal/paths"
+	"go.voodu.clowk.in/internal/progress"
 )
 
 // BuildIDLen is the number of hex characters kept from the tarball's
@@ -51,20 +52,28 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return fmt.Errorf("tarball source is nil")
 	}
 
-	opts.log("-----> Receiving build context for '%s'...", app)
+	r := opts.reporter()
+
+	r.StepStart("receive", fmt.Sprintf("Receiving build context for '%s'...", app))
 
 	// A new scope or a renamed deployment produces an AppID the server
 	// has never seen. Materialise the app tree lazily so the operator
 	// doesn't have to run `voodu apps create` every time — the
 	// MkdirAll is idempotent, so re-deploys pay nothing.
 	if err := ensureAppLayout(app); err != nil {
+		r.StepEnd("receive", progress.StatusFail, err)
+
 		return err
 	}
 
 	buildID, tmpPath, err := bufferTarball(src)
 	if err != nil {
+		r.StepEnd("receive", progress.StatusFail, err)
+
 		return fmt.Errorf("buffer tarball: %w", err)
 	}
+
+	r.StepEnd("receive", progress.StatusOK, nil)
 
 	defer os.Remove(tmpPath)
 
@@ -80,16 +89,22 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return swapCurrentSymlink(app, releaseDir)
 	}
 
-	opts.log("-----> Creating release %s", buildID)
+	r.StepStart("create", fmt.Sprintf("Creating release %s", buildID))
 
 	if err := os.MkdirAll(releaseDir, 0755); err != nil {
+		r.StepEnd("create", progress.StatusFail, err)
+
 		return fmt.Errorf("create release dir: %w", err)
 	}
 
 	if err := extractTarball(tmpPath, releaseDir); err != nil {
 		_ = os.RemoveAll(releaseDir)
+		r.StepEnd("create", progress.StatusFail, err)
+
 		return fmt.Errorf("extract tarball: %w", err)
 	}
+
+	r.StepEnd("create", progress.StatusOK, nil)
 
 	// Surface a quick directory listing so the operator can confirm the
 	// build context that actually landed on the server. When a build
@@ -113,9 +128,15 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 	if pruned, err := gcReleases(app, keep); err != nil {
 		// GC failure is non-fatal: the deploy succeeded, the user sees
 		// a warning, disk cleanup can be done by hand later.
-		opts.log("Warning: release GC failed: %v", err)
+		opts.warn("Warning: release GC failed: %v", err)
 	} else if pruned > 0 {
-		opts.log("-----> Pruned %d old release(s)", pruned)
+		// Pruned is routed as a Summary because the legacy client's
+		// stream_filter treats `-----> Pruned ...` as a passthrough
+		// banner and promotes it to a ✓ line — a shape Summary
+		// naturally carries (text reporter emits it with the `----->`
+		// prefix, NDJSON clients render it as a ✓ from the typed
+		// event).
+		opts.reporter().Summary(fmt.Sprintf("Pruned %d old release(s)", pruned))
 	}
 
 	return nil
