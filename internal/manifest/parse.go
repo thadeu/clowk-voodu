@@ -165,7 +165,15 @@ func formatFromExt(path string) (Format, error) {
 // its own slice so hclsimple can tell blocks apart by label. HCL block
 // structs list their fields explicitly — hcl/v2 doesn't walk anonymous
 // embedded specs, so we mirror (not embed) the typed Spec shape.
+//
+// `app` is authoring sugar — not a controller kind. Each app block in
+// the source expands into one deployment + one ingress with the same
+// (scope, name); the controller never sees an "app". This keeps the
+// runtime contract simple (every manifest is one of the canonical
+// kinds) while letting users declare the overwhelmingly common
+// "1 deployment ↔ 1 ingress" pair in a single block.
 type hclRoot struct {
+	Apps        []hclApp        `hcl:"app,block"`
 	Deployments []hclDeployment `hcl:"deployment,block"`
 	Databases   []hclDatabase   `hcl:"database,block"`
 	Services    []hclService    `hcl:"service,block"`
@@ -234,6 +242,148 @@ func (b hclDeployment) spec() DeploymentSpec {
 	s.applyDefaults()
 
 	return s
+}
+
+// hclApp is authoring sugar for the "deployment + ingress with the
+// same (scope, name)" pair — by far the most common shape for web
+// apps. It is NOT a controller kind: the parser expands every app
+// into two manifests (one deployment, one ingress) and the rest of
+// the system never knows the original block was an app. That way
+// `voodu describe`, diff, prune, --force and all client commands
+// keep working against the canonical kinds without special cases.
+//
+// Field selection rules:
+//
+//   - Every deployment field is exposed verbatim (image, replicas,
+//     env, ports, lang block, …). The deployment side of the app is
+//     a regular deployment.
+//
+//   - On the ingress side, only `host`, `tls`, `location`, and `lb`
+//     are exposed. We omit `service` and `port` deliberately:
+//
+//     • `service` would always equal the app's own name (same
+//       identity), so making the user repeat it is busywork. The
+//       ingress handler already defaults service to the ingress
+//       name (handlers_service.go:202) — that default lands on the
+//       deployment we synthesise next to it.
+//
+//     • `port` would normally come from the ingress, but the
+//       deployment's `ports` is right here in the same block. The
+//       ingress handler derives the upstream port from the
+//       deployment's first container port when ingress.Port == 0
+//       (handlers_service.go#firstContainerPort). One source of
+//       truth — the user types `ports = ["3000"]` once and both
+//       sides agree.
+//
+// If you genuinely need two ingresses on the same deployment, or a
+// custom service-name pointer, drop the `app` shorthand and write
+// `deployment` + `ingress` separately. The parser doesn't try to
+// cover every shape — it covers the 90% case in fewer lines.
+type hclApp struct {
+	Scope string `hcl:"scope,label"`
+	Name  string `hcl:"name,label"`
+
+	// Deployment-side fields — verbatim copy of hclDeployment minus
+	// the labels (which the app already carries). Kept in sync by
+	// hand: HCL doesn't walk embedded structs, and a code-gen step
+	// would be heavier than the duplication.
+	Image        string            `hcl:"image,optional"`
+	Workdir      string            `hcl:"workdir,optional"`
+	Dockerfile   string            `hcl:"dockerfile,optional"`
+	Path         string            `hcl:"path,optional"`
+	Replicas     int               `hcl:"replicas,optional"`
+	Command      []string          `hcl:"command,optional"`
+	Env          map[string]string `hcl:"env,optional"`
+	Ports        []string          `hcl:"ports,optional"`
+	Volumes      []string          `hcl:"volumes,optional"`
+	Network      string            `hcl:"network,optional"`
+	Networks     []string          `hcl:"networks,optional"`
+	NetworkMode  string            `hcl:"network_mode,optional"`
+	Restart      string            `hcl:"restart,optional"`
+	HealthCheck  string            `hcl:"health_check,optional"`
+	PostDeploy   []string          `hcl:"post_deploy,optional"`
+	KeepReleases int               `hcl:"keep_releases,optional"`
+
+	Lang *hclLangBlock `hcl:"lang,block"`
+
+	// Ingress-side fields. Host is required (no host = no reason to
+	// be an app, write a plain deployment instead).
+	Host      string               `hcl:"host"`
+	TLS       *hclIngressTLS       `hcl:"tls,block"`
+	Locations []hclIngressLocation `hcl:"location,block"`
+	LB        *hclIngressLB        `hcl:"lb,block"`
+}
+
+// deploymentSpec extracts the deployment half of the app block. The
+// shape is identical to what hclDeployment.spec() produces — same
+// defaults, same lang handling — so a deployment authored as `app`
+// reconciles byte-for-byte the same as one authored as `deployment`.
+func (b hclApp) deploymentSpec() DeploymentSpec {
+	s := DeploymentSpec{
+		Image:        b.Image,
+		Workdir:      b.Workdir,
+		Dockerfile:   b.Dockerfile,
+		Path:         b.Path,
+		Replicas:     b.Replicas,
+		Command:      b.Command,
+		Env:          b.Env,
+		Ports:        b.Ports,
+		Volumes:      b.Volumes,
+		Network:      b.Network,
+		Networks:     b.Networks,
+		NetworkMode:  b.NetworkMode,
+		Restart:      b.Restart,
+		HealthCheck:  b.HealthCheck,
+		PostDeploy:   b.PostDeploy,
+		KeepReleases: b.KeepReleases,
+	}
+
+	if b.Lang != nil {
+		s.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+			BuildArgs:  b.Lang.BuildArgs,
+		}
+	}
+
+	s.applyDefaults()
+
+	return s
+}
+
+// ingressSpec extracts the ingress half. Service is left empty so
+// the controller's default-service-to-name path (handlers_service.go:
+// 202) lands on the deployment we just emitted alongside. Port stays
+// zero so the deployment's ports[0] is auto-picked at reconcile.
+func (b hclApp) ingressSpec() IngressSpec {
+	out := IngressSpec{Host: b.Host}
+
+	if b.TLS != nil {
+		out.TLS = &IngressTLS{
+			Enabled:  b.TLS.Enabled,
+			Provider: b.TLS.Provider,
+			Email:    b.TLS.Email,
+			OnDemand: b.TLS.OnDemand,
+			Ask:      b.TLS.Ask,
+		}
+	}
+
+	if len(b.Locations) > 0 {
+		out.Locations = make([]IngressLocation, 0, len(b.Locations))
+		for _, loc := range b.Locations {
+			out.Locations = append(out.Locations, IngressLocation{
+				Path:  loc.Path,
+				Strip: loc.Strip,
+			})
+		}
+	}
+
+	if b.LB != nil {
+		out.LB = &IngressLB{Policy: b.LB.Policy, Interval: b.LB.Interval}
+	}
+
+	return out
 }
 
 type hclDatabase struct {
@@ -351,6 +501,28 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 
 	var out []controller.Manifest
 
+	// Apps expand into a deployment + ingress pair with the same
+	// (scope, name). Emit the pair first so the canonical kinds are
+	// already in `out` when collision detection runs at the end — that
+	// way duplicate (kind, scope, name) errors point at the standalone
+	// block as the redeclaration regardless of where it sits in the
+	// source.
+	for _, b := range root.Apps {
+		dep, err := encode(controller.KindDeployment, b.Scope, b.Name, b.deploymentSpec())
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, dep)
+
+		ing, err := encode(controller.KindIngress, b.Scope, b.Name, b.ingressSpec())
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, ing)
+	}
+
 	for _, b := range root.Deployments {
 		m, err := encode(controller.KindDeployment, b.Scope, b.Name, b.spec())
 		if err != nil {
@@ -387,7 +559,48 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 		out = append(out, m)
 	}
 
+	if err := assertNoDuplicateIdentities(out); err != nil {
+		return nil, err
+	}
+
 	return out, nil
+}
+
+// assertNoDuplicateIdentities rejects files that declare the same
+// (kind, scope, name) tuple more than once. Catches two authoring
+// mistakes in a single sweep:
+//
+//   - Two standalone blocks of the same kind colliding — e.g. two
+//     `deployment "x" "y" {}` in one file. hcl/v2 doesn't error on
+//     these (shape depends on labels, not uniqueness), so without
+//     this check the latter declaration would silently win.
+//
+//   - An `app "x" "y"` paired with a standalone `deployment "x" "y"`
+//     or `ingress "x" "y"`. The app already emitted the canonical
+//     pair; the standalone is either a duplicate (busywork) or an
+//     override attempt (better expressed by dropping the `app`
+//     shorthand and writing both blocks explicitly). Either way,
+//     the user should see it instead of guessing why their override
+//     didn't take effect.
+//
+// The error doesn't point at line numbers — hcl.Decode's position
+// info is gone once we project into Manifest, and threading it
+// through would mean re-reading the source. The kind/scope/name
+// tuple is enough to grep for.
+func assertNoDuplicateIdentities(mans []controller.Manifest) error {
+	seen := make(map[string]struct{}, len(mans))
+
+	for _, m := range mans {
+		key := string(m.Kind) + "/" + m.Scope + "/" + m.Name
+
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("duplicate identity %s: declared more than once (check `app` blocks and standalone %s blocks for collisions)", key, m.Kind)
+		}
+
+		seen[key] = struct{}{}
+	}
+
+	return nil
 }
 
 // yamlDoc mirrors the controller wire shape so users can hand-roll

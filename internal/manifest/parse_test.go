@@ -236,6 +236,212 @@ service "web" {
 	}
 }
 
+// TestParseHCLAppExpandsToDeploymentAndIngress locks in the authoring
+// sugar contract: `app "scope" "name" { … }` produces exactly two
+// manifests, one deployment and one ingress, sharing the same
+// identity. The runtime never sees an "app" — it sees the canonical
+// pair — so describe/diff/prune/--force keep working without
+// special-casing the block shape.
+func TestParseHCLAppExpandsToDeploymentAndIngress(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  replicas = 1
+  ports    = ["3000"]
+
+  lang {
+    name    = "nodejs"
+    version = "22"
+  }
+
+  host = "vd-web.lvh.me"
+
+  tls {
+    enabled  = true
+    provider = "internal"
+  }
+}
+`
+	tmp := writeTemp(t, "app.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 2 {
+		t.Fatalf("want 2 manifests (deployment+ingress), got %d", len(mans))
+	}
+
+	// Order is deterministic — apps are emitted before standalone
+	// blocks, deployment before ingress within the pair.
+	dep, ing := mans[0], mans[1]
+
+	if dep.Kind != controller.KindDeployment || dep.Scope != "clowk-lp" || dep.Name != "web" {
+		t.Errorf("deployment header wrong: %+v", dep)
+	}
+
+	if ing.Kind != controller.KindIngress || ing.Scope != "clowk-lp" || ing.Name != "web" {
+		t.Errorf("ingress header wrong: %+v", ing)
+	}
+
+	var depSpec DeploymentSpec
+	if err := json.Unmarshal(dep.Spec, &depSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	if depSpec.Replicas != 1 {
+		t.Errorf("replicas not carried: %d", depSpec.Replicas)
+	}
+
+	if len(depSpec.Ports) != 1 || depSpec.Ports[0] != "3000" {
+		t.Errorf("ports not carried: %+v", depSpec.Ports)
+	}
+
+	if depSpec.Lang == nil || depSpec.Lang.Name != "nodejs" || depSpec.Lang.Version != "22" {
+		t.Errorf("lang block lost: %+v", depSpec.Lang)
+	}
+
+	// Path defaults must run on the app-emitted deployment too — same
+	// applyDefaults() that `deployment` blocks get. Otherwise an app
+	// authored deployment would diverge from a hand-written one.
+	if depSpec.Path != "." {
+		t.Errorf("default path not applied to app deployment: %q", depSpec.Path)
+	}
+
+	var ingSpec IngressSpec
+	if err := json.Unmarshal(ing.Spec, &ingSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	if ingSpec.Host != "vd-web.lvh.me" {
+		t.Errorf("host not carried: %q", ingSpec.Host)
+	}
+
+	// service/port omitted on purpose: the controller derives them
+	// from the sibling deployment at reconcile time. If we filled
+	// them in here we'd freeze a stale answer; leave the zero values
+	// so the auto-resolution path runs.
+	if ingSpec.Service != "" {
+		t.Errorf("service should stay empty for auto-derive, got %q", ingSpec.Service)
+	}
+
+	if ingSpec.Port != 0 {
+		t.Errorf("port should stay zero for auto-derive, got %d", ingSpec.Port)
+	}
+
+	if ingSpec.TLS == nil || !ingSpec.TLS.Enabled || ingSpec.TLS.Provider != "internal" {
+		t.Errorf("tls block lost: %+v", ingSpec.TLS)
+	}
+}
+
+// TestParseHCLAppCollidesWithStandaloneDeployment guards the most
+// common authoring mistake: writing `app "x" "y"` and then also
+// declaring `deployment "x" "y"` thinking the latter overrides the
+// former. The parser surfaces it as a duplicate-identity error so
+// the user fixes the file instead of debugging a silent merge.
+func TestParseHCLAppCollidesWithStandaloneDeployment(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  host = "vd-web.lvh.me"
+  ports = ["3000"]
+}
+
+deployment "clowk-lp" "web" {
+  image = "nginx:1"
+}
+`
+	tmp := writeTemp(t, "collision.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected duplicate identity error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "duplicate identity") || !strings.Contains(err.Error(), "deployment/clowk-lp/web") {
+		t.Errorf("error should name the colliding tuple, got: %v", err)
+	}
+}
+
+// TestParseHCLAppCollidesWithStandaloneIngress mirrors the deployment
+// collision path on the ingress side — both halves of the pair are
+// load-bearing for the duplicate check.
+func TestParseHCLAppCollidesWithStandaloneIngress(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  host = "vd-web.lvh.me"
+}
+
+ingress "clowk-lp" "web" {
+  host    = "alt.lvh.me"
+  service = "web"
+}
+`
+	tmp := writeTemp(t, "collision.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected duplicate identity error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "ingress/clowk-lp/web") {
+		t.Errorf("error should name the ingress tuple, got: %v", err)
+	}
+}
+
+// TestParseHCLDuplicateStandaloneDeployment makes the duplicate check
+// a general invariant — it would have been silently last-wins before
+// this guard. App is the motivating case but the rule applies
+// uniformly.
+func TestParseHCLDuplicateStandaloneDeployment(t *testing.T) {
+	src := `
+deployment "test" "api" {
+  image = "nginx:1"
+}
+
+deployment "test" "api" {
+  image = "nginx:2"
+}
+`
+	tmp := writeTemp(t, "dup.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected duplicate identity error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "deployment/test/api") {
+		t.Errorf("error should name the deployment tuple, got: %v", err)
+	}
+}
+
+// TestParseHCLAppDistinctIdentitiesCoexist ensures the duplicate check
+// doesn't false-positive: an `app` and a `deployment` with different
+// names (or scopes) in the same file must parse fine. Otherwise users
+// can't have an app + a sidecar deployment in the same project.
+func TestParseHCLAppDistinctIdentitiesCoexist(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  host = "vd-web.lvh.me"
+}
+
+deployment "clowk-lp" "worker" {
+  image = "alpine:3"
+}
+`
+	tmp := writeTemp(t, "ok.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1 deployment + 1 ingress from the app, plus 1 standalone
+	// deployment = 3 manifests total.
+	if len(mans) != 3 {
+		t.Fatalf("want 3 manifests, got %d: %+v", len(mans), mans)
+	}
+}
+
 func TestParseYAMLMultiDoc(t *testing.T) {
 	src := `
 ---
