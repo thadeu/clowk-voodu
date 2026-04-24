@@ -27,6 +27,12 @@ Use ":" syntax as shorthand for subcommands:
 	}
 	root.SetVersionTemplate("voodu {{.Version}}\n")
 
+	// Cobra auto-registers a `completion` subcommand by default. We don't
+	// ship shell completions yet, and leaving it in pollutes `voodu --help`
+	// with a command that advertises functionality the CLI doesn't provide.
+	// Re-enable by removing this line when completions become a real thing.
+	root.CompletionOptions.DisableDefaultCmd = true
+
 	root.PersistentFlags().String("controller-url", "", "controller HTTP endpoint (env: VOODU_CONTROLLER_URL)")
 	root.PersistentFlags().StringP("output", "o", "text", "output format: text|json|yaml")
 	root.PersistentFlags().StringP("remote", "r", "", "voodu remote name to forward to (client mode only; defaults to the 'voodu' git remote)")

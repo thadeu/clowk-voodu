@@ -16,14 +16,13 @@ import (
 // localOnlyCommands never forward over SSH — they manage client-side
 // state (git remotes, local setup) or are purely informational.
 var localOnlyCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"--help":     true,
-	"-h":         true,
-	"--version":  true,
-	"setup":      true,
-	"remote":     true,
-	"completion": true,
+	"version":   true,
+	"help":      true,
+	"--help":    true,
+	"-h":        true,
+	"--version": true,
+	"setup":     true,
+	"remote":    true,
 }
 
 // maybeForwardRemote is the M5.5 dispatch hook. In client mode, if the
