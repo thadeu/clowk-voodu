@@ -52,7 +52,7 @@ func TestForwardInvokesSSH(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	info := &Info{Host: "ubuntu@example.com", App: "api"}
+	info := &Info{Host: "ubuntu@example.com"}
 
 	force := false
 
@@ -107,7 +107,7 @@ func TestForwardStreamsStdin(t *testing.T) {
 
 	force := true
 
-	info := &Info{Host: "u@h", App: "api"}
+	info := &Info{Host: "u@h"}
 
 	_, err := Forward(info, []string{"apply", "-f", "-", "--format", "json"}, ForwardOptions{
 		SSHBin:   stub,
@@ -145,7 +145,7 @@ func TestForwardPassesIdentityAndTTY(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	info := &Info{Host: "u@h", App: "api"}
+	info := &Info{Host: "u@h"}
 
 	force := true
 

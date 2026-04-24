@@ -41,18 +41,18 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return 0, false
 	}
 
-	remoteFlag, appFlag, forwardArgs := remote.ExtractFlags(args)
+	remoteFlag, forwardArgs := remote.ExtractFlags(args)
 
-	// No remote-targeting signals at all → the user probably just
-	// wants local execution (common for help flows, apply --dry-run,
-	// offline development). We do not auto-forward in that case; only
-	// an explicit --remote, an -a flag, or a configured default
-	// "voodu" remote triggers the SSH path.
-	if remoteFlag == "" && appFlag == "" && !hasDefaultRemote() {
+	// No remote-targeting signal at all → the user probably just wants
+	// local execution (common for help flows, apply --dry-run, offline
+	// development). We do not auto-forward in that case; only an
+	// explicit --remote or a configured default "voodu" remote triggers
+	// the SSH path.
+	if remoteFlag == "" && !hasDefaultRemote() {
 		return 0, false
 	}
 
-	info, err := remote.Resolve(remoteFlag, appFlag)
+	info, err := remote.Resolve(remoteFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1, true

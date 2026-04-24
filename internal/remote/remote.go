@@ -6,14 +6,18 @@ import (
 	"strings"
 )
 
-// Info is where a command is going: the SSH destination plus the app
-// name to use on the far side. BaseDir is the server's Voodu root —
-// currently constant, kept as a field because the Gokku layout had it
-// configurable and we may want that back.
+// Info is where a command is going: the SSH destination for this
+// invocation. BaseDir is the server's Voodu root — currently constant,
+// kept as a field because the Gokku layout had it configurable and we
+// may want that back.
+//
+// Historical note: early versions carried an App field because remote
+// URLs had the form `user@host:app` (Gokku's shape). Identity now lives
+// in the HCL manifest itself (scope + name), so the remote reduces to
+// "which server do I ssh to" and App is gone.
 type Info struct {
 	RemoteName string // git remote label that resolved to this info
 	Host       string // user@hostname (passed verbatim to ssh)
-	App        string // app name as stored on the server
 	BaseDir    string // /opt/voodu by default
 }
 
@@ -26,31 +30,39 @@ const DefaultRemote = "voodu"
 // filesystem layout.
 const DefaultBaseDir = "/opt/voodu"
 
-// ParseRemoteURL parses the `user@host:app` form that `git remote add`
+// ParseRemoteURL parses the `user@host` form that `git remote add`
 // stores. The URL is not a real URL (no scheme) — voodu reuses the git
 // remote config as a lightweight key/value store for SSH targets,
-// nothing more.
+// nothing more. Normal git URLs (https://, git@github.com:..., etc.)
+// are rejected so ListAll can scan a repo with mixed remotes and keep
+// only the voodu ones.
 func ParseRemoteURL(url string) (Info, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return Info{}, fmt.Errorf("empty remote URL")
 	}
 
-	idx := strings.Index(url, ":")
-	if idx <= 0 || idx == len(url)-1 {
-		return Info{}, fmt.Errorf("invalid remote URL %q: want user@host:app", url)
+	// Reject real URL schemes and github-style SSH refs outright. The
+	// test is conservative: anything containing "://" or ending in ".git"
+	// is definitely not a voodu remote.
+	if strings.Contains(url, "://") || strings.HasSuffix(url, ".git") {
+		return Info{}, fmt.Errorf("invalid remote URL %q: want user@host", url)
 	}
 
-	host := url[:idx]
-	app := url[idx+1:]
-
-	if !strings.Contains(host, "@") {
+	if !strings.Contains(url, "@") {
 		return Info{}, fmt.Errorf("invalid remote URL %q: host must be user@hostname", url)
 	}
 
+	// Legacy `user@host:app` form — the :app is redundant now that HCL
+	// carries the identity, so reject it loudly. No silent strip: the
+	// operator's git config is stale and needs a manual fix (one-line
+	// `git remote set-url NAME user@host`).
+	if strings.Contains(url, ":") {
+		return Info{}, fmt.Errorf("invalid remote URL %q: drop the ':app' suffix — HCL now owns the app identity. Update with: git remote set-url NAME user@host", url)
+	}
+
 	return Info{
-		Host:    host,
-		App:     app,
+		Host:    url,
 		BaseDir: DefaultBaseDir,
 	}, nil
 }
@@ -74,17 +86,21 @@ func Lookup(name string) (Info, error) {
 	return info, nil
 }
 
-// Resolve picks the right remote for this invocation. The precedence
-// mirrors Gokku so existing muscle memory works:
+// Resolve picks the right remote for this invocation. Precedence:
 //
 //  1. --remote NAME flag wins
-//  2. -a APP flag: we try a remote literally named APP
-//  3. default remote "voodu"
+//  2. default remote "voodu"
 //
 // Returns (nil, nil) when no remote can be located — the caller treats
 // that as "not forwarding", not as an error, because many commands are
 // perfectly fine running locally (e.g. `voodu version`).
-func Resolve(remoteFlag, appFlag string) (*Info, error) {
+//
+// Historical note: -a APP used to double as a remote-name lookup
+// fallback (Gokku shape, when a git remote per app was the norm). That
+// overload is gone. -a stays as a server-side arg (see ExtractFlags)
+// for commands like `config set FOO=bar -a api`, but no longer feeds
+// remote selection.
+func Resolve(remoteFlag string) (*Info, error) {
 	if remoteFlag != "" {
 		info, err := Lookup(remoteFlag)
 		if err != nil {
@@ -94,31 +110,22 @@ func Resolve(remoteFlag, appFlag string) (*Info, error) {
 		return &info, nil
 	}
 
-	if appFlag != "" {
-		if info, err := Lookup(appFlag); err == nil {
-			return &info, nil
-		}
-		// Fall through to default if the app-named remote doesn't exist;
-		// -a can legitimately reference something the server knows about
-		// that has no corresponding git remote (rare, but possible).
-	}
-
 	if info, err := Lookup(DefaultRemote); err == nil {
-		if appFlag != "" {
-			info.App = appFlag
-		}
-
 		return &info, nil
 	}
 
 	return nil, nil
 }
 
-// ExtractFlags pulls --remote and -a/--app out of argv. They are
-// returned as (remote, app, remainingArgs). The dispatcher needs both
-// forms: the values to pick a remote, and a cleaned argv to send to
-// the server (stripping --remote because it has no meaning there).
-func ExtractFlags(args []string) (remote, app string, rest []string) {
+// ExtractFlags pulls --remote / -r out of argv. Returns (remote,
+// remainingArgs): the remote name for dispatcher bookkeeping, and a
+// cleaned argv to send to the server (stripping the flag because it
+// has no meaning there).
+//
+// -a/--app is NOT consumed — it stays in `rest` as an opaque argv
+// entry so server-side commands (`config set -a api`, `logs -a api`)
+// get it verbatim. It's purely server-facing now.
+func ExtractFlags(args []string) (remote string, rest []string) {
 	rest = make([]string, 0, len(args))
 
 	i := 0
@@ -126,7 +133,7 @@ func ExtractFlags(args []string) (remote, app string, rest []string) {
 		tok := args[i]
 
 		switch {
-		case tok == "--remote":
+		case tok == "--remote", tok == "-r":
 			if i+1 < len(args) {
 				remote = args[i+1]
 				i += 2
@@ -140,21 +147,8 @@ func ExtractFlags(args []string) (remote, app string, rest []string) {
 			remote = strings.TrimPrefix(tok, "--remote=")
 			i++
 
-		case tok == "-a" || tok == "--app":
-			if i+1 < len(args) {
-				app = args[i+1]
-				rest = append(rest, tok, args[i+1])
-				i += 2
-
-				continue
-			}
-
-			rest = append(rest, tok)
-			i++
-
-		case strings.HasPrefix(tok, "--app="):
-			app = strings.TrimPrefix(tok, "--app=")
-			rest = append(rest, tok)
+		case strings.HasPrefix(tok, "-r="):
+			remote = strings.TrimPrefix(tok, "-r=")
 			i++
 
 		default:
@@ -163,7 +157,7 @@ func ExtractFlags(args []string) (remote, app string, rest []string) {
 		}
 	}
 
-	return remote, app, rest
+	return remote, rest
 }
 
 // ListAll returns every git remote that parses as a Voodu remote.

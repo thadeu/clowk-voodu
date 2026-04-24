@@ -289,6 +289,28 @@ func TestParseDirMixedFormats(t *testing.T) {
 	}
 }
 
+// All voodu-branded extensions parse as HCL. Keeps the extension set
+// from silently drifting out of sync between formatFromExt and the
+// parseHCL synthesized path.
+func TestParseFileVooduExtensions(t *testing.T) {
+	src := `deployment "test" "api" { image = "nginx:1" }`
+
+	for _, ext := range []string{".hcl", ".voodu", ".vdu", ".vd"} {
+		t.Run(ext, func(t *testing.T) {
+			tmp := writeTemp(t, "web"+ext, src)
+
+			mans, err := ParseFile(tmp, nil)
+			if err != nil {
+				t.Fatalf("ParseFile(%s): %v", tmp, err)
+			}
+
+			if len(mans) != 1 || mans[0].Name != "api" {
+				t.Errorf("unexpected: %+v", mans)
+			}
+		})
+	}
+}
+
 func TestParseReaderStdin(t *testing.T) {
 	src := `deployment "test" "api" { image = "nginx:1" }`
 

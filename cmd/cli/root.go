@@ -29,7 +29,7 @@ Use ":" syntax as shorthand for subcommands:
 
 	root.PersistentFlags().String("controller-url", "", "controller HTTP endpoint (env: VOODU_CONTROLLER_URL)")
 	root.PersistentFlags().StringP("output", "o", "text", "output format: text|json|yaml")
-	root.PersistentFlags().String("remote", "", "voodu remote name to forward to (client mode only)")
+	root.PersistentFlags().StringP("remote", "r", "", "voodu remote name to forward to (client mode only; defaults to the 'voodu' git remote)")
 
 	root.AddCommand(
 		newVersionCmd(),

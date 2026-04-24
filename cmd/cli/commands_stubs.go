@@ -93,7 +93,7 @@ omitted and the CLI infers it.`,
 
 	cmd.Flags().StringVarP(&app, "app", "a", "", "app name (required)")
 	cmd.Flags().StringVar(&scope, "scope", "", "scope owning the deployment (optional when unambiguous)")
-	cmd.Flags().IntVarP(&replicas, "replicas", "r", 0, "desired replica count (>= 1)")
+	cmd.Flags().IntVar(&replicas, "replicas", 0, "desired replica count (>= 1)")
 
 	return cmd
 }
@@ -108,7 +108,7 @@ func runScale(cmd *cobra.Command, scope, app string, replicas int) error {
 	}
 
 	if replicas < 1 {
-		return fmt.Errorf("--replicas/-r must be >= 1 (removing the app is how you scale to zero)")
+		return fmt.Errorf("--replicas must be >= 1 (removing the app is how you scale to zero)")
 	}
 
 	root := cmd.Root()

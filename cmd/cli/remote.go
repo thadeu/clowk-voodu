@@ -19,15 +19,16 @@ func newRemoteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remote",
 		Short: "Manage Voodu server remotes (stored as git remotes)",
-		Long: `Voodu reuses git remotes as the source of truth for where to send
-commands. A remote is a label mapped to a user@host:app triple:
+		Long: `Voodu reuses git remotes as the source of truth for where to ssh.
+A remote is a label mapped to a user@host pair:
 
-    voodu remote add api ubuntu@prod.example.com:api
-    voodu apply -f voodu.hcl -a api    # deploys to prod.example.com
-    voodu config:set FOO=bar -a api    # forwards to prod.example.com
+    voodu remote add staging ubuntu@staging.example.com
+    voodu remote add prod-1  ubuntu@prod-1.example.com
+    voodu apply -f prod.hcl --remote prod-1
 
-Commands with -a APP pick the remote named APP when one exists;
-otherwise they fall back to the default remote named "voodu".`,
+The HCL manifest owns the app identity (scope + name). The remote
+owns only the SSH target — one voodu host can run as many apps as
+the HCL declares.`,
 	}
 
 	cmd.AddCommand(
@@ -42,7 +43,7 @@ otherwise they fall back to the default remote named "voodu".`,
 
 func newRemoteAddCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "add NAME user@host:APP",
+		Use:   "add NAME user@host",
 		Short: "Register a new Voodu remote (delegates to git remote add)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,7 +68,7 @@ func newRemoteAddCmd() *cobra.Command {
 func newRemoteListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List Voodu remotes (those with user@host:app URLs)",
+		Short: "List Voodu remotes (those with user@host URLs)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			infos, err := remote.ListAll()
 			if err != nil {
@@ -76,13 +77,13 @@ func newRemoteListCmd() *cobra.Command {
 
 			if len(infos) == 0 {
 				fmt.Println("no voodu remotes configured")
-				fmt.Println("add one with: voodu remote add <name> <user@host:app>")
+				fmt.Println("add one with: voodu remote add <name> <user@host>")
 
 				return nil
 			}
 
 			for _, info := range infos {
-				fmt.Printf("%-16s %s:%s\n", info.RemoteName, info.Host, info.App)
+				fmt.Printf("%-16s %s\n", info.RemoteName, info.Host)
 			}
 
 			return nil
@@ -113,36 +114,36 @@ func newRemoteRemoveCmd() *cobra.Command {
 
 // newRemoteSetupCmd bootstraps a Voodu server end-to-end: it verifies
 // SSH, optionally scps a prebuilt binary, runs `voodu setup` on the far
-// side, creates an app, and registers the matching git remote locally.
+// side, and registers the matching git remote locally.
 //
 // Not covered here (by design): binary compilation, SSH key
-// provisioning, default-plugin install. Compilation belongs in the
-// release pipeline; keys are the user's responsibility; plugins land
-// piecemeal via `voodu plugins install`.
+// provisioning, default-plugin install, per-app setup. Compilation
+// belongs in the release pipeline; keys are the user's responsibility;
+// plugins land piecemeal via `voodu plugins install`; app directories
+// are created on-demand by `voodu apply` (see ensureAppLayout).
 func newRemoteSetupCmd() *cobra.Command {
 	var (
 		identity    string
 		binary      string
 		installPath string
 		skipSetup   bool
-		skipApp     bool
 	)
 
 	cmd := &cobra.Command{
-		Use:   "setup NAME user@host APP",
+		Use:   "setup NAME user@host",
 		Short: "Bootstrap a Voodu server over SSH and register it as a git remote",
 		Long: `Runs, in order:
   1. ssh preflight (BatchMode + ConnectTimeout)
   2. optional: scp --binary PATH to the server and install it
   3. 'voodu setup' on the remote (idempotent)
-  4. 'voodu apps create APP' on the remote (ignored if it exists)
-  5. 'git remote add NAME user@host:APP' locally (stores the target)
+  4. 'git remote add NAME user@host' locally (stores the target)
 
-After this runs you can 'voodu apply -f voodu.hcl -a APP' from this
-repo and it will ship over SSH to APP on HOST.`,
-		Args: cobra.ExactArgs(3),
+After this runs you can 'voodu apply -f voodu.hcl --remote NAME' from
+any repo and it will ship over SSH to that host. The HCL owns which
+apps get deployed; the remote just owns the destination.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, host, app := args[0], args[1], args[2]
+			name, host := args[0], args[1]
 
 			if !strings.Contains(host, "@") {
 				return fmt.Errorf("host must be user@hostname, got %q", host)
@@ -170,38 +171,19 @@ repo and it will ship over SSH to APP on HOST.`,
 				fmt.Printf("✓ voodu setup ran on %s\n", host)
 			}
 
-			if !skipApp {
-				// `apps create` is not idempotent, so swallow "already
-				// exists" sort of errors by checking via apps list first.
-				if exists, err := remoteAppExists(host, identity, app); err != nil {
-					return err
-				} else if !exists {
-					if err := remoteRun(host, identity, "voodu", "apps", "create", app); err != nil {
-						return fmt.Errorf("remote voodu apps create: %w", err)
-					}
-
-					fmt.Printf("✓ app %q created on %s\n", app, host)
-				} else {
-					fmt.Printf("· app %q already exists on %s\n", app, host)
-				}
-			}
-
-			url := host + ":" + app
-
 			if _, err := remote.Lookup(name); err == nil {
 				fmt.Printf("· git remote %q already configured\n", name)
 			} else {
-				out, err := exec.Command("git", "remote", "add", name, url).CombinedOutput()
+				out, err := exec.Command("git", "remote", "add", name, host).CombinedOutput()
 				if err != nil {
 					return fmt.Errorf("git remote add %s: %s", name, strings.TrimSpace(string(out)))
 				}
 
-				fmt.Printf("✓ git remote %q → %s\n", name, url)
+				fmt.Printf("✓ git remote %q → %s\n", name, host)
 			}
 
 			fmt.Println()
-			fmt.Printf("Done. Try: voodu apply -f voodu.hcl -a %s\n", app)
-			fmt.Printf("       or: voodu config list -a %s\n", app)
+			fmt.Printf("Done. Try: voodu apply -f voodu.hcl --remote %s\n", name)
 
 			return nil
 		},
@@ -211,7 +193,6 @@ repo and it will ship over SSH to APP on HOST.`,
 	cmd.Flags().StringVar(&binary, "binary", "", "upload this voodu binary to the server before running setup")
 	cmd.Flags().StringVar(&installPath, "install-path", "/usr/local/bin/voodu", "where to place --binary on the server")
 	cmd.Flags().BoolVar(&skipSetup, "skip-setup", false, "do not run 'voodu setup' on the remote")
-	cmd.Flags().BoolVar(&skipApp, "skip-app-create", false, "do not run 'voodu apps create APP' on the remote")
 
 	return cmd
 }
@@ -303,34 +284,6 @@ func remoteRunShell(host, identity, line string) error {
 	}
 
 	return nil
-}
-
-// remoteAppExists checks whether APP is already in `voodu apps list`.
-// Used before `apps create` because the subcommand errors on conflict
-// and we want setup to be idempotent.
-func remoteAppExists(host, identity, app string) (bool, error) {
-	args := []string{}
-
-	if identity != "" {
-		args = append(args, "-i", identity)
-	}
-
-	args = append(args, host, "voodu apps list")
-
-	out, err := exec.Command("ssh", args...).CombinedOutput()
-	if err != nil {
-		// A non-zero from `apps list` likely means voodu isn't installed
-		// yet; surface the raw output so the user can see why.
-		return false, fmt.Errorf("remote voodu apps list: %s", strings.TrimSpace(string(out)))
-	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.TrimSpace(line) == app {
-			return true, nil
-		}
-	}
-
-	return false, nil
 }
 
 // randToken generates a short unique-ish suffix so parallel setups from

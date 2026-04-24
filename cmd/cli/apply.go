@@ -34,10 +34,10 @@ func newApplyCmd() *cobra.Command {
 		Long: `Reads one or more manifests and POSTs them to the controller.
 
 Accepted inputs:
-  -f api               short form — resolves to api.hcl / api.yml / api.yaml
-  -f file.hcl          apply a single file
-  -f ./dir             walk dir recursively for .hcl/.yml/.yaml
-  -f a.hcl -f b.yml    mix files of either format
+  -f api               short form — tries .hcl/.voodu/.vdu/.vd/.yml/.yaml
+  -f file.hcl          apply a single file (.hcl/.voodu/.vdu/.vd are all HCL)
+  -f ./dir             walk dir recursively for manifest files
+  -f a.voodu -f b.yml  mix files of either format
   -f -                 read from stdin (requires --format hcl|yaml)
 
 Use -a <remote> to forward the apply to a configured voodu remote.
@@ -283,16 +283,17 @@ func loadOne(path, stdinFormat string, env map[string]string) ([]controller.Mani
 	return manifest.ParseFile(resolved, env)
 }
 
-// resolveManifestPath adds a .hcl/.yml/.yaml extension when the user
-// omitted one. `voodu apply -f api` should just work when api.hcl is
-// sitting next to it — that's the common case, and typing the
-// extension every time is noise.
+// resolveManifestPath adds a manifest extension when the user omitted
+// one. `voodu apply -f api` should just work when api.voodu (or .hcl,
+// .vdu, .vd, .yml, .yaml) is sitting next to it. HCL variants are
+// probed before YAML so a project with both wins toward the typed
+// format.
 func resolveManifestPath(path string) (string, os.FileInfo, error) {
 	if info, err := os.Stat(path); err == nil {
 		return path, info, nil
 	}
 
-	for _, ext := range []string{".hcl", ".yml", ".yaml"} {
+	for _, ext := range []string{".hcl", ".voodu", ".vdu", ".vd", ".yml", ".yaml"} {
 		candidate := path + ext
 
 		if info, err := os.Stat(candidate); err == nil {
@@ -301,7 +302,7 @@ func resolveManifestPath(path string) (string, os.FileInfo, error) {
 	}
 
 	// Fall back to the original path so the error message names what the
-	// user typed, not a .hcl the user didn't write.
+	// user typed, not an extension the user didn't write.
 	_, err := os.Stat(path)
 
 	return path, nil, err

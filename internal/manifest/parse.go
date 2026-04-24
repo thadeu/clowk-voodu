@@ -137,14 +137,27 @@ func parseJSON(raw []byte) ([]controller.Manifest, error) {
 	return out, nil
 }
 
+// hclExts is the set of file extensions treated as HCL manifests. All
+// four are equivalent — .hcl for tool compatibility, the voodu-branded
+// ones for projects that want the manifest to read like a first-class
+// config (web.voodu, api.vdu, etc.).
+var hclExts = map[string]bool{
+	".hcl":   true,
+	".voodu": true,
+	".vdu":   true,
+	".vd":    true,
+}
+
 func formatFromExt(path string) (Format, error) {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".hcl", ".vdu", ".vd":
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch {
+	case hclExts[ext]:
 		return FormatHCL, nil
-	case ".yml", ".yaml":
+	case ext == ".yml", ext == ".yaml":
 		return FormatYAML, nil
 	default:
-		return "", fmt.Errorf("unsupported extension %q (want .hcl, .vdu, .vd, .yml, .yaml)", filepath.Ext(path))
+		return "", fmt.Errorf("unsupported extension %q (want .hcl, .voodu, .vdu, .vd, .yml, .yaml)", filepath.Ext(path))
 	}
 }
 
@@ -321,11 +334,12 @@ func (b hclIngress) spec() IngressSpec {
 }
 
 func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
-	// hclsimple.Decode routes by the source filename's extension, so
-	// synthesize one for stdin/readers that lack a path.
-	ext := filepath.Ext(source)
-
-	if ext != ".hcl" && ext != ".vdu" && ext != ".vd" {
+	// hclsimple.Decode hard-codes its dispatch on ".hcl" / ".hcl.json",
+	// so any other extension (our branded .voodu/.vdu/.vd, or a stdin
+	// source with no extension at all) gets rewritten to a synthetic
+	// .hcl path before the call. The original name is kept for error
+	// messages when it already ended in .hcl.
+	if strings.ToLower(filepath.Ext(source)) != ".hcl" {
 		source = source + ".hcl"
 	}
 

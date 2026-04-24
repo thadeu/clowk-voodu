@@ -106,10 +106,10 @@ func takesValue(flag string) bool {
 	known := map[string]bool{
 		"-a": true, "--app": true,
 		"-f": true, "--file": true,
-		"-r": true, "--replicas": true,
+		"-r": true, "--remote": true,
 		"-o": true, "--output": true,
 		"--controller-url": true,
-		"--remote":         true,
+		"--replicas":       true,
 		"--format":         true,
 	}
 

@@ -11,9 +11,9 @@ import (
 
 func TestParseRemoteURL(t *testing.T) {
 	ok := map[string]Info{
-		"ubuntu@server:api":          {Host: "ubuntu@server", App: "api", BaseDir: "/opt/voodu"},
-		"root@10.0.0.1:pg-0":         {Host: "root@10.0.0.1", App: "pg-0", BaseDir: "/opt/voodu"},
-		"deploy@ec2.example.com:web": {Host: "deploy@ec2.example.com", App: "web", BaseDir: "/opt/voodu"},
+		"ubuntu@server":          {Host: "ubuntu@server", BaseDir: "/opt/voodu"},
+		"root@10.0.0.1":          {Host: "root@10.0.0.1", BaseDir: "/opt/voodu"},
+		"deploy@ec2.example.com": {Host: "deploy@ec2.example.com", BaseDir: "/opt/voodu"},
 	}
 
 	for url, want := range ok {
@@ -31,11 +31,12 @@ func TestParseRemoteURL(t *testing.T) {
 	bad := []string{
 		"",
 		"notarealurl",
-		"ubuntu@server",               // no :app
-		":api",                        // no host
-		"ubuntu@server:",              // no app
-		"https://github.com/foo/bar",  // git URL, not voodu
-		"server:app",                  // missing user@
+		"ubuntu@server:api",              // legacy :app suffix — rejected
+		"root@10.0.0.1:pg-0",             // legacy :app suffix — rejected
+		":api",                           // no host
+		"https://github.com/foo/bar",     // git URL, not voodu
+		"git@github.com:foo/bar.git",     // github-style SSH
+		"server",                         // missing user@
 	}
 
 	for _, url := range bad {
@@ -50,47 +51,58 @@ func TestExtractFlags(t *testing.T) {
 		name       string
 		in         []string
 		wantRemote string
-		wantApp    string
 		wantRest   []string
 	}{
 		{
 			"no flags",
 			[]string{"config", "set", "FOO=bar"},
-			"", "",
+			"",
 			[]string{"config", "set", "FOO=bar"},
 		},
 		{
-			"app space separated",
+			"-a passes through untouched",
 			[]string{"config", "set", "FOO=bar", "-a", "api"},
-			"", "api",
+			"",
 			[]string{"config", "set", "FOO=bar", "-a", "api"},
 		},
 		{
 			"remote strip",
 			[]string{"logs", "--remote", "prod", "-a", "web"},
-			"prod", "web",
+			"prod",
 			[]string{"logs", "-a", "web"},
 		},
 		{
 			"equals form",
 			[]string{"postgres", "info", "--remote=staging", "--app=pg-0"},
-			"staging", "pg-0",
+			"staging",
 			[]string{"postgres", "info", "--app=pg-0"},
 		},
 		{
-			"long --app",
+			"-r shortcut",
+			[]string{"apply", "-f", "voodu.hcl", "-r", "prod-1"},
+			"prod-1",
+			[]string{"apply", "-f", "voodu.hcl"},
+		},
+		{
+			"-r equals form",
+			[]string{"logs", "-r=staging", "-a", "api"},
+			"staging",
+			[]string{"logs", "-a", "api"},
+		},
+		{
+			"--app stays server-side",
 			[]string{"--app", "api", "status"},
-			"", "api",
+			"",
 			[]string{"--app", "api", "status"},
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotR, gotA, gotRest := ExtractFlags(c.in)
+			gotR, gotRest := ExtractFlags(c.in)
 
-			if gotR != c.wantRemote || gotA != c.wantApp {
-				t.Errorf("flags: remote=%q app=%q (want %q/%q)", gotR, gotA, c.wantRemote, c.wantApp)
+			if gotR != c.wantRemote {
+				t.Errorf("flags: remote=%q (want %q)", gotR, c.wantRemote)
 			}
 
 			if !reflect.DeepEqual(gotRest, c.wantRest) {
@@ -157,8 +169,8 @@ func TestLookupAndResolve(t *testing.T) {
 	}
 
 	run("init", "-q")
-	run("remote", "add", "voodu", "ubuntu@host1:api")
-	run("remote", "add", "staging", "deploy@stage:api-stage")
+	run("remote", "add", "voodu", "ubuntu@host1")
+	run("remote", "add", "staging", "deploy@stage")
 	run("remote", "add", "github", "https://github.com/foo/bar.git") // should be ignored
 
 	cwd, _ := os.Getwd()
@@ -168,7 +180,7 @@ func TestLookupAndResolve(t *testing.T) {
 
 	// Direct lookup.
 	info, err := Lookup("voodu")
-	if err != nil || info.Host != "ubuntu@host1" || info.App != "api" {
+	if err != nil || info.Host != "ubuntu@host1" {
 		t.Errorf("Lookup voodu: %+v / %v", info, err)
 	}
 
@@ -177,28 +189,21 @@ func TestLookupAndResolve(t *testing.T) {
 		t.Error("Lookup missing remote should fail")
 	}
 
-	// Resolve: --remote beats -a.
-	info2, _ := Resolve("staging", "api")
-	if info2 == nil || info2.RemoteName != "staging" {
-		t.Errorf("Resolve --remote precedence: %+v", info2)
+	// Resolve: --remote wins when given.
+	info2, _ := Resolve("staging")
+	if info2 == nil || info2.RemoteName != "staging" || info2.Host != "deploy@stage" {
+		t.Errorf("Resolve --remote: %+v", info2)
 	}
 
-	// Resolve: -a finds same-named remote.
-	info3, _ := Resolve("", "staging")
-	if info3 == nil || info3.RemoteName != "staging" {
-		t.Errorf("Resolve -a match: %+v", info3)
+	// Resolve: nothing → default "voodu" remote.
+	info3, _ := Resolve("")
+	if info3 == nil || info3.RemoteName != "voodu" || info3.Host != "ubuntu@host1" {
+		t.Errorf("Resolve default: %+v", info3)
 	}
 
-	// Resolve: -a falls back to default voodu remote, overrides App.
-	info4, _ := Resolve("", "api-override")
-	if info4 == nil || info4.RemoteName != "voodu" || info4.App != "api-override" {
-		t.Errorf("Resolve -a fallback: %+v", info4)
-	}
-
-	// Resolve: nothing → default voodu.
-	info5, _ := Resolve("", "")
-	if info5 == nil || info5.RemoteName != "voodu" || info5.App != "api" {
-		t.Errorf("Resolve default: %+v", info5)
+	// Resolve: missing remote surfaces as error.
+	if _, err := Resolve("nope"); err == nil {
+		t.Error("Resolve unknown remote should fail")
 	}
 
 	// ListAll skips github (non-voodu URL).
