@@ -193,6 +193,120 @@ func TestApplyPruneRemovesMissing(t *testing.T) {
 	}
 }
 
+// TestApplyDryRunDoesNotPersist is the core contract of ?dry_run=true:
+// the store must end the call byte-identical to how it started, but the
+// response still describes what would have happened. This is what
+// `voodu diff` relies on to show accurate plans without side effects.
+func TestApplyDryRunDoesNotPersist(t *testing.T) {
+	api, store := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	// Seed an existing deployment with a known spec so we can compare
+	// before/after and confirm dry-run didn't overwrite.
+	_, _ = store.Put(t.Context(), &Manifest{
+		Kind:  KindDeployment,
+		Scope: "app",
+		Name:  "web",
+		Spec:  json.RawMessage(`{"replicas":2}`),
+	})
+
+	// Also seed a sibling that would be pruned by a non-dry-run apply
+	// declaring only `web`.
+	_, _ = store.Put(t.Context(), &Manifest{
+		Kind:  KindDeployment,
+		Scope: "app",
+		Name:  "worker",
+	})
+
+	body := `[{"kind":"deployment","scope":"app","name":"web","spec":{"replicas":5}}]`
+
+	resp, err := http.Post(ts.URL+"/apply?dry_run=true", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	// Store assertions — nothing changed.
+	got, _ := store.Get(t.Context(), KindDeployment, "app", "web")
+	if got == nil || string(got.Spec) != `{"replicas":2}` {
+		t.Errorf("dry-run mutated store: got spec %s", got.Spec)
+	}
+
+	if got, _ := store.Get(t.Context(), KindDeployment, "app", "worker"); got == nil {
+		t.Error("dry-run pruned worker despite dry_run=true")
+	}
+
+	// Response shape — must include current (for client diff) and
+	// the pruned list (what would be removed).
+	var env struct {
+		Data struct {
+			Applied []*Manifest `json:"applied"`
+			Current []*Manifest `json:"current"`
+			Pruned  []string    `json:"pruned"`
+			DryRun  bool        `json:"dry_run"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if !env.Data.DryRun {
+		t.Error("response missing dry_run=true marker")
+	}
+
+	if len(env.Data.Applied) != 1 || len(env.Data.Current) != 1 {
+		t.Fatalf("expected 1 applied/current, got %d/%d", len(env.Data.Applied), len(env.Data.Current))
+	}
+
+	if string(env.Data.Applied[0].Spec) != `{"replicas":5}` {
+		t.Errorf("applied[0].spec = %s, want replicas:5 (the desired)", env.Data.Applied[0].Spec)
+	}
+
+	if env.Data.Current[0] == nil || string(env.Data.Current[0].Spec) != `{"replicas":2}` {
+		t.Errorf("current[0].spec = %v, want replicas:2 (the before)", env.Data.Current[0])
+	}
+
+	if len(env.Data.Pruned) != 1 || env.Data.Pruned[0] != "deployment/app/worker" {
+		t.Errorf("pruned = %v, want [deployment/app/worker]", env.Data.Pruned)
+	}
+}
+
+// TestApplyDryRunNewResourceHasNilCurrent: a resource that doesn't
+// exist yet should still round-trip through dry-run with current[i] =
+// null — that's how the client-side renderer knows to print the `+`
+// marker instead of a modification diff.
+func TestApplyDryRunNewResourceHasNilCurrent(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	body := `[{"kind":"deployment","scope":"app","name":"brand-new","spec":{"replicas":1}}]`
+
+	resp, err := http.Post(ts.URL+"/apply?dry_run=true", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Current []*Manifest `json:"current"`
+		} `json:"data"`
+	}
+
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+
+	if len(env.Data.Current) != 1 || env.Data.Current[0] != nil {
+		t.Errorf("expected current=[nil], got %v", env.Data.Current)
+	}
+}
+
 // TestApplyNoPruneKeepsSiblings covers the shared-scope escape hatch:
 // when several independent applies (different repos, different CI
 // pipelines) each declare only a slice of the same (scope, kind),

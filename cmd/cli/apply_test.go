@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -200,6 +203,132 @@ deployment "clowk" "lp" {
 
 	if gotRawQuery != "" {
 		t.Errorf("raw query = %q, want empty (default prune=on)", gotRawQuery)
+	}
+}
+
+// TestRunDiffRendersFieldAndPruneBlocks is the end-to-end contract for
+// `voodu diff`: one request to /apply?dry_run=true, field-by-field
+// rendering of modified/added resources, and a trailing "Would prune"
+// block that surfaces what the matching apply would remove. The server
+// is stubbed so the test is pure CLI-layer.
+func TestRunDiffRendersFieldAndPruneBlocks(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image    = "nginx:1.27"
+  replicas = 2
+}
+`)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("dry_run") != "true" {
+			t.Errorf("runDiff must send dry_run=true, got %q", r.URL.RawQuery)
+		}
+
+		// Stub a server response: applied[0] is what the client sent,
+		// current[0] is what the store already had (replicas differed),
+		// and pruned lists one sibling that would disappear on apply.
+		reply := `{
+			"status": "ok",
+			"data": {
+				"applied": [{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:1.27","replicas":2}}],
+				"current": [{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:1.26","replicas":1}}],
+				"pruned":  ["deployment/clowk/jobs"],
+				"dry_run": true
+			}
+		}`
+
+		_, _ = w.Write([]byte(reply))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"diff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+
+	if err := runDiff(cmd, applyFlags{files: []string{dir}}); err != nil {
+		t.Fatalf("runDiff: %v", err)
+	}
+
+	out := stdout.String()
+
+	for _, want := range []string{
+		"~ deployment/clowk/lp",
+		`~ image`,
+		`"nginx:1.26"  →  "nginx:1.27"`,
+		`~ replicas`,
+		"--- Would prune",
+		"- deployment/clowk/jobs",
+		"1 to modify, 1 to prune",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff output missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+}
+
+// TestRunDiffDetailedExitcode verifies the sentinel error path: when
+// --detailed-exitcode is set AND the plan has changes, runDiff returns
+// errExitWithChanges so main() maps to exit 2. Clean plan returns nil.
+func TestRunDiffDetailedExitcode(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "nginx:1"
+}
+`)
+
+	// Server response varies by test case.
+	var replyJSON string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(replyJSON))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, _ := root.Find([]string{"diff"})
+
+	// Case 1: clean plan — spec identical, nothing pruned. Should
+	// return nil even with --detailed-exitcode.
+	replyJSON = `{"status":"ok","data":{
+		"applied":[{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:1"}}],
+		"current":[{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:1"}}],
+		"pruned":[]
+	}}`
+
+	var quiet bytes.Buffer
+	cmd.SetOut(&quiet)
+
+	if err := runDiff(cmd, applyFlags{files: []string{dir}, detailedExitcode: true}); err != nil {
+		t.Errorf("clean plan with --detailed-exitcode must return nil, got %v", err)
+	}
+
+	// Case 2: changes pending — runDiff must return the sentinel so
+	// main() maps it to exit 2.
+	replyJSON = `{"status":"ok","data":{
+		"applied":[{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:1"}}],
+		"current":[{"kind":"deployment","scope":"clowk","name":"lp","spec":{"image":"nginx:0"}}],
+		"pruned":[]
+	}}`
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	err := runDiff(cmd, applyFlags{files: []string{dir}, detailedExitcode: true})
+	if !errors.Is(err, errExitWithChanges) {
+		t.Errorf("expected errExitWithChanges, got %v", err)
 	}
 }
 

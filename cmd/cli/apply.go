@@ -20,10 +20,11 @@ import (
 const applyTimeout = 30 * time.Second
 
 type applyFlags struct {
-	files   []string
-	dryRun  bool
-	format  string // stdin only: "hcl" | "yaml"
-	noPrune bool   // apply only: upsert without deleting siblings in the same (scope, kind)
+	files            []string
+	dryRun           bool
+	format           string // stdin only: "hcl" | "yaml"
+	noPrune          bool   // apply + diff: upsert without deleting siblings in the same (scope, kind)
+	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
 }
 
 func newApplyCmd() *cobra.Command {
@@ -72,6 +73,20 @@ func newDiffCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "diff",
 		Short: "Show changes between local manifests and the controller",
+		Long: `Renders a plan-style diff of what 'voodu apply' would do:
+
+  ~ kind/scope/name      — resource exists and its spec changed
+  + kind/scope/name      — resource would be created
+  = kind/scope/name      — spec matches the controller (no change)
+  --- Would prune ---    — resources that would be deleted by prune
+
+The diff calls the controller with ?dry_run=true, so nothing is
+persisted and the output matches byte-for-byte what the next
+'voodu apply' would do with the same flags.
+
+By default, the pruned section reflects the source-of-truth apply
+behavior. Pass --no-prune to simulate an upsert-only apply (for
+shared-scope cross-repo workflows).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDiff(cmd, f)
 		},
@@ -79,6 +94,14 @@ func newDiffCmd() *cobra.Command {
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "simulate an apply that wouldn't prune siblings in the same (scope, kind)")
+	cmd.Flags().BoolVar(&f.detailedExitcode, "detailed-exitcode", false, "exit 0 when no changes, 2 when changes, 1 on error (CI-friendly)")
+
+	// --detailed-exitcode returns errExitWithChanges to signal code 2.
+	// Silence cobra's auto-printed "Error:" + usage blurb so the
+	// diff output stays clean — main() takes over exit-code mapping.
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
 
 	return cmd
 }
@@ -169,34 +192,135 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 		return err
 	}
 
-	root := cmd.Root()
+	if len(local) == 0 {
+		return fmt.Errorf("no manifests found")
+	}
 
-	for _, m := range local {
-		remote, err := fetchRemote(root, m.Kind, m.Scope, m.Name)
-		if err != nil {
-			return err
-		}
+	body, err := json.Marshal(local)
+	if err != nil {
+		return err
+	}
 
-		label := formatRef(m.Kind, m.Scope, m.Name)
+	// Diff piggybacks on /apply?dry_run=true so the controller is the
+	// one source of truth about what would happen — same prune logic,
+	// same validation, same ordering. Whatever the server would do on
+	// a real apply shows up here, nothing more.
+	query := "dry_run=true"
+	if f.noPrune {
+		query += "&prune=false"
+	}
 
-		if remote == nil {
-			fmt.Printf("+ %s (new)\n", label)
-			continue
-		}
+	resp, err := controllerDo(cmd.Root(), http.MethodPost, "/apply", query, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 
-		if bytes.Equal(canonicalJSON(m.Spec), canonicalJSON(remote.Spec)) {
-			fmt.Printf("= %s (unchanged)\n", label)
-			continue
-		}
+	raw, _ := io.ReadAll(resp.Body)
 
-		fmt.Printf("~ %s\n  local : %s\n  remote: %s\n",
-			label,
-			string(canonicalJSON(m.Spec)),
-			string(canonicalJSON(remote.Spec)),
-		)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var plan diffResponse
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return fmt.Errorf("decode dry-run: %w", err)
+	}
+
+	out := cmd.OutOrStdout()
+	palette := newDiffPalette(out)
+
+	added, modified := renderApplyPlan(out, plan, palette)
+	renderPrunePlan(out, plan.Data.Pruned, palette)
+
+	fmt.Fprintf(out, "\n%s\n", diffSummary(added, modified, len(plan.Data.Pruned)))
+
+	// `--detailed-exitcode` mirrors `terraform plan`: 0 = clean,
+	// 2 = changes pending, 1 = error. Without the flag, we return nil
+	// so existing scripts that ignore exit code keep working.
+	if f.detailedExitcode && (added+modified+len(plan.Data.Pruned)) > 0 {
+		return errExitWithChanges
 	}
 
 	return nil
+}
+
+// errExitWithChanges is a sentinel returned by runDiff to signal the
+// main() exit-code handler that a non-zero code is warranted even
+// though no actual error occurred.
+var errExitWithChanges = fmt.Errorf("voodu-diff-has-changes")
+
+// renderApplyPlan walks each (applied, current) pair from the dry-run
+// response and prints the resource header plus — for modified and
+// created resources — the field-by-field diff underneath. A blank
+// line separates each resource so two back-to-back kinds
+// (deployment + ingress, say) don't smash into one visual block.
+// Returns counts so the caller can produce the final summary line.
+func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modified int) {
+	first := true
+
+	for i, desired := range plan.Data.Applied {
+		if desired == nil {
+			continue
+		}
+
+		var current *controller.Manifest
+
+		if i < len(plan.Data.Current) {
+			current = plan.Data.Current[i]
+		}
+
+		label := formatRef(desired.Kind, desired.Scope, desired.Name)
+
+		// Blank line between resources. Skipped before the first
+		// printed row so a single-resource diff stays compact.
+		if !first {
+			fmt.Fprintln(w)
+		}
+
+		first = false
+
+		if current == nil {
+			fmt.Fprintf(w, "%s %s (new)\n", p.Add("+"), label)
+
+			renderResourceDiff(w, diffSpec(desired.Spec, nil), p)
+
+			added++
+
+			continue
+		}
+
+		changes := diffSpec(desired.Spec, current.Spec)
+
+		if len(changes) == 0 {
+			fmt.Fprintf(w, "= %s (unchanged)\n", label)
+			continue
+		}
+
+		fmt.Fprintf(w, "%s %s\n", p.Mod("~"), label)
+
+		renderResourceDiff(w, changes, p)
+
+		modified++
+	}
+
+	return added, modified
+}
+
+// renderPrunePlan prints the footer block listing resources that would
+// be removed. Skipped when empty so clean diffs stay terse; the hint
+// about --no-prune reminds operators about the shared-scope escape
+// hatch without forcing them to recall the flag name.
+func renderPrunePlan(w io.Writer, pruned []string, p diffPalette) {
+	if len(pruned) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w, "\n--- Would prune (pass --no-prune to keep) ---")
+
+	for _, ref := range pruned {
+		fmt.Fprintf(w, "%s %s\n", p.Del("-"), ref)
+	}
 }
 
 // formatRef prints "kind/scope/name" when scoped, "kind/name" otherwise.
@@ -424,22 +548,3 @@ func fetchRemote(root *cobra.Command, kind controller.Kind, scope, name string) 
 	return nil, nil
 }
 
-// canonicalJSON re-marshals a JSON blob with sorted keys so diff output
-// isn't thrown off by key ordering differences.
-func canonicalJSON(raw json.RawMessage) []byte {
-	if len(raw) == 0 {
-		return []byte("{}")
-	}
-
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return raw
-	}
-
-	b, err := json.Marshal(v)
-	if err != nil {
-		return raw
-	}
-
-	return b
-}

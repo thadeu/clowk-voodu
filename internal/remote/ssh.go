@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"golang.org/x/term"
@@ -30,6 +31,14 @@ type ForwardOptions struct {
 	// process. Setting this also disables TTY allocation (a piped reader
 	// and a TTY don't mix — ssh -tt would eat raw bytes with CR/LF fun).
 	Stdin io.Reader
+
+	// Env gets inlined before the remote binary as `KEY=VAL` pairs so
+	// the remote voodu sees them. SSH won't forward env vars through
+	// AcceptEnv by default, and we can't count on server sshd config,
+	// so we embed them in the command string. Used for color hints
+	// (FORCE_COLOR, NO_COLOR) because the remote stdout is a pipe and
+	// can't self-detect what the local user's terminal can render.
+	Env map[string]string
 }
 
 // Forward runs `ssh [opts] HOST voodu <args...>` with stdio wired to
@@ -66,7 +75,7 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 		sshArgs = append(sshArgs, "-tt")
 	}
 
-	sshArgs = append(sshArgs, info.Host, buildRemoteCommand(remoteBin, args))
+	sshArgs = append(sshArgs, info.Host, buildRemoteCommand(remoteBin, args, opts.Env))
 
 	cmd := exec.Command(bin, sshArgs...)
 
@@ -97,8 +106,26 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 // the remote shell reconstructs the argv exactly. Without escaping,
 // `config:set FOO="bar baz" -a api` would land on the server as three
 // tokens plus garbage — classic Gokku bug.
-func buildRemoteCommand(bin string, args []string) string {
-	parts := make([]string, 0, len(args)+1)
+//
+// When env is non-empty, `KEY=VAL` pairs are prepended before the
+// binary. The remote shell interprets them as per-command env, same
+// as `FOO=bar VOODU=1 voodu ...` on a local shell.
+func buildRemoteCommand(bin string, args []string, env map[string]string) string {
+	parts := make([]string, 0, len(args)+len(env)+1)
+
+	// Sort env keys so the command is deterministic — helpful for
+	// logs, `ssh -v`, and the table-driven tests.
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		parts = append(parts, shellEscape(k+"="+env[k]))
+	}
+
 	parts = append(parts, shellEscape(bin))
 
 	for _, a := range args {

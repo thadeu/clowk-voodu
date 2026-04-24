@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"go.voodu.clowk.in/internal/remote"
 	"go.voodu.clowk.in/internal/tarball"
@@ -88,6 +89,7 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 	code, err := remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    stream.stdin,
+		Env:      remoteEnv(),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -200,6 +202,38 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep) er
 	}
 
 	return nil
+}
+
+// remoteEnv builds the env map inlined into the SSH command so the
+// remote voodu can emit colorized output. Why this exists: the server
+// process writes to a pipe (sshd), so its lipgloss renderer would
+// otherwise pick the no-color profile. The user's *local* stdout is
+// the real tty — we detect here, propagate FORCE_COLOR=1 across the
+// wire, and let the bytes stream back to the actual terminal intact.
+//
+// Precedence mirrors no-color.org:
+//   - NO_COLOR (non-empty local) → forwarded as-is, disables everything
+//   - FORCE_COLOR (non-empty local) → forwarded as-is, user's override wins
+//   - Else if local stdout is a tty → synthesize FORCE_COLOR=1
+//   - Else → empty map, remote stays plain (pipes, CI, redirects)
+func remoteEnv() map[string]string {
+	env := map[string]string{}
+
+	if v := os.Getenv("NO_COLOR"); v != "" {
+		env["NO_COLOR"] = v
+		return env
+	}
+
+	if v := os.Getenv("FORCE_COLOR"); v != "" {
+		env["FORCE_COLOR"] = v
+		return env
+	}
+
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		env["FORCE_COLOR"] = "1"
+	}
+
+	return env
 }
 
 // buildContextMaxSize returns the byte cap for an individual

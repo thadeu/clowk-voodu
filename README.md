@@ -270,6 +270,52 @@ Everything inside the app itself (404 pages, rewrites, SPA fallback,
 compression) stays in your Dockerfile's web server — the platform
 terminates at `host → container:port`.
 
+## Previewing changes with `voodu diff`
+
+`voodu diff` is the "what would apply do?" button. It calls the
+controller with `?dry_run=true`, so nothing gets persisted and the
+output reflects **exactly** what the next `voodu apply` with the same
+flags would do — same prune logic, same validation, same ordering.
+
+```sh
+$ voodu diff -f voodu.hcl
+~ deployment/clowk/web
+    ~ image     "nginx:1.26"  →  "nginx:1.27"
+    ~ replicas  1  →  2
+    + lang.name  "bun"
+= ingress/clowk/web (unchanged)
+
+--- Would prune (pass --no-prune to keep) ---
+- deployment/clowk/old-worker
+
+1 to modify, 1 to prune
+```
+
+Markers:
+- `~ kind/scope/name` — resource exists and its spec changed. Each
+  line underneath is one JSON field that differs, dotted for nested
+  keys (`tls.email`, `lang.name`).
+- `+ kind/scope/name (new)` — resource would be created; field lines
+  underneath are its initial spec.
+- `= kind/scope/name (unchanged)` — spec matches the controller.
+- `--- Would prune ---` — resources that would be removed by the
+  source-of-truth apply contract. Use `--no-prune` to simulate an
+  upsert-only apply (shared-scope case).
+
+### CI-friendly exit codes
+
+Pass `--detailed-exitcode` to get `terraform plan`-style exit codes:
+
+| Exit code | Meaning |
+|---|---|
+| 0 | No changes |
+| 1 | Error (couldn't reach controller, invalid manifest, …) |
+| 2 | Plan has pending changes |
+
+Lets you wire a `voodu diff --detailed-exitcode` step in CI that
+fails a branch when it drifts from the declared state, or gates a
+deploy step behind an explicit "yes there are changes" signal.
+
 ## Configuration
 
 Per-app environment variables are managed out-of-band from the manifest

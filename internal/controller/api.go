@@ -129,9 +129,43 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	applied := make([]*Manifest, 0, len(manifests))
+	// dry_run=true makes this a plan-only call: `voodu diff` uses it to
+	// ask "what would happen if I applied this?" without touching the
+	// store. We still run every validation (host collisions already
+	// ran above) and fetch each input's current on-disk manifest so
+	// the CLI can render a proper field-by-field diff client-side.
+	dryRun := r.URL.Query().Get("dry_run") == "true"
+
+	// `?prune=false` is the escape hatch for shared-scope setups where
+	// several independent applies (different repos, different pipelines)
+	// each declare only a slice of the scope. Default remains prune=on —
+	// that's the source-of-truth contract most mono-repo users want, and
+	// renames don't leave zombies behind. See README "Shared scope" for
+	// the intended usage pattern.
+	prune := r.URL.Query().Get("prune") != "false"
+
+	var (
+		applied = make([]*Manifest, 0, len(manifests))
+		current = make([]*Manifest, 0, len(manifests))
+	)
 
 	for _, m := range manifests {
+		// Capture the existing on-disk manifest BEFORE we overwrite it,
+		// so diff can compare "was vs. will be". Nil slot = a create.
+		// Unscoped kinds use empty scope; Store.Get handles that.
+		before, err := a.Store.Get(r.Context(), m.Kind, m.Scope, m.Name)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("read current: %w", err))
+			return
+		}
+
+		current = append(current, before)
+
+		if dryRun {
+			applied = append(applied, m)
+			continue
+		}
+
 		stored, err := a.Store.Put(r.Context(), m)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
@@ -141,30 +175,46 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		applied = append(applied, stored)
 	}
 
-	// `?prune=false` is the escape hatch for shared-scope setups where
-	// several independent applies (different repos, different pipelines)
-	// each declare only a slice of the scope. Default remains prune=on —
-	// that's the source-of-truth contract most mono-repo users want, and
-	// renames don't leave zombies behind. See README "Shared scope" for
-	// the intended usage pattern.
-	var pruned []string
+	var pruned []pruneTarget
 
-	if r.URL.Query().Get("prune") != "false" {
-		out, err := a.pruneMissing(r.Context(), manifests)
+	if prune {
+		targets, err := a.computePruneTargets(r.Context(), manifests)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune: %w", err))
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune plan: %w", err))
 			return
 		}
 
-		pruned = out
+		pruned = targets
+
+		if !dryRun {
+			if err := a.applyPrune(r.Context(), pruned); err != nil {
+				writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune: %w", err))
+				return
+			}
+		}
+	}
+
+	prunedRefs := make([]string, 0, len(pruned))
+	for _, t := range pruned {
+		prunedRefs = append(prunedRefs, t.String())
+	}
+
+	data := map[string]any{
+		"applied": applied,
+		"pruned":  prunedRefs,
+	}
+
+	// `current` is only meaningful for dry-run — it's the "before"
+	// side of the diff. Regular apply callers don't need it and the
+	// CLI's apply-output doesn't render it, so skip the payload bulk.
+	if dryRun {
+		data["current"] = current
+		data["dry_run"] = true
 	}
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data: map[string]any{
-			"applied": applied,
-			"pruned":  pruned,
-		},
+		Data:   data,
 	})
 }
 
@@ -261,14 +311,28 @@ func ingressHost(m *Manifest) (string, error) {
 	return spec.Host, nil
 }
 
-// pruneMissing deletes every resource in etcd that (a) shares a
-// (scope, kind) with something in the input and (b) is absent from the
-// input's name set for that (scope, kind). The per-(scope, kind)
-// granularity is deliberate: an apply of `deployments.hcl` won't touch
-// ingresses in the same scope, so callers can decompose by kind without
-// losing the pair they didn't include. Returns the list of deleted
-// references so the CLI can surface "pruned: deployment/foo" lines.
-func (a *API) pruneMissing(ctx context.Context, manifests []*Manifest) ([]string, error) {
+// pruneTarget names one resource that would be (or has been) pruned.
+// Kept as a struct so diff can surface structured info; the string form
+// `kind/scope/name` matches what the store keys on disk.
+type pruneTarget struct {
+	Kind  Kind
+	Scope string
+	Name  string
+}
+
+func (p pruneTarget) String() string {
+	return fmt.Sprintf("%s/%s/%s", p.Kind, p.Scope, p.Name)
+}
+
+// computePruneTargets is the pure half of prune: it figures out what
+// *would* be deleted without touching the store. Splitting this from
+// applyPrune lets `/apply?dry_run=true` answer "what would change" for
+// `voodu diff`, while the real apply path runs both halves.
+//
+// The per-(scope, kind) granularity is deliberate: an apply of
+// `deployments.hcl` won't touch ingresses in the same scope, so callers
+// can decompose by kind without losing the pair they didn't include.
+func (a *API) computePruneTargets(ctx context.Context, manifests []*Manifest) ([]pruneTarget, error) {
 	keep := map[string]map[string]struct{}{}
 
 	for _, m := range manifests {
@@ -285,7 +349,7 @@ func (a *API) pruneMissing(ctx context.Context, manifests []*Manifest) ([]string
 		keep[bucket][m.Name] = struct{}{}
 	}
 
-	var pruned []string
+	var targets []pruneTarget
 
 	for bucket, names := range keep {
 		i := strings.Index(bucket, "/")
@@ -302,15 +366,23 @@ func (a *API) pruneMissing(ctx context.Context, manifests []*Manifest) ([]string
 				continue
 			}
 
-			if _, err := a.Store.Delete(ctx, e.Kind, e.Scope, e.Name); err != nil {
-				return nil, err
-			}
-
-			pruned = append(pruned, fmt.Sprintf("%s/%s/%s", e.Kind, e.Scope, e.Name))
+			targets = append(targets, pruneTarget{Kind: e.Kind, Scope: e.Scope, Name: e.Name})
 		}
 	}
 
-	return pruned, nil
+	return targets, nil
+}
+
+// applyPrune is the side-effect half: given a plan from
+// computePruneTargets, delete each target from the store.
+func (a *API) applyPrune(ctx context.Context, targets []pruneTarget) error {
+	for _, t := range targets {
+		if _, err := a.Store.Delete(ctx, t.Kind, t.Scope, t.Name); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (a *API) applyGet(w http.ResponseWriter, r *http.Request) {

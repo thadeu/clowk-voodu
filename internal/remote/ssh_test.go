@@ -30,11 +30,34 @@ func TestShellEscape(t *testing.T) {
 }
 
 func TestBuildRemoteCommand(t *testing.T) {
-	got := buildRemoteCommand("voodu", []string{"config", "set", "FOO=bar baz", "-a", "api"})
+	got := buildRemoteCommand("voodu", []string{"config", "set", "FOO=bar baz", "-a", "api"}, nil)
 	want := "voodu config set 'FOO=bar baz' -a api"
 
 	if got != want {
 		t.Errorf("buildRemoteCommand:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// TestBuildRemoteCommandWithEnv checks that env pairs are sorted,
+// shell-escaped as whole KEY=VAL tokens, and prepended before the
+// binary so the remote shell interprets them as per-command env —
+// our workaround for sshd's AcceptEnv being unreliable in the wild.
+// Note that shellEscape operates on the full "KEY=VAL" string, so an
+// empty value (NO_COLOR=) stays unquoted (shell-safe chars only),
+// while "WEIRD=a b" gets single-quoted as one unit because of the
+// space. Both forms are valid shell assignments.
+func TestBuildRemoteCommandWithEnv(t *testing.T) {
+	env := map[string]string{
+		"FORCE_COLOR": "1",
+		"NO_COLOR":    "",
+		"WEIRD":       "a b",
+	}
+
+	got := buildRemoteCommand("voodu", []string{"diff"}, env)
+	want := "FORCE_COLOR=1 NO_COLOR= 'WEIRD=a b' voodu diff"
+
+	if got != want {
+		t.Errorf("buildRemoteCommand with env:\n  got:  %s\n  want: %s", got, want)
 	}
 }
 
