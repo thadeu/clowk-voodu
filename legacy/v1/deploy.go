@@ -28,12 +28,12 @@ func NewDeployCommand(output Output) *DeployCommand {
 }
 
 func (c *DeployCommand) Execute(appName string) error {
-	c.output.Print(fmt.Sprintf("Deploying app '%s'...", appName))
+	c.output.Print(fmt.Sprintf("-----> Deploying app '%s'...", appName))
 
 	repoDir := filepath.Join(c.baseDir, "repos", appName+".git")
 
 	if !c.hasCommits(repoDir) {
-		c.output.Error("Repository is empty, cannot deploy")
+		c.output.Error("-----> Repository is empty, cannot deploy")
 		return fmt.Errorf("repository is empty")
 	}
 
@@ -41,7 +41,7 @@ func (c *DeployCommand) Execute(appName string) error {
 	releaseDir := filepath.Join(c.baseDir, "apps", appName, "releases", releaseID)
 
 	if err := os.MkdirAll(releaseDir, 0755); err != nil {
-		c.output.Error(fmt.Sprintf("Failed to create release directory: %v", err))
+		c.output.Error(fmt.Sprintf("-----> Failed to create release directory: %v", err))
 		return err
 	}
 
@@ -58,32 +58,32 @@ func (c *DeployCommand) Execute(appName string) error {
 		c.output.Print("-----> Found gokku.yml, processing configuration...")
 
 		if err := c.initialSetup(appName, gokkuYmlPath, releaseDir); err != nil {
-			c.output.Print(fmt.Sprintf("Warning: Failed to process gokku.yml: %v", err))
+			c.output.Print(fmt.Sprintf("-----> Warning: Failed to process gokku.yml: %v", err))
 		}
 	}
 
 	if err := c.buildRelease(appName, releaseDir); err != nil {
-		c.output.Error(fmt.Sprintf("Failed to build release: %v", err))
+		c.output.Error(fmt.Sprintf("-----> Failed to build release: %v", err))
 		return err
 	}
 
 	currentLink := filepath.Join(c.baseDir, "apps", appName, "current")
 
 	if err := c.updateCurrentSymlink(currentLink, releaseDir); err != nil {
-		c.output.Error(fmt.Sprintf("Failed to update current symlink: %v", err))
+		c.output.Error(fmt.Sprintf("-----> Failed to update current symlink: %v", err))
 		return err
 	}
 
 	if err := c.executePostDeployCommands(appName, releaseDir); err != nil {
-		c.output.Print(fmt.Sprintf("Warning: Post-deploy commands failed: %v", err))
+		c.output.Print(fmt.Sprintf("-----> Warning: Post-deploy commands failed: %v", err))
 	}
 
 	if err := c.startContainers(appName, releaseDir); err != nil {
-		c.output.Error(fmt.Sprintf("Failed to start containers: %v", err))
+		c.output.Error(fmt.Sprintf("-----> Failed to start containers: %v", err))
 		return err
 	}
 
-	c.output.Success(fmt.Sprintf("Deploy completed successfully for '%s'", appName))
+	c.output.Success(fmt.Sprintf("-----> Deploy completed successfully for '%s'", appName))
 	return nil
 }
 

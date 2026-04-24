@@ -129,7 +129,7 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 			word = "deployments"
 		}
 
-		fmt.Fprintf(os.Stdout, "No spec changes. Re-pushing source for %d build-mode %s.\n",
+		fmt.Fprintf(os.Stdout, "-----> No spec changes. Re-pushing source for %d build-mode %s.\n",
 			len(stream.buildModeDeploys), word)
 	}
 

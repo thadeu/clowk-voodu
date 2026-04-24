@@ -71,10 +71,10 @@ func runPipeline(app, releaseDir string, opts *Options) error {
 	}
 
 	if err := runPostDeploy(releaseDir, spec, opts); err != nil {
-		opts.log("Warning: post-deploy hook failed: %v", err)
+		opts.log("-----> Warning: post-deploy hook failed: %v", err)
 	}
 
-	opts.log("Deploy completed successfully for '%s'", app)
+	opts.log("-----> Deploy completed successfully for '%s'", app)
 
 	return nil
 }

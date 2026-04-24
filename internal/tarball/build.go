@@ -88,7 +88,7 @@ func Stream(w io.Writer, srcDir string, opts Options) (int64, error) {
 		return 0, err
 	}
 
-	logProgress(opts.Progress, "tarball: %s (%d patterns)", ignoreSourceLabel(source), len(patterns))
+	logProgress(opts.Progress, "-----> tarball: %s (%d patterns)", ignoreSourceLabel(source), len(patterns))
 
 	warnIfDockerfileIgnored(opts.Progress, srcAbs, patterns, source)
 
@@ -215,7 +215,7 @@ func Stream(w io.Writer, srcDir string, opts Options) (int64, error) {
 		return written, err
 	}
 
-	logProgress(opts.Progress, "tarball: %d files, %s uncompressed", filesSent, humanBytes(written))
+	logProgress(opts.Progress, "-----> tarball: %d files, %s uncompressed", filesSent, humanBytes(written))
 
 	// Closing in defers above ensures the gzip footer is written.
 	return written, nil
