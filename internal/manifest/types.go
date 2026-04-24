@@ -14,16 +14,33 @@ package manifest
 
 // DeploymentSpec is an app the controller should run as a container.
 //
-// Source resolution is intentionally implicit (mirrors legacy voodu.yml —
-// no `source {}` block). The handler picks a mode from which fields are
-// set at reconcile time:
+// Shape: the root holds pipeline- and container-level concerns (image,
+// networking, env, post-deploy hooks, release retention). Language-
+// specific build inputs live inside an optional `lang {}` block whose
+// `name` field names the runtime — any value is accepted, so operators
+// can target runtimes the platform doesn't know about (Elixir, Java,
+// Haskell...) as long as they provide a custom Dockerfile.
+//
+// Source resolution is implicit. The handler picks a mode from which
+// fields are set at reconcile time:
 //
 //   - Image non-empty        → pull from registry and run (no build)
 //   - Image empty + Path set → docker build using <Workdir>/<Path> as context
-//   - Image empty + no Path  → docker build at repo root (same as `gokku deploy`)
+//   - Image empty + no Path  → docker build at repo root
 //
 // Workdir narrows the repo subtree (monorepo case); Dockerfile picks a
 // non-default filename. Both are ignored when Image is set.
+//
+// Language dispatch:
+//   - `lang {}` is optional. When present, `name` picks the handler
+//     (go, ruby, rails, python, nodejs, or any custom string — unknown
+//     values fall through to the generic Dockerfile path).
+//   - Zero block is fine: handlers auto-detect at build time from
+//     well-known marker files (go.mod, Gemfile, package.json, ...).
+//   - `version`, `entrypoint`, and `build_args` are forwarded to the
+//     handler. Cross-compile flags (GOOS/GOARCH/CGO_ENABLED) live inside
+//     `build_args` — the Go handler injects defaults and any explicit
+//     entry overrides them.
 //
 // Networking:
 //   - `network_mode = "host" | "none"` escapes docker bridge entirely.
@@ -36,23 +53,44 @@ package manifest
 //   - `network = "..."` — legacy singular shorthand, treated as networks=[X].
 //   - All empty → `[voodu0]`.
 type DeploymentSpec struct {
-	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
-	Workdir     string            `yaml:"workdir,omitempty"      json:"workdir,omitempty"`
-	Dockerfile  string            `yaml:"dockerfile,omitempty"   json:"dockerfile,omitempty"`
-	Path        string            `yaml:"path,omitempty"         json:"path,omitempty"`
-	Lang        string            `yaml:"lang,omitempty"         json:"lang,omitempty"`
-	GoVersion   string            `yaml:"go_version,omitempty"   json:"go_version,omitempty"`
-	Replicas    int               `yaml:"replicas,omitempty"     json:"replicas,omitempty"`
-	Command     []string          `yaml:"command,omitempty"      json:"command,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty"          json:"env,omitempty"`
-	Ports       []string          `yaml:"ports,omitempty"        json:"ports,omitempty"`
-	Volumes     []string          `yaml:"volumes,omitempty"      json:"volumes,omitempty"`
-	Network     string            `yaml:"network,omitempty"      json:"network,omitempty"`
-	Networks    []string          `yaml:"networks,omitempty"     json:"networks,omitempty"`
-	NetworkMode string            `yaml:"network_mode,omitempty" json:"network_mode,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
-	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
-	PostDeploy  []string          `yaml:"post_deploy,omitempty"  json:"post_deploy,omitempty"`
+	Image        string            `yaml:"image,omitempty"         json:"image,omitempty"`
+	Workdir      string            `yaml:"workdir,omitempty"       json:"workdir,omitempty"`
+	Dockerfile   string            `yaml:"dockerfile,omitempty"    json:"dockerfile,omitempty"`
+	Path         string            `yaml:"path,omitempty"          json:"path,omitempty"`
+	Replicas     int               `yaml:"replicas,omitempty"      json:"replicas,omitempty"`
+	Command      []string          `yaml:"command,omitempty"       json:"command,omitempty"`
+	Env          map[string]string `yaml:"env,omitempty"           json:"env,omitempty"`
+	Ports        []string          `yaml:"ports,omitempty"         json:"ports,omitempty"`
+	Volumes      []string          `yaml:"volumes,omitempty"       json:"volumes,omitempty"`
+	Network      string            `yaml:"network,omitempty"       json:"network,omitempty"`
+	Networks     []string          `yaml:"networks,omitempty"      json:"networks,omitempty"`
+	NetworkMode  string            `yaml:"network_mode,omitempty"  json:"network_mode,omitempty"`
+	Restart      string            `yaml:"restart,omitempty"       json:"restart,omitempty"`
+	HealthCheck  string            `yaml:"health_check,omitempty"  json:"health_check,omitempty"`
+	PostDeploy   []string          `yaml:"post_deploy,omitempty"   json:"post_deploy,omitempty"`
+	KeepReleases int               `yaml:"keep_releases,omitempty" json:"keep_releases,omitempty"`
+
+	// Lang is the single, runtime-agnostic build-input block. A nil
+	// pointer means "not declared" — handlers fall back to auto-detect.
+	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
+}
+
+// LangSpec carries build-time inputs for the chosen runtime. The
+// `name` field picks the handler; `version`, `entrypoint`, and
+// `build_args` are universal — each handler reads what's meaningful to
+// it and ignores the rest. That way new runtimes slot in without
+// schema churn: the HCL shape is identical for Go, Ruby, Elixir, or a
+// bespoke custom-Dockerfile app.
+//
+// build_args doubles as the escape hatch for lang-specific knobs.
+// Go users pass `{ GOOS = "linux", GOARCH = "arm64", CGO_ENABLED = "0" }`
+// here rather than getting a dedicated struct field — the Go handler
+// auto-injects defaults and user entries override them.
+type LangSpec struct {
+	Name       string            `yaml:"name,omitempty"       json:"name,omitempty"`
+	Version    string            `yaml:"version,omitempty"    json:"version,omitempty"`
+	Entrypoint string            `yaml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
+	BuildArgs  map[string]string `yaml:"build_args,omitempty" json:"build_args,omitempty"`
 }
 
 // applyDefaults fills implicit values so the minimal HCL

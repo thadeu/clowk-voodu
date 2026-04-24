@@ -472,7 +472,7 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 		}
 
 		replicas := effectiveReplicas(*dep)
-		slots := slotNames(spec.Service, replicas)
+		slots := slotNames(AppID(scope, spec.Service), replicas)
 		upstreams := make([]string, len(slots))
 
 		for i, slot := range slots {

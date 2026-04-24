@@ -53,6 +53,14 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 
 	opts.log("-----> Receiving build context for '%s'...", app)
 
+	// A new scope or a renamed deployment produces an AppID the server
+	// has never seen. Materialise the app tree lazily so the operator
+	// doesn't have to run `voodu apps create` every time — the
+	// MkdirAll is idempotent, so re-deploys pay nothing.
+	if err := ensureAppLayout(app); err != nil {
+		return err
+	}
+
 	buildID, tmpPath, err := bufferTarball(src)
 	if err != nil {
 		return fmt.Errorf("buffer tarball: %w", err)
@@ -65,11 +73,11 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 	if existing, err := os.Stat(releaseDir); err == nil && existing.IsDir() && !opts.Force {
 		opts.log("-----> Release %s already exists — skipping rebuild (use --force to override)", buildID)
 
-		if err := swapCurrentSymlink(app, releaseDir); err != nil {
-			return fmt.Errorf("swap current symlink: %w", err)
-		}
-
-		return startContainers(app, releaseDir, &opts)
+		// Same tarball → same image. Only repoint `current`; the
+		// controller reconciler is responsible for restarting the
+		// container against the (unchanged) image when it notices the
+		// symlink flip or a desired-state bump.
+		return swapCurrentSymlink(app, releaseDir)
 	}
 
 	opts.log("-----> Creating release %s", buildID)
@@ -90,12 +98,40 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return err
 	}
 
-	if pruned, err := gcReleases(app, DefaultKeepReleases); err != nil {
+	keep := DefaultKeepReleases
+	if opts.Spec != nil && opts.Spec.KeepReleases > 0 {
+		keep = opts.Spec.KeepReleases
+	}
+
+	if pruned, err := gcReleases(app, keep); err != nil {
 		// GC failure is non-fatal: the deploy succeeded, the user sees
 		// a warning, disk cleanup can be done by hand later.
 		opts.log("Warning: release GC failed: %v", err)
 	} else if pruned > 0 {
 		opts.log("-----> Pruned %d old release(s)", pruned)
+	}
+
+	return nil
+}
+
+// ensureAppLayout creates the filesystem tree a deployment needs:
+// the app dir, its releases/ and shared/ children, and the per-app
+// volumes dir. Mirrors what `voodu apps create` does so the first
+// receive-pack for a brand-new AppID doesn't require an explicit
+// bootstrap step. MkdirAll is idempotent, so subsequent deploys pay
+// only the stat syscalls.
+func ensureAppLayout(app string) error {
+	dirs := []string{
+		paths.AppDir(app),
+		paths.AppReleasesDir(app),
+		paths.AppSharedDir(app),
+		paths.AppVolumeDir(app),
+	}
+
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d, err)
+		}
 	}
 
 	return nil

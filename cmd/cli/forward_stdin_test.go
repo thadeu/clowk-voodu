@@ -132,10 +132,13 @@ func TestRewriteForStdinStream_BuildModeFlagsSourcePush(t *testing.T) {
 }
 
 deployment "prod" "api" {
-  workdir    = "apps/api"
-  lang       = "go"
-  go_version = "1.25"
-  ports      = ["3000"]
+  workdir = "apps/api"
+  ports   = ["3000"]
+
+  lang {
+    name    = "go"
+    version = "1.25"
+  }
 }
 `
 

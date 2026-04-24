@@ -193,10 +193,11 @@ func TestApplyPruneRemovesMissing(t *testing.T) {
 	}
 }
 
-// TestApplyRejectsCrossScopeCollision ensures two scopes can't share a
-// deployment name — the reconciler would otherwise fight over the same
-// container slot.
-func TestApplyRejectsCrossScopeCollision(t *testing.T) {
+// TestApplyAllowsCrossScopeNameReuse verifies two scopes can share a
+// deployment name. Identity on disk (container slots, image tags, env
+// files, release dirs) is keyed by AppID(scope, name) = "<scope>-<name>",
+// so there is no slot collision at reconcile time.
+func TestApplyAllowsCrossScopeNameReuse(t *testing.T) {
 	api, store := newTestAPI(t)
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
@@ -211,8 +212,16 @@ func TestApplyRejectsCrossScopeCollision(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 got %d", resp.StatusCode)
+	}
+
+	if got, _ := store.Get(t.Context(), KindDeployment, "app-a", "web"); got == nil {
+		t.Error("app-a/web should still exist — it wasn't in this apply's (scope,kind)")
+	}
+
+	if got, _ := store.Get(t.Context(), KindDeployment, "app-b", "web"); got == nil {
+		t.Error("app-b/web should have been written")
 	}
 }
 

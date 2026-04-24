@@ -198,7 +198,7 @@ func TestDeploymentHandler_ResolvesRefsIntoEnv(t *testing.T) {
 		t.Fatalf("expected 1 env write, got %d", len(writes))
 	}
 
-	if writes[0].App != "api" {
+	if writes[0].App != "test-api" {
 		t.Errorf("wrong app: %q", writes[0].App)
 	}
 
@@ -419,7 +419,7 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	}
 
 	got := cm.ensures[0]
-	if got.Name != "api-0" || got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/api.env" {
+	if got.Name != "test-api-0" || got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/test-api.env" {
 		t.Errorf("unexpected ensure spec: %+v", got)
 	}
 
@@ -697,7 +697,7 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 		// Pretend the indexed slot already exists (e.g. a previous
 		// reconcile) so Ensure returns created=false and the restart
 		// branch fires for an env change.
-		exists: map[string]bool{"api-0": true},
+		exists: map[string]bool{"test-api-0": true},
 	}
 
 	h := &DeploymentHandler{
@@ -715,8 +715,8 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 
 	h.Handle(context.Background(), ev)
 
-	if got, want := cm.restarts, []string{"api-0"}; len(got) != len(want) || got[0] != want[0] {
-		t.Errorf("expected restart of api-0, got %+v", got)
+	if got, want := cm.restarts, []string{"test-api-0"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected restart of test-api-0, got %+v", got)
 	}
 }
 
@@ -728,11 +728,11 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	// on first reconcile after upgrade — by design.
 	prevHash := deploymentSpecHash(deploymentSpec{Image: "ghcr.io/acme/api:1.0.0"})
 	pre, _ := json.Marshal(DeploymentStatus{Image: "ghcr.io/acme/api:1.0.0", SpecHash: prevHash})
-	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"api-0": true},
-		images: map[string]string{"api-0": "ghcr.io/acme/api:1.0.0"},
+		exists: map[string]bool{"test-api-0": true},
+		images: map[string]string{"test-api-0": "ghcr.io/acme/api:1.0.0"},
 	}
 
 	h := &DeploymentHandler{
@@ -767,7 +767,7 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 
 	// Status must be re-baselined to the new image so subsequent
 	// replays with the same manifest don't trigger another recreate.
-	raw, _ := store.GetStatus(context.Background(), KindDeployment, "api")
+	raw, _ := store.GetStatus(context.Background(), KindDeployment, "test-api")
 
 	var st DeploymentStatus
 	_ = json.Unmarshal(raw, &st)
@@ -784,11 +784,11 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 	prevSpec := deploymentSpec{Image: "nginx:latest", Ports: []string{"80"}}
 	prevHash := deploymentSpecHash(prevSpec)
 	pre, _ := json.Marshal(DeploymentStatus{Image: prevSpec.Image, SpecHash: prevHash})
-	_ = store.PutStatus(context.Background(), KindDeployment, "web", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-web", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"web-0": true},
-		images: map[string]string{"web-0": "nginx:latest"},
+		exists: map[string]bool{"test-web-0": true},
+		images: map[string]string{"test-web-0": "nginx:latest"},
 	}
 
 	h := &DeploymentHandler{
@@ -829,14 +829,14 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 
 	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
-	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"vd-web-0": true},
+		exists: map[string]bool{"test-vd-web-0": true},
 		// Slot 0 is still running the layer sha it was created with, but
 		// the tag "vd-web:latest" now points at a freshly-built layer.
 		// The reconciler checks slot 0 as the canary for image-id drift.
-		containerImageIDs: map[string]string{"vd-web-0": "sha256:oldlayer"},
+		containerImageIDs: map[string]string{"test-vd-web-0": "sha256:oldlayer"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:newlayer"},
 	}
 
@@ -872,11 +872,11 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 
 	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
-	_ = store.PutStatus(context.Background(), KindDeployment, "vd-web", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
 	cm := &fakeContainers{
-		exists:            map[string]bool{"vd-web-0": true},
-		containerImageIDs: map[string]string{"vd-web-0": "sha256:same"},
+		exists:            map[string]bool{"test-vd-web-0": true},
+		containerImageIDs: map[string]string{"test-vd-web-0": "sha256:same"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:same"},
 	}
 
@@ -908,11 +908,11 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	// handler will recompute after apply() runs its normalization.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
-	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"api-0": true},
-		images: map[string]string{"api-0": "img:1"},
+		exists: map[string]bool{"test-api-0": true},
+		images: map[string]string{"test-api-0": "img:1"},
 	}
 
 	h := &DeploymentHandler{
@@ -946,8 +946,8 @@ func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) 
 	cm := &fakeContainers{
 		// Slot already exists (imagine: controller upgrade onto a server
 		// where deployments ran under the pre-hash code path).
-		exists: map[string]bool{"api-0": true},
-		images: map[string]string{"api-0": "img:old"},
+		exists: map[string]bool{"test-api-0": true},
+		images: map[string]string{"test-api-0": "img:old"},
 	}
 
 	h := &DeploymentHandler{
@@ -971,7 +971,7 @@ func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) 
 
 	// But it MUST persist a baseline hash so the next real drift gets
 	// caught. Without this write, every reconcile would re-baseline.
-	raw, _ := store.GetStatus(context.Background(), KindDeployment, "api")
+	raw, _ := store.GetStatus(context.Background(), KindDeployment, "test-api")
 	if raw == nil {
 		t.Fatal("expected status baseline to be persisted on first reconcile")
 	}
@@ -1070,8 +1070,8 @@ func TestDeploymentHandler_EmptyImageDefaultsToAppLatest(t *testing.T) {
 		t.Fatalf("ensure should fire once with defaulted image, got %d calls", len(cm.ensures))
 	}
 
-	if cm.ensures[0].Image != "vd-web:latest" {
-		t.Errorf("expected image vd-web:latest, got %q", cm.ensures[0].Image)
+	if cm.ensures[0].Image != "test-vd-web:latest" {
+		t.Errorf("expected image test-vd-web:latest, got %q", cm.ensures[0].Image)
 	}
 }
 
@@ -1103,7 +1103,7 @@ func TestDeploymentHandler_ReplicasSpawnsEveryIndexedSlot(t *testing.T) {
 	}
 
 	for i, e := range cm.ensures {
-		want := fmt.Sprintf("api-%d", i)
+		want := fmt.Sprintf("test-api-%d", i)
 
 		if e.Name != want {
 			t.Errorf("ensure[%d] name: got %q want %q", i, e.Name, want)
@@ -1119,21 +1119,21 @@ func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
 
 	cm := &fakeContainers{
 		exists: map[string]bool{
-			"api-0": true,
-			"api-1": true,
-			"api-2": true,
+			"test-api-0": true,
+			"test-api-1": true,
+			"test-api-2": true,
 		},
 		images: map[string]string{
-			"api-0": "img:1",
-			"api-1": "img:1",
-			"api-2": "img:1",
+			"test-api-0": "img:1",
+			"test-api-1": "img:1",
+			"test-api-2": "img:1",
 		},
 	}
 
 	// Baseline status so no spec-drift recreate triggers.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
-	_ = store.PutStatus(context.Background(), KindDeployment, "api", pre)
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -1149,7 +1149,7 @@ func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
 
 	sort.Strings(cm.removes)
 
-	if want := []string{"api-1", "api-2"}; len(cm.removes) != len(want) ||
+	if want := []string{"test-api-1", "test-api-2"}; len(cm.removes) != len(want) ||
 		cm.removes[0] != want[0] || cm.removes[1] != want[1] {
 		t.Errorf("scale-down removes: got %+v want %+v", cm.removes, want)
 	}
@@ -1166,7 +1166,7 @@ func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
 	store := newMemStore()
 
 	cm := &fakeContainers{
-		exists: map[string]bool{"api": true},
+		exists: map[string]bool{"test-api": true},
 	}
 
 	h := &DeploymentHandler{
@@ -1181,12 +1181,12 @@ func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.removes) != 1 || cm.removes[0] != "api" {
-		t.Errorf("expected legacy removal of %q, got %+v", "api", cm.removes)
+	if len(cm.removes) != 1 || cm.removes[0] != "test-api" {
+		t.Errorf("expected legacy removal of %q, got %+v", "test-api", cm.removes)
 	}
 
-	if len(cm.ensures) != 1 || cm.ensures[0].Name != "api-0" {
-		t.Errorf("expected ensure of api-0 after legacy prune, got %+v", cm.ensures)
+	if len(cm.ensures) != 1 || cm.ensures[0].Name != "test-api-0" {
+		t.Errorf("expected ensure of test-api-0 after legacy prune, got %+v", cm.ensures)
 	}
 }
 

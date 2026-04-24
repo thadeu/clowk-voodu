@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"go.voodu.clowk.in/internal/config"
 	"go.voodu.clowk.in/internal/paths"
 )
 
@@ -279,13 +278,15 @@ func IsRegistryImage(image string, customRegistries ...[]string) bool {
 	return false
 }
 
-// GetCustomRegistries returns custom registries configured for an app.
+// GetCustomRegistries is a historical hook for per-app registry hints
+// that used to live in voodu.yml's docker.registry block. In the HCL
+// world the DeploymentSpec.Image is expected to be fully qualified, so
+// we return the empty set and rely on IsRegistryImage's URL heuristic.
+// The appName parameter is kept so downstream call sites don't churn.
 func GetCustomRegistries(appName string) []string {
-	if cfg, err := config.LoadServerConfigByApp(appName); err == nil && cfg.Docker != nil && len(cfg.Docker.Registry) > 0 {
-		return cfg.Docker.Registry
-	}
+	_ = appName
 
-	return []string{}
+	return nil
 }
 
 // PullRegistryImage pulls a pre-built image from a registry.

@@ -6,34 +6,31 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"go.voodu.clowk.in/internal/config"
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/paths"
 )
 
-type Generic struct {
-	app *config.App
-}
+type Generic struct{}
 
-func (l *Generic) Build(appName string, app *config.App, releaseDir string) error {
+func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) error {
 	fmt.Println("-----> Building generic application...")
 
 	var dockerfilePath string
 
-	if app.Dockerfile != "" {
-		dockerfilePath = filepath.Join(releaseDir, app.Dockerfile)
+	if spec.Dockerfile != "" {
+		dockerfilePath = filepath.Join(releaseDir, spec.Dockerfile)
 
-		if app.WorkDir != "" {
-			workdirDockerfilePath := filepath.Join(releaseDir, app.WorkDir, app.Dockerfile)
+		if spec.Workdir != "" {
+			workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
-				fmt.Printf("-----> Using custom Dockerfile in workdir: %s/%s\n", app.WorkDir, app.Dockerfile)
+				fmt.Printf("-----> Using custom Dockerfile in workdir: %s/%s\n", spec.Workdir, spec.Dockerfile)
 			} else {
-				fmt.Printf("-----> Using custom Dockerfile: %s\n", app.Dockerfile)
+				fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
 			}
 		} else {
-			fmt.Printf("-----> Using custom Dockerfile: %s\n", app.Dockerfile)
+			fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
 		}
 	} else {
 		dockerfilePath = filepath.Join(releaseDir, "Dockerfile")
@@ -47,18 +44,14 @@ func (l *Generic) Build(appName string, app *config.App, releaseDir string) erro
 	imageTag := fmt.Sprintf("%s:latest", appName)
 
 	var cmd *exec.Cmd
-	if app.Dockerfile != "" {
+	if spec.Dockerfile != "" {
 		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", imageTag, releaseDir)
-
-		for _, label := range docker.GetVooduLabels() {
-			cmd.Args = append(cmd.Args, "--label", label)
-		}
 	} else {
 		cmd = exec.Command("docker", "build", "-t", imageTag, releaseDir)
+	}
 
-		for _, label := range docker.GetVooduLabels() {
-			cmd.Args = append(cmd.Args, "--label", label)
-		}
+	for _, label := range docker.GetVooduLabels() {
+		cmd.Args = append(cmd.Args, "--label", label)
 	}
 
 	cmd.Stdout = os.Stdout
@@ -73,22 +66,22 @@ func (l *Generic) Build(appName string, app *config.App, releaseDir string) erro
 	return nil
 }
 
-func (l *Generic) Deploy(appName string, app *config.App, releaseDir string) error {
+func (l *Generic) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
 	fmt.Println("-----> Deploying generic application...")
 
 	envFile := paths.AppEnvFile(appName)
 
 	networkMode := "bridge"
 
-	if app.Network != nil && app.Network.Mode != "" {
-		networkMode = app.Network.Mode
+	if spec.NetworkMode != "" {
+		networkMode = spec.NetworkMode
 	}
 
 	volumes := []string{}
 	volumes = append(volumes, fmt.Sprintf("%s:/app/shared", paths.AppVolumeDir(appName)))
 
-	if len(app.Volumes) > 0 {
-		volumes = append(volumes, app.Volumes...)
+	if len(spec.Volumes) > 0 {
+		volumes = append(volumes, spec.Volumes...)
 	}
 
 	return docker.DeployContainer(docker.DeploymentConfig{
@@ -99,57 +92,17 @@ func (l *Generic) Deploy(appName string, app *config.App, releaseDir string) err
 		ZeroDowntime:  true,
 		HealthTimeout: 60,
 		NetworkMode:   networkMode,
-		DockerPorts:   app.Ports,
+		DockerPorts:   spec.Ports,
 		Volumes:       volumes,
 	})
 }
 
-func (l *Generic) Restart(appName string, app *config.App) error {
-	fmt.Printf("-----> Restarting %s...\n", appName)
-
-	containerName := appName
-
-	if !docker.ContainerExists(containerName) {
-		containerName = appName + "-green"
-	}
-
-	if !docker.ContainerExists(containerName) {
-		return fmt.Errorf("no active container found for %s", appName)
-	}
-
-	cmd := exec.Command("docker", "restart", containerName)
-
-	return cmd.Run()
+func (l *Generic) Restart(appName string, spec *BuildSpec) error {
+	return restartContainer(appName)
 }
 
-func (l *Generic) Cleanup(appName string, app *config.App) error {
-	fmt.Printf("-----> Cleaning up old releases for %s...\n", appName)
-
-	releasesDir := paths.AppReleasesDir(appName)
-
-	entries, err := os.ReadDir(releasesDir)
-	if err != nil {
-		return err
-	}
-
-	keepReleases := 5
-	if len(entries) <= keepReleases {
-		return nil
-	}
-
-	toRemove := len(entries) - keepReleases
-	for i := 0; i < toRemove; i++ {
-		entry := entries[i]
-		releasePath := filepath.Join(releasesDir, entry.Name())
-
-		if err := os.RemoveAll(releasePath); err != nil {
-			fmt.Printf("Warning: Failed to remove old release %s: %v\n", entry.Name(), err)
-		} else {
-			fmt.Printf("-----> Removed old release: %s\n", entry.Name())
-		}
-	}
-
-	return nil
+func (l *Generic) Cleanup(appName string, spec *BuildSpec) error {
+	return cleanupReleases(appName)
 }
 
 func (l *Generic) DetectLanguage(releaseDir string) (string, error) {
@@ -160,18 +113,13 @@ func (l *Generic) DetectLanguage(releaseDir string) (string, error) {
 	return "generic", nil
 }
 
-func (l *Generic) EnsureDockerfile(releaseDir string, appName string, app *config.App) error {
+func (l *Generic) EnsureDockerfile(releaseDir string, appName string, spec *BuildSpec) error {
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
 		fmt.Println("-----> Using existing Dockerfile")
-
 		return nil
 	}
 
 	return fmt.Errorf("no Dockerfile found and no language-specific strategy available")
-}
-
-func (l *Generic) GetDefaultConfig() *config.App {
-	return &config.App{}
 }

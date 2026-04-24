@@ -120,15 +120,6 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject cross-scope name collisions before writing anything. Two
-	// scopes claiming the same deployment name would both try to own the
-	// same container slot at reconcile time — refusing at this boundary
-	// is safer than letting the reconciler thrash.
-	if err := a.checkCrossScopeCollisions(r.Context(), manifests); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
 	// Two ingresses pointing at the same Host produce duplicate caddy
 	// automation policies, which caddy rejects at /load with an opaque
 	// error. Refuse here so the operator sees a clean "host already in
@@ -163,34 +154,6 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 			"pruned":  pruned,
 		},
 	})
-}
-
-// checkCrossScopeCollisions refuses any apply where a (kind, name)
-// already exists under a different scope. The reconciler maps a name
-// to a container slot — two scopes sharing a name would fight over
-// `web-0`, so the only safe time to catch it is here, before any Put.
-func (a *API) checkCrossScopeCollisions(ctx context.Context, manifests []*Manifest) error {
-	for _, m := range manifests {
-		if !IsScoped(m.Kind) {
-			continue
-		}
-
-		existing, err := a.Store.List(ctx, m.Kind)
-		if err != nil {
-			return err
-		}
-
-		for _, e := range existing {
-			if e.Name == m.Name && e.Scope != m.Scope {
-				return fmt.Errorf(
-					"%s/%s already exists under scope %q — rename one or use the existing scope",
-					m.Kind, m.Name, e.Scope,
-				)
-			}
-		}
-	}
-
-	return nil
 }
 
 // checkIngressHostCollisions rejects any apply that would leave two

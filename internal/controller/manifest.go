@@ -10,19 +10,41 @@ import (
 // arbitrary JSON; the parser in internal/manifest decodes HCL/YAML into
 // this shape before the controller ever sees it.
 //
-// Scope is the diff/prune grouping key. Deployment and ingress require
-// a non-empty Scope (parsed from the first HCL label in `deployment
-// "scope" "name" { ... }`). All other kinds leave Scope empty — they
-// exist at most once per name, so there's nothing for a prune pass to
-// group by. Scope is metadata only: it never prefixes container or DNS
-// names, and uniqueness of (kind, name) is enforced across scopes so
-// two scopes cannot accidentally collide on the same container slot.
+// Scope is both a diff/prune grouping key AND part of the app identity
+// on disk and in docker. Deployment and ingress require a non-empty
+// Scope (parsed from the first HCL label in `deployment "scope" "name"
+// { ... }`). Uniqueness of (kind, name) is enforced per-scope only:
+// two scopes may both declare `deployment "web"` because their
+// container slots, image tags, release dirs and env files are keyed by
+// AppID(scope, name), which collapses to `<scope>-<name>`. Other kinds
+// leave Scope empty — they exist at most once per name.
 type Manifest struct {
 	Kind     Kind            `json:"kind"`
 	Scope    string          `json:"scope,omitempty"`
 	Name     string          `json:"name"`
 	Spec     json.RawMessage `json:"spec,omitempty"`
 	Metadata *Metadata       `json:"metadata,omitempty"`
+}
+
+// AppID is the canonical on-host identifier for a (scope, name) pair.
+// Every filesystem path, container name, image tag, and env-file the
+// platform materialises for a deployment is keyed by this string so
+// multiple scopes can reuse the same name without colliding.
+//
+//	AppID("prod", "web")  == "prod-web"
+//	AppID("", "postgres") == "postgres"        // unscoped kinds
+//
+// Unscoped callers (databases, generic services) pass scope == "" and
+// get the bare name back. Deployment and ingress — the scoped kinds —
+// always carry a scope, so the "-" form is the effective shape in
+// practice. Keep this function the single source of truth for the
+// derivation; ad-hoc `scope + "-" + name` concatenations will drift.
+func AppID(scope, name string) string {
+	if scope == "" {
+		return name
+	}
+
+	return scope + "-" + name
 }
 
 // ScopedKinds is the set of kinds whose manifests must carry a non-empty

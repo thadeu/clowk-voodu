@@ -53,18 +53,15 @@ deployment "test" "api" {
 }
 
 func TestParseHCLDeploymentBuildMode(t *testing.T) {
-	// Mirrors the flat "voodu.yml-style" attribute set: no image, a
-	// workdir/dockerfile/path pointing at a subtree, lang hints, and a
-	// post_deploy hook. The resolution rule (image → registry vs. path →
-	// build) is enforced by the handler — the parser just has to carry
-	// every field through cleanly.
+	// The pipeline/container concerns stay at root (workdir, path,
+	// ports, env, post_deploy, ...) while runtime build inputs live
+	// inside the unified `lang {}` block. Go-specific cross-compile
+	// flags (GOOS/GOARCH/CGO_ENABLED) ride inside build_args.
 	src := `
 deployment "test" "api" {
   workdir      = "apps/esl"
   dockerfile   = "Dockerfile.api"
   path         = "cmd/api"
-  lang         = "go"
-  go_version   = "1.25"
   ports        = ["127.0.0.1:9092:9092"]
   volumes      = ["/opt/gokku/volumes/rtp:/app/recordings"]
   network      = "bridge"
@@ -72,6 +69,17 @@ deployment "test" "api" {
   env          = { RAILS_ENV = "production" }
   post_deploy  = ["./bin/migrate"]
   health_check = "/healthz"
+
+  lang {
+    name    = "go"
+    version = "1.25"
+    build_args = {
+      GOOS        = "linux"
+      GOARCH      = "amd64"
+      CGO_ENABLED = "0"
+      GIT_SHA     = "abc123"
+    }
+  }
 }
 `
 	tmp := writeTemp(t, "build.hcl", src)
@@ -99,8 +107,16 @@ deployment "test" "api" {
 		t.Errorf("source fields not carried: %+v", spec)
 	}
 
-	if spec.Lang != "go" || spec.GoVersion != "1.25" {
-		t.Errorf("lang hints lost: lang=%q go_version=%q", spec.Lang, spec.GoVersion)
+	if spec.Lang == nil {
+		t.Fatal("lang block lost")
+	}
+
+	if spec.Lang.Name != "go" || spec.Lang.Version != "1.25" {
+		t.Errorf("lang block fields lost: %+v", spec.Lang)
+	}
+
+	if spec.Lang.BuildArgs["GOOS"] != "linux" || spec.Lang.BuildArgs["GIT_SHA"] != "abc123" {
+		t.Errorf("build_args lost: %+v", spec.Lang.BuildArgs)
 	}
 
 	if len(spec.PostDeploy) != 1 || spec.PostDeploy[0] != "./bin/migrate" {
@@ -109,6 +125,43 @@ deployment "test" "api" {
 
 	if spec.HealthCheck != "/healthz" || spec.Restart != "unless-stopped" || spec.Network != "bridge" {
 		t.Errorf("runtime fields: %+v", spec)
+	}
+}
+
+func TestParseHCLDeploymentLangBlockExotic(t *testing.T) {
+	// The lang block accepts any name string — platforms the handler
+	// registry doesn't know about (Elixir, Java, Haskell) still land
+	// cleanly in the spec; handler dispatch at build time falls through
+	// to the generic Dockerfile path.
+	src := `
+deployment "test" "api" {
+  lang {
+    name    = "elixir"
+    version = "1.17"
+    build_args = {
+      MIX_ENV = "prod"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "exotic.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Lang == nil || spec.Lang.Name != "elixir" || spec.Lang.Version != "1.17" {
+		t.Errorf("exotic lang not carried: %+v", spec.Lang)
+	}
+
+	if spec.Lang.BuildArgs["MIX_ENV"] != "prod" {
+		t.Errorf("build_args lost: %+v", spec.Lang.BuildArgs)
 	}
 }
 

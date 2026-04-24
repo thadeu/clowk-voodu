@@ -461,6 +461,12 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return err
 	}
 
+	// Single on-host identity for this deployment: container slots,
+	// image tag, env file, release directory — everything is keyed by
+	// AppID so two scopes can both declare `deployment "web"` without
+	// fighting over the same docker name or filesystem path.
+	app := AppID(ev.Scope, ev.Name)
+
 	// Build-mode (no image, source streamed via voodu receive-pack)
 	// produces an image tagged <app>:latest. The controller never sees
 	// the build itself — receive-pack runs it — so we resolve the
@@ -468,7 +474,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// ensureContainer's `Image == ""` early return swallows every
 	// build-mode reconcile.
 	if spec.Image == "" {
-		spec.Image = ev.Name + ":latest"
+		spec.Image = app + ":latest"
 	}
 
 	// Network shaping. Two disjoint modes:
@@ -517,17 +523,15 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// (postgres pinned to 0.0.0.0:5432, say) declare the IP explicitly.
 	spec.Ports = normalizePorts(spec.Ports)
 
-	envChanged := false
-
-	if len(spec.Env) > 0 {
-		changed, err := h.linkEnv(ctx, ev.Name, spec.Env)
-		if err != nil {
-			return err
-		}
-
-		envChanged = changed
-	} else {
-		h.logf("deployment/%s no env to link", ev.Name)
+	// Always link env, even when spec.Env is empty. Two reasons:
+	//   1. docker run is invoked with --env-file unconditionally, so the
+	//      file must exist or the container fails to start.
+	//   2. `voodu config set` writes to the same file; linkEnv's Load/
+	//      Save round-trip preserves those values when the spec declares
+	//      no Env block of its own.
+	envChanged, err := h.linkEnv(ctx, app, spec.Env)
+	if err != nil {
+		return err
 	}
 
 	if h.Containers == nil {
@@ -535,19 +539,19 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	}
 
 	replicas := effectiveReplicas(spec)
-	slots := slotNames(ev.Name, replicas)
+	slots := slotNames(app, replicas)
 
 	// Prune the legacy bare-name container (pre-slot era) before
 	// anything else. Leaving it around collides on ports/volumes with
 	// the new `<app>-0` slot and leaks a detached process that ingress
 	// has no way to reach.
 	if spec.Image != "" {
-		if err := h.pruneLegacyContainer(ev.Name); err != nil {
+		if err := h.pruneLegacyContainer(app); err != nil {
 			h.logf("deployment/%s legacy prune failed: %v", ev.Name, err)
 		}
 	}
 
-	createdSlots, err := h.ensureSlots(ev.Name, slots, spec)
+	createdSlots, err := h.ensureSlots(app, slots, spec)
 	if err != nil {
 		return err
 	}
@@ -558,7 +562,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// from a previous apply that must go. Runs before drift detection
 	// so the rollout loop doesn't churn through containers that are
 	// about to be removed anyway.
-	if err := h.pruneExtraSlots(ev.Name, replicas); err != nil {
+	if err := h.pruneExtraSlots(app, replicas); err != nil {
 		h.logf("deployment/%s scale-down failed: %v", ev.Name, err)
 	}
 
@@ -566,7 +570,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		// Baseline the spec hash so the next reconcile has something
 		// to compare against. Without this, the very next apply would
 		// see no persisted status and treat a real drift as first-seen.
-		if err := h.putDeploymentStatus(ctx, ev.Name, spec); err != nil {
+		if err := h.putDeploymentStatus(ctx, app, spec); err != nil {
 			h.logf("deployment/%s status persist failed: %v", ev.Name, err)
 		}
 	}
@@ -580,7 +584,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	recreatedAny := false
 
 	if spec.Image != "" {
-		r, err := h.recreateSlotsIfSpecChanged(ctx, ev.Name, slots, spec)
+		r, err := h.recreateSlotsIfSpecChanged(ctx, app, slots, spec)
 		if err != nil {
 			return err
 		}
@@ -594,7 +598,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// nor just recreated (recreate already absorbed the env), and only
 	// when env actually moved.
 	if envChanged && !recreatedAny {
-		h.restartSlots(ev.Name, excludeSlots(slots, createdSlots))
+		h.restartSlots(app, excludeSlots(slots, createdSlots))
 	}
 
 	return nil

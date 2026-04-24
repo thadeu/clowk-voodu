@@ -13,8 +13,6 @@ const (
 	UserRCFile   = ".voodurc"
 	UserCfgDir   = ".voodu"
 	ConfigFile   = "config.yml"
-	VooduYAML    = "voodu.yml"
-	GokkuYAML    = "gokku.yml"
 	RemoteName   = "voodu"
 	RemoteLegacy = "gokku"
 )
@@ -41,7 +39,6 @@ func AppRelease(app string) string     { return filepath.Join(AppDir(app), "rele
 func AppCurrentLink(app string) string { return filepath.Join(AppDir(app), "current") }
 func AppSharedDir(app string) string   { return filepath.Join(AppDir(app), "shared") }
 func AppEnvFile(app string) string     { return filepath.Join(AppSharedDir(app), ".env") }
-func AppConfigYAML(app string) string  { return filepath.Join(AppDir(app), VooduYAML) }
 func AppVolumeDir(app string) string   { return filepath.Join(VolumesDir(), app) }
 func AppContainersDir(app string) string {
 	return filepath.Join(AppDir(app), "containers")

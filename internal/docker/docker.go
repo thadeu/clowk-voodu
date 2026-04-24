@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"go.voodu.clowk.in/internal/config"
 )
 
 const (
@@ -715,8 +713,16 @@ func updateContainerRestartPolicy(containerName, policy string) {
 	cmd.Run()
 }
 
-// RecreateActiveContainer recreates the active container with new environment variables.
-// Kept for backward compatibility but deprecated in favor of full redeploy.
+// RecreateActiveContainer recreates the active container with a new env
+// file. Used when secrets rotate — docker reads --env-file at container
+// create time only, so a plain `docker restart` would not pick up the
+// change; we have to destroy and recreate.
+//
+// Image, network mode, volumes, and port mappings are preserved from the
+// running container via `docker inspect`. That's deliberate: the live
+// container is the source of truth for "what's currently serving", and
+// re-reading a declarative spec here risks diverging from what actually
+// got deployed.
 func RecreateActiveContainer(appName, envFile, appDir string) error {
 	var activeContainer string
 
@@ -730,37 +736,13 @@ func RecreateActiveContainer(appName, envFile, appDir string) error {
 
 	fmt.Printf("-----> Recreating container: %s\n", activeContainer)
 
-	serverConfig, err := config.LoadServerConfigByApp(appName)
-
+	inspected, err := inspectContainerShape(activeContainer)
 	if err != nil {
-		return fmt.Errorf("failed to load server config: %v", err)
+		return fmt.Errorf("inspect %s: %w", activeContainer, err)
 	}
 
-	appConfig, err := serverConfig.GetApp(appName)
-
-	if err != nil {
-		return fmt.Errorf("failed to get app config: %v", err)
-	}
-
-	cmd := exec.Command("docker", "inspect", activeContainer, "--format", "{{.Config.Image}}")
-	output, err := cmd.Output()
-
-	if err != nil {
-		return fmt.Errorf("could not determine container image: %v", err)
-	}
-
-	image := strings.TrimSpace(string(output))
-	fmt.Printf("       Using image: %s\n", image)
-
-	networkMode := "bridge"
-
-	if appConfig.Network != nil && appConfig.Network.Mode != "" {
-		networkMode = appConfig.Network.Mode
-	}
-
-	containerPort := GetContainerPort(envFile, 0)
-
-	fmt.Printf("       Network mode: %s\n", networkMode)
+	fmt.Printf("       Using image: %s\n", inspected.Image)
+	fmt.Printf("       Network mode: %s\n", inspected.NetworkMode)
 
 	fmt.Println("       Stopping old container...")
 
@@ -769,27 +751,16 @@ func RecreateActiveContainer(appName, envFile, appDir string) error {
 
 	containerConfig := ContainerConfig{
 		Name:          activeContainer,
-		Image:         image,
-		NetworkMode:   networkMode,
+		Image:         inspected.Image,
+		NetworkMode:   inspected.NetworkMode,
 		RestartPolicy: "always",
 		WorkingDir:    "/app",
-		Volumes:       []string{fmt.Sprintf("%s:/app", appDir)},
+		Volumes:       inspected.Volumes,
+		Ports:         inspected.Ports,
 	}
 
-	if len(appConfig.Volumes) > 0 {
-		containerConfig.Volumes = append(containerConfig.Volumes, appConfig.Volumes...)
-		fmt.Printf("       Adding %d custom volumes\n", len(appConfig.Volumes))
-	}
-
-	if networkMode != "host" {
-		if len(appConfig.Ports) > 0 {
-			containerConfig.Ports = appConfig.Ports
-			fmt.Println("       Using ports from voodu.yml")
-		} else {
-			containerConfig.Ports = []string{fmt.Sprintf("%d:%d", containerPort, containerPort)}
-		}
-	} else {
-		fmt.Println("       Using host network (all ports exposed)")
+	if len(containerConfig.Volumes) == 0 {
+		containerConfig.Volumes = []string{fmt.Sprintf("%s:/app", appDir)}
 	}
 
 	if fileExists(envFile) {
@@ -805,6 +776,76 @@ func RecreateActiveContainer(appName, envFile, appDir string) error {
 	fmt.Println("Container recreated successfully with new environment")
 
 	return nil
+}
+
+// containerShape captures the bits of a live container we need to
+// recreate it identically minus its env.
+type containerShape struct {
+	Image       string
+	NetworkMode string
+	Ports       []string
+	Volumes     []string
+}
+
+// inspectContainerShape pulls image, network mode, port bindings and
+// bind-mount volumes out of a running container via `docker inspect`.
+func inspectContainerShape(name string) (*containerShape, error) {
+	cmd := exec.Command("docker", "inspect", name)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var raw []struct {
+		Config struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
+
+		HostConfig struct {
+			NetworkMode  string                           `json:"NetworkMode"`
+			Binds        []string                         `json:"Binds"`
+			PortBindings map[string][]struct{ HostIP, HostPort string } `json:"PortBindings"`
+		} `json:"HostConfig"`
+	}
+
+	if err := json.Unmarshal(output, &raw); err != nil {
+		return nil, fmt.Errorf("parse docker inspect: %w", err)
+	}
+
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("no container data for %s", name)
+	}
+
+	entry := raw[0]
+
+	shape := &containerShape{
+		Image:       entry.Config.Image,
+		NetworkMode: entry.HostConfig.NetworkMode,
+		Volumes:     entry.HostConfig.Binds,
+	}
+
+	if shape.NetworkMode == "" {
+		shape.NetworkMode = "bridge"
+	}
+
+	for containerSpec, bindings := range entry.HostConfig.PortBindings {
+		containerPort := strings.SplitN(containerSpec, "/", 2)[0]
+
+		for _, b := range bindings {
+			if b.HostPort == "" {
+				continue
+			}
+
+			if b.HostIP != "" {
+				shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s:%s", b.HostIP, b.HostPort, containerPort))
+			} else {
+				shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s", b.HostPort, containerPort))
+			}
+		}
+	}
+
+	return shape, nil
 }
 
 // BlueGreenRollback performs rollback to previous blue container.

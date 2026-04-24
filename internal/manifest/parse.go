@@ -160,46 +160,62 @@ type hclRoot struct {
 }
 
 type hclDeployment struct {
-	Scope       string            `hcl:"scope,label"`
-	Name        string            `hcl:"name,label"`
-	Image       string            `hcl:"image,optional"`
-	Workdir     string            `hcl:"workdir,optional"`
-	Dockerfile  string            `hcl:"dockerfile,optional"`
-	Path        string            `hcl:"path,optional"`
-	Lang        string            `hcl:"lang,optional"`
-	GoVersion   string            `hcl:"go_version,optional"`
-	Replicas    int               `hcl:"replicas,optional"`
-	Command     []string          `hcl:"command,optional"`
-	Env         map[string]string `hcl:"env,optional"`
-	Ports       []string          `hcl:"ports,optional"`
-	Volumes     []string          `hcl:"volumes,optional"`
-	Network     string            `hcl:"network,optional"`
-	Networks    []string          `hcl:"networks,optional"`
-	NetworkMode string            `hcl:"network_mode,optional"`
-	Restart     string            `hcl:"restart,optional"`
-	HealthCheck string            `hcl:"health_check,optional"`
-	PostDeploy  []string          `hcl:"post_deploy,optional"`
+	Scope        string            `hcl:"scope,label"`
+	Name         string            `hcl:"name,label"`
+	Image        string            `hcl:"image,optional"`
+	Workdir      string            `hcl:"workdir,optional"`
+	Dockerfile   string            `hcl:"dockerfile,optional"`
+	Path         string            `hcl:"path,optional"`
+	Replicas     int               `hcl:"replicas,optional"`
+	Command      []string          `hcl:"command,optional"`
+	Env          map[string]string `hcl:"env,optional"`
+	Ports        []string          `hcl:"ports,optional"`
+	Volumes      []string          `hcl:"volumes,optional"`
+	Network      string            `hcl:"network,optional"`
+	Networks     []string          `hcl:"networks,optional"`
+	NetworkMode  string            `hcl:"network_mode,optional"`
+	Restart      string            `hcl:"restart,optional"`
+	HealthCheck  string            `hcl:"health_check,optional"`
+	PostDeploy   []string          `hcl:"post_deploy,optional"`
+	KeepReleases int               `hcl:"keep_releases,optional"`
+
+	Lang *hclLangBlock `hcl:"lang,block"`
+}
+
+type hclLangBlock struct {
+	Name       string            `hcl:"name,optional"`
+	Version    string            `hcl:"version,optional"`
+	Entrypoint string            `hcl:"entrypoint,optional"`
+	BuildArgs  map[string]string `hcl:"build_args,optional"`
 }
 
 func (b hclDeployment) spec() DeploymentSpec {
 	s := DeploymentSpec{
-		Image:       b.Image,
-		Workdir:     b.Workdir,
-		Dockerfile:  b.Dockerfile,
-		Path:        b.Path,
-		Lang:        b.Lang,
-		GoVersion:   b.GoVersion,
-		Replicas:    b.Replicas,
-		Command:     b.Command,
-		Env:         b.Env,
-		Ports:       b.Ports,
-		Volumes:     b.Volumes,
-		Network:     b.Network,
-		Networks:    b.Networks,
-		NetworkMode: b.NetworkMode,
-		Restart:     b.Restart,
-		HealthCheck: b.HealthCheck,
-		PostDeploy:  b.PostDeploy,
+		Image:        b.Image,
+		Workdir:      b.Workdir,
+		Dockerfile:   b.Dockerfile,
+		Path:         b.Path,
+		Replicas:     b.Replicas,
+		Command:      b.Command,
+		Env:          b.Env,
+		Ports:        b.Ports,
+		Volumes:      b.Volumes,
+		Network:      b.Network,
+		Networks:     b.Networks,
+		NetworkMode:  b.NetworkMode,
+		Restart:      b.Restart,
+		HealthCheck:  b.HealthCheck,
+		PostDeploy:   b.PostDeploy,
+		KeepReleases: b.KeepReleases,
+	}
+
+	if b.Lang != nil {
+		s.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+			BuildArgs:  b.Lang.BuildArgs,
+		}
 	}
 
 	s.applyDefaults()
@@ -399,7 +415,7 @@ func parseYAML(raw []byte) ([]controller.Manifest, error) {
 			return nil, err
 		}
 
-		spec, err := decodeYAMLSpec(kind, doc.Spec)
+		spec, err := decodeYAMLSpec(kind, doc.Name, doc.Spec)
 		if err != nil {
 			return nil, fmt.Errorf("%s/%s: %w", doc.Kind, doc.Name, err)
 		}
@@ -418,7 +434,7 @@ func parseYAML(raw []byte) ([]controller.Manifest, error) {
 // decodeYAMLSpec enforces the per-kind schema when reading YAML. HCL gets
 // this for free from hclsimple; YAML has to do it explicitly to keep
 // error messages actionable.
-func decodeYAMLSpec(kind controller.Kind, node yaml.Node) (any, error) {
+func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, error) {
 	switch kind {
 	case controller.KindDeployment:
 		var s DeploymentSpec

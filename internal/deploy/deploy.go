@@ -1,12 +1,19 @@
 // Package deploy orchestrates a single app release after its source has
-// landed on disk: apply env overrides from voodu.yml, build the image,
-// swap the `current` symlink, run post-deploy hooks, and restart the
-// container.
+// landed on disk: build the image, swap the `current` symlink, run
+// post-deploy hooks, and restart the container.
 //
 // Source lands via RunFromTarball in tarball.go — the CLI streams a
 // gzipped build context over SSH into `voodu receive-pack`, which
 // extracts to a content-addressed release dir and then drives the
 // pipeline below.
+//
+// Build-time configuration (lang, go_version, dockerfile, post_deploy,
+// etc.) reaches this package through the controller: receive-pack
+// fetches the DeploymentSpec from the local controller HTTP API and
+// hands it to RunFromTarball via Options.Spec. When absent (legacy
+// callers or brand-new app with no manifest yet), the pipeline falls
+// back to zero-value defaults and auto-detects the language from the
+// extracted release tree.
 package deploy
 
 import (
@@ -14,13 +21,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 
-	"gopkg.in/yaml.v3"
-
-	"go.voodu.clowk.in/internal/config"
-	"go.voodu.clowk.in/internal/docker"
-	"go.voodu.clowk.in/internal/envfile"
 	"go.voodu.clowk.in/internal/lang"
 	"go.voodu.clowk.in/internal/paths"
 )
@@ -33,6 +34,13 @@ type Options struct {
 	// Force bypasses content-hash dedup: even if a release with the
 	// incoming build-id already exists, rebuild from scratch.
 	Force bool
+
+	// Spec is the DeploymentSpec fetched from the controller for this
+	// app. It carries both build-time inputs (consumed by lang handlers
+	// via Spec.toBuildSpec) and pipeline-only fields (PostDeploy,
+	// KeepReleases). Nil is valid — the pipeline falls back to
+	// auto-detection with zero-value defaults.
+	Spec *Spec
 }
 
 func (o *Options) log(format string, args ...any) {
@@ -47,11 +55,14 @@ func (o *Options) log(format string, args ...any) {
 
 // runPipeline executes every stage *after* source has landed in releaseDir.
 func runPipeline(app, releaseDir string, opts *Options) error {
-	if err := applyConfigEnv(app, releaseDir, opts); err != nil {
-		opts.log("Warning: could not process voodu.yml: %v", err)
+	spec := opts.Spec
+	if spec == nil {
+		spec = &Spec{}
 	}
 
-	if err := buildRelease(app, releaseDir, opts); err != nil {
+	build := spec.toBuildSpec()
+
+	if err := buildRelease(app, releaseDir, build, opts); err != nil {
 		return fmt.Errorf("build release: %w", err)
 	}
 
@@ -59,79 +70,13 @@ func runPipeline(app, releaseDir string, opts *Options) error {
 		return fmt.Errorf("swap current symlink: %w", err)
 	}
 
-	if err := runPostDeploy(app, releaseDir, opts); err != nil {
+	if err := runPostDeploy(releaseDir, spec, opts); err != nil {
 		opts.log("Warning: post-deploy hook failed: %v", err)
-	}
-
-	if err := startContainers(app, releaseDir, opts); err != nil {
-		return fmt.Errorf("start containers: %w", err)
 	}
 
 	opts.log("Deploy completed successfully for '%s'", app)
 
 	return nil
-}
-
-// applyConfigEnv looks for <release>/voodu.yml (or legacy gokku.yml) and
-// merges its `env:` block into the app's shared/.env file, preserving
-// any keys previously set via `voodu config:set`.
-func applyConfigEnv(app, releaseDir string, opts *Options) error {
-	vooduYml := filepath.Join(releaseDir, paths.VooduYAML)
-	legacyYml := filepath.Join(releaseDir, paths.GokkuYAML)
-
-	cfgPath := vooduYml
-
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		if _, err := os.Stat(legacyYml); err == nil {
-			cfgPath = legacyYml
-		} else {
-			return nil
-		}
-	}
-
-	opts.log("-----> Found %s, processing configuration...", filepath.Base(cfgPath))
-
-	srv, err := loadServerConfig(cfgPath)
-	if err != nil {
-		return err
-	}
-
-	appCfg, err := srv.GetApp(app)
-	if err != nil {
-		return nil
-	}
-
-	if len(appCfg.Env) == 0 {
-		return nil
-	}
-
-	envPath := paths.AppEnvFile(app)
-
-	vars, err := envfile.Load(envPath)
-	if err != nil {
-		return err
-	}
-
-	for k, v := range appCfg.Env {
-		vars[k] = v
-	}
-
-	return envfile.Save(envPath, vars)
-}
-
-func loadServerConfig(path string) (*config.ServerConfig, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	var srv config.ServerConfig
-
-	if err := yaml.Unmarshal(data, &srv); err != nil {
-		return nil, err
-	}
-
-	return &srv, nil
 }
 
 // buildRelease turns the extracted release directory into a Docker image
@@ -141,26 +86,18 @@ func loadServerConfig(path string) (*config.ServerConfig, error) {
 // with Voodu metadata via internal/docker.GetVooduLabels).
 //
 // Resolution order:
-//   - No voodu.yml → auto-detect language from the release contents.
-//   - App.Image set to a registry image → pull + retag instead of build.
-//   - Otherwise → generate or honour Dockerfile, run `docker build`.
-func buildRelease(appName, releaseDir string, opts *Options) error {
+//   - spec.Lang.Name non-empty → use that handler.
+//   - spec.Image set to a registry image → pull + retag instead of build.
+//   - otherwise → auto-detect language from release contents.
+func buildRelease(appName, releaseDir string, spec *lang.BuildSpec, opts *Options) error {
 	opts.log("-----> Building release...")
 
-	appCfg, err := config.LoadAppConfig(appName)
-	if err != nil || appCfg == nil {
-		// No voodu.yml on disk yet (common for a brand-new app — the
-		// first tarball creates it). Fall back to an empty app spec so
-		// lang.NewLang runs pure auto-detection on the release dir.
-		appCfg = &config.App{Name: appName}
-	}
-
-	handler, err := lang.NewLang(appCfg, releaseDir)
+	handler, err := lang.NewLang(spec, releaseDir)
 	if err != nil {
 		return fmt.Errorf("select language handler: %w", err)
 	}
 
-	if err := handler.Build(appName, appCfg, releaseDir); err != nil {
+	if err := handler.Build(appName, spec, releaseDir); err != nil {
 		return err
 	}
 
@@ -176,19 +113,19 @@ func swapCurrentSymlink(app, releaseDir string) error {
 	return os.Symlink(releaseDir, link)
 }
 
-func runPostDeploy(app, releaseDir string, opts *Options) error {
-	appCfg, err := config.LoadAppConfig(app)
-	if err != nil {
-		return nil
-	}
-
-	if appCfg.Deployment == nil || len(appCfg.Deployment.PostDeploy) == 0 {
+// runPostDeploy runs spec.PostDeploy commands (if any) with the release
+// dir as CWD. Each command runs through `bash -c` so shell features
+// (pipes, redirection, `&&`) just work. First failure aborts the
+// sequence and surfaces to the caller — the caller logs without
+// failing the overall deploy.
+func runPostDeploy(releaseDir string, spec *Spec, opts *Options) error {
+	if spec == nil || len(spec.PostDeploy) == 0 {
 		return nil
 	}
 
 	opts.log("-----> Running post-deploy commands...")
 
-	for _, command := range appCfg.Deployment.PostDeploy {
+	for _, command := range spec.PostDeploy {
 		opts.log("       $ %s", command)
 
 		cmd := exec.Command("bash", "-c", command)
@@ -200,32 +137,6 @@ func runPostDeploy(app, releaseDir string, opts *Options) error {
 			return fmt.Errorf("post-deploy %q: %w", command, err)
 		}
 	}
-
-	return nil
-}
-
-func startContainers(app, releaseDir string, opts *Options) error {
-	// HCL-managed apps don't have voodu.yml — the controller owns
-	// container lifecycle via `voodu apply`, which runs right after
-	// receive-pack completes. Trying the legacy recreate path here would
-	// fail on the missing config and pollute output with a red herring.
-	vooduYml := filepath.Join(releaseDir, paths.VooduYAML)
-	legacyYml := filepath.Join(releaseDir, paths.GokkuYAML)
-
-	if _, err := os.Stat(vooduYml); os.IsNotExist(err) {
-		if _, err := os.Stat(legacyYml); os.IsNotExist(err) {
-			opts.log("-----> Skipping container start (no voodu.yml — controller-managed)")
-			return nil
-		}
-	}
-
-	opts.log("-----> Starting containers...")
-
-	if err := docker.RecreateActiveContainer(app, paths.AppEnvFile(app), releaseDir); err != nil {
-		return err
-	}
-
-	opts.log("-----> Containers started")
 
 	return nil
 }

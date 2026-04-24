@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/deploy"
 )
 
@@ -18,14 +19,15 @@ import (
 // Invoked as:
 //
 //	voodu receive-pack <scope>/<name>     # two-label form (preferred)
-//	voodu receive-pack <name>             # legacy single-label, same
-//	                                        semantics while we migrate
+//	voodu receive-pack <name>             # legacy single-label, empty
+//	                                        scope — AppID collapses to name
 //
-// The scope is accepted in the ref for forward compatibility and to
-// mirror what the controller stores, but only the name is used to
-// resolve filesystem paths today — per-scope app dirs would be a
-// separate migration. Hidden from `voodu --help` because normal users
-// never invoke it by hand — the CLI drives it via SSH from `voodu apply`.
+// The scope shapes the on-host identity: the release dir, env file,
+// image tag, and container slots are all keyed by AppID(scope, name)
+// (= "<scope>-<name>"), so two different scopes can deploy the same
+// logical name without fighting over disk or docker. Hidden from
+// `voodu --help` because normal users never invoke it by hand — the
+// CLI drives it via SSH from `voodu apply`.
 func newReceivePackCmd() *cobra.Command {
 	var force bool
 
@@ -45,18 +47,32 @@ which detects build-mode deployments and streams the tarball for you.
 
 Dedup: the build-id is the sha256 of the tarball content. A second
 invocation with an identical tree skips rebuild and just repoints
-'current'. Pass --force to rebuild anyway.`,
+'current'. Pass --force to rebuild anyway.
+
+Build configuration (lang, go_version, dockerfile, post_deploy, …)
+is pulled from the local controller at VOODU_CONTROLLER_URL — the
+source of truth is whatever 'voodu apply' persisted for this
+deployment. When the controller has no manifest yet (first receive
+for a brand-new app) the pipeline falls back to auto-detection.`,
 		Hidden: true,
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, name, err := parseScopedRef(args[0])
+			scope, name, err := parseScopedRef(args[0])
 			if err != nil {
 				return err
 			}
 
-			return deploy.RunFromTarball(name, os.Stdin, deploy.Options{
+			spec, err := deploy.FetchSpec(controllerURL(cmd.Root()), scope, name)
+			if err != nil {
+				// Don't fall back silently — the operator needs to see
+				// that the build-config source of truth is broken.
+				return fmt.Errorf("fetch deployment spec from controller: %w", err)
+			}
+
+			return deploy.RunFromTarball(controller.AppID(scope, name), os.Stdin, deploy.Options{
 				LogWriter: os.Stdout,
 				Force:     force,
+				Spec:      spec,
 			})
 		},
 	}
