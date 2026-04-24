@@ -27,6 +27,7 @@ type applyFlags struct {
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
 	autoApprove      bool   // apply only: skip the interactive confirmation in forwarded mode
 	force            bool   // apply only: force rebuild even when the tarball hash already has a release
+	verbose          bool   // apply only: passthrough raw build output instead of collapsing to a spinner
 }
 
 func newApplyCmd() *cobra.Command {
@@ -67,7 +68,11 @@ tarball. Identical trees skip rebuild and just repoint the 'current'
 symlink — fast path for "same code, redeploy". Pass --force to
 rebuild the image anyway (useful for non-deterministic build caches
 or when validating CI image changes). VOODU_FORCE_REBUILD=1 has the
-same effect.`,
+same effect.
+
+Build output is collapsed into a spinner by default so docker buildx
+chatter stays out of the way. Pass --verbose (alias -v) to see the
+raw stream when debugging a failed build.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runApply(cmd, f)
 		},
@@ -78,6 +83,7 @@ same effect.`,
 	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "upsert only; do not delete other resources in the same (scope, kind)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
+	cmd.Flags().BoolVarP(&f.verbose, "verbose", "v", false, "show raw docker build output (default: collapse into a spinner)")
 
 	return cmd
 }
@@ -157,8 +163,12 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	// `force` only has meaning when we push a tarball to receive-pack;
 	// the local path reconciles the controller directly and never
 	// touches the build cache. The flag is silently ignored here.
+	//
+	// `verbose` is a presentation knob for the forwarded path's
+	// spinner — local apply has no build output to collapse.
 	_ = f.autoApprove
 	_ = f.force
+	_ = f.verbose
 
 	root := cmd.Root()
 

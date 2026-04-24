@@ -101,7 +101,7 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 	// only reachable here via the env var — the --force flag lives on
 	// `apply` and is routed through runApplyForwarded above.
 	if len(stream.buildModeDeploys) > 0 {
-		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys, false); err != nil {
+		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys, false, false); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1, true
 		}
@@ -139,12 +139,13 @@ func isApplyCommand(args []string) bool {
 // applyClientFlags is the small bag of apply-only flags that the
 // client *consumes* before forwarding. The server ignores all of them
 // — they drive client-side control flow (the y/N prompt, the force
-// bit on the receive-pack push) — so we pull them out once here and
-// pass the parsed result to the orchestrator, keeping the forwarded
-// SSH argv tidy.
+// bit on the receive-pack push, the spinner/verbose presentation
+// mode) — so we pull them out once here and pass the parsed result
+// to the orchestrator, keeping the forwarded SSH argv tidy.
 type applyClientFlags struct {
 	autoApprove bool // -y / --auto-approve: skip the interactive prompt
 	force       bool // --force: rebuild build-mode deploys on hash hit
+	verbose     bool // -v / --verbose: disable spinner, passthrough raw build output
 }
 
 // extractApplyClientFlags walks argv once, pulling out the bool flags
@@ -165,6 +166,8 @@ func extractApplyClientFlags(args []string) (applyClientFlags, []string) {
 			f.autoApprove = true
 		case "--force":
 			f.force = true
+		case "-v", "--verbose":
+			f.verbose = true
 		default:
 			out = append(out, tok)
 		}
@@ -224,9 +227,14 @@ func hasDefaultRemote() bool {
 // validating CI image changes. VOODU_FORCE_REBUILD=1 is still honoured
 // as an env-var escape hatch; either path lights the same --force
 // token on the remote receive-pack invocation.
-func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildModeDep, force bool) error {
+//
+// `verbose` disables the spinner that collapses docker buildx output
+// in a TTY. Off by default — docker buildx dumps 80% chatter 20%
+// signal, and the user already sees `-----> Building release...` →
+// `✓ Built X in Ns`. Pass -v on apply to debug a failed build.
+func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildModeDep, force, verbose bool) error {
 	for _, d := range deploys {
-		if err := pushSourceViaTarball(info, identity, d, force); err != nil {
+		if err := pushSourceViaTarball(info, identity, d, force, verbose); err != nil {
 			return fmt.Errorf("receive-pack %s/%s: %w", d.Scope, d.Name, err)
 		}
 	}
@@ -242,17 +250,47 @@ func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildMod
 // `force` (or VOODU_FORCE_REBUILD=1 in the env) appends --force to the
 // remote receive-pack argv, asking the server to rebuild the image
 // even when the content-addressed release already exists.
-func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, force bool) error {
-	fmt.Fprintf(os.Stderr, "-----> Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
+//
+// `verbose` bypasses the progressFilter so the raw docker buildx
+// stream reaches the user's terminal untouched. Default (verbose
+// false) collapses the noisy middle of the build into a spinner.
+func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, force, verbose bool) error {
+	// Filter is built up front so the client-side "-----> Shipping …"
+	// banner flows through the same pipeline as the server-emitted
+	// phases (Receiving, Creating release, Building release). In
+	// non-verbose TTY mode that means Shipping opens the first spinner
+	// step and commits as `✓ Shipping … (Ns)` when Receiving arrives.
+	// In verbose / non-TTY modes the filter passes through, so the
+	// banner still shows up — just with its raw `----->` prefix.
+	filter := newProgressFilter(os.Stdout, verbose)
+
+	// Record the deploy name BEFORE the filter sees Shipping, so the
+	// step's openStep() reads the right lastShippedTag for the
+	// eventual `✓ Built <tag> in Ns` summary.
+	rememberShippedTag(d.Name)
+
+	fmt.Fprintf(filter, "-----> Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
 
 	pr, pw := io.Pipe()
+
+	// The tar builder's own progress log ("tarball: using .dockerignore",
+	// "tarball: N files, X KB") is useful when debugging a slow or
+	// oversized upload, but it bypasses the progressFilter (it goes
+	// direct to stderr, not through the SSH pipe), so leaving it on in
+	// non-verbose mode would clutter the curated output. Attach it only
+	// when the user asked for --verbose; the spinner covers the user-
+	// facing feedback otherwise.
+	var tarProgress io.Writer
+	if verbose {
+		tarProgress = os.Stderr
+	}
 
 	// Goroutine drives tar production; any error flows to the reader
 	// side via CloseWithError and surfaces when SSH hits EOF.
 	go func() {
 		_, err := tarball.Stream(pw, d.Path, tarball.Options{
 			MaxSize:  buildContextMaxSize(),
-			Progress: os.Stderr,
+			Progress: tarProgress,
 		})
 
 		// CloseWithError(nil) behaves like Close — no error propagates
@@ -270,10 +308,23 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 		args = append(args, "--force")
 	}
 
+	// Both streams feed the filter. docker buildx writes its progress
+	// stream to stderr; ignoring stderr here would let the #N noise
+	// bypass the spinner entirely (proven during first live test).
+	// The filter's mutex keeps concurrent writes from interleaving
+	// mid-line.
 	code, err := remote.Forward(info, args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    pr,
+		Stdout:   filter,
+		Stderr:   filter,
 	})
+
+	// Always flush the filter, even on error — otherwise a build that
+	// crashed mid-stream would leave a dangling spinner on the user's
+	// terminal. Close is a no-op when verbose/non-TTY.
+	_ = filter.Close()
+
 	if err != nil {
 		return err
 	}

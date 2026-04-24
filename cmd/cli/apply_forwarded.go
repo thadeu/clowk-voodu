@@ -136,26 +136,45 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// Phase 2: push source tarballs for build-mode deployments *now*,
 	// not before the diff. If the user cancels at the prompt (in case
 	// 2 above) we never reach this point — that's the whole win of the
-	// split flow.
+	// split flow. A blank line both before and after the build block
+	// separates it visually from the surrounding narrative ("No spec
+	// changes…" header, "deployment/X applied" footer) so the user
+	// reads three distinct sections: intent, build, result.
 	if needsSourcePush {
-		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys, flags.force); err != nil {
+		fmt.Fprintln(os.Stdout)
+
+		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys, flags.force, flags.verbose); err != nil {
 			return 1, err
 		}
+
+		fmt.Fprintln(os.Stdout)
 	}
 
-	return remote.Forward(info, stream.args, remote.ForwardOptions{
+	// Phase 3: the actual `voodu apply` on the server. The server emits
+	// one status line per manifest ("<kind>/<scope>/<name> applied").
+	// We wrap its stdout through applyResultFilter to get a matching
+	// green ✓ for each, keeping the DX consistent with the build steps
+	// above. --verbose is the escape hatch: no styling, raw stream.
+	resultFilter := newApplyResultFilter(os.Stdout, flags.verbose)
+
+	code, err = remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    bytes.NewReader(body),
+		Stdout:   resultFilter,
 		Env:      env,
 	})
+
+	_ = resultFilter.Close()
+
+	return code, err
 }
 
 // rewriteApplyToDiffJSON turns the forwarded `apply ...` argv into its
 // `diff ...` equivalent for phase 1. We always force `-o json` so the
 // server emits the machine-readable plan regardless of whatever the
-// user typed at top level. Apply-only flags (--auto-approve, --force)
-// are stripped — harmless on diff (--force would just be ignored), but
-// leaves the SSH command line clean for ssh -v / logs.
+// user typed at top level. Apply-only flags (--auto-approve, --force,
+// --verbose) are stripped — harmless on diff, but leaves the SSH
+// command line clean for ssh -v / logs.
 //
 // `--detailed-exitcode` is intentionally passed through: if the
 // server's diff decides there are no changes it'll exit 0, which is
@@ -167,7 +186,7 @@ func rewriteApplyToDiffJSON(args []string) []string {
 		switch tok {
 		case "apply":
 			out = append(out, "diff")
-		case "-y", "--auto-approve", "--force":
+		case "-y", "--auto-approve", "--force", "-v", "--verbose":
 			// Apply-only concern. Drop.
 		default:
 			out = append(out, tok)

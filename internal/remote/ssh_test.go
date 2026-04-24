@@ -193,6 +193,42 @@ func TestForwardCapturesStdout(t *testing.T) {
 	}
 }
 
+// TestForwardCapturesStderr is the symmetric counterpart to
+// TestForwardCapturesStdout. It matters because docker buildx (the
+// main consumer of the progress filter on the client) writes its
+// `#N` stream to stderr, not stdout. Without this override the
+// filter would only see half the build output.
+func TestForwardCapturesStderr(t *testing.T) {
+	tmp := t.TempDir()
+
+	stub := filepath.Join(tmp, "ssh-stub")
+	// The stub emits on stderr only; stdout stays empty.
+	script := "#!/bin/bash\nprintf 'HELLO-STDERR' >&2\n"
+
+	if err := os.WriteFile(stub, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	info := &Info{Host: "u@h"}
+
+	var buf bytes.Buffer
+
+	force := false
+
+	_, err := Forward(info, []string{"receive-pack", "app"}, ForwardOptions{
+		SSHBin:   stub,
+		ForceTTY: &force,
+		Stderr:   &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := buf.String(); got != "HELLO-STDERR" {
+		t.Errorf("captured stderr: got %q, want %q", got, "HELLO-STDERR")
+	}
+}
+
 func TestForwardPassesIdentityAndTTY(t *testing.T) {
 	tmp := t.TempDir()
 	out := filepath.Join(tmp, "args.txt")

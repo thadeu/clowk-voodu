@@ -36,9 +36,15 @@ type ForwardOptions struct {
 	// for the remote process. Used by orchestrated flows (e.g. `voodu
 	// apply` forwarded: phase 1 captures `diff -o json` into a buffer
 	// so the client can parse and prompt before kicking off phase 2).
-	// Stderr always streams to os.Stderr — we want remote errors visible
-	// in real time regardless of what we do with stdout.
 	Stdout io.Writer
+
+	// Stderr, when non-nil, replaces os.Stderr as the sink for the
+	// remote process's stderr. Needed because docker buildx on the
+	// server emits its progress stream over stderr, not stdout — so
+	// the client-side progressFilter has to intercept both pipes to
+	// see the full picture. When nil, stderr passes straight through
+	// to the user's terminal (the sane default for interactive flows).
+	Stderr io.Writer
 
 	// Env gets inlined before the remote binary as `KEY=VAL` pairs so
 	// the remote voodu sees them. SSH won't forward env vars through
@@ -99,7 +105,11 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 		cmd.Stdout = os.Stdout
 	}
 
-	cmd.Stderr = os.Stderr
+	if opts.Stderr != nil {
+		cmd.Stderr = opts.Stderr
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 
 	err := cmd.Run()
 	if err == nil {

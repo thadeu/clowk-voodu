@@ -52,6 +52,11 @@ func TestRewriteApplyToDiffJSON(t *testing.T) {
 			in:   []string{"apply", "--force", "-y", "-f", "-", "--format", "json"},
 			want: []string{"diff", "-f", "-", "--format", "json", "-o", "json"},
 		},
+		{
+			name: "strips -v / --verbose (apply-only)",
+			in:   []string{"apply", "-v", "--verbose", "-f", "-", "--format", "json"},
+			want: []string{"diff", "-f", "-", "--format", "json", "-o", "json"},
+		},
 	}
 
 	for _, c := range cases {
@@ -105,6 +110,24 @@ func TestExtractApplyClientFlags(t *testing.T) {
 			name:     "both --auto-approve and --force (idempotent, order preserved)",
 			in:       []string{"apply", "--auto-approve", "-f", "infra/dev", "--force"},
 			want:     applyClientFlags{autoApprove: true, force: true},
+			wantRest: []string{"apply", "-f", "infra/dev"},
+		},
+		{
+			name:     "-v short form",
+			in:       []string{"apply", "-v", "-f", "-"},
+			want:     applyClientFlags{verbose: true},
+			wantRest: []string{"apply", "-f", "-"},
+		},
+		{
+			name:     "--verbose long form",
+			in:       []string{"apply", "--verbose", "-f", "-"},
+			want:     applyClientFlags{verbose: true},
+			wantRest: []string{"apply", "-f", "-"},
+		},
+		{
+			name:     "all three flags together",
+			in:       []string{"apply", "-y", "--force", "--verbose", "-f", "infra/dev"},
+			want:     applyClientFlags{autoApprove: true, force: true, verbose: true},
 			wantRest: []string{"apply", "-f", "infra/dev"},
 		},
 	}
