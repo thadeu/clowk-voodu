@@ -47,6 +47,15 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// Phase 1: diff with -o json, capture stdout.
 	diffArgs := rewriteApplyToDiffJSON(stream.args)
 
+	// The SSH round-trip for the remote diff is the first — and
+	// slowest — thing that happens after the user hits Enter: handshake
+	// plus the server parsing the manifest and diffing it against live
+	// controller state. On a cold connection this can read as 1–3s of
+	// "is it frozen?" silence. Open a spinner up front so the terminal
+	// shows immediate life, and commit it as a ✓ when the plan lands.
+	checking := newProgressFilter(os.Stdout, flags.verbose)
+	fmt.Fprintln(checking, "-----> Checking remote state...")
+
 	var planBuf bytes.Buffer
 
 	code, err := remote.Forward(info, diffArgs, remote.ForwardOptions{
@@ -56,14 +65,22 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		Env:      env,
 	})
 	if err != nil {
+		// Dirty close clears the spinner without an inaccurate ✓ — the
+		// error message prints right after on its own row.
+		_ = checking.Close()
 		return code, fmt.Errorf("remote diff: %w", err)
 	}
 
 	if code != 0 {
+		// Same rationale: the server already wrote to stderr, committing
+		// a ✓ over a failed diff would be lying.
+		_ = checking.Close()
 		// Server already wrote its error to stderr (we pass-through
 		// stderr always). Propagate the exit code so CI sees it.
 		return code, nil
 	}
+
+	checking.CommitStep()
 
 	var plan diffResponse
 	if err := json.Unmarshal(planBuf.Bytes(), &plan); err != nil {
@@ -285,6 +302,12 @@ func envAutoApprove() bool {
 // insensitive). Anything else — including empty input (just Enter) —
 // is treated as No. The prompt is intentionally on stderr so stdout
 // stays piping-clean for the diff content printed just above.
+//
+// The leading `\n` before the prompt and the trailing `\n` after the
+// user's input bracket the question with blank rows so it doesn't
+// read as glued to the diff above or to the build spinner / "Apply
+// canceled." line that runs immediately after. Symmetric to the blank
+// lines surrounding the build block in runApplyForwarded.
 func promptConfirm(in io.Reader, out io.Writer) (bool, error) {
 	fmt.Fprint(out, "\nApply these changes? [y/N]: ")
 
@@ -292,6 +315,8 @@ func promptConfirm(in io.Reader, out io.Writer) (bool, error) {
 	if err != nil && err != io.EOF {
 		return false, err
 	}
+
+	fmt.Fprintln(out)
 
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":

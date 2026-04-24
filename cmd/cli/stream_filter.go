@@ -37,6 +37,7 @@ var endMarkers = []string{
 // in passthroughBanners are treated as sub-details and swallowed; the
 // spinner keeps showing the active step while the build churns.
 var stepBanners = []string{
+	"Checking ",
 	"Shipping ",
 	"Receiving ",
 	"Creating release",
@@ -306,6 +307,14 @@ func (f *progressFilter) openStepLocked(msg string) {
 // it. Shared between the ticker goroutine (which advances the frame
 // first) and openStepLocked (which just wants to show the current
 // frame on a brand-new step). Caller must hold f.mu.
+//
+// After the spinner line we emit `\n\x1b[2K\x1b[1A` — move down one
+// row, clear it, move back up. This reserves a blank row immediately
+// below the live spinner, so when the build lands at the bottom edge
+// of the user's terminal the animated line isn't hugging the frame
+// (which reads as "stuck"). At most one row of scroll happens on the
+// first render per step; subsequent ticks reuse the already-blank row
+// without further scrolling.
 func (f *progressFilter) renderSpinnerLocked() {
 	if !f.active || f.currentStep == "" {
 		return
@@ -314,7 +323,7 @@ func (f *progressFilter) renderSpinnerLocked() {
 	frames := []rune(spinnerFrames)
 	elapsed := time.Since(f.stepStarted).Round(time.Second)
 
-	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[36m%c\x1b[0m %s \x1b[2m(%s)\x1b[0m",
+	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[36m%c\x1b[0m %s \x1b[2m(%s)\x1b[0m\n\x1b[2K\x1b[1A",
 		frames[f.frame], f.currentStep, elapsed)
 }
 
@@ -465,6 +474,29 @@ func (f *progressFilter) stopSpinnerLocked() {
 
 	f.stopCh = nil
 	f.doneCh = nil
+}
+
+// CommitStep finalizes the currently-open step as a green ✓ without
+// requiring a text-level end marker. Used by callers that orchestrate
+// a spinner around a discrete unit of work (e.g. the phase-1 diff in
+// apply_forwarded.go) where there's no "Build completed" signal in the
+// stream — the caller just knows when the work is done. No-op in
+// verbose / non-TTY mode, matching the rest of the filter's escape
+// hatches.
+func (f *progressFilter) CommitStep() {
+	if f.verbose || !f.tty {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.closeCurrentStepLocked()
+
+	if f.active {
+		f.stopSpinnerLocked()
+		f.active = false
+	}
 }
 
 // Close flushes any trailing partial line and stops a running
