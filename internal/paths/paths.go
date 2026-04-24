@@ -30,7 +30,6 @@ func Root() string {
 
 func AppsDir() string     { return filepath.Join(Root(), "apps") }
 func ServicesDir() string { return filepath.Join(Root(), "services") }
-func ReposDir() string    { return filepath.Join(Root(), "repos") }
 func PluginsDir() string  { return filepath.Join(Root(), "plugins") }
 func ScriptsDir() string  { return filepath.Join(Root(), "scripts") }
 func StateDir() string    { return filepath.Join(Root(), "state") }
@@ -43,7 +42,6 @@ func AppCurrentLink(app string) string { return filepath.Join(AppDir(app), "curr
 func AppSharedDir(app string) string   { return filepath.Join(AppDir(app), "shared") }
 func AppEnvFile(app string) string     { return filepath.Join(AppSharedDir(app), ".env") }
 func AppConfigYAML(app string) string  { return filepath.Join(AppDir(app), VooduYAML) }
-func AppRepoDir(app string) string     { return filepath.Join(ReposDir(), app+".git") }
 func AppVolumeDir(app string) string   { return filepath.Join(VolumesDir(), app) }
 func AppContainersDir(app string) string {
 	return filepath.Join(AppDir(app), "containers")

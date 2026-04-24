@@ -30,7 +30,9 @@ const BuildIDLen = 12
 const DefaultKeepReleases = 5
 
 // RunFromTarball ingests a gzipped tar stream as the source of a release
-// and runs the same post-extract pipeline as a git-driven deploy.
+// and runs the build/swap/container pipeline against it. This is the
+// only path into the pipeline — the CLI pipes a tar over SSH and we
+// drive from here.
 //
 // The build-id is the content hash of the tarball (sha256, first
 // BuildIDLen hex chars). If the resulting release dir already exists and

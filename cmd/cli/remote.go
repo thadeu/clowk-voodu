@@ -23,7 +23,7 @@ func newRemoteCmd() *cobra.Command {
 commands. A remote is a label mapped to a user@host:app triple:
 
     voodu remote add api ubuntu@prod.example.com:api
-    git push api main         # deploys, same as before
+    voodu apply -f voodu.hcl -a api    # deploys to prod.example.com
     voodu config:set FOO=bar -a api    # forwards to prod.example.com
 
 Commands with -a APP pick the remote named APP when one exists;
@@ -136,9 +136,10 @@ func newRemoteSetupCmd() *cobra.Command {
   2. optional: scp --binary PATH to the server and install it
   3. 'voodu setup' on the remote (idempotent)
   4. 'voodu apps create APP' on the remote (ignored if it exists)
-  5. 'git remote add NAME user@host:APP' locally
+  5. 'git remote add NAME user@host:APP' locally (stores the target)
 
-After this runs you can 'git push NAME main' and 'voodu <cmd> -a APP'.`,
+After this runs you can 'voodu apply -f voodu.hcl -a APP' from this
+repo and it will ship over SSH to APP on HOST.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, host, app := args[0], args[1], args[2]
@@ -199,7 +200,7 @@ After this runs you can 'git push NAME main' and 'voodu <cmd> -a APP'.`,
 			}
 
 			fmt.Println()
-			fmt.Printf("Done. Try: git push %s main\n", name)
+			fmt.Printf("Done. Try: voodu apply -f voodu.hcl -a %s\n", app)
 			fmt.Printf("       or: voodu config list -a %s\n", app)
 
 			return nil

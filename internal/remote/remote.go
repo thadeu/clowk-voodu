@@ -17,8 +17,8 @@ type Info struct {
 	BaseDir    string // /opt/voodu by default
 }
 
-// DefaultRemote is the convention that `git push voodu` goes to the
-// primary server. Gokku used "gokku"; we keep the parallel.
+// DefaultRemote is the name of the git remote voodu looks up first when
+// no --remote / -a is given. Gokku used "gokku"; we keep the parallel.
 const DefaultRemote = "voodu"
 
 // DefaultBaseDir mirrors paths.DefaultRoot on the server side. We don't
@@ -27,8 +27,9 @@ const DefaultRemote = "voodu"
 const DefaultBaseDir = "/opt/voodu"
 
 // ParseRemoteURL parses the `user@host:app` form that `git remote add`
-// stores. The URL is not a real URL (no scheme) — it mirrors the
-// scp-like Git syntax, which keeps `git push` working for free.
+// stores. The URL is not a real URL (no scheme) — voodu reuses the git
+// remote config as a lightweight key/value store for SSH targets,
+// nothing more.
 func ParseRemoteURL(url string) (Info, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
@@ -205,8 +206,9 @@ func ListAll() ([]Info, error) {
 }
 
 // gitRemoteURL shells out to `git remote get-url NAME`. We don't use
-// go-git here: the client-side CLI already assumes `git` is on PATH
-// (users run `git push voodu main`), and one shell-out per command is
+// go-git here: git is already a client-side prerequisite (the user
+// stores their voodu targets via `voodu remote add`, which is just a
+// `git remote add` under the hood), and one shell-out per command is
 // negligible.
 func gitRemoteURL(name string) (string, error) {
 	// Stderr is swallowed — callers handle the error themselves and we

@@ -1,6 +1,7 @@
 # Example voodu.yml (M1 — YAML format, transitional).
-# Place this at the root of your app repo. On `git push`, voodu reads it
-# during deploy and uses it to shape the build and container.
+# Place this at the root of your app repo. During deploy (when the CLI
+# streams the tarball to `voodu receive-pack`), voodu reads it and uses
+# it to shape the build and container.
 #
 # M4 introduces the HCL multi-kind format; this YAML shape is the M1
 # transitional format inherited from Gokku so existing apps keep running.

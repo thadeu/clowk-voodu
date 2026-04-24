@@ -405,15 +405,14 @@ func (h *DatabaseHandler) logf(format string, args ...any) {
 //
 //   - spec.Image != "" (registry-mode): the manifest names a pullable
 //     image; the handler owns the full container lifecycle.
-//   - spec.Image == "" (build-mode): the image comes from a git push.
-//     `voodu apply` fires the push automatically before POSTing the
-//     manifests, and the bare repo's post-receive hook runs the legacy
-//     `voodu deploy` pipeline (extract → build → start container).
-//     The handler here still runs linkEnv so ${ref.*} resolves to the
-//     on-disk .env file the hook's deploy will mount, but it leaves
-//     container orchestration to that path. A future refactor can
-//     collapse both modes under the handler once the hook is demoted
-//     to a pure build step.
+//   - spec.Image == "" (build-mode): the image is built from a tarball
+//     the CLI streams over SSH before POSTing the manifests. `voodu
+//     receive-pack` extracts the tarball and runs the build/swap/
+//     start-container pipeline. The handler here still runs linkEnv so
+//     ${ref.*} resolves to the on-disk .env file that pipeline will
+//     mount, but it leaves container orchestration to that path. A
+//     future refactor can collapse both modes under the handler once
+//     receive-pack is demoted to a pure build step.
 type DeploymentHandler struct {
 	Store Store
 	Log   *log.Logger
@@ -462,11 +461,12 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return err
 	}
 
-	// Build-mode (no image, source pushed via git) produces an image
-	// tagged <app>:latest. The controller never sees the build itself —
-	// the post-receive hook runs it — so we resolve the resulting image
-	// here by convention. Without this default, ensureContainer's
-	// `Image == ""` early return swallows every build-mode reconcile.
+	// Build-mode (no image, source streamed via voodu receive-pack)
+	// produces an image tagged <app>:latest. The controller never sees
+	// the build itself — receive-pack runs it — so we resolve the
+	// resulting image here by convention. Without this default,
+	// ensureContainer's `Image == ""` early return swallows every
+	// build-mode reconcile.
 	if spec.Image == "" {
 		spec.Image = ev.Name + ":latest"
 	}
@@ -815,7 +815,7 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 		reason = fmt.Sprintf("spec drift (hash %s → %s)", shortHash(prev.SpecHash), shortHash(hash))
 	} else if len(slots) > 0 {
 		// Spec text is stable, but build-mode rebuilds `<app>:latest` on
-		// every git push — the tag string is identical yet the underlying
+		// every apply — the tag string is identical yet the underlying
 		// image ID changes. Containers freeze the image ID at create
 		// time, so the running process stays on the old layers until we
 		// explicitly recreate. Spec-hash can't catch this (manifest text

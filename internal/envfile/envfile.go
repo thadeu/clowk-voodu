@@ -57,7 +57,7 @@ func Save(path string, vars map[string]string) error {
 		b.WriteString(fmt.Sprintf("%s=%s\n", k, vars[k]))
 	}
 
-	// `voodu apply` can fire before any git push, so /opt/voodu/apps/<app>/shared
+	// `voodu apply` can fire before any deploy, so /opt/voodu/apps/<app>/shared
 	// may not exist yet. MkdirAll instead of expecting the deploy flow
 	// to have prepared the tree.
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {

@@ -1,12 +1,16 @@
 # voodu
 
-> Self-hosted, git-push-style PaaS with first-class stateful services.
+> Self-hosted, commitless-deploy PaaS with first-class stateful services.
 
 Voodu is the evolution of [Gokku](https://github.com/thadeu/gokku). It keeps
-what works — deploys via `git push`, blue-green swaps, per-app env
+what works — single `voodu apply` deploys, blue-green swaps, per-app env
 management — and invests where Gokku is weak: Postgres, Mongo, and other
 stateful services with backup, replica, and test-restore built in, without
 requiring the plugin sprawl of a full Kubernetes stack.
+
+Commitless by default: edit code, run `voodu apply`, done. The CLI
+streams the build context straight to the server over SSH — no git
+commit required, no push, no bare repo.
 
 ## Install
 
@@ -47,7 +51,7 @@ After installing in server mode, `/opt/voodu/` is already seeded and the
 controller is running. Create your first app:
 
 ```sh
-voodu apps create prod           # creates dirs, bare repo, post-receive hook
+voodu apps create prod           # creates /opt/voodu/apps/prod + initial .env
 ```
 
 From your laptop — declare the app with an HCL manifest:
@@ -98,8 +102,8 @@ desired state. The controller diffs against etcd and **prunes per
 decompose by kind without cross-kind deletion.
 
 For a deployment that already has a published image, drop `path` and set
-`image = "ghcr.io/you/api:1.2.3"` — no `git push` happens, the controller
-pulls from the registry.
+`image = "ghcr.io/you/api:1.2.3"` — no tarball gets streamed, the
+controller pulls from the registry.
 
 More examples live in [`examples/`](examples/):
 
@@ -176,19 +180,23 @@ so a `voodu apply` can't accidentally reset a production secret.
 ## How it works
 
 ```
-your laptop                            server
-───────────                            ──────
+your laptop                                 server
+───────────                                 ──────
 voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
-  │                                    │
-  │  (build-mode only)                 ├─ reconcile ingress/services (etcd)
-  └─ git push HEAD:main  ────────▶  bare repo
-                                       │
-                                       └─ post-receive hook
-                                          └─ extract → build image
-                                             → swap `current` symlink
-                                             → run post_deploy hooks
-                                             → recreate container
+  │                                         │
+  │                                         └─ reconcile ingress/services (etcd)
+  │  (build-mode only: stream tarball)
+  └─ tar -czf - <path>  ──ssh──▶  voodu receive-pack <scope>/<name>
+                                             └─ extract → build image
+                                                → swap `current` symlink
+                                                → run post_deploy hooks
+                                                → recreate container
 ```
+
+Tarball transport is content-addressed: an identical tree produces the
+same build-id (sha256 of the tar bytes) and the server skips the
+rebuild, just repointing `current`. Use `VOODU_FORCE_REBUILD=1` (or
+`voodu receive-pack --force` on the server) to bypass.
 
 - **CLI (`voodu`)** — parses HCL, forwards commands over SSH or to the
   controller's HTTP API. Installed on laptops and servers both.

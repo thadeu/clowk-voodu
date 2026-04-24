@@ -40,10 +40,10 @@ Accepted inputs:
   -f a.hcl -f b.yml    mix files of either format
   -f -                 read from stdin (requires --format hcl|yaml)
 
-Use -a <remote> to forward the apply to a configured git remote
-(same name as your git push target). The file is parsed locally so
-${VAR} expands on your dev machine, then streamed to the server
-over SSH — the controller never needs a public port.
+Use -a <remote> to forward the apply to a configured voodu remote.
+The file is parsed locally so ${VAR} expands on your dev machine,
+then streamed to the server over SSH — the controller never needs
+a public port.
 
 ${VAR} in the file body is interpolated from the current process
 environment before parsing. Use ${VAR:-default} to fall back.`,

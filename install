@@ -128,9 +128,10 @@ detect_platform() {
     DISTRO="$OS"
   fi
 
-  # The user that will own bare repos and push to them. When the script
-  # runs as a regular user with sudo, that user is the deploy user. When
-  # run as root (cloud-init), fall back to SUDO_USER if present, else root.
+  # The user that will own /opt/voodu and receive tarball pushes over
+  # SSH. When the script runs as a regular user with sudo, that user is
+  # the deploy user. When run as root (cloud-init), fall back to
+  # SUDO_USER if present, else root.
   if [ "$(id -u)" -eq 0 ]; then
     TARGET_USER="${SUDO_USER:-root}"
   else
@@ -348,12 +349,8 @@ download_and_install_binary() {
 server_setup() {
   # Pre-create and chown the root so the target user can run `voodu
   # setup` themselves. Doing the setup AS the user (not root) matters
-  # for two reasons:
-  #   1. bare repos live under $VOODU_ROOT/repos/ and must be owned by
-  #      the user who pushes to them — otherwise `git push` hits
-  #      permission errors on the post-receive hook.
-  #   2. `voodu setup` writes mode=server to ~/.voodurc — we want that
-  #      file in the deploy user's home, not /root/.
+  # because `voodu setup` writes mode=server to ~/.voodurc — we want
+  # that file in the deploy user's home, not /root/.
   log "creating $VOODU_ROOT owned by $TARGET_USER"
   sudo_ install -m 0755 -d "$VOODU_ROOT"
 
@@ -429,7 +426,7 @@ ${GREEN}Voodu server ready.${NC}
 ${CYAN}Next steps:${NC}
   1. (if you weren't root) log out and back in so docker group membership applies
   2. On this server:      voodu apps create api
-  3. On your laptop:      git remote add voodu ${TARGET_USER}@${host}:api
+  3. On your laptop:      voodu remote add voodu ${TARGET_USER}@${host}:api
   4. Write voodu.hcl, then: voodu apply -f voodu.hcl -a api
 
 EOF
@@ -441,7 +438,7 @@ ${GREEN}Voodu CLI installed.${NC}
 
 ${CYAN}Next steps:${NC}
   1. Install voodu on a Linux server (same installer, --server is default there).
-  2. Add a git remote:         git remote add voodu user@server:<app>
+  2. Register the target:      voodu remote add voodu user@server:<app>
   3. Write voodu.hcl, then:    voodu apply -f voodu.hcl -a <app>
 
 EOF

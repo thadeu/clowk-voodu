@@ -1,9 +1,12 @@
-// Package deploy orchestrates a single app release: extract code from the
-// bare repo, apply env overrides from voodu.yml, build, swap the current
-// symlink, run post-deploy hooks, and restart the container.
+// Package deploy orchestrates a single app release after its source has
+// landed on disk: apply env overrides from voodu.yml, build the image,
+// swap the `current` symlink, run post-deploy hooks, and restart the
+// container.
 //
-// This is the pragmatic M1 port of the Gokku deploy pipeline. Blue/green
-// and richer orchestration are the concern of the M3 controller.
+// Source lands via RunFromTarball in tarball.go — the CLI streams a
+// gzipped build context over SSH into `voodu receive-pack`, which
+// extracts to a content-addressed release dir and then drives the
+// pipeline below.
 package deploy
 
 import (
@@ -12,8 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,10 +30,8 @@ type Options struct {
 	// LogWriter receives human-readable progress lines. Defaults to os.Stdout.
 	LogWriter io.Writer
 
-	// Force bypasses content-hash dedup in tarball mode: even if a release
-	// with the incoming build-id already exists, rebuild from scratch.
-	// Has no effect on the git-driven Run path (each push always produces
-	// a fresh timestamp-based release).
+	// Force bypasses content-hash dedup: even if a release with the
+	// incoming build-id already exists, rebuild from scratch.
 	Force bool
 }
 
@@ -46,34 +45,7 @@ func (o *Options) log(format string, args ...any) {
 	fmt.Fprintf(w, format+"\n", args...)
 }
 
-// Run executes a full deploy for the given app.
-func Run(app string, opts Options) error {
-	opts.log("Deploying app '%s'...", app)
-
-	repoDir := paths.AppRepoDir(app)
-
-	if !hasCommits(repoDir) {
-		return fmt.Errorf("repository is empty, cannot deploy")
-	}
-
-	releaseID := time.Now().Format("20060102150405")
-	releaseDir := filepath.Join(paths.AppReleasesDir(app), releaseID)
-
-	if err := os.MkdirAll(releaseDir, 0755); err != nil {
-		return fmt.Errorf("create release dir: %w", err)
-	}
-
-	opts.log("-----> Creating release %s", releaseID)
-
-	if err := extractCode(repoDir, releaseDir, &opts); err != nil {
-		return fmt.Errorf("extract code: %w", err)
-	}
-
-	return runPipeline(app, releaseDir, &opts)
-}
-
 // runPipeline executes every stage *after* source has landed in releaseDir.
-// Shared by Run (git push → clone) and RunFromTarball (ssh stream → untar).
 func runPipeline(app, releaseDir string, opts *Options) error {
 	if err := applyConfigEnv(app, releaseDir, opts); err != nil {
 		opts.log("Warning: could not process voodu.yml: %v", err)
@@ -96,29 +68,6 @@ func runPipeline(app, releaseDir string, opts *Options) error {
 	}
 
 	opts.log("Deploy completed successfully for '%s'", app)
-
-	return nil
-}
-
-func hasCommits(repoDir string) bool {
-	return exec.Command("git", "-C", repoDir, "rev-parse", "--verify", "HEAD").Run() == nil
-}
-
-func extractCode(repoDir, releaseDir string, opts *Options) error {
-	head, err := exec.Command("git", "-C", repoDir, "symbolic-ref", "HEAD").Output()
-	if err != nil {
-		return fmt.Errorf("read HEAD: %w", err)
-	}
-
-	branch := strings.TrimPrefix(strings.TrimSpace(string(head)), "refs/heads/")
-	opts.log("-----> Extracting code from branch: %s", branch)
-
-	out, err := exec.Command("git", "clone", "--branch", branch, "--depth", "1", repoDir, releaseDir).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("clone: %v (output: %s)", err, string(out))
-	}
-
-	_ = os.RemoveAll(filepath.Join(releaseDir, ".git"))
 
 	return nil
 }
@@ -201,7 +150,7 @@ func buildRelease(appName, releaseDir string, opts *Options) error {
 	appCfg, err := config.LoadAppConfig(appName)
 	if err != nil || appCfg == nil {
 		// No voodu.yml on disk yet (common for a brand-new app — the
-		// first push creates it). Fall back to an empty app spec so
+		// first tarball creates it). Fall back to an empty app spec so
 		// lang.NewLang runs pure auto-detection on the release dir.
 		appCfg = &config.App{Name: appName}
 	}
@@ -258,9 +207,8 @@ func runPostDeploy(app, releaseDir string, opts *Options) error {
 func startContainers(app, releaseDir string, opts *Options) error {
 	// HCL-managed apps don't have voodu.yml — the controller owns
 	// container lifecycle via `voodu apply`, which runs right after
-	// this hook completes. Trying the legacy recreate path here would
-	// fail on the missing config and pollute the push output with a
-	// red herring.
+	// receive-pack completes. Trying the legacy recreate path here would
+	// fail on the missing config and pollute output with a red herring.
 	vooduYml := filepath.Join(releaseDir, paths.VooduYAML)
 	legacyYml := filepath.Join(releaseDir, paths.GokkuYAML)
 

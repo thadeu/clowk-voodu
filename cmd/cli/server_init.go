@@ -90,7 +90,6 @@ func ensureServerLayout() error {
 	dirs := []string{
 		paths.Root(),
 		paths.AppsDir(),
-		paths.ReposDir(),
 		paths.PluginsDir(),
 		paths.ServicesDir(),
 		paths.ScriptsDir(),

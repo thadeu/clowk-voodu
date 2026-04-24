@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"go.voodu.clowk.in/internal/git"
 	"go.voodu.clowk.in/internal/remote"
 	"go.voodu.clowk.in/internal/tarball"
 )
@@ -75,12 +73,11 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return 1, true
 	}
 
-	// Build-mode deployments need their source on the server before the
-	// controller can reconcile. Default transport is a per-deployment
-	// gzipped tar piped to `voodu receive-pack` over SSH — commitless,
-	// respects per-deployment `path` (monorepo-friendly). Legacy `git
-	// push` flow stays available via $VOODU_PUSH_MODE=git for ops who
-	// want a trail in the server-side bare repo.
+	// Build-mode deployments need their source on the server before
+	// the controller can reconcile. We stream a gzipped tar per
+	// deployment into `voodu receive-pack <scope>/<name>` over SSH —
+	// commitless, per-deployment `path` as the build context, content-
+	// addressable so identical trees skip the rebuild.
 	if len(stream.buildModeDeploys) > 0 {
 		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -143,32 +140,12 @@ func hasDefaultRemote() bool {
 	return err == nil
 }
 
-// sourcePushBranch picks the ref name to push to on the bare repo.
-// Override via $VOODU_DEPLOY_BRANCH; defaults to "main" to match the
-// bare repo bootstrap (`git init --bare --initial-branch=main`).
-func sourcePushBranch() string {
-	if b := os.Getenv("VOODU_DEPLOY_BRANCH"); b != "" {
-		return b
-	}
-
-	return "main"
-}
-
 // pushSourceForDeploys transports each build-mode deployment's source
-// to the server. Mode is picked once for the whole apply:
-//
-//   - $VOODU_PUSH_MODE=git → single `git push` of the current HEAD, one
-//     bare repo update regardless of how many deployments are in the
-//     manifest. Kept for ops who want audit trail.
-//
-//   - anything else (default) → one gzipped tar per deployment, piped
-//     into `voodu receive-pack <scope>/<name>` over SSH. No git commit
-//     required, respects each deployment's `path` as the build context.
+// to the server as a gzipped tar piped into `voodu receive-pack
+// <scope>/<name>` over SSH. One stream per deployment so each respects
+// its own `path` (the build context). Content-addressable on the far
+// side: identical trees skip the rebuild entirely.
 func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildModeDep) error {
-	if os.Getenv("VOODU_PUSH_MODE") == "git" {
-		return pushSourceViaGit(info)
-	}
-
 	for _, d := range deploys {
 		if err := pushSourceViaTarball(info, identity, d); err != nil {
 			return fmt.Errorf("receive-pack %s/%s: %w", d.Scope, d.Name, err)
@@ -176,14 +153,6 @@ func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildMod
 	}
 
 	return nil
-}
-
-func pushSourceViaGit(info *remote.Info) error {
-	branch := sourcePushBranch()
-
-	fmt.Fprintf(os.Stderr, "-----> Pushing source via git to %s (branch: %s)\n", info.RemoteName, branch)
-
-	return git.PushHead(context.Background(), info.RemoteName, branch)
 }
 
 // pushSourceViaTarball streams `path`'s contents as a gzipped tar into

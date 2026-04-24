@@ -10,7 +10,7 @@
 
 ## Contexto
 
-Evolução do [Gokku](https://github.com/thadeu/gokku) com foco em **stateful services como cidadãos de primeira classe**. O Gokku já resolve deploy de apps via `git push` (battle-tested com 5 apps em prod). O Voodu mantém essa parte e investe onde o Gokku é fraco: **databases confiáveis** (Postgres, Mongo) com backup, replica, test-restore — tudo out-of-the-box, sem exigir N plugins separados como K8s.
+Evolução do [Gokku](https://github.com/thadeu/gokku) com foco em **stateful services como cidadãos de primeira classe**. O Gokku resolvia deploy via `git push` + post-receive hook (battle-tested com 5 apps em prod). O Voodu pivota pra **deploy commitless** (`voodu apply` streama um tarball direto pro `voodu receive-pack` sobre SSH, content-addressable) e investe onde o Gokku é fraco: **databases confiáveis** (Postgres, Mongo) com backup, replica, test-restore — tudo out-of-the-box, sem exigir N plugins separados como K8s.
 
 **Bar pessoal:** roda meus apps, não perde dados, não me acorda 3am.
 
@@ -33,7 +33,7 @@ Evolução do [Gokku](https://github.com/thadeu/gokku) com foco em **stateful se
 ```
 voodu CLI (Cobra + dispatch dinâmico)
   │
-  ├── git push → post-receive hook (Gokku-style, mantido)
+  ├── tar -cz <path> | ssh voodu receive-pack <scope>/<name>   (build-mode)
   └── HTTP → voodu-controller
                 │
                 ├── etcd embedded (state, watch API)
@@ -144,10 +144,8 @@ voodu plugins:install caddy
 voodu plugins:install postgres
 voodu plugins:list
 
-# Deploy (git push continua funcionando)
-git push voodu main
-voodu deploy                       # alternativa via CLI
-voodu apply -f ./config/           # aplica HCL files
+# Deploy (commitless — tarball over SSH)
+voodu apply -f ./config/           # aplica HCL files + streama tarball se build-mode
 voodu status
 voodu logs api
 voodu rollback api
@@ -272,13 +270,13 @@ commands:
 **Entregáveis:**
 - [ ] `internal/lang/` portado de `pkg/lang/` (as-is)
 - [ ] `internal/deploy/bluegreen.go` usando Docker SDK (não mais `exec.Command`)
-- [ ] `internal/git/` — git bare + `post-receive` hook
+- [ ] `internal/tarball/` + `voodu receive-pack` — transporte commitless
 - [ ] `internal/ssh/` — exec remoto + file copy
 - [ ] `internal/config/secrets/` — `config:set|list|unset`
 - [ ] Paths `/opt/voodu/`, env vars `VOODU_*`
 - [ ] Plugin nginx (bash) portado temporariamente — será substituído por Caddy em M6
 
-**Done quando:** `git push voodu main` faz deploy funcional de app Go e app Rails.
+**Done quando:** `voodu apply -f voodu.hcl -a api` faz deploy funcional de app Go e app Rails.
 
 ---
 
@@ -469,7 +467,7 @@ M8                                              ███  1w  ← prova real
 1. **Postgres com backup/restore sólido** — M7 completo antes de migrar qualquer app
 2. **Safety net** — dump pra Neon/Supabase durante período de confiança
 3. **Test-restore semanal** — se não passa, alarme dispara, não importa o que seja
-4. **git push mantido** — não quebrar o UX que já funciona
+4. **Commitless deploy é default** — tarball over SSH, sem git push obrigatório
 
 ---
 

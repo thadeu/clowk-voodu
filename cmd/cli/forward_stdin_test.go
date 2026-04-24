@@ -120,8 +120,9 @@ func TestRewriteForStdinStream_ReadsFileAndEmitsJSON(t *testing.T) {
 
 func TestRewriteForStdinStream_BuildModeFlagsSourcePush(t *testing.T) {
 	// Two deployments in one file: one registry-mode, one build-mode.
-	// Any build-mode manifest means apply has to `git push` before
-	// POSTing manifests — that's the Option B source transport.
+	// Any build-mode manifest means apply has to stream its source via
+	// `voodu receive-pack` before POSTing manifests so the controller
+	// has an image to reference.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stack.hcl")
 

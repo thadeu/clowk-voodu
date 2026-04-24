@@ -25,8 +25,7 @@ import (
 // mirror what the controller stores, but only the name is used to
 // resolve filesystem paths today — per-scope app dirs would be a
 // separate migration. Hidden from `voodu --help` because normal users
-// never invoke it by hand (same posture as `voodu deploy`, the git
-// post-receive plumbing).
+// never invoke it by hand — the CLI drives it via SSH from `voodu apply`.
 func newReceivePackCmd() *cobra.Command {
 	var force bool
 
@@ -36,7 +35,7 @@ func newReceivePackCmd() *cobra.Command {
 		Long: `Reads a gzipped tar of the build context from stdin, extracts it to
 a content-addressed release directory, and runs the build/swap/container
 pipeline. This is the commitless-deploy counterpart of git's receive-pack
-— the CLI pipes a tar to this command instead of firing git push.
+— the CLI pipes a tar here over SSH; no git commit required.
 
 This command is plumbing. The supported user entry point is:
 

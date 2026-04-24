@@ -820,8 +820,8 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 }
 
 func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
-	// Build-mode scenario: manifest text is identical across pushes
-	// (image = "vd-web:latest"), but each git push rebuilds the tag so
+	// Build-mode scenario: manifest text is identical across applies
+	// (image = "vd-web:latest"), but each rebuild refreshes the tag so
 	// the image ID underneath flips. Spec-hash can't see this — only an
 	// ID comparison can — and without catching it, the container keeps
 	// serving yesterday's code.
