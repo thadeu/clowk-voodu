@@ -90,6 +90,8 @@ func Stream(w io.Writer, srcDir string, opts Options) (int64, error) {
 
 	logProgress(opts.Progress, "tarball: %s (%d patterns)", ignoreSourceLabel(source), len(patterns))
 
+	warnIfDockerfileIgnored(opts.Progress, srcAbs, patterns, source)
+
 	matcher, err := patternmatcher.New(patterns)
 	if err != nil {
 		return 0, fmt.Errorf("compile ignore patterns: %w", err)
@@ -288,6 +290,44 @@ func loadPatternsAndSource(srcDir string, extra []string) ([]string, string, err
 	patterns = append(patterns, extra...)
 
 	return patterns, source, nil
+}
+
+// warnIfDockerfileIgnored surfaces a loud message when the source dir
+// has a `Dockerfile` on disk but the active ignore patterns would
+// strip it from the tarball. Rails's `rails new --dockerfile`-
+// generated `.dockerignore` contains `/Dockerfile*`, which silently
+// causes the server to fall back to lang auto-gen instead of using
+// the user's Dockerfile — an extremely surprising, hard-to-debug
+// failure. We don't auto-override because the user may have meant it
+// (e.g., local-only Dockerfile alongside a different build strategy),
+// but we make sure they see what's happening.
+func warnIfDockerfileIgnored(progress io.Writer, srcDir string, patterns []string, source string) {
+	if progress == nil {
+		return
+	}
+
+	if _, err := os.Stat(filepath.Join(srcDir, "Dockerfile")); err != nil {
+		return
+	}
+
+	matcher, err := patternmatcher.New(patterns)
+	if err != nil {
+		return
+	}
+
+	ignored, err := matcher.MatchesOrParentMatches("Dockerfile")
+	if err != nil || !ignored {
+		return
+	}
+
+	label := ".dockerignore"
+
+	if source == "gitignore" {
+		label = ".gitignore"
+	}
+
+	fmt.Fprintf(progress, "!!!    WARNING: Dockerfile exists in the build context but is excluded by %s\n", label)
+	fmt.Fprintf(progress, "!!!    The server will fall back to lang auto-detection. Add `!Dockerfile` to %s to ship it.\n", label)
 }
 
 // readIgnoreFile picks the first ignore file that exists in srcDir and

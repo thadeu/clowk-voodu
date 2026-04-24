@@ -97,11 +97,20 @@ type LangSpec struct {
 //
 //	deployment "scope" "web" {}
 //
-// means "build the repo root with ./Dockerfile, health-check /".
-// Build-mode fields (Path/Dockerfile) only fire when Image is empty —
-// registry-mode deployments should not carry build metadata they
-// won't use. HealthCheck defaults in both modes because the ingress
-// probe needs a path regardless of how the image was produced.
+// means "build the repo root, health-check /". Dockerfile is left
+// empty on purpose: lang handlers auto-resolve it (use existing
+// ./Dockerfile, else generate one for the detected runtime). Setting
+// an explicit default here would make the server-side pipeline treat
+// it as a *custom* dockerfile path and error out with a misleading
+// "custom Dockerfile not found" when it's missing — blocking the
+// auto-generation fallback that handlers like Rails/Ruby/Node rely
+// on for zero-config builds.
+//
+// Path defaults to "." (build the repo root) in build mode only —
+// registry-mode deployments (Image set) skip both defaults because
+// build metadata is meaningless when no build runs. HealthCheck
+// defaults in both modes because the ingress probe needs a path
+// regardless of how the image was produced.
 func (s *DeploymentSpec) applyDefaults() {
 	if s.HealthCheck == "" {
 		s.HealthCheck = "/"
@@ -113,10 +122,6 @@ func (s *DeploymentSpec) applyDefaults() {
 
 	if s.Path == "" {
 		s.Path = "."
-	}
-
-	if s.Dockerfile == "" {
-		s.Dockerfile = "Dockerfile"
 	}
 }
 

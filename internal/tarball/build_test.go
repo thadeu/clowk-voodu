@@ -444,3 +444,76 @@ func TestStreamExtraIgnores(t *testing.T) {
 		}
 	}
 }
+
+// Rails-default case: `rails new --dockerfile` ships a .dockerignore
+// that includes `/Dockerfile*`. Previously that silently stripped the
+// Dockerfile from the tarball and caused the server to fall back to
+// lang auto-gen with no visible hint. We don't auto-override (user
+// might mean it), but we MUST warn loudly on stderr so the operator
+// sees what's happening.
+func TestStreamWarnsWhenDockerfileIgnored(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "app.go", []byte("package main\n"), 0644)
+	writeFile(t, src, ".dockerignore", []byte("/Dockerfile*\n"), 0644)
+
+	var buf, progress bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{Progress: &progress}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	out := progress.String()
+
+	if !bytes.Contains([]byte(out), []byte("WARNING")) {
+		t.Errorf("expected WARNING in progress output, got:\n%s", out)
+	}
+
+	if !bytes.Contains([]byte(out), []byte("Dockerfile")) {
+		t.Errorf("expected warning to mention Dockerfile, got:\n%s", out)
+	}
+
+	if !bytes.Contains([]byte(out), []byte(".dockerignore")) {
+		t.Errorf("expected warning to name .dockerignore, got:\n%s", out)
+	}
+}
+
+// Negative case: when the Dockerfile is not ignored, we must NOT
+// emit the warning. Otherwise every normal build would be noisy.
+func TestStreamNoWarnWhenDockerfileShipped(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "Dockerfile", []byte("FROM alpine\n"), 0644)
+	writeFile(t, src, "app.go", []byte("package main\n"), 0644)
+	writeFile(t, src, ".dockerignore", []byte("tmp/\n"), 0644)
+
+	var buf, progress bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{Progress: &progress}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if bytes.Contains(progress.Bytes(), []byte("WARNING")) {
+		t.Errorf("unexpected warning when Dockerfile ships fine:\n%s", progress.String())
+	}
+}
+
+// No Dockerfile on disk = nothing to warn about, even if the ignore
+// file would have excluded it (lang auto-gen is the intended path).
+func TestStreamNoWarnWhenNoDockerfile(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "app.go", []byte("package main\n"), 0644)
+	writeFile(t, src, ".dockerignore", []byte("/Dockerfile*\n"), 0644)
+
+	var buf, progress bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{Progress: &progress}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if bytes.Contains(progress.Bytes(), []byte("WARNING")) {
+		t.Errorf("warned about missing Dockerfile that user doesn't have:\n%s", progress.String())
+	}
+}

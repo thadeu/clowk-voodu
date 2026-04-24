@@ -91,6 +91,13 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return fmt.Errorf("extract tarball: %w", err)
 	}
 
+	// Surface a quick directory listing so the operator can confirm the
+	// build context that actually landed on the server. When a build
+	// "can't find the Dockerfile at root", 99% of the time the Dockerfile
+	// never made it into the tarball — this listing turns a 10-minute
+	// debug session into an eyeball check.
+	logReleaseSummary(releaseDir, &opts)
+
 	if err := runPipeline(app, releaseDir, &opts); err != nil {
 		// Leave the release dir in place — useful for forensics — but
 		// don't repoint `current` (swap happens inside the pipeline
@@ -338,6 +345,46 @@ func extractTarball(path, dest string) error {
 			continue
 		}
 	}
+}
+
+// logReleaseSummary dumps a one-line preview of the release root: how
+// many entries landed, whether a Dockerfile is present, and the top 10
+// names. Enough to catch the two common failure modes ("I ran from the
+// wrong CWD so only a subdir got shipped", "my .dockerignore excludes
+// the Dockerfile") without a server-side shell. Silent on error — this
+// is best-effort diagnostics, not part of the build contract.
+func logReleaseSummary(releaseDir string, opts *Options) {
+	entries, err := os.ReadDir(releaseDir)
+	if err != nil {
+		return
+	}
+
+	const maxNames = 10
+
+	names := make([]string, 0, maxNames)
+	hasDockerfile := false
+
+	for _, e := range entries {
+		if e.Name() == "Dockerfile" {
+			hasDockerfile = true
+		}
+
+		if len(names) < maxNames {
+			if e.IsDir() {
+				names = append(names, e.Name()+"/")
+			} else {
+				names = append(names, e.Name())
+			}
+		}
+	}
+
+	preview := strings.Join(names, ", ")
+	if len(entries) > maxNames {
+		preview += fmt.Sprintf(", … (+%d more)", len(entries)-maxNames)
+	}
+
+	opts.log("-----> Release root has %d entries, Dockerfile=%v", len(entries), hasDockerfile)
+	opts.log("       contents: %s", preview)
 }
 
 // safeJoin returns base/rel, rejecting anything that would land outside

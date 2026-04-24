@@ -346,6 +346,54 @@ func StopContainer(name string) error {
 	return cmd.Run()
 }
 
+// IsRunning reports whether the container is currently in the running
+// state. Distinct from ContainerExists: a stopped container exists but
+// is not running, and the reconciler treats that as "needs a start".
+// Returns (false, nil) when the container doesn't exist — the caller
+// can decide whether that's an error in its context.
+func IsRunning(name string) (bool, error) {
+	cmd := exec.Command("docker", "inspect", "--format", "{{.State.Running}}", name)
+
+	out, err := cmd.Output()
+	if err != nil {
+		// `docker inspect` exits non-zero when the container is missing.
+		// Treat "missing" as "not running" and let the caller distinguish
+		// via ContainerExists if it cares.
+		return false, nil
+	}
+
+	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+// StartContainer runs `docker start` on an existing, stopped container.
+// Used by the reconciler's replay path to recover containers whose
+// restart policy was "no" and which therefore stayed dead after a host
+// reboot.
+func StartContainer(name string) error {
+	cmd := exec.Command("docker", "start", name)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker start %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+// UpdateRestartPolicy sets the restart policy on an existing container.
+// Used to repair containers that were created before voodu defaulted
+// to "unless-stopped" — those containers wouldn't survive a reboot,
+// and we want the next reconcile to fix them in place without a
+// destructive recreate.
+func UpdateRestartPolicy(name, policy string) error {
+	cmd := exec.Command("docker", "update", "--restart", policy, name)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker update --restart %s %s: %v: %s", policy, name, err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
 // RemoveContainer removes a container.
 func RemoveContainer(name string, force bool) error {
 	args := []string{"rm"}

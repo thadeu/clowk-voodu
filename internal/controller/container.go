@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 
 	"go.voodu.clowk.in/internal/docker"
@@ -106,8 +107,42 @@ func (DockerContainerManager) Exists(name string) (bool, error) {
 	return docker.ContainerExists(name), nil
 }
 
+// Ensure brings the container up. Three cases:
+//
+//  1. Container missing → create it.
+//  2. Container exists and is running → no-op (the common steady-state
+//     replay case; returns created=false so the handler skips a
+//     redundant restart).
+//  3. Container exists but is stopped → start it. Host reboots with a
+//     restart="no" policy land here, as do old containers created
+//     before voodu started defaulting to "unless-stopped".
+//
+// In case 3 we also repair the restart policy in place so the NEXT
+// reboot survives without needing a manual apply. `docker update
+// --restart` is cheap and idempotent, so we run it whenever the spec
+// declares a policy — no drift detection, the reconciler is the
+// source of truth.
 func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 	if docker.ContainerExists(spec.Name) {
+		if spec.Restart != "" {
+			// Non-fatal: an operator running an ancient docker might not
+			// support `update --restart`. Log-only fits the reconciler's
+			// "best-effort on replay" philosophy — the container is
+			// already there, we just couldn't improve its future.
+			_ = docker.UpdateRestartPolicy(spec.Name, spec.Restart)
+		}
+
+		running, err := docker.IsRunning(spec.Name)
+		if err != nil {
+			return false, fmt.Errorf("inspect %s: %w", spec.Name, err)
+		}
+
+		if !running {
+			if err := docker.StartContainer(spec.Name); err != nil {
+				return false, fmt.Errorf("start stopped container %s: %w", spec.Name, err)
+			}
+		}
+
 		return false, nil
 	}
 

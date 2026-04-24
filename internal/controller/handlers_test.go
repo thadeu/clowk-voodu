@@ -433,6 +433,53 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	}
 }
 
+// Docker's native default for --restart is "no", which leaves
+// containers dead after a host reboot — the wrong default for a PaaS.
+// The handler must rewrite an empty Restart to "unless-stopped" before
+// handing the spec to the container manager, while leaving an explicit
+// value ("no", "on-failure", etc.) untouched.
+func TestDeploymentHandler_DefaultsRestartPolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    string
+	}{
+		{"unset → unless-stopped", "", "unless-stopped"},
+		{"explicit no preserved", "no", "no"},
+		{"explicit on-failure preserved", "on-failure", "on-failure"},
+		{"explicit always preserved", "always", "always"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := &fakeContainers{}
+
+			h := &DeploymentHandler{
+				Store:       newMemStore(),
+				Log:         quietLogger(),
+				WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+				EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+				Containers:  cm,
+			}
+
+			ev := putEvent(t, KindDeployment, "app", deploymentSpec{
+				Image:   "img:1",
+				Restart: tc.input,
+			})
+
+			h.Handle(context.Background(), ev)
+
+			if len(cm.ensures) != 1 {
+				t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+			}
+
+			if got := cm.ensures[0].Restart; got != tc.want {
+				t.Errorf("restart policy: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDeploymentHandler_AlwaysJoinsVoodu0(t *testing.T) {
 	// voodu0 is the platform's plumbing bridge — caddy and plugins live
 	// there, so the handler MUST ensure every container joins it, even
@@ -827,7 +874,7 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 	// serving yesterday's code.
 	store := newMemStore()
 
-	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
+	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
@@ -870,7 +917,7 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 	// build-mode tags would churn the container on every reconcile.
 	store := newMemStore()
 
-	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}}
+	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
@@ -906,7 +953,7 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	// Networks is explicit (matches the handler's default normalization
 	// of empty → [voodu0]) so the hash we pre-seed matches the hash the
 	// handler will recompute after apply() runs its normalization.
-	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
+	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
@@ -1131,7 +1178,7 @@ func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
 	}
 
 	// Baseline status so no spec-drift recreate triggers.
-	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}}
+	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 

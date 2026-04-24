@@ -562,6 +562,15 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// (postgres pinned to 0.0.0.0:5432, say) declare the IP explicitly.
 	spec.Ports = normalizePorts(spec.Ports)
 
+	// Default restart policy. Docker's native default is "no", which
+	// leaves containers dead after a host reboot — the wrong default for
+	// a PaaS where "apply once, stay up forever" is the whole pitch.
+	// Operators can still opt out explicitly (restart = "no") or pick
+	// "on-failure" etc.; only the empty case is overridden.
+	if spec.Restart == "" {
+		spec.Restart = "unless-stopped"
+	}
+
 	// Always link env, even when spec.Env is empty. Two reasons:
 	//   1. docker run is invoked with --env-file unconditionally, so the
 	//      file must exist or the container fails to start.

@@ -115,7 +115,9 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 // field is empty — those are the manifests that need source on the
 // server before the controller can reconcile. The returned Path is
 // already defaulted ("." for root), so callers don't repeat the
-// defaulting logic.
+// defaulting logic. Path is CWD-relative: the build context is whatever
+// directory the operator invoked `voodu apply` from, matching the
+// mental model of docker/podman (`docker build .` = "here").
 func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 	var out []buildModeDep
 

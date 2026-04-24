@@ -167,9 +167,11 @@ deployment "test" "api" {
 
 func TestParseHCLDeploymentImageOptional(t *testing.T) {
 	// Minimal build-mode deployment: no image, no path either. Parser
-	// fills in `path="."` / `dockerfile="Dockerfile"` so `deployment {}`
-	// means "build the repo root with ./Dockerfile" without requiring
-	// the operator to spell it out.
+	// fills in `path="."` only — Dockerfile stays empty so lang handlers
+	// can auto-resolve (use existing ./Dockerfile, else generate). A
+	// forced default here would push the server-side pipeline down the
+	// "custom Dockerfile" error path when the file isn't present,
+	// blocking zero-config Rails/Ruby/Node builds.
 	src := `deployment "test" "api" {}`
 
 	tmp := writeTemp(t, "bare.hcl", src)
@@ -197,8 +199,8 @@ func TestParseHCLDeploymentImageOptional(t *testing.T) {
 		t.Errorf("path default not applied: got %q, want %q", spec.Path, ".")
 	}
 
-	if spec.Dockerfile != "Dockerfile" {
-		t.Errorf("dockerfile default not applied: got %q, want %q", spec.Dockerfile, "Dockerfile")
+	if spec.Dockerfile != "" {
+		t.Errorf("dockerfile should stay empty so handlers can auto-resolve: got %q", spec.Dockerfile)
 	}
 
 	if spec.Workdir != "" {

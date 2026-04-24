@@ -83,10 +83,17 @@ Scoped kinds (`deployment`, `ingress`) take **two labels**: `<scope>` and
 environment); it groups manifests, selects what prune touches, and is
 the uniqueness boundary for names. `service` inside `ingress` defaults
 to the ingress name, so the 1-to-1 shape (`deployment "prod" "api"` ↔
-`ingress "prod" "api"`) is declaration-only. Path, Dockerfile, port, and
-health_check all have sensible defaults (`.`, `Dockerfile`, the
-deployment's declared port, `/`) — set them only when you need to
-override.
+`ingress "prod" "api"`) is declaration-only. Path, port, and
+health_check all have sensible defaults (`.`, the deployment's declared
+port, `/`) — set them only when you need to override. Dockerfile has no
+default: the lang handler picks `Dockerfile` if you ship one, else
+auto-generates one for the detected runtime (Go/Ruby/Rails/Python/Node).
+
+`path` is **CWD-relative**: the build context is whichever directory you
+invoked `voodu apply` from, same as `docker build .`. If your manifest
+lives in a subdir (`infra/dev.voodu`) and your Dockerfile is at the
+project root, run `voodu apply -f infra/dev.voodu` from the project
+root — the tarball mirrors your shell's current dir.
 
 Apply it:
 

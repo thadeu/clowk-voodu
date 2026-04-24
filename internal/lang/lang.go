@@ -82,18 +82,31 @@ type Lang interface {
 }
 
 // DetectLanguage automatically detects the programming language based on project files.
+//
+// Resolution order matters: a Dockerfile at the release root ALWAYS wins,
+// even if a language-specific marker is also present. A Rails repo that
+// ships its own Dockerfile should go through the Generic (docker) handler
+// and use that file verbatim — not have the Rails handler take over and
+// try to auto-generate one. Downstream handlers trust this ordering.
 func DetectLanguage(releaseDir string) (string, error) {
-	if _, err := os.Stat(filepath.Join(releaseDir, "Dockerfile")); err == nil {
+	dockerfile := filepath.Join(releaseDir, "Dockerfile")
+
+	if _, err := os.Stat(dockerfile); err == nil {
+		fmt.Printf("-----> Detected Dockerfile at %s → using 'docker' strategy\n", dockerfile)
 		return "docker", nil
 	}
 
 	if lang := detectLanguageInDir(releaseDir); lang != "" {
+		fmt.Printf("-----> No Dockerfile at %s — detected '%s' from marker files\n", dockerfile, lang)
 		return lang, nil
 	}
 
 	if lang := detectLanguageRecursive(releaseDir, 2); lang != "" {
+		fmt.Printf("-----> No Dockerfile at release root — detected '%s' in subdirectory\n", lang)
 		return lang, nil
 	}
+
+	fmt.Printf("-----> No Dockerfile or language markers found — falling back to 'generic'\n")
 
 	return "generic", nil
 }
@@ -159,7 +172,9 @@ func detectLanguageRecursive(dir string, maxDepth int) string {
 func NewLang(spec *BuildSpec, releaseDir string) (Lang, error) {
 	langType := spec.LangName()
 
-	if langType == "" {
+	if langType != "" {
+		fmt.Printf("-----> Using explicit lang strategy: %q (from manifest)\n", langType)
+	} else {
 		detected, err := DetectLanguage(releaseDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to detect language: %v", err)
