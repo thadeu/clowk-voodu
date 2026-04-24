@@ -157,6 +157,42 @@ func TestForwardStreamsStdin(t *testing.T) {
 	}
 }
 
+// TestForwardCapturesStdout verifies the Stdout override on
+// ForwardOptions. Used by the apply orchestrator: phase 1's `diff -o
+// json` must land in a local buffer so the client can parse it,
+// rather than streaming to the user's terminal. Stderr always
+// passes through regardless.
+func TestForwardCapturesStdout(t *testing.T) {
+	tmp := t.TempDir()
+
+	stub := filepath.Join(tmp, "ssh-stub")
+	// The stub emits a payload on stdout; the test captures it.
+	script := "#!/bin/bash\nprintf 'HELLO-STDOUT'\n"
+
+	if err := os.WriteFile(stub, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	info := &Info{Host: "u@h"}
+
+	var buf bytes.Buffer
+
+	force := false
+
+	_, err := Forward(info, []string{"diff", "-o", "json"}, ForwardOptions{
+		SSHBin:   stub,
+		ForceTTY: &force,
+		Stdout:   &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := buf.String(); got != "HELLO-STDOUT" {
+		t.Errorf("captured stdout: got %q, want %q", got, "HELLO-STDOUT")
+	}
+}
+
 func TestForwardPassesIdentityAndTTY(t *testing.T) {
 	tmp := t.TempDir()
 	out := filepath.Join(tmp, "args.txt")

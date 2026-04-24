@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/manifest"
@@ -21,10 +22,11 @@ const applyTimeout = 30 * time.Second
 
 type applyFlags struct {
 	files            []string
-	dryRun           bool
 	format           string // stdin only: "hcl" | "yaml"
 	noPrune          bool   // apply + diff: upsert without deleting siblings in the same (scope, kind)
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
+	autoApprove      bool   // apply only: skip the interactive confirmation in forwarded mode
+	force            bool   // apply only: force rebuild even when the tarball hash already has a release
 }
 
 func newApplyCmd() *cobra.Command {
@@ -53,16 +55,29 @@ environment before parsing. Use ${VAR:-default} to fall back.
 By default, apply is source-of-truth: anything in the same
 (scope, kind) that isn't in this apply gets pruned. Pass --no-prune
 when several independent applies (different repos, different CI
-pipelines) share a scope and each declares only a slice of it.`,
+pipelines) share a scope and each declares only a slice of it.
+
+When forwarded to a remote, apply runs diff first, shows the plan,
+and prompts for y/N on your local terminal. Pass --auto-approve
+(alias -y) or set VOODU_AUTO_APPROVE=1 to skip the prompt in CI.
+Non-interactive invocations without either will refuse to apply.
+
+Build-mode deployments ship their source as a content-addressed
+tarball. Identical trees skip rebuild and just repoint the 'current'
+symlink — fast path for "same code, redeploy". Pass --force to
+rebuild the image anyway (useful for non-deterministic build caches
+or when validating CI image changes). VOODU_FORCE_REBUILD=1 has the
+same effect.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runApply(cmd, f)
 		},
 	}
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
-	cmd.Flags().BoolVarP(&f.dryRun, "dry-run", "n", false, "print the manifests that would be applied and exit")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
 	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "upsert only; do not delete other resources in the same (scope, kind)")
+	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
+	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
 
 	return cmd
 }
@@ -133,9 +148,17 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		return fmt.Errorf("no manifests found")
 	}
 
-	if f.dryRun {
-		return printManifests(mans)
-	}
+	// Local apply (no remote, no SSH) applies directly. The diff+prompt
+	// dance belongs to the forwarded path — on the dev box or the
+	// server itself, `runApply` is used by tests, server-init, and
+	// one-off operator commands where a prompt would get in the way.
+	// See runApplyForwarded for the two-phase orchestrated flow.
+	//
+	// `force` only has meaning when we push a tarball to receive-pack;
+	// the local path reconciles the controller directly and never
+	// touches the build cache. The flag is silently ignored here.
+	_ = f.autoApprove
+	_ = f.force
 
 	root := cmd.Root()
 
@@ -228,6 +251,33 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	}
 
 	out := cmd.OutOrStdout()
+
+	// Machine-readable formats bypass the renderer entirely. The plan
+	// struct is emitted verbatim so callers (CI pipelines, the
+	// apply-forwarded orchestrator on the client) can parse it. We
+	// still honour --detailed-exitcode so `voodu diff -o json
+	// --detailed-exitcode | jq` scripts get the same signal as text
+	// mode. Counts are derived locally from plan.Data — mirrors what
+	// the text renderer would compute.
+	switch outputFormat(cmd.Root()) {
+	case "json":
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+
+		if err := enc.Encode(plan); err != nil {
+			return err
+		}
+
+		return detailedExitcodeFromPlan(f.detailedExitcode, plan)
+
+	case "yaml":
+		if err := yaml.NewEncoder(out).Encode(plan); err != nil {
+			return err
+		}
+
+		return detailedExitcodeFromPlan(f.detailedExitcode, plan)
+	}
+
 	palette := newDiffPalette(out)
 
 	added, modified := renderApplyPlan(out, plan, palette)
@@ -239,6 +289,41 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	// 2 = changes pending, 1 = error. Without the flag, we return nil
 	// so existing scripts that ignore exit code keep working.
 	if f.detailedExitcode && (added+modified+len(plan.Data.Pruned)) > 0 {
+		return errExitWithChanges
+	}
+
+	return nil
+}
+
+// detailedExitcodeFromPlan replays the `--detailed-exitcode` decision
+// without running the text renderer, so JSON / YAML callers get the
+// same exit-code contract as humans. A resource with no matching
+// `current` entry (or a spec mismatch) counts as a change — same
+// rule the text renderer uses via renderApplyPlan.
+func detailedExitcodeFromPlan(enabled bool, plan diffResponse) error {
+	if !enabled {
+		return nil
+	}
+
+	changes := len(plan.Data.Pruned)
+
+	for i, desired := range plan.Data.Applied {
+		if desired == nil {
+			continue
+		}
+
+		var current *controller.Manifest
+
+		if i < len(plan.Data.Current) {
+			current = plan.Data.Current[i]
+		}
+
+		if current == nil || len(diffSpec(desired.Spec, current.Spec)) > 0 {
+			changes++
+		}
+	}
+
+	if changes > 0 {
 		return errExitWithChanges
 	}
 
@@ -454,17 +539,6 @@ func envAsMap() map[string]string {
 	}
 
 	return out
-}
-
-func printManifests(mans []controller.Manifest) error {
-	b, err := json.MarshalIndent(mans, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(b))
-
-	return nil
 }
 
 // controllerDo is the one-stop HTTP helper for apply/diff/delete. It

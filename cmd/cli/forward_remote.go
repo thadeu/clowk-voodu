@@ -74,13 +74,35 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return 1, true
 	}
 
+	// `voodu apply` takes the two-phase orchestrated flow: diff, prompt,
+	// apply. The orchestrator handles its own tarball push *after* the
+	// prompt so a canceled apply doesn't upload source for nothing.
+	// See runApplyForwarded for the full dance.
+	if isApplyCommand(stream.args) {
+		flags, cleanedArgs := extractApplyClientFlags(stream.args)
+		stream.args = cleanedArgs
+
+		code, err := runApplyForwarded(info, identity, stream, flags)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+
+			if code == 0 {
+				code = 1
+			}
+		}
+
+		return code, true
+	}
+
 	// Build-mode deployments need their source on the server before
 	// the controller can reconcile. We stream a gzipped tar per
 	// deployment into `voodu receive-pack <scope>/<name>` over SSH —
 	// commitless, per-deployment `path` as the build context, content-
-	// addressable so identical trees skip the rebuild.
+	// addressable so identical trees skip the rebuild. Force rebuild
+	// only reachable here via the env var — the --force flag lives on
+	// `apply` and is routed through runApplyForwarded above.
 	if len(stream.buildModeDeploys) > 0 {
-		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys); err != nil {
+		if err := pushSourceForDeploys(info, identity, stream.buildModeDeploys, false); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1, true
 		}
@@ -100,6 +122,56 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 	}
 
 	return code, true
+}
+
+// isApplyCommand returns true when the first positional token in argv
+// is "apply". Shared by the forwarder router to pick the two-phase
+// orchestrator. Uses findPrimaryCommand (forward_stdin.go) so flag
+// values like `-o json apply` classify correctly.
+func isApplyCommand(args []string) bool {
+	idx := findPrimaryCommand(args)
+	if idx < 0 {
+		return false
+	}
+
+	return args[idx] == "apply"
+}
+
+// applyClientFlags is the small bag of apply-only flags that the
+// client *consumes* before forwarding. The server ignores all of them
+// — they drive client-side control flow (the y/N prompt, the force
+// bit on the receive-pack push) — so we pull them out once here and
+// pass the parsed result to the orchestrator, keeping the forwarded
+// SSH argv tidy.
+type applyClientFlags struct {
+	autoApprove bool // -y / --auto-approve: skip the interactive prompt
+	force       bool // --force: rebuild build-mode deploys on hash hit
+}
+
+// extractApplyClientFlags walks argv once, pulling out the bool flags
+// that are meaningful only to the client-side orchestrator. Returns
+// the parsed flags struct and a copy of argv with those tokens
+// removed. Cosmetic for the server (its apply would ignore them
+// anyway), but keeps logs and `ssh -v` output readable. Any future
+// client-only apply flag should join this function, not spawn a
+// second walker.
+func extractApplyClientFlags(args []string) (applyClientFlags, []string) {
+	var f applyClientFlags
+
+	out := make([]string, 0, len(args))
+
+	for _, tok := range args {
+		switch tok {
+		case "-y", "--auto-approve":
+			f.autoApprove = true
+		case "--force":
+			f.force = true
+		default:
+			out = append(out, tok)
+		}
+	}
+
+	return f, out
 }
 
 // isLocalOnly returns true when the first positional token is a
@@ -147,9 +219,15 @@ func hasDefaultRemote() bool {
 // <scope>/<name>` over SSH. One stream per deployment so each respects
 // its own `path` (the build context). Content-addressable on the far
 // side: identical trees skip the rebuild entirely.
-func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildModeDep) error {
+//
+// `force` requests a rebuild even when the content hash matches an
+// existing release. Useful for non-deterministic build caches or when
+// validating CI image changes. VOODU_FORCE_REBUILD=1 is still honoured
+// as an env-var escape hatch; either path lights the same --force
+// token on the remote receive-pack invocation.
+func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildModeDep, force bool) error {
 	for _, d := range deploys {
-		if err := pushSourceViaTarball(info, identity, d); err != nil {
+		if err := pushSourceViaTarball(info, identity, d, force); err != nil {
 			return fmt.Errorf("receive-pack %s/%s: %w", d.Scope, d.Name, err)
 		}
 	}
@@ -161,7 +239,11 @@ func pushSourceForDeploys(info *remote.Info, identity string, deploys []buildMod
 // `voodu receive-pack <scope>/<name>` on the server. Uses an os.Pipe so
 // the tar is produced lazily while SSH drains it — no temp file on the
 // client, no full-archive buffered in memory.
-func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep) error {
+//
+// `force` (or VOODU_FORCE_REBUILD=1 in the env) appends --force to the
+// remote receive-pack argv, asking the server to rebuild the image
+// even when the content-addressed release already exists.
+func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, force bool) error {
 	fmt.Fprintf(os.Stderr, "-----> Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
 
 	pr, pw := io.Pipe()
@@ -185,7 +267,7 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep) er
 	}
 
 	args := []string{"receive-pack", ref}
-	if os.Getenv("VOODU_FORCE_REBUILD") == "1" {
+	if force || os.Getenv("VOODU_FORCE_REBUILD") == "1" {
 		args = append(args, "--force")
 	}
 

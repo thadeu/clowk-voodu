@@ -32,6 +32,14 @@ type ForwardOptions struct {
 	// and a TTY don't mix — ssh -tt would eat raw bytes with CR/LF fun).
 	Stdin io.Reader
 
+	// Stdout, when non-nil, replaces os.Stdout as the capture target
+	// for the remote process. Used by orchestrated flows (e.g. `voodu
+	// apply` forwarded: phase 1 captures `diff -o json` into a buffer
+	// so the client can parse and prompt before kicking off phase 2).
+	// Stderr always streams to os.Stderr — we want remote errors visible
+	// in real time regardless of what we do with stdout.
+	Stdout io.Writer
+
 	// Env gets inlined before the remote binary as `KEY=VAL` pairs so
 	// the remote voodu sees them. SSH won't forward env vars through
 	// AcceptEnv by default, and we can't count on server sshd config,
@@ -85,7 +93,12 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 		cmd.Stdin = os.Stdin
 	}
 
-	cmd.Stdout = os.Stdout
+	if opts.Stdout != nil {
+		cmd.Stdout = opts.Stdout
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+
 	cmd.Stderr = os.Stderr
 
 	err := cmd.Run()
