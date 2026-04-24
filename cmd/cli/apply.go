@@ -20,9 +20,10 @@ import (
 const applyTimeout = 30 * time.Second
 
 type applyFlags struct {
-	files  []string
-	dryRun bool
-	format string // stdin only: "hcl" | "yaml"
+	files   []string
+	dryRun  bool
+	format  string // stdin only: "hcl" | "yaml"
+	noPrune bool   // apply only: upsert without deleting siblings in the same (scope, kind)
 }
 
 func newApplyCmd() *cobra.Command {
@@ -46,7 +47,12 @@ then streamed to the server over SSH — the controller never needs
 a public port.
 
 ${VAR} in the file body is interpolated from the current process
-environment before parsing. Use ${VAR:-default} to fall back.`,
+environment before parsing. Use ${VAR:-default} to fall back.
+
+By default, apply is source-of-truth: anything in the same
+(scope, kind) that isn't in this apply gets pruned. Pass --no-prune
+when several independent applies (different repos, different CI
+pipelines) share a scope and each declares only a slice of it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runApply(cmd, f)
 		},
@@ -55,6 +61,7 @@ environment before parsing. Use ${VAR:-default} to fall back.`,
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
 	cmd.Flags().BoolVarP(&f.dryRun, "dry-run", "n", false, "print the manifests that would be applied and exit")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "upsert only; do not delete other resources in the same (scope, kind)")
 
 	return cmd
 }
@@ -114,7 +121,12 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		return err
 	}
 
-	resp, err := controllerDo(root, http.MethodPost, "/apply", "", bytes.NewReader(body))
+	query := ""
+	if f.noPrune {
+		query = "prune=false"
+	}
+
+	resp, err := controllerDo(root, http.MethodPost, "/apply", query, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

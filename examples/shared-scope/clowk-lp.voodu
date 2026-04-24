@@ -1,0 +1,22 @@
+// Lives in github.com/you/clowk-landingpage — the marketing site.
+// Scope `clowk`, name `lp`. Apply with --no-prune so this doesn't
+// clobber the sibling deployments (app, api, jobs) that live in
+// other repos.
+//
+//     voodu apply -f clowk-lp.voodu --no-prune
+
+deployment "clowk" "lp" {
+  image    = "ghcr.io/you/clowk-lp:${IMAGE_TAG:-latest}"
+  replicas = 1
+  ports    = ["8080"]
+}
+
+ingress "clowk" "lp" {
+  host = "clowk.in"
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@clowk.in"
+  }
+}

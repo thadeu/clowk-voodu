@@ -141,10 +141,22 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 		applied = append(applied, stored)
 	}
 
-	pruned, err := a.pruneMissing(r.Context(), manifests)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune: %w", err))
-		return
+	// `?prune=false` is the escape hatch for shared-scope setups where
+	// several independent applies (different repos, different pipelines)
+	// each declare only a slice of the scope. Default remains prune=on —
+	// that's the source-of-truth contract most mono-repo users want, and
+	// renames don't leave zombies behind. See README "Shared scope" for
+	// the intended usage pattern.
+	var pruned []string
+
+	if r.URL.Query().Get("prune") != "false" {
+		out, err := a.pruneMissing(r.Context(), manifests)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("prune: %w", err))
+			return
+		}
+
+		pruned = out
 	}
 
 	writeJSON(w, http.StatusOK, envelope{

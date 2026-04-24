@@ -1,0 +1,24 @@
+// Lives in github.com/you/clowk-api — the public API service.
+// Scope `clowk`, name `api`. Apply with --no-prune.
+//
+//     voodu apply -f clowk-api.voodu --no-prune
+
+deployment "clowk" "api" {
+  image    = "ghcr.io/you/clowk-api:${IMAGE_TAG:-latest}"
+  replicas = 3
+  ports    = ["4000"]
+
+  env = {
+    PORT = "4000"
+  }
+}
+
+ingress "clowk" "api" {
+  host = "api.clowk.in"
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@clowk.in"
+  }
+}

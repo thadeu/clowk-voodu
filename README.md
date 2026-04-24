@@ -108,6 +108,10 @@ desired state. The controller diffs against etcd and **prunes per
 `deployments.hcl` won't touch ingresses in the same scope, so you can
 decompose by kind without cross-kind deletion.
 
+Pass `--no-prune` to upsert without deletions — see
+[Shared scope across repos](#shared-scope-across-repos) for the
+intended use case.
+
 ### File extensions
 
 All of these are parsed as HCL — pick whichever reads best in your
@@ -133,6 +137,8 @@ More examples live in [`examples/`](examples/):
 - [`fullstack/`](examples/fullstack/) — deployment + database + ingress
 - [`multi-env/app.voodu`](examples/multi-env/app.voodu) — one manifest,
   many servers (staging / prod-1 / prod-2 selected with `-r`)
+- [`shared-scope/`](examples/shared-scope/) — one scope fanned out
+  across independent repos with `--no-prune` upsert
 - [`ingress/profiles.hcl`](examples/ingress/profiles.hcl) — four TLS
   profiles (HTTP, Let's Encrypt, internal CA, on-demand wildcard)
 - [`ingress/paths.hcl`](examples/ingress/paths.hcl) — path-based
@@ -172,6 +178,49 @@ you want `voodu apply` to "just work".
 Three prod hosts behind an AWS ALB? Add `prod-1`, `prod-2`, `prod-3` and
 loop: `for r in prod-1 prod-2 prod-3; do voodu apply -f voodu.hcl -r $r;
 done`. The scope+name in the manifest stays constant across rollouts.
+
+## Shared scope across repos
+
+By default every `voodu apply` is a full source-of-truth statement for
+the `(scope, kind)` pairs it touches — anything the controller knows
+about in that pair that isn't in this apply gets pruned. That's the
+right default for a single repo that owns its scope: rename a
+deployment in HCL and the old one disappears, no zombies left behind.
+
+The shape below is **different**. Four independent repos, one shared
+scope, each applying only its own slice:
+
+```hcl
+# github.com/you/clowk
+deployment "clowk" "app" { image = "ghcr.io/you/clowk:1" }
+
+# github.com/you/clowk-landingpage
+deployment "clowk" "lp"  { image = "ghcr.io/you/clowk-lp:1" }
+
+# github.com/you/clowk-api
+deployment "clowk" "api" { image = "ghcr.io/you/clowk-api:1" }
+
+# github.com/you/clowk-jobs
+deployment "clowk" "jobs" { image = "ghcr.io/you/clowk-jobs:1" }
+```
+
+With the default behavior, each `voodu apply` would delete the three
+others' deployments. Use `--no-prune` to opt into upsert-only:
+
+```sh
+voodu apply -f voodu.hcl --no-prune
+```
+
+The flag lives in every CI pipeline that shares a scope, so the choice
+is explicit and grep-able. The default elsewhere stays strict.
+
+**When to reach for this vs. distinct scopes.** The cleaner shape is
+usually one scope per repo (`clowk-app`, `clowk-lp`, `clowk-api`,
+`clowk-jobs`) — ownership is obvious, `voodu list -s clowk-api` scopes
+to one repo, and no pipeline needs a flag. Pick shared scope only when
+grouping is a first-class concern (a logical environment you want to
+query and config together) and every apply that touches the scope
+passes `--no-prune`.
 
 ## Ingress routing
 

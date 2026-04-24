@@ -1,0 +1,32 @@
+// Lives in github.com/you/clowk — the main Rails app.
+//
+// Scope `clowk` is shared with three sibling repos (landing page, API,
+// jobs). Each one owns its own `name` inside the shared scope.
+// Because no single repo declares ALL the deployments at once, every
+// apply must pass `--no-prune` so the controller upserts this slice
+// without deleting the siblings owned by the other repos.
+//
+// From this repo's CI:
+//
+//     voodu apply -f clowk-app.voodu --no-prune
+
+deployment "clowk" "app" {
+  image    = "ghcr.io/you/clowk:${IMAGE_TAG:-latest}"
+  replicas = 2
+  ports    = ["3000"]
+
+  env = {
+    RAILS_ENV = "production"
+    PORT      = "3000"
+  }
+}
+
+ingress "clowk" "app" {
+  host = "app.clowk.in"
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@clowk.in"
+  }
+}

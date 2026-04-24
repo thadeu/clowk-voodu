@@ -99,6 +99,110 @@ ingress "test" "api" {
 	}
 }
 
+// TestApplyNoPrunePropagatesQuery verifies the CLI flag translates to
+// the controller's ?prune=false query param — the wire contract that
+// lets shared-scope cross-repo applies coexist.
+func TestApplyNoPrunePropagatesQuery(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "ghcr.io/clowk/lp:1"
+}
+`)
+
+	var (
+		mu           sync.Mutex
+		gotRawQuery  string
+		gotPath      string
+		requestCount int
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		gotPath = r.URL.Path
+		gotRawQuery = r.URL.RawQuery
+		mu.Unlock()
+
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runApply(cmd, applyFlags{files: []string{dir}, noPrune: true}); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if requestCount != 1 {
+		t.Fatalf("expected 1 request, got %d", requestCount)
+	}
+
+	if gotPath != "/apply" {
+		t.Errorf("path = %q, want /apply", gotPath)
+	}
+
+	if gotRawQuery != "prune=false" {
+		t.Errorf("raw query = %q, want prune=false", gotRawQuery)
+	}
+}
+
+// TestApplyDefaultPruneSendsNoQuery verifies the default apply does NOT
+// include a prune query param — the controller sees an empty query and
+// applies the source-of-truth contract (prune on).
+func TestApplyDefaultPruneSendsNoQuery(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "ghcr.io/clowk/lp:1"
+}
+`)
+
+	var (
+		mu          sync.Mutex
+		gotRawQuery string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotRawQuery = r.URL.RawQuery
+		mu.Unlock()
+
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runApply(cmd, applyFlags{files: []string{dir}}); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if gotRawQuery != "" {
+		t.Errorf("raw query = %q, want empty (default prune=on)", gotRawQuery)
+	}
+}
+
 func mustWrite(t *testing.T, path, content string) {
 	t.Helper()
 

@@ -193,6 +193,52 @@ func TestApplyPruneRemovesMissing(t *testing.T) {
 	}
 }
 
+// TestApplyNoPruneKeepsSiblings covers the shared-scope escape hatch:
+// when several independent applies (different repos, different CI
+// pipelines) each declare only a slice of the same (scope, kind),
+// prune=false prevents them from clobbering each other's resources.
+func TestApplyNoPruneKeepsSiblings(t *testing.T) {
+	api, store := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	// Simulate four independent repos that have already each applied
+	// their own deployment into the shared "clowk" scope.
+	seed := []*Manifest{
+		{Kind: KindDeployment, Scope: "clowk", Name: "app"},
+		{Kind: KindDeployment, Scope: "clowk", Name: "lp"},
+		{Kind: KindDeployment, Scope: "clowk", Name: "api"},
+		{Kind: KindDeployment, Scope: "clowk", Name: "jobs"},
+	}
+
+	for _, m := range seed {
+		if _, err := store.Put(t.Context(), m); err != nil {
+			t.Fatalf("seed %s/%s/%s: %v", m.Kind, m.Scope, m.Name, err)
+		}
+	}
+
+	// clowk-lp repo re-applies only its own deployment — but with
+	// ?prune=false, the sibling deployments owned by other repos must
+	// survive.
+	body := `[{"kind":"deployment","scope":"clowk","name":"lp","spec":{}}]`
+
+	resp, err := http.Post(ts.URL+"/apply?prune=false", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	for _, name := range []string{"app", "lp", "api", "jobs"} {
+		if got, _ := store.Get(t.Context(), KindDeployment, "clowk", name); got == nil {
+			t.Errorf("clowk/%s was pruned despite ?prune=false", name)
+		}
+	}
+}
+
 // TestApplyAllowsCrossScopeNameReuse verifies two scopes can share a
 // deployment name. Identity on disk (container slots, image tags, env
 // files, release dirs) is keyed by AppID(scope, name) = "<scope>-<name>",

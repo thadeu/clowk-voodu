@@ -1,0 +1,14 @@
+// Lives in github.com/you/clowk-jobs — the background worker.
+// Scope `clowk`, name `jobs`. No ingress — workers don't serve HTTP.
+// Apply with --no-prune.
+//
+//     voodu apply -f clowk-jobs.voodu --no-prune
+
+deployment "clowk" "jobs" {
+  image    = "ghcr.io/you/clowk-jobs:${IMAGE_TAG:-latest}"
+  replicas = 2
+
+  env = {
+    WORKER_CONCURRENCY = "10"
+  }
+}
