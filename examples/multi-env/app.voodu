@@ -1,0 +1,57 @@
+// Single manifest, many servers — the voodu multi-env shape.
+//
+// The scope + name in the HCL is the app identity, stable across every
+// environment. Which SERVER receives the apply is a CLI-level concern
+// controlled by -r (short for --remote). Register the remotes once:
+//
+//     voodu remote add staging ubuntu@staging.example.com
+//     voodu remote add prod-1  ubuntu@prod-1.example.com
+//     voodu remote add prod-2  ubuntu@prod-2.example.com
+//
+// Then roll out the same file to any of them:
+//
+//     voodu apply -f app.voodu -r staging
+//     voodu apply -f app.voodu -r prod-1
+//     voodu apply -f app.voodu -r prod-2
+//
+// Fan-out a production rollout with a simple loop:
+//
+//     for r in prod-1 prod-2; do voodu apply -f app.voodu -r $r; done
+//
+// Variable interpolation is resolved on YOUR machine before the
+// tarball ships, so per-env knobs can come from your shell (direnv,
+// .envrc, etc.):
+//
+//     IMAGE_TAG=v1.4.2 voodu apply -f app.voodu -r prod-1
+//
+// The deployment block below reads IMAGE_TAG and APP_HOST from the
+// environment, with sensible fallbacks.
+//
+// Note the file extension: `.voodu` is parsed as HCL, identical to
+// `.hcl`. `.vdu` and `.vd` are the shorter aliases. Pick whichever
+// reads best in your editor / file tree.
+
+deployment "clowk-lp" "web" {
+  image    = "ghcr.io/clowk/lp:${IMAGE_TAG:-latest}"
+  replicas = 2
+  ports    = ["8080"]
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  restart      = "always"
+  health_check = "/"
+}
+
+ingress "clowk-lp" "web" {
+  host = "${APP_HOST:-clowk.in}"
+  port = 8080
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@clowk.in"
+  }
+}

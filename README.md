@@ -101,6 +101,22 @@ desired state. The controller diffs against etcd and **prunes per
 `deployments.hcl` won't touch ingresses in the same scope, so you can
 decompose by kind without cross-kind deletion.
 
+### File extensions
+
+All of these are parsed as HCL — pick whichever reads best in your
+editor and file tree:
+
+| Extension | When it's nice |
+|---|---|
+| `.hcl` | Tooling compatibility (most editors / IDEs highlight this by default) |
+| `.voodu` | Branded, reads like a first-class config (`web.voodu`, `api.voodu`) |
+| `.vdu`, `.vd` | Shorter aliases for the same |
+| `.yml`, `.yaml` | YAML variant — same schema, different syntax |
+
+`voodu apply -f web` resolves bare names against all of the above in
+order, so editing `web.voodu` and running `voodu apply -f web` just
+works.
+
 For a deployment that already has a published image, drop `path` and set
 `image = "ghcr.io/you/api:1.2.3"` — no tarball gets streamed, the
 controller pulls from the registry.
@@ -108,10 +124,47 @@ controller pulls from the registry.
 More examples live in [`examples/`](examples/):
 
 - [`fullstack/`](examples/fullstack/) — deployment + database + ingress
+- [`multi-env/app.voodu`](examples/multi-env/app.voodu) — one manifest,
+  many servers (staging / prod-1 / prod-2 selected with `-r`)
 - [`ingress/profiles.hcl`](examples/ingress/profiles.hcl) — four TLS
   profiles (HTTP, Let's Encrypt, internal CA, on-demand wildcard)
 - [`ingress/paths.hcl`](examples/ingress/paths.hcl) — path-based
   routing with `location {}` blocks
+
+## Remotes
+
+A **remote** is just an SSH target — a `user@host` pair stored as a git
+remote so every developer clone already knows where the app ships.
+Voodu inherits the git-remote lookup so there's no extra config file.
+
+```sh
+# one-shot bootstrap of a fresh host (ssh preflight + install + server setup)
+voodu remote setup staging ubuntu@staging.example.com --binary ./bin/voodu
+
+# or just register a remote for an already-provisioned host
+voodu remote add    prod-1 ubuntu@prod-1.example.com
+voodu remote add    prod-2 ubuntu@prod-2.example.com
+voodu remote list
+```
+
+The HCL manifest owns the app identity (`scope` + `name`). The remote
+owns only the SSH destination. So **one server runs as many apps as the
+HCL declares**, and the same manifest ships unchanged to any server —
+only `-r` changes:
+
+```sh
+voodu apply -f voodu.hcl              # default: looks up the "voodu" git remote
+voodu apply -f voodu.hcl -r staging   # ship to staging
+voodu apply -f voodu.hcl -r prod-1    # ship to prod-1
+```
+
+`-r` is the shorthand for `--remote`. Omit both and voodu uses the git
+remote named `voodu` — handy when a repo targets a single server and
+you want `voodu apply` to "just work".
+
+Three prod hosts behind an AWS ALB? Add `prod-1`, `prod-2`, `prod-3` and
+loop: `for r in prod-1 prod-2 prod-3; do voodu apply -f voodu.hcl -r $r;
+done`. The scope+name in the manifest stays constant across rollouts.
 
 ## Ingress routing
 
