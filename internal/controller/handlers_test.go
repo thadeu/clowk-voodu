@@ -1190,6 +1190,70 @@ func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
 	}
 }
 
+// Delete is terminal: every slot container for the AppID must be torn
+// down, and the status blob cleared so the next re-apply baselines
+// from scratch. Filesystem state (env file, releases) stays — a
+// subsequent `voodu apply` of the same name picks up where config-set
+// left off. Tests the scoped case (two apps with `deployment "web"`
+// must not clobber each other on delete).
+func TestDeploymentHandler_DeleteRemovesSlotsAndClearsStatus(t *testing.T) {
+	store := newMemStore()
+
+	cm := &fakeContainers{
+		exists: map[string]bool{
+			"test-api-0": true,
+			"test-api-1": true,
+			// A slot in another scope that happens to share the deployment
+			// name — must be untouched.
+			"other-api-0": true,
+		},
+	}
+
+	pre, _ := json.Marshal(DeploymentStatus{Image: "img:1", SpecHash: "hash"})
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
+
+	otherPre, _ := json.Marshal(DeploymentStatus{Image: "img:1", SpecHash: "hash"})
+	_ = store.PutStatus(context.Background(), KindDeployment, "other-api", otherPre)
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	err := h.Handle(context.Background(), WatchEvent{
+		Type:  WatchDelete,
+		Kind:  KindDeployment,
+		Scope: "test",
+		Name:  "api",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sort.Strings(cm.removes)
+
+	want := []string{"test-api-0", "test-api-1"}
+	if len(cm.removes) != len(want) || cm.removes[0] != want[0] || cm.removes[1] != want[1] {
+		t.Errorf("delete removes: got %+v want %+v", cm.removes, want)
+	}
+
+	if raw, _ := store.GetStatus(context.Background(), KindDeployment, "test-api"); raw != nil {
+		t.Errorf("deployment status not cleared after delete: %s", raw)
+	}
+
+	// Cross-scope: `other-api`'s container and status must be intact.
+	if raw, _ := store.GetStatus(context.Background(), KindDeployment, "other-api"); raw == nil {
+		t.Errorf("sibling scope's status was cleared — delete leaked across scopes")
+	}
+
+	if !cm.exists["other-api-0"] {
+		t.Errorf("sibling scope's container was removed — delete leaked across scopes")
+	}
+}
+
 func TestIngressApplyEnv_EmitsMultiUpstreamAndLB(t *testing.T) {
 	env := ingressApplyEnv(
 		"api",

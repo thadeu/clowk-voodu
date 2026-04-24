@@ -440,13 +440,52 @@ func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
 		return h.apply(ctx, ev)
 
 	case WatchDelete:
-		// Don't nuke the app's env on deployment delete — the user may
-		// have secrets set through `voodu config set` that survive
-		// deployment churn. Explicit `voodu config unset` or removing
-		// the app is the right escape hatch.
-		h.logf("deployment/%s deleted (env left intact)", ev.Name)
-		return nil
+		return h.remove(ctx, ev)
 	}
+
+	return nil
+}
+
+// remove tears down every container that belongs to this deployment's
+// AppID and clears its status blob. Filesystem state (env file, release
+// dirs, shared volumes) is intentionally left in place — two reasons:
+//
+//   1. `voodu config set` writes secrets that outlive any single manifest
+//      revision. A user who re-applies the deployment expects their
+//      secrets to still be there.
+//   2. A release dir carries the build context from the last `voodu
+//      deploy`. Keeping it around lets the user roll back by re-applying
+//      without re-building.
+//
+// Operators who want a full wipe still have the shell: `rm -rf
+// /opt/voodu/apps/<app>` is the explicit, loud way to do that.
+func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
+	app := AppID(ev.Scope, ev.Name)
+
+	if h.Containers != nil {
+		existing, err := h.Containers.ListByAppPrefix(app)
+		if err != nil {
+			return fmt.Errorf("list slots: %w", err)
+		}
+
+		for _, name := range existing {
+			h.logf("deployment/%s deleting slot %s", ev.Name, name)
+
+			if err := h.Containers.Remove(name); err != nil {
+				return fmt.Errorf("remove %s: %w", name, err)
+			}
+		}
+	}
+
+	// Status blob is keyed by AppID (see writeDeploymentStatus). Clearing
+	// it matters: the next `voodu apply` of the same name re-baselines
+	// cleanly instead of comparing fresh containers against a stale
+	// spec-hash from the previous incarnation.
+	if err := h.Store.DeleteStatus(ctx, KindDeployment, app); err != nil {
+		return fmt.Errorf("clear deployment status: %w", err)
+	}
+
+	h.logf("deployment/%s deleted (containers removed, env+releases left intact)", ev.Name)
 
 	return nil
 }
@@ -529,7 +568,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	//   2. `voodu config set` writes to the same file; linkEnv's Load/
 	//      Save round-trip preserves those values when the spec declares
 	//      no Env block of its own.
-	envChanged, err := h.linkEnv(ctx, app, spec.Env)
+	envChanged, err := h.linkEnv(ctx, ev.Scope, app, spec.Env)
 	if err != nil {
 		return err
 	}
@@ -884,8 +923,13 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 // Split out of apply() so the ensure-container step can run independently
 // when the manifest has no env block. Returns whether the write actually
 // changed any value — used to gate restart.
-func (h *DeploymentHandler) linkEnv(ctx context.Context, app string, env map[string]string) (bool, error) {
-	lookup := h.refLookup(ctx)
+//
+// scope is the deployment's scope — used by refLookup to AppID-ify
+// lookups for scoped kinds (service, ingress) so a deployment in scope
+// "clowk-lp" resolves `${ref.service.api}` against its own scope's
+// service, not another scope's same-named one.
+func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, app string, env map[string]string) (bool, error) {
+	lookup := h.refLookup(ctx, scope)
 
 	resolved, err := InterpolateRefsMap(env, lookup)
 	if err != nil {
@@ -919,14 +963,24 @@ func (h *DeploymentHandler) linkEnv(ctx context.Context, app string, env map[str
 // that has a top-level `data` object. That way this closure doesn't
 // need to switch on kind — any future kind (service, ingress, queue)
 // becomes referenceable just by following the convention.
-func (h *DeploymentHandler) refLookup(ctx context.Context) RefLookup {
+//
+// Scoped-kind status is keyed by AppID, so the closure prefixes `name`
+// with `scope-` for any IsScoped kind. Unscoped kinds (database) stay
+// keyed by bare name. scope is the calling deployment's scope — that's
+// the lens through which refs resolve.
+func (h *DeploymentHandler) refLookup(ctx context.Context, scope string) RefLookup {
 	return func(kind, name, field string) (string, bool) {
 		k, err := ParseKind(kind)
 		if err != nil {
 			return "", false
 		}
 
-		raw, err := h.Store.GetStatus(ctx, k, name)
+		key := name
+		if IsScoped(k) {
+			key = AppID(scope, name)
+		}
+
+		raw, err := h.Store.GetStatus(ctx, k, key)
 		if err != nil || raw == nil {
 			return "", false
 		}

@@ -160,8 +160,9 @@ func TestIngressHandler_ApplyDispatchesToPlugin(t *testing.T) {
 	}
 
 	// Status should carry plugin name + envelope data (so
-	// ${ref.ingress.public.url} resolves downstream).
-	raw, _ := store.GetStatus(context.Background(), KindIngress, "public")
+	// ${ref.ingress.public.url} resolves downstream). Key is AppID-prefixed
+	// since KindIngress is scoped — putEvent sets scope="test".
+	raw, _ := store.GetStatus(context.Background(), KindIngress, "test-public")
 	if raw == nil {
 		t.Fatal("ingress status not persisted")
 	}
@@ -400,14 +401,16 @@ func TestIngressHandler_HostStillRequired(t *testing.T) {
 func TestIngressHandler_RemoveCallsPluginAndClearsStatus(t *testing.T) {
 	store := newMemStore()
 
+	// Status is keyed by AppID — the real store emits delete events with
+	// scope populated from the /desired key, so mirror that here.
 	pre, _ := json.Marshal(IngressStatus{Plugin: "caddy", Data: map[string]any{"host": "x"}})
-	_ = store.PutStatus(context.Background(), KindIngress, "public", pre)
+	_ = store.PutStatus(context.Background(), KindIngress, "test-public", pre)
 
 	inv := &fakeInvoker{}
 
 	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
 
-	if err := h.Handle(context.Background(), WatchEvent{Type: WatchDelete, Kind: KindIngress, Name: "public"}); err != nil {
+	if err := h.Handle(context.Background(), WatchEvent{Type: WatchDelete, Kind: KindIngress, Scope: "test", Name: "public"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -415,7 +418,7 @@ func TestIngressHandler_RemoveCallsPluginAndClearsStatus(t *testing.T) {
 		t.Fatalf("remove not called: %+v", inv.calls)
 	}
 
-	raw, _ := store.GetStatus(context.Background(), KindIngress, "public")
+	raw, _ := store.GetStatus(context.Background(), KindIngress, "test-public")
 	if raw != nil {
 		t.Errorf("ingress status not cleared")
 	}
@@ -423,7 +426,9 @@ func TestIngressHandler_RemoveCallsPluginAndClearsStatus(t *testing.T) {
 
 // The generalised refLookup (see DeploymentHandler.refLookup) must
 // resolve service and ingress refs the same way it resolves database
-// refs — the uniform status envelope is what enables this.
+// refs — the uniform status envelope is what enables this. Services
+// are unscoped (bare name), ingresses are scoped (AppID-keyed); the
+// closure picks the right key based on IsScoped.
 func TestRefLookupResolvesServiceAndIngressStatus(t *testing.T) {
 	store := newMemStore()
 
@@ -431,11 +436,11 @@ func TestRefLookupResolvesServiceAndIngressStatus(t *testing.T) {
 	_ = store.PutStatus(context.Background(), KindService, "web", svcStatus)
 
 	ingStatus, _ := json.Marshal(IngressStatus{Plugin: "caddy", Data: map[string]any{"url": "https://x"}})
-	_ = store.PutStatus(context.Background(), KindIngress, "public", ingStatus)
+	_ = store.PutStatus(context.Background(), KindIngress, "myapp-public", ingStatus)
 
 	h := &DeploymentHandler{Store: store, Log: quietLogger()}
 
-	lookup := h.refLookup(context.Background())
+	lookup := h.refLookup(context.Background(), "myapp")
 
 	if v, ok := lookup("service", "web", "target"); !ok || v != "api" {
 		t.Errorf("service ref: got (%q, %v)", v, ok)
@@ -443,6 +448,25 @@ func TestRefLookupResolvesServiceAndIngressStatus(t *testing.T) {
 
 	if v, ok := lookup("ingress", "public", "url"); !ok || v != "https://x" {
 		t.Errorf("ingress ref: got (%q, %v)", v, ok)
+	}
+}
+
+// Cross-scope isolation: a deployment in scope "app-a" referencing
+// `${ref.ingress.public.url}` must see its own scope's ingress, not
+// an ingress named "public" declared in scope "app-b". Same name +
+// different scopes → different AppIDs → different status keys.
+func TestRefLookupIsScopeIsolated(t *testing.T) {
+	store := newMemStore()
+
+	other, _ := json.Marshal(IngressStatus{Plugin: "caddy", Data: map[string]any{"url": "https://b.example"}})
+	_ = store.PutStatus(context.Background(), KindIngress, "app-b-public", other)
+
+	h := &DeploymentHandler{Store: store, Log: quietLogger()}
+
+	lookup := h.refLookup(context.Background(), "app-a")
+
+	if v, ok := lookup("ingress", "public", "url"); ok {
+		t.Errorf("scope leak: app-a saw app-b's ingress (got %q)", v)
 	}
 }
 

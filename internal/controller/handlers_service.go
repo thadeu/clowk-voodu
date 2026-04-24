@@ -217,9 +217,15 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		pluginName = "caddy"
 	}
 
-	env := ingressApplyEnv(ev.Name, spec, up)
+	// Same AppID story as deployments: the router plugin keys its state
+	// by the app name it receives (voodu-caddy writes routes/<app>.json),
+	// so two scopes declaring `ingress "web"` would clobber each other's
+	// file without the scope prefix.
+	app := AppID(ev.Scope, ev.Name)
 
-	res, err := h.Invoker.Invoke(ctx, pluginName, "apply", []string{ev.Name}, env)
+	env := ingressApplyEnv(app, spec, up)
+
+	res, err := h.Invoker.Invoke(ctx, pluginName, "apply", []string{app}, env)
 	if err != nil {
 		return err
 	}
@@ -252,7 +258,7 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return err
 	}
 
-	if err := h.Store.PutStatus(ctx, KindIngress, ev.Name, blob); err != nil {
+	if err := h.Store.PutStatus(ctx, KindIngress, app, blob); err != nil {
 		return err
 	}
 
@@ -262,7 +268,9 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 }
 
 func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
-	raw, err := h.Store.GetStatus(ctx, KindIngress, ev.Name)
+	app := AppID(ev.Scope, ev.Name)
+
+	raw, err := h.Store.GetStatus(ctx, KindIngress, app)
 	if err != nil {
 		return err
 	}
@@ -281,8 +289,8 @@ func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 		pluginName = "caddy"
 	}
 
-	res, err := h.Invoker.Invoke(ctx, pluginName, "remove", []string{ev.Name}, map[string]string{
-		plugin.EnvApp: ev.Name,
+	res, err := h.Invoker.Invoke(ctx, pluginName, "remove", []string{app}, map[string]string{
+		plugin.EnvApp: app,
 	})
 	if err != nil {
 		return err
@@ -292,7 +300,7 @@ func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("%s remove exited %d: %s", pluginName, res.ExitCode, pluginErrorDetail(res))
 	}
 
-	if err := h.Store.DeleteStatus(ctx, KindIngress, ev.Name); err != nil {
+	if err := h.Store.DeleteStatus(ctx, KindIngress, app); err != nil {
 		return err
 	}
 
