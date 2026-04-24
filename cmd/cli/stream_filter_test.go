@@ -204,6 +204,73 @@ func TestProgressFilterCloseFlushesPartialLine(t *testing.T) {
 	}
 }
 
+// TestProgressFilterUnknownBannerPrintsWhenIdle locks in the decision
+// that unknown `-----> ` lines do not auto-open an implicit spinner
+// step. The filter has a curated stepBanners table — anything outside
+// it (and outside passthroughBanners) should land in scrollback as a
+// plain line when no step is open. The motivating case is lines like
+// `-----> No spec changes. Re-pushing source …` that the client itself
+// routes through the filter before any build phase begins: spinning
+// on an unknown phrase would be worse DX than just showing it.
+func TestProgressFilterUnknownBannerPrintsWhenIdle(t *testing.T) {
+	var out bytes.Buffer
+
+	f := forceFilter(&out, false)
+
+	if _, err := f.Write([]byte("-----> No spec changes. Re-pushing source for 1 build-mode deployment.\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = f.Close()
+
+	got := stripANSI(out.String())
+
+	if !strings.Contains(got, "-----> No spec changes. Re-pushing source for 1 build-mode deployment.") {
+		t.Errorf("unknown banner must pass through verbatim when idle, got: %q", got)
+	}
+
+	if f.active {
+		t.Error("unknown banner must not open an implicit step")
+	}
+}
+
+// TestProgressFilterUnknownBannerSwallowedInStep mirrors the idle case:
+// once a real step is open, unknown `-----> ` sub-details (plugin
+// banners like "Detected Dockerfile at /…") stay swallowed so the
+// spinner headline remains the single animated line.
+func TestProgressFilterUnknownBannerSwallowedInStep(t *testing.T) {
+	var out bytes.Buffer
+
+	f := forceFilter(&out, false)
+
+	rememberShippedTag("web")
+
+	payload := strings.Join([]string{
+		"-----> Building release...",
+		"-----> Detected Dockerfile at /app/Dockerfile",
+		"-----> Release root has 42 entries",
+		"-----> Build completed",
+		"",
+	}, "\n")
+
+	if _, err := f.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = f.Close()
+
+	got := stripANSI(out.String())
+
+	for _, banned := range []string{
+		"-----> Detected Dockerfile",
+		"-----> Release root",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("sub-banner %q leaked into output:\n%s", banned, got)
+		}
+	}
+}
+
 // TestProgressFilterCloseClearsDanglingSpinner handles the crash
 // scenario: we entered a build block, docker exploded, SSH died
 // before emitting `-----> Build completed`. Close() must stop the

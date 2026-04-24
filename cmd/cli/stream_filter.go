@@ -236,26 +236,40 @@ func (f *progressFilter) processLineLocked(line string) {
 			fmt.Fprintf(f.out, "\x1b[32m✓\x1b[0m %s\n", msg)
 
 		default:
-			// Sub-banner (Detected Dockerfile at /…, Using default
-			// Dockerfile, Release root has N entries, …). Neither opens
-			// a step nor writes to scrollback. `-v` is the escape hatch.
-			if !f.active {
-				// No step is open yet but the server is already emitting
-				// sub-banners — open an implicit step so the user sees
-				// the animated line and doesn't feel stuck.
-				f.openStepLocked(msg)
+			// Unknown `-----> ` banner — neither in stepBanners nor
+			// passthroughBanners. When a step is active we swallow
+			// (plugin sub-details like "Detected Dockerfile at /…",
+			// "Release root has N entries" — the spinner headline is
+			// the story) but we also nudge the spinner one frame forward
+			// so chatter-heavy phases still animate even if the ticker
+			// goroutine is starved by lock contention. When idle we
+			// print the line verbatim instead of auto-opening an implicit
+			// step: spinning on an unknown phrase is worse DX than
+			// showing it plain, and callers already outside the build
+			// flow (e.g. "-----> No spec changes. Re-pushing source …")
+			// should land in scrollback unchanged. New phases opt into
+			// the spinner by joining one of the tables above.
+			if f.active {
+				f.advanceAndRenderLocked()
+			} else {
+				fmt.Fprintln(f.out, line)
 			}
 		}
 
 		return
 	}
 
-	// Non-banner content. Inside a step we swallow unconditionally
-	// (tarball noise, plugin continuation lines with leading whitespace,
-	// buildx `#N` chatter, blank separators). Outside a step we passthrough
-	// because this is how "no spec changes" / trailing "deployment/...
-	// applied" lines reach the user.
+	// Non-banner content. Inside a step we swallow (tarball noise,
+	// plugin continuation lines with leading whitespace, buildx `#N`
+	// chatter, blank separators) but treat each line as a spinner
+	// heartbeat — the goroutine ticker fires every 100ms, but docker
+	// buildx can hold the Write lock in a near-continuous burst during
+	// a build; advancing the frame here guarantees the animation moves
+	// regardless. Outside a step we passthrough because this is how
+	// trailing "deployment/... applied" lines and idle banners reach
+	// the user.
 	if f.active {
+		f.advanceAndRenderLocked()
 		return
 	}
 
@@ -277,6 +291,31 @@ func (f *progressFilter) openStepLocked(msg string) {
 
 	f.currentStep = msg
 	f.stepStarted = time.Now()
+
+	// Render the first frame synchronously. The ticker goroutine only
+	// fires 100ms after start, which is longer than many sub-steps take
+	// to complete — without this explicit render, Shipping/Receiving/
+	// Creating would close so fast the user never actually sees a
+	// spinner frame between "start" and "✓". Drawing here guarantees at
+	// least one visible `⠋ <step>` frame per step, even if the next line
+	// arrives the very next microsecond.
+	f.renderSpinnerLocked()
+}
+
+// renderSpinnerLocked draws the current spinner frame without advancing
+// it. Shared between the ticker goroutine (which advances the frame
+// first) and openStepLocked (which just wants to show the current
+// frame on a brand-new step). Caller must hold f.mu.
+func (f *progressFilter) renderSpinnerLocked() {
+	if !f.active || f.currentStep == "" {
+		return
+	}
+
+	frames := []rune(spinnerFrames)
+	elapsed := time.Since(f.stepStarted).Round(time.Second)
+
+	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[36m%c\x1b[0m %s \x1b[2m(%s)\x1b[0m",
+		frames[f.frame], f.currentStep, elapsed)
 }
 
 // closeCurrentStepLocked commits the currently-open step as a green
@@ -388,6 +427,14 @@ func (f *progressFilter) tick() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.advanceAndRenderLocked()
+}
+
+// advanceAndRenderLocked bumps the spinner frame by one and repaints
+// the current step line. The timer is per-step (not overall) so the
+// user sees "Building release... (3s)" as the build churns — resetting
+// on each new step keeps the number meaningful. Caller must hold f.mu.
+func (f *progressFilter) advanceAndRenderLocked() {
 	if !f.active || f.currentStep == "" {
 		return
 	}
@@ -395,15 +442,7 @@ func (f *progressFilter) tick() {
 	frames := []rune(spinnerFrames)
 	f.frame = (f.frame + 1) % len(frames)
 
-	elapsed := time.Since(f.stepStarted).Round(time.Second)
-
-	// \r + clear-to-end-of-line + redraw. Cyan spinner + headline of
-	// the open step + dim per-step timer. The timer is per-step (not
-	// overall) so the user sees "Building release... (3s)" as the
-	// build churns — resetting on each new step keeps the number
-	// meaningful.
-	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[36m%c\x1b[0m %s \x1b[2m(%s)\x1b[0m",
-		frames[f.frame], f.currentStep, elapsed)
+	f.renderSpinnerLocked()
 }
 
 // stopSpinnerLocked signals the goroutine to exit and waits. Lock is

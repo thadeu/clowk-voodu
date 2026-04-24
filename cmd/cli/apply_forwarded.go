@@ -129,7 +129,13 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 			word = "deployments"
 		}
 
-		fmt.Fprintf(os.Stdout, "-----> No spec changes. Re-pushing source for %d build-mode %s.\n",
+		// Prefix with a green ✓ so the line reads as a finished check in
+		// the same visual language as the ✓ build steps below — but
+		// keep the `----->` phase marker so it still signals "this is a
+		// server-style banner" in the scrollback. The check conveys "we
+		// looked, nothing to apply"; the banner body explains why we're
+		// still doing work (re-pushing source for build-mode deploys).
+		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m No spec changes. Re-pushing source for %d build-mode %s.\n",
 			len(stream.buildModeDeploys), word)
 	}
 
