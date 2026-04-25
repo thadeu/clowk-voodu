@@ -26,6 +26,9 @@ type jobSpec struct {
 	Networks    []string          `json:"networks,omitempty"`
 	NetworkMode string            `json:"network_mode,omitempty"`
 	Timeout     string            `json:"timeout,omitempty"`
+
+	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
+	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 }
 
 // JobHandler reconciles job manifests. Unlike DeploymentHandler, the
@@ -40,16 +43,17 @@ type jobSpec struct {
 //
 //   2. RunOnce — the one imperative entry point. Pulls the manifest off
 //      the store (so the run reflects current desired state, not a
-//      snapshot taken at apply time), spawns a one-shot container with
-//      `--rm`, blocks on docker wait, and records the exit code +
-//      duration in the status's history. Removes the container itself
-//      on success; on Wait error we leave the container around for the
-//      operator to inspect.
+//      snapshot taken at apply time), spawns a one-shot container
+//      WITHOUT AutoRemove, blocks on docker wait, and records the exit
+//      code + duration in the status's history. The stopped container
+//      stays around so `voodu logs job <name>` (and the docker
+//      json-file driver underneath it) has something to read; the
+//      runner GCs old run containers down to the spec's
+//      successful_history_limit / failed_history_limit caps.
 //
-//   3. remove — torch any historical job containers (rare, since
-//      AutoRemove cleans them up post-run, but a long-running job that
-//      hasn't exited yet would still be live). Status blob clears so
-//      the next apply baselines from scratch.
+//   3. remove — torch any historical job containers (in-flight or
+//      retained-for-logs). Status blob clears so the next apply
+//      baselines from scratch.
 //
 // JobHandler does not own scheduling. M4's cronjob handler will share
 // the RunOnce method (or a near twin) so cron ticks dispatch through
@@ -101,12 +105,6 @@ type JobRun struct {
 	Status    string    `json:"status"`
 	Error     string    `json:"error,omitempty"`
 }
-
-// historyCap bounds JobStatus.History so a long-lived job doesn't grow
-// the status blob without limit. 50 is enough for an operator looking
-// at `voodu describe job foo` to see the recent trend; older runs are
-// gone — voodu logs (M5) can replace the audit trail.
-const historyCap = 50
 
 // JobRunStatus values. Strings (not iota) so etcd-stored history is
 // readable in raw etcdctl dumps.
@@ -182,9 +180,10 @@ func (h *JobHandler) remove(ctx context.Context, ev WatchEvent) error {
 	app := AppID(ev.Scope, ev.Name)
 
 	if h.Containers != nil {
-		// Torch any in-flight or stuck containers. Successful runs
-		// should have AutoRemove'd already, but a still-running job at
-		// delete time gets killed.
+		// Torch every retained run container (we drop AutoRemove now,
+		// so successful runs leave their stopped containers around for
+		// `voodu logs`) plus any in-flight container that hasn't
+		// exited yet. Both kinds get the same Remove treatment.
 		slots, err := h.Containers.ListByIdentity(string(KindJob), ev.Scope, ev.Name)
 		if err != nil {
 			return fmt.Errorf("list job containers: %w", err)
@@ -273,7 +272,9 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		Status:    JobStatusRunning,
 	}
 
-	if err := h.appendRun(ctx, app, spec.Image, run); err != nil {
+	successCap, failureCap := jobHistoryLimits(spec)
+
+	if err := h.appendRun(ctx, app, spec.Image, run, successCap, failureCap); err != nil {
 		// Status persist failure isn't fatal — the run can still
 		// proceed. Log and carry on.
 		h.logf("job/%s status persist failed (pre-run): %v", app, err)
@@ -288,7 +289,11 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		NetworkMode: spec.NetworkMode,
 		EnvFile:     envFile,
 		Labels:      labels,
-		AutoRemove:  true,
+		// AutoRemove is intentionally false: docker keeps the stopped
+		// container (and its json-file logs) so `voodu logs job <name>`
+		// can read them post-exit. The runner GCs old run containers
+		// past the spec's history limits below.
+		AutoRemove: false,
 	}); err != nil {
 		// Recreate covers the rare "previous run with the same id is
 		// still around" case. Failure here means we never even started
@@ -297,7 +302,7 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		run.EndedAt = time.Now().UTC()
 		run.Error = fmt.Sprintf("spawn: %v", err)
 
-		_ = h.appendRun(ctx, app, spec.Image, run)
+		_ = h.appendRun(ctx, app, spec.Image, run, successCap, failureCap)
 
 		return run, fmt.Errorf("spawn job container %s: %w", cname, err)
 	}
@@ -319,8 +324,16 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		run.Status = JobStatusFailed
 	}
 
-	if err := h.appendRun(ctx, app, spec.Image, run); err != nil {
+	if err := h.appendRun(ctx, app, spec.Image, run, successCap, failureCap); err != nil {
 		h.logf("job/%s status persist failed (post-run): %v", app, err)
+	}
+
+	// GC stopped run containers past the spec's history caps. We use
+	// the freshly-persisted history as the keep-set so the docker
+	// state and the status blob agree on what's retained. GC errors
+	// don't fail the run — the operator already has their exit code.
+	if err := h.gcRuns(ctx, scope, name); err != nil {
+		h.logf("job/%s container gc failed: %v", app, err)
 	}
 
 	if waitErr != nil {
@@ -336,6 +349,51 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 	h.logf("job/%s run %s succeeded", app, runID)
 
 	return run, nil
+}
+
+// jobHistoryLimits returns the (success, failure) bounds for this
+// job's run history (and matching docker container retention),
+// defaulting unset fields to k8s-style 3 / 1.
+func jobHistoryLimits(spec jobSpec) (successCap, failureCap int) {
+	successCap = spec.SuccessfulHistoryLimit
+
+	if successCap <= 0 {
+		successCap = 3
+	}
+
+	failureCap = spec.FailedHistoryLimit
+
+	if failureCap <= 0 {
+		failureCap = 1
+	}
+
+	return successCap, failureCap
+}
+
+// gcRuns prunes stopped run containers whose replica id no longer
+// appears in the persisted history (i.e. they've fallen out the back
+// of the success/failure caps). Running containers are never touched —
+// the tick that owns them will update history first, and the next GC
+// pass picks them up if needed.
+func (h *JobHandler) gcRuns(ctx context.Context, scope, name string) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	st, err := h.loadStatus(ctx, AppID(scope, name))
+	if err != nil {
+		return err
+	}
+
+	keep := map[string]bool{}
+
+	if st != nil {
+		for _, r := range st.History {
+			keep[r.RunID] = true
+		}
+	}
+
+	return gcRunContainers(h.Containers, string(KindJob), scope, name, keep)
 }
 
 // linkEnv writes the job's static Env block to its app env file when a
@@ -403,8 +461,9 @@ func (h *JobHandler) saveStatus(ctx context.Context, app string, status JobStatu
 // the result back. The run is matched by RunID — pre-run records get
 // updated in place when post-run finalises. Newest run sits at the
 // front (history[0]) so the common "show me the last run" query is
-// O(1).
-func (h *JobHandler) appendRun(ctx context.Context, app, image string, run JobRun) error {
+// O(1). After the upsert the history is capped at successCap +
+// failureCap (running entries always survive — see capHistory).
+func (h *JobHandler) appendRun(ctx context.Context, app, image string, run JobRun, successCap, failureCap int) error {
 	st, err := h.loadStatus(ctx, app)
 	if err != nil {
 		return err
@@ -435,9 +494,7 @@ func (h *JobHandler) appendRun(ctx context.Context, app, image string, run JobRu
 		st.History = append([]JobRun{run}, st.History...)
 	}
 
-	if len(st.History) > historyCap {
-		st.History = st.History[:historyCap]
-	}
+	st.History = capHistory(st.History, successCap, failureCap)
 
 	if !run.EndedAt.IsZero() {
 		t := run.EndedAt

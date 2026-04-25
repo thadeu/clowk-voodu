@@ -216,8 +216,8 @@ func TestJobHandler_RunOnceSpawnsContainerAndRecordsSuccess(t *testing.T) {
 		t.Errorf("image: got %q", got.Image)
 	}
 
-	if !got.AutoRemove {
-		t.Errorf("job container must run with AutoRemove=true so successful runs disappear")
+	if got.AutoRemove {
+		t.Errorf("job container must run with AutoRemove=false so docker keeps the stopped container (and its logs) for `voodu logs job`")
 	}
 
 	id := identityFromSpec(got)
@@ -249,6 +249,95 @@ func TestJobHandler_RunOnceSpawnsContainerAndRecordsSuccess(t *testing.T) {
 
 	if st.LastRun == nil {
 		t.Errorf("LastRun should be populated after a run")
+	}
+}
+
+// TestJobHandler_RunOnceGCsOldRunContainers locks in the GC contract
+// added when AutoRemove was dropped: once the freshly-finished run
+// pushes the success cap past its limit, the runner removes stopped
+// containers whose replica id no longer appears in history. Running
+// containers (and the just-finished one, since it's still in history)
+// must be left alone.
+func TestJobHandler_RunOnceGCsOldRunContainers(t *testing.T) {
+	store := newMemStore()
+
+	// successful_history_limit=1, failed_history_limit=0 (defaults to 1
+	// internally, but we only seed one stale success so the cap is the
+	// driver here).
+	spec := map[string]any{
+		"image":                    "img:1",
+		"successful_history_limit": 1,
+	}
+	seedManifest(t, store, KindJob, "migrate", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	_ = apply.Handle(context.Background(), putEvent(t, KindJob, "migrate", spec))
+
+	cm := &fakeContainers{}
+
+	// Stale stopped container from a previous successful run — should
+	// be GC'd. Same kind/scope/name identity, different replica id.
+	stale := containers.ContainerName("test", "migrate", "old1")
+	cm.seedSlot(ContainerSlot{
+		Name:    stale,
+		Image:   "img:1",
+		Running: false,
+		Identity: containers.Identity{
+			Kind:      containers.KindJob,
+			Scope:     "test",
+			Name:      "migrate",
+			ReplicaID: "old1",
+		},
+	})
+
+	// Running container from a separate prior run — must NOT be touched
+	// even if it isn't in history (the next pass after it exits will
+	// pick it up).
+	live := containers.ContainerName("test", "migrate", "live")
+	cm.seedSlot(ContainerSlot{
+		Name:    live,
+		Image:   "img:1",
+		Running: true,
+		Identity: containers.Identity{
+			Kind:      containers.KindJob,
+			Scope:     "test",
+			Name:      "migrate",
+			ReplicaID: "live",
+		},
+	})
+
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "migrate"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(cm.removes) != 1 || cm.removes[0] != stale {
+		t.Errorf("expected stale stopped container %q removed, got removes=%v", stale, cm.removes)
+	}
+}
+
+// TestJobHistoryLimitsDefaults guards the k8s-style 3/1 defaults the
+// runner falls back to when the manifest leaves the limits unset.
+func TestJobHistoryLimitsDefaults(t *testing.T) {
+	cases := []struct {
+		name string
+		spec jobSpec
+		s, f int
+	}{
+		{"unset → 3 / 1", jobSpec{}, 3, 1},
+		{"explicit success", jobSpec{SuccessfulHistoryLimit: 5}, 5, 1},
+		{"explicit failure", jobSpec{FailedHistoryLimit: 4}, 3, 4},
+		{"both explicit", jobSpec{SuccessfulHistoryLimit: 7, FailedHistoryLimit: 2}, 7, 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := jobHistoryLimits(tc.spec)
+			if s != tc.s || f != tc.f {
+				t.Errorf("got (%d, %d), want (%d, %d)", s, f, tc.s, tc.f)
+			}
+		})
 	}
 }
 

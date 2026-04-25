@@ -659,6 +659,38 @@ job "api" "migrate" {
 	}
 }
 
+// TestParseHCLJobHistoryLimits guards the wire bind for the
+// successful_history_limit / failed_history_limit fields the runner
+// uses to retain stopped run containers (and matching JobStatus
+// history entries) past AutoRemove. A drift here means `voodu logs
+// job <name>` would mysteriously lose old runs even when the operator
+// requested they stick around.
+func TestParseHCLJobHistoryLimits(t *testing.T) {
+	src := `
+job "api" "migrate" {
+  image                    = "img:1"
+  successful_history_limit = 5
+  failed_history_limit     = 2
+}
+`
+	tmp := writeTemp(t, "job.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec JobSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.SuccessfulHistoryLimit != 5 || spec.FailedHistoryLimit != 2 {
+		t.Errorf("history limits: succ=%d fail=%d (want 5, 2)",
+			spec.SuccessfulHistoryLimit, spec.FailedHistoryLimit)
+	}
+}
+
 // TestParseHCLJobMissingScope mirrors the deployment validator: jobs
 // are scoped, so a single-label `job "name" {}` must error loudly with
 // the suggested fix in the message.

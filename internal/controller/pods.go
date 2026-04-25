@@ -102,6 +102,104 @@ func (DockerPodsLister) ListPods() ([]Pod, error) {
 	return out, nil
 }
 
+// PodDetail is the rich-inspect view returned by GET /pods/{name} —
+// the runtime counterpart to the manifest+status `voodu describe`
+// renders for declared resources. Embeds Pod so the basic identity
+// columns the CLI already knows how to render are reused, and adds
+// the docker-inspect fields (state details, networks, mounts, env,
+// command) that only make sense per-replica.
+type PodDetail struct {
+	Pod
+
+	// State carries the precise running/exited bookkeeping including
+	// exit code and start/finish timestamps. The Pod.Running field is
+	// a duplicate of State.Running kept for table-rendering ergonomics.
+	State docker.ContainerState `json:"state"`
+
+	Command    []string                           `json:"command,omitempty"`
+	Entrypoint []string                           `json:"entrypoint,omitempty"`
+	WorkingDir string                             `json:"working_dir,omitempty"`
+	Env        map[string]string                  `json:"env,omitempty"`
+	Labels     map[string]string                  `json:"labels,omitempty"`
+	Networks   map[string]docker.ContainerNetwork `json:"networks,omitempty"`
+	Mounts     []docker.ContainerMount            `json:"mounts,omitempty"`
+	Ports      []docker.ContainerPort             `json:"ports,omitempty"`
+
+	RestartPolicy string `json:"restart_policy,omitempty"`
+
+	// ID is the docker container ID — useful for `docker logs <id>`
+	// when the operator wants to escape voodu and debug at the daemon
+	// level.
+	ID string `json:"id,omitempty"`
+}
+
+// PodDescriber is the seam GET /pods/{name} dispatches through. The
+// production implementation is DockerPodsLister (its GetPod method
+// delegates to docker.InspectContainer); tests substitute a fake to
+// avoid shelling out.
+//
+// Returns (nil, nil) when the named container doesn't exist — distinct
+// from (nil, err) which is a real inspect failure (docker daemon down,
+// permissions, etc.). The handler maps the nil-detail case to 404.
+type PodDescriber interface {
+	GetPod(name string) (*PodDetail, error)
+}
+
+// GetPod fetches the rich inspect view of a single voodu-managed
+// container. Returns (nil, nil) when the container isn't on this
+// host — operators sometimes typo a name and the 404 is much friendlier
+// than a stack trace.
+//
+// The container does NOT need to carry voodu labels — `voodu describe
+// pod` is also useful as an escape hatch for diagnosing legacy
+// containers that pre-date the structured-label rollout. When labels
+// are present we surface the parsed identity; when they aren't, the
+// embedded Pod fields are left at their zero values and the operator
+// still gets the rich state/network/mount detail.
+func (DockerPodsLister) GetPod(name string) (*PodDetail, error) {
+	det, err := docker.InspectContainer(name)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	if det == nil {
+		return nil, nil
+	}
+
+	out := &PodDetail{
+		Pod: Pod{
+			Name:    det.Name,
+			Image:   det.Image,
+			Status:  det.State.Status,
+			Running: det.State.Running,
+		},
+		ID:            det.ID,
+		State:         det.State,
+		Command:       det.Command,
+		Entrypoint:    det.Entrypoint,
+		WorkingDir:    det.WorkingDir,
+		Env:           det.Env,
+		Labels:        det.Labels,
+		Networks:      det.Networks,
+		Mounts:        det.Mounts,
+		Ports:         det.Ports,
+		RestartPolicy: det.RestartPolicy,
+	}
+
+	// Layer on the structured voodu identity when present. Pre-M0 /
+	// non-voodu containers fall through with empty identity fields —
+	// the renderer surfaces that as "(no voodu identity labels)".
+	if id, ok := containers.ParseLabels(det.Labels); ok {
+		out.Pod.Kind = id.Kind
+		out.Pod.Scope = id.Scope
+		out.Pod.ResourceName = id.Name
+		out.Pod.ReplicaID = id.ReplicaID
+		out.Pod.CreatedAt = id.CreatedAt
+	}
+
+	return out, nil
+}
+
 // sortPods orders pods so the CLI renders a deterministic table:
 // scope first (with empty scope last so unscoped kinds group at the
 // bottom), then resource name, then replica id. Anything missing a

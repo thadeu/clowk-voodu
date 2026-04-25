@@ -269,7 +269,12 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		NetworkMode: spec.Job.NetworkMode,
 		EnvFile:     envFile,
 		Labels:      labels,
-		AutoRemove:  true,
+		// AutoRemove is intentionally false: docker keeps the stopped
+		// container (and its json-file logs) so `voodu logs cronjob
+		// <name>` can read them post-tick. The runner GCs old run
+		// containers past successful_history_limit /
+		// failed_history_limit below.
+		AutoRemove: false,
 	}); err != nil {
 		run.Status = JobStatusFailed
 		run.EndedAt = time.Now().UTC()
@@ -299,6 +304,13 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 
 	if err := h.appendRun(ctx, app, spec.Schedule, spec.Job.Image, run, successCap, failureCap); err != nil {
 		h.logf("cronjob/%s status persist failed (post-run): %v", app, err)
+	}
+
+	// GC stopped run containers past the spec's history caps. Mirrors
+	// JobHandler.RunOnce — keep set comes from the freshly-persisted
+	// history, errors don't fail the tick.
+	if err := h.gcRuns(ctx, scope, name); err != nil {
+		h.logf("cronjob/%s container gc failed: %v", app, err)
 	}
 
 	if waitErr != nil {
@@ -338,6 +350,57 @@ func (h *CronJobHandler) markInFlight(key string, value bool) bool {
 
 	h.inFlight[key] = true
 	return false
+}
+
+// gcRuns prunes stopped run containers whose replica id no longer
+// appears in the persisted history. Mirrors JobHandler.gcRuns; the
+// only difference is the kind label and the status type.
+func (h *CronJobHandler) gcRuns(ctx context.Context, scope, name string) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	st, err := h.loadStatus(ctx, AppID(scope, name))
+	if err != nil {
+		return err
+	}
+
+	keep := map[string]bool{}
+
+	if st != nil {
+		for _, r := range st.History {
+			keep[r.RunID] = true
+		}
+	}
+
+	return gcRunContainers(h.Containers, string(KindCronJob), scope, name, keep)
+}
+
+// gcRunContainers walks the container slots for the given identity
+// and removes any stopped one whose replica id isn't in keepRunIDs.
+// Running containers are skipped — the next pass after they exit will
+// catch them. Used by both JobHandler and CronJobHandler post-run GC.
+func gcRunContainers(cm ContainerManager, kind, scope, name string, keepRunIDs map[string]bool) error {
+	slots, err := cm.ListByIdentity(kind, scope, name)
+	if err != nil {
+		return fmt.Errorf("list %s containers: %w", kind, err)
+	}
+
+	for _, s := range slots {
+		if s.Running {
+			continue
+		}
+
+		if keepRunIDs[s.Identity.ReplicaID] {
+			continue
+		}
+
+		if err := cm.Remove(s.Name); err != nil {
+			return fmt.Errorf("remove %s: %w", s.Name, err)
+		}
+	}
+
+	return nil
 }
 
 // historyLimits returns the (success, failure) bounds for this

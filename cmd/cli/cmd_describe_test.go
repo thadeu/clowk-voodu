@@ -547,3 +547,129 @@ func TestDescribeOutputModeSpec(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 }
+
+// TestDescribeDescAliasRoutesToDescribe makes sure `voodu desc` is a
+// drop-in for `voodu describe` — same wire shape, same query params.
+// Without this the alias could silently route somewhere else and we'd
+// only learn during an operator demo.
+func TestDescribeDescAliasRoutesToDescribe(t *testing.T) {
+	ts, state := newDescribeMockServer(t, map[string]any{
+		"status": "ok",
+		"data": map[string]any{
+			"manifest": &controller.Manifest{
+				Kind: controller.KindDeployment, Scope: "api", Name: "web",
+				Spec: json.RawMessage(`{"image":"x:1"}`),
+			},
+		},
+	})
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"desc", "deployment", "api/web"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute via desc alias: %v", err)
+	}
+
+	if state.path != "/describe" {
+		t.Errorf("desc should route to /describe, got %q", state.path)
+	}
+
+	if !strings.Contains(state.rawQuery, "kind=deployment") || !strings.Contains(state.rawQuery, "name=web") {
+		t.Errorf("desc query missing fields: %q", state.rawQuery)
+	}
+}
+
+// TestDescribePodRoutesToPodsName proves `voodu describe pod <name>`
+// (and the `pd` short form) hit GET /pods/{name} rather than
+// /describe — pods don't fit the kind/scope/name shape and have their
+// own endpoint.
+func TestDescribePodRoutesToPodsName(t *testing.T) {
+	cases := []struct {
+		name      string
+		kindToken string
+	}{
+		{"long form", "pod"},
+		{"short form", "pd"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, state := newDescribeMockServer(t, map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pod": &controller.PodDetail{
+						Pod: controller.Pod{
+							Name: "test-web.a3f9", Kind: "deployment",
+							Scope: "test", ResourceName: "web",
+							ReplicaID: "a3f9", Image: "vd-web:latest",
+						},
+					},
+				},
+			})
+			defer ts.Close()
+
+			if err := runDescribeCmd(t, ts, tc.kindToken, "test-web.a3f9"); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+
+			if state.method != http.MethodGet {
+				t.Errorf("method=%q want GET", state.method)
+			}
+
+			if state.path != "/pods/test-web.a3f9" {
+				t.Errorf("path=%q want /pods/test-web.a3f9", state.path)
+			}
+
+			if state.rawQuery != "" {
+				t.Errorf("query should be empty for /pods/{name}, got %q", state.rawQuery)
+			}
+		})
+	}
+}
+
+// TestDescribePodRejectsScopeRefShape makes sure an operator who
+// accidentally types "pod scope/name" gets a clear error pointing at
+// the container-name shape instead of a confusing 404 from the
+// controller.
+func TestDescribePodRejectsScopeRefShape(t *testing.T) {
+	ts, _ := newDescribeMockServer(t, map[string]any{"status": "ok"})
+	defer ts.Close()
+
+	err := runDescribeCmd(t, ts, "pod", "test/web")
+	if err == nil {
+		t.Fatal("expected error for slash-style ref")
+	}
+
+	if !strings.Contains(err.Error(), "container name") {
+		t.Errorf("error should mention container name, got %q", err.Error())
+	}
+}
+
+// TestDescribePodSurfacesEnvelopeError mirrors the logs test: a 404
+// envelope from the controller becomes the CLI's error verbatim, not
+// an opaque "controller returned 404".
+func TestDescribePodSurfacesEnvelopeError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "error",
+			"error":  "pod \"missing.0000\" not found",
+		})
+	}))
+	defer ts.Close()
+
+	err := runDescribeCmd(t, ts, "pod", "missing.0000")
+	if err == nil {
+		t.Fatal("expected error for 404")
+	}
+
+	if !strings.Contains(err.Error(), "missing.0000") {
+		t.Errorf("error should surface server message, got %q", err.Error())
+	}
+}

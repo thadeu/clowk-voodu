@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"io"
 	"strings"
 
 	"go.voodu.clowk.in/internal/containers"
@@ -86,6 +87,29 @@ type ContainerManager interface {
 	// forever — but the interface keeps it on the same surface so a
 	// future scheduler can dispatch via one ContainerManager handle.
 	Wait(name string) (exitCode int, err error)
+
+	// Logs returns a stream of stdout+stderr from the named container.
+	// Works on running AND stopped containers (the docker json-file
+	// driver keeps logs around until the container is removed). The
+	// caller is responsible for Close()ing the returned reader to reap
+	// the underlying docker process — leaving it open leaks a process.
+	//
+	// Used by the /logs endpoint to power `voodu logs <kind> <ref>`.
+	// Job and cronjob runs are kept post-exit (no AutoRemove) so this
+	// is the operator's window into "why did the last run fail?".
+	Logs(name string, opts LogsOptions) (io.ReadCloser, error)
+}
+
+// LogsOptions tunes the docker logs invocation. Both fields are
+// optional — zero values mean "all logs, no follow".
+type LogsOptions struct {
+	// Follow asks for a streaming tail (`docker logs -f`). The reader
+	// stays open until the container exits or the caller closes it.
+	Follow bool
+
+	// Tail caps the number of trailing lines returned. Zero means
+	// unlimited (whole log). Negative values are treated as zero.
+	Tail int
 }
 
 // ContainerSlot is a snapshot of one running deployment replica (or
@@ -413,6 +437,12 @@ func (DockerContainerManager) ListLegacyByApp(app string) ([]string, error) {
 // ContainerManager so the job runner can be tested with a fake.
 func (DockerContainerManager) Wait(name string) (int, error) {
 	return docker.WaitContainer(name)
+}
+
+// Logs is a thin shim over docker.LogsStream. The interface lives on
+// ContainerManager so the API handler stays testable with a fake.
+func (DockerContainerManager) Logs(name string, opts LogsOptions) (io.ReadCloser, error) {
+	return docker.LogsStream(name, opts.Follow, opts.Tail)
 }
 
 func (DockerContainerManager) Recreate(spec ContainerSpec) error {

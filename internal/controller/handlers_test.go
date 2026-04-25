@@ -300,6 +300,12 @@ type fakeContainers struct {
 	// waits records every Wait(name) call so tests can assert the job
 	// runner blocked on the exact replica it spawned.
 	waits []string
+
+	// logsByName feeds the Logs() stub: tests that exercise the /logs
+	// path (or anything that drains a container's output) can pre-seed
+	// canned text per container name. Absent entries return an empty
+	// reader, matching the real "no logs yet" case.
+	logsByName map[string]string
 }
 
 // seedSlot inserts a pre-existing M0-labeled container into the fake.
@@ -435,6 +441,10 @@ func (f *fakeContainers) Wait(name string) (int, error) {
 	}
 
 	return 0, nil
+}
+
+func (f *fakeContainers) Logs(name string, _ LogsOptions) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(f.logsByName[name])), nil
 }
 
 func (f *fakeContainers) ListLegacyByApp(app string) ([]string, error) {

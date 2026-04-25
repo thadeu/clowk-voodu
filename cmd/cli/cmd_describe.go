@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -24,22 +25,31 @@ import (
 // history (when applicable), all in one screen.
 func newDescribeCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "describe <kind> <ref>",
-		Short: "Show detailed state of one resource (manifest + status + pods)",
+		Use:     "describe <kind> <ref>",
+		Aliases: []string{"desc"},
+		Short:   "Show detailed state of one resource (manifest + status + pods)",
 		Long: `describe asks the controller for everything it knows about one
 declared resource: the source manifest, the persisted status blob,
 and any voodu-managed containers matching its (kind, scope, name)
 identity.
 
-<kind> is one of: deployment, database, ingress, job, cronjob.
+<kind> is one of: deployment, database, ingress, job, cronjob, pod.
 <ref>  is "<scope>/<name>" for scoped kinds, or "<name>" for an
 unambiguous match. Unscoped kinds (database) take "<name>" only.
+
+The "pod" (alias "pd") kind is the runtime view of a single
+voodu-managed container. Its <ref> is the container name as it
+appears in 'voodu get pods' (e.g. test-web.a3f9) — pods don't share
+the kind/scope/name shape because more than one replica can match
+the same identity.
 
 Examples:
   voodu describe deployment clowk/web
   voodu describe job api/migrate
   voodu describe cronjob ops/purge
   voodu describe database main
+  voodu describe pod test-web.a3f9
+  voodu desc pd test-web.a3f9
 
 Output formats:
   -o text  (default) human-friendly summary, no raw spec dump
@@ -88,6 +98,14 @@ type describeResponse struct {
 }
 
 func runDescribe(cmd *cobra.Command, kindStr, ref string) error {
+	// "pod" / "pd" is the runtime-only kind. It doesn't go through the
+	// Kind enum (no manifest, no scope/name shape) — its <ref> is the
+	// container name and it has its own dedicated endpoint.
+	switch strings.ToLower(strings.TrimSpace(kindStr)) {
+	case "pod", "pd":
+		return runDescribePod(cmd, ref)
+	}
+
 	kind, err := controller.ParseKind(kindStr)
 	if err != nil {
 		return err
@@ -580,4 +598,275 @@ func decodeCronJobSpecLocal(blob json.RawMessage) cronJobSpecView {
 	}
 
 	return v
+}
+
+// --- Pod describe ---------------------------------------------------
+
+// describePodResponse mirrors the /pods/{name} envelope. Pod is a
+// pointer so 404 (no body) decodes cleanly to nil — though in practice
+// the controller emits an error envelope for that case.
+type describePodResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Pod *controller.PodDetail `json:"pod"`
+	} `json:"data"`
+	Error string `json:"error,omitempty"`
+}
+
+// runDescribePod fetches GET /pods/{name} and renders the rich detail.
+// `ref` here is the docker container name (e.g. "test-web.a3f9") —
+// pods don't share the kind/scope/name shape because more than one
+// replica can match the same identity.
+//
+// Output formats follow the same -o text|json|yaml|spec contract as
+// the other describe variants. "spec" falls through to text since
+// there's no manifest spec to dump for a runtime container.
+func runDescribePod(cmd *cobra.Command, ref string) error {
+	ref = strings.TrimSpace(ref)
+
+	if ref == "" {
+		return fmt.Errorf("pod name is empty")
+	}
+
+	// Defensive: a slash here means the operator typed "pod scope/name"
+	// expecting the same ref shape as the other kinds. Tell them
+	// explicitly what we expect — pods are addressed by container name.
+	if strings.Contains(ref, "/") {
+		return fmt.Errorf("pod ref %q contains a slash — pods are addressed by container name (e.g. test-web.a3f9), not scope/name", ref)
+	}
+
+	root := cmd.Root()
+
+	// PathEscape the name in case it contains characters URL-special
+	// characters. Container names from voodu are safe (alphanum + dash
+	// + dot), but the legacy / non-voodu path could surface anything.
+	resp, err := controllerDo(root, http.MethodGet, "/pods/"+url.PathEscape(ref), "", nil)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	var env describePodResponse
+	if jsonErr := json.Unmarshal(raw, &env); jsonErr != nil {
+		return fmt.Errorf("decode response (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if env.Status == "error" || resp.StatusCode >= 400 {
+		if env.Error != "" {
+			return fmt.Errorf("%s", env.Error)
+		}
+
+		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if env.Data.Pod == nil {
+		return fmt.Errorf("empty response: no pod detail returned")
+	}
+
+	switch describeOutputMode(root) {
+	case "json":
+		out := json.NewEncoder(os.Stdout)
+		out.SetIndent("", "  ")
+
+		return out.Encode(env.Data)
+
+	case "yaml":
+		return yaml.NewEncoder(os.Stdout).Encode(env.Data)
+	}
+
+	// "spec" falls through to text — runtime containers have no
+	// manifest spec to dump. The text view is already complete.
+	return renderPodDetail(os.Stdout, env.Data.Pod)
+}
+
+// renderPodDetail prints the runtime view of one container as
+// per-section blocks. Each section silently elides itself when
+// empty so a freshly-created pod (no networks attached yet, no
+// mounts) renders cleanly.
+//
+// Section order roughly tracks "what does the operator look at
+// first": identity → state → image → command → networks → ports →
+// mounts → env. Env is last because it's typically the longest
+// section and pushes everything else off-screen if printed earlier.
+func renderPodDetail(w io.Writer, p *controller.PodDetail) error {
+	// Header: container name. When voodu identity labels are present
+	// we prefix with kind/scope/name so the operator knows which
+	// declared resource this replica belongs to.
+	if p.Pod.Kind != "" {
+		if p.Pod.Scope != "" {
+			fmt.Fprintf(w, "pod %s/%s/%s (%s)\n",
+				p.Pod.Kind, p.Pod.Scope, p.Pod.ResourceName, p.Pod.Name)
+		} else {
+			fmt.Fprintf(w, "pod %s/%s (%s)\n",
+				p.Pod.Kind, p.Pod.ResourceName, p.Pod.Name)
+		}
+	} else {
+		fmt.Fprintf(w, "pod %s\n", p.Pod.Name)
+		fmt.Fprintln(w, "  (no voodu identity labels — legacy or non-voodu container)")
+	}
+
+	if p.Pod.ReplicaID != "" {
+		fmt.Fprintf(w, "  replica:        %s\n", p.Pod.ReplicaID)
+	}
+
+	if p.ID != "" {
+		shortID := p.ID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
+		fmt.Fprintf(w, "  container_id:   %s\n", shortID)
+	}
+
+	fmt.Fprintf(w, "  image:          %s\n", dashIfEmpty(p.Pod.Image))
+
+	// State block. "status" alone (e.g. "exited") is ambiguous on its
+	// own — pair with running flag and exit code so the operator gets
+	// the whole story in one line. CreatedAt comes from the voodu
+	// label (when present) so it survives across re-inspects.
+	fmt.Fprintf(w, "  status:         %s\n", dashIfEmpty(p.State.Status))
+	fmt.Fprintf(w, "  running:        %t\n", p.State.Running)
+
+	if !p.State.Running {
+		fmt.Fprintf(w, "  exit_code:      %d\n", p.State.ExitCode)
+	}
+
+	if p.State.StartedAt != "" {
+		fmt.Fprintf(w, "  started_at:     %s\n", p.State.StartedAt)
+	}
+
+	if !p.State.Running && p.State.FinishedAt != "" {
+		fmt.Fprintf(w, "  finished_at:    %s\n", p.State.FinishedAt)
+	}
+
+	if p.State.Restarts > 0 {
+		fmt.Fprintf(w, "  restart_count:  %d\n", p.State.Restarts)
+	}
+
+	if p.RestartPolicy != "" {
+		fmt.Fprintf(w, "  restart_policy: %s\n", p.RestartPolicy)
+	}
+
+	if p.Pod.CreatedAt != "" {
+		fmt.Fprintf(w, "  created_at:     %s\n", p.Pod.CreatedAt)
+	}
+
+	if p.WorkingDir != "" {
+		fmt.Fprintf(w, "  working_dir:    %s\n", p.WorkingDir)
+	}
+
+	if cmdLine := strings.Join(p.Command, " "); cmdLine != "" {
+		fmt.Fprintf(w, "  command:        %s\n", cmdLine)
+	}
+
+	if entry := strings.Join(p.Entrypoint, " "); entry != "" {
+		fmt.Fprintf(w, "  entrypoint:     %s\n", entry)
+	}
+
+	// Networks: render each attached network with its IP and any
+	// aliases. Aliases are how docker DNS routes service names within
+	// a network; surfacing them helps debug "why can't web reach db".
+	if len(p.Networks) > 0 {
+		// Stable order so the rendering is deterministic across runs —
+		// docker returns the map in random iteration order otherwise.
+		names := make([]string, 0, len(p.Networks))
+		for n := range p.Networks {
+			names = append(names, n)
+		}
+
+		sort.Strings(names)
+
+		fmt.Fprintf(w, "\nnetworks (%d):\n", len(p.Networks))
+
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  NETWORK\tIP\tGATEWAY\tALIASES")
+
+		for _, n := range names {
+			net := p.Networks[n]
+
+			aliases := strings.Join(net.Aliases, ",")
+			if aliases == "" {
+				aliases = "-"
+			}
+
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n",
+				n, dashIfEmpty(net.IPAddress), dashIfEmpty(net.Gateway), aliases)
+		}
+
+		_ = tw.Flush()
+	}
+
+	// Ports: docker renders these as "container/proto" → "host:port".
+	// Empty bindings (port exposed but not published) still appear so
+	// the operator can see what's reachable in-network.
+	if len(p.Ports) > 0 {
+		fmt.Fprintf(w, "\nports (%d):\n", len(p.Ports))
+
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  CONTAINER\tHOST")
+
+		for _, port := range p.Ports {
+			host := "-"
+			if port.HostPort != "" {
+				if port.HostIP != "" {
+					host = port.HostIP + ":" + port.HostPort
+				} else {
+					host = port.HostPort
+				}
+			}
+
+			fmt.Fprintf(tw, "  %s\t%s\n", port.Container, host)
+		}
+
+		_ = tw.Flush()
+	}
+
+	// Mounts: bind mounts and named volumes. RW flag matters because
+	// a read-only mount can silently break apps that try to write.
+	if len(p.Mounts) > 0 {
+		fmt.Fprintf(w, "\nmounts (%d):\n", len(p.Mounts))
+
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  TYPE\tSOURCE\tDESTINATION\tMODE")
+
+		for _, m := range p.Mounts {
+			mode := m.Mode
+			if mode == "" {
+				if m.RW {
+					mode = "rw"
+				} else {
+					mode = "ro"
+				}
+			}
+
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n",
+				dashIfEmpty(m.Type), dashIfEmpty(m.Source), dashIfEmpty(m.Destination), mode)
+		}
+
+		_ = tw.Flush()
+	}
+
+	// Env last, sorted by key for deterministic output. Values are
+	// printed verbatim — no truncation, no redaction. The operator
+	// asked for the full picture; truncating would just send them
+	// looking for a flag to turn truncation off.
+	if len(p.Env) > 0 {
+		fmt.Fprintf(w, "\nenv (%d):\n", len(p.Env))
+
+		keys := make([]string, 0, len(p.Env))
+		for k := range p.Env {
+			keys = append(keys, k)
+		}
+
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			fmt.Fprintf(w, "  %s=%s\n", k, p.Env[k])
+		}
+	}
+
+	return nil
 }

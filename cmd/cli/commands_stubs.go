@@ -36,23 +36,6 @@ func newStatusCmd() *cobra.Command {
 	return cmd
 }
 
-func newLogsCmd() *cobra.Command {
-	var app string
-
-	var follow bool
-
-	cmd := &cobra.Command{
-		Use:   "logs",
-		Short: "Tail logs for an app",
-		RunE:  stubRunE("M3", "Log streaming goes through the controller (M3)."),
-	}
-
-	cmd.Flags().StringVarP(&app, "app", "a", "", "app name (required)")
-	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "stream new lines")
-
-	return cmd
-}
-
 func newExecCmd() *cobra.Command {
 	var app string
 

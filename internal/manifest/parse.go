@@ -493,22 +493,27 @@ type hclJob struct {
 	NetworkMode string            `hcl:"network_mode,optional"`
 	Timeout     string            `hcl:"timeout,optional"`
 
+	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
+	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
+
 	Lang *hclLangBlock `hcl:"lang,block"`
 }
 
 func (b hclJob) spec() JobSpec {
 	s := JobSpec{
-		Image:       b.Image,
-		Workdir:     b.Workdir,
-		Dockerfile:  b.Dockerfile,
-		Path:        b.Path,
-		Command:     b.Command,
-		Env:         b.Env,
-		Volumes:     b.Volumes,
-		Network:     b.Network,
-		Networks:    b.Networks,
-		NetworkMode: b.NetworkMode,
-		Timeout:     b.Timeout,
+		Image:                  b.Image,
+		Workdir:                b.Workdir,
+		Dockerfile:             b.Dockerfile,
+		Path:                   b.Path,
+		Command:                b.Command,
+		Env:                    b.Env,
+		Volumes:                b.Volumes,
+		Network:                b.Network,
+		Networks:               b.Networks,
+		NetworkMode:            b.NetworkMode,
+		Timeout:                b.Timeout,
+		SuccessfulHistoryLimit: b.SuccessfulHistoryLimit,
+		FailedHistoryLimit:     b.FailedHistoryLimit,
 	}
 
 	if b.Lang != nil {

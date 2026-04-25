@@ -6,10 +6,12 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -308,6 +310,245 @@ func InspectLabels(name string) (map[string]string, error) {
 	return labels, nil
 }
 
+// ContainerDetail is the rich-inspect blob `voodu describe pod`
+// renders. Subset of `docker inspect` flattened into a flat,
+// CLI-friendly shape so the controller doesn't ship the full,
+// 200-field daemon JSON to the operator.
+//
+// All fields are omitempty so a partially-populated container (just
+// created, not yet started, no networks attached) renders cleanly
+// with missing sections elided.
+type ContainerDetail struct {
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Image string `json:"image,omitempty"`
+
+	// State mirrors the running/stopped/exited bookkeeping. ExitCode
+	// is meaningful only when Running is false; StartedAt / FinishedAt
+	// are RFC3339 strings as docker emits them.
+	State ContainerState `json:"state"`
+
+	// Config from the container's Config block.
+	Command    []string          `json:"command,omitempty"`
+	Entrypoint []string          `json:"entrypoint,omitempty"`
+	WorkingDir string            `json:"working_dir,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+
+	// HostConfig — restart policy is the only knob `voodu describe`
+	// cares about today; the rest stay in the docker JSON for now.
+	RestartPolicy string `json:"restart_policy,omitempty"`
+
+	// Networks lists every network the container is attached to.
+	// Mounts is a flat shape — bind/volume distinction lives in Type.
+	// Ports flatten the docker port-binding map: "80/tcp" → "0.0.0.0:8080".
+	Networks map[string]ContainerNetwork `json:"networks,omitempty"`
+	Mounts   []ContainerMount            `json:"mounts,omitempty"`
+	Ports    []ContainerPort             `json:"ports,omitempty"`
+}
+
+type ContainerState struct {
+	Status     string `json:"status,omitempty"`
+	Running    bool   `json:"running"`
+	ExitCode   int    `json:"exit_code,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Restarts   int    `json:"restarts,omitempty"`
+}
+
+type ContainerNetwork struct {
+	NetworkID string `json:"network_id,omitempty"`
+	IPAddress string `json:"ip_address,omitempty"`
+	Gateway   string `json:"gateway,omitempty"`
+	Aliases   []string `json:"aliases,omitempty"`
+}
+
+type ContainerMount struct {
+	Type        string `json:"type,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	RW          bool   `json:"rw,omitempty"`
+}
+
+type ContainerPort struct {
+	Container string `json:"container,omitempty"`
+	HostIP    string `json:"host_ip,omitempty"`
+	HostPort  string `json:"host_port,omitempty"`
+}
+
+// InspectContainer returns the rich `docker inspect` blob flattened
+// into a CLI-friendly shape. Returns (nil, nil) when the container
+// doesn't exist — distinct from (nil, err) which is a real inspect
+// failure (docker daemon down, malformed output, etc.).
+//
+// The full `docker inspect` is enormous (200+ fields) and most are
+// noise for an operator. This helper keeps just the parts `voodu
+// describe pod` actually renders. New fields can be added one by one.
+func InspectContainer(name string) (*ContainerDetail, error) {
+	if !ContainerExists(name) {
+		return nil, nil
+	}
+
+	cmd := exec.Command("docker", "inspect", name)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	// `docker inspect <name>` returns a JSON array (always one element
+	// for a single name). Decode into a permissive intermediate shape
+	// then map to the flat detail.
+	var raw []dockerInspectRaw
+
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse inspect %s: %w", name, err)
+	}
+
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	r := raw[0]
+
+	d := &ContainerDetail{
+		ID:    r.ID,
+		Name:  strings.TrimPrefix(r.Name, "/"),
+		Image: r.Config.Image,
+		State: ContainerState{
+			Status:     r.State.Status,
+			Running:    r.State.Running,
+			ExitCode:   r.State.ExitCode,
+			StartedAt:  r.State.StartedAt,
+			FinishedAt: r.State.FinishedAt,
+			Restarts:   r.RestartCount,
+		},
+		Command:    r.Config.Cmd,
+		Entrypoint: r.Config.Entrypoint,
+		WorkingDir: r.Config.WorkingDir,
+		Labels:     r.Config.Labels,
+	}
+
+	if len(r.Config.Env) > 0 {
+		d.Env = make(map[string]string, len(r.Config.Env))
+
+		for _, kv := range r.Config.Env {
+			if i := strings.IndexByte(kv, '='); i >= 0 {
+				d.Env[kv[:i]] = kv[i+1:]
+			} else {
+				d.Env[kv] = ""
+			}
+		}
+	}
+
+	if r.HostConfig.RestartPolicy.Name != "" {
+		d.RestartPolicy = r.HostConfig.RestartPolicy.Name
+	}
+
+	if len(r.NetworkSettings.Networks) > 0 {
+		d.Networks = make(map[string]ContainerNetwork, len(r.NetworkSettings.Networks))
+
+		for k, n := range r.NetworkSettings.Networks {
+			d.Networks[k] = ContainerNetwork{
+				NetworkID: n.NetworkID,
+				IPAddress: n.IPAddress,
+				Gateway:   n.Gateway,
+				Aliases:   n.Aliases,
+			}
+		}
+	}
+
+	for _, m := range r.Mounts {
+		d.Mounts = append(d.Mounts, ContainerMount{
+			Type:        m.Type,
+			Source:      m.Source,
+			Destination: m.Destination,
+			Mode:        m.Mode,
+			RW:          m.RW,
+		})
+	}
+
+	for portKey, bindings := range r.NetworkSettings.Ports {
+		if len(bindings) == 0 {
+			d.Ports = append(d.Ports, ContainerPort{Container: portKey})
+			continue
+		}
+
+		for _, b := range bindings {
+			d.Ports = append(d.Ports, ContainerPort{
+				Container: portKey,
+				HostIP:    b.HostIP,
+				HostPort:  b.HostPort,
+			})
+		}
+	}
+
+	return d, nil
+}
+
+// dockerInspectRaw is the permissive shape we decode `docker inspect`
+// into. Only the subfields we actually surface are listed — extra
+// fields in the docker JSON are ignored without warning.
+type dockerInspectRaw struct {
+	ID              string                  `json:"Id"`
+	Name            string                  `json:"Name"`
+	RestartCount    int                     `json:"RestartCount"`
+	State           dockerInspectState      `json:"State"`
+	Config          dockerInspectConfig     `json:"Config"`
+	HostConfig      dockerInspectHostConfig `json:"HostConfig"`
+	NetworkSettings dockerInspectNetSet     `json:"NetworkSettings"`
+	Mounts          []dockerInspectMount    `json:"Mounts"`
+}
+
+type dockerInspectState struct {
+	Status     string `json:"Status"`
+	Running    bool   `json:"Running"`
+	ExitCode   int    `json:"ExitCode"`
+	StartedAt  string `json:"StartedAt"`
+	FinishedAt string `json:"FinishedAt"`
+}
+
+type dockerInspectConfig struct {
+	Image      string            `json:"Image"`
+	Cmd        []string          `json:"Cmd"`
+	Entrypoint []string          `json:"Entrypoint"`
+	Env        []string          `json:"Env"`
+	Labels     map[string]string `json:"Labels"`
+	WorkingDir string            `json:"WorkingDir"`
+}
+
+type dockerInspectHostConfig struct {
+	RestartPolicy struct {
+		Name string `json:"Name"`
+	} `json:"RestartPolicy"`
+}
+
+type dockerInspectNetSet struct {
+	Networks map[string]dockerInspectNetwork    `json:"Networks"`
+	Ports    map[string][]dockerInspectPortBind `json:"Ports"`
+}
+
+type dockerInspectNetwork struct {
+	NetworkID string   `json:"NetworkID"`
+	IPAddress string   `json:"IPAddress"`
+	Gateway   string   `json:"Gateway"`
+	Aliases   []string `json:"Aliases"`
+}
+
+type dockerInspectPortBind struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}
+
+type dockerInspectMount struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Mode        string `json:"Mode"`
+	RW          bool   `json:"RW"`
+}
+
 // ContainerExists checks if a container exists.
 // First checks containers with Voodu labels, then falls back to direct name check for backwards compatibility.
 func ContainerExists(name string) bool {
@@ -501,6 +742,114 @@ func WaitContainer(name string) (int, error) {
 	}
 
 	return code, nil
+}
+
+// LogsStream spawns `docker logs [-f] [--tail N] <name>` and returns
+// the merged stdout+stderr as a ReadCloser. The caller MUST Close the
+// returned reader to reap the docker process — otherwise we leak a
+// zombie per call.
+//
+// Tail = 0 means "all logs"; positive values translate to `--tail N`.
+// Follow streams new lines as they arrive (until the container exits
+// or the reader is closed). Both modes work on stopped containers
+// because docker keeps the json-file driver's log around until the
+// container is removed — this is the whole point of dropping
+// AutoRemove on jobs.
+//
+// Stderr is interleaved with stdout in the returned stream because
+// `docker logs` already merges them at the daemon level. Splitting
+// them would require two pipes and callers always want them
+// interleaved anyway (just like a tail of a normal process).
+func LogsStream(name string, follow bool, tail int) (io.ReadCloser, error) {
+	args := []string{"logs"}
+
+	if follow {
+		args = append(args, "-f")
+	}
+
+	if tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(tail))
+	}
+
+	args = append(args, name)
+
+	cmd := exec.Command("docker", args...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("docker logs %s: stdout pipe: %w", name, err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdout.Close()
+		return nil, fmt.Errorf("docker logs %s: stderr pipe: %w", name, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		return nil, fmt.Errorf("docker logs %s: start: %w", name, err)
+	}
+
+	return &dockerLogsReader{
+		cmd:    cmd,
+		stdout: stdout,
+		stderr: stderr,
+	}, nil
+}
+
+// dockerLogsReader reads stdout + stderr concurrently and reaps the
+// underlying process on Close. We read both streams because docker
+// writes container stderr to the reader's stderr — losing it would
+// hide the most useful debug output (panic traces, "permission
+// denied", etc.).
+type dockerLogsReader struct {
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+
+	once   sync.Once
+	closed chan struct{}
+}
+
+// Read merges stdout and stderr by interleaving Reads. We don't
+// promise line-perfect ordering across the two streams — docker
+// itself doesn't either when its driver isn't json-file — but each
+// individual line stays atomic.
+func (r *dockerLogsReader) Read(p []byte) (int, error) {
+	// Drain stdout first; when stdout closes (process exit), fall
+	// through to stderr. This matches how `docker logs name 2>&1` would
+	// look on a shell — stderr typically sees the last gasps when
+	// stdout has already closed.
+	n, err := r.stdout.Read(p)
+	if err == io.EOF {
+		return r.stderr.Read(p)
+	}
+
+	return n, err
+}
+
+// Close kills the docker process and waits for it. Idempotent — the
+// HTTP handler may call it multiple times if the client disconnects
+// mid-stream.
+func (r *dockerLogsReader) Close() error {
+	var err error
+
+	r.once.Do(func() {
+		_ = r.stdout.Close()
+		_ = r.stderr.Close()
+
+		if r.cmd.Process != nil {
+			_ = r.cmd.Process.Kill()
+		}
+
+		// Wait reaps the process; the error is uninteresting (we just
+		// killed it) so we discard it.
+		_ = r.cmd.Wait()
+	})
+
+	return err
 }
 
 // RemoveContainer removes a container.

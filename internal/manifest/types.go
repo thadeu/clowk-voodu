@@ -239,6 +239,15 @@ type JobSpec struct {
 	// no enforced cap. The controller kills + records a non-zero exit
 	// when the deadline passes.
 	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+
+	// SuccessfulHistoryLimit / FailedHistoryLimit cap how many run
+	// containers (and matching JobStatus.History entries) the runner
+	// keeps after each invocation. The runner drops AutoRemove and
+	// instead garbage-collects stopped run containers beyond these
+	// caps, so `voodu logs job <name>` can replay the recent past.
+	// Defaults match cronjobs: 3 successes, 1 failure.
+	SuccessfulHistoryLimit int `yaml:"successful_history_limit,omitempty" json:"successful_history_limit,omitempty"`
+	FailedHistoryLimit     int `yaml:"failed_history_limit,omitempty"     json:"failed_history_limit,omitempty"`
 }
 
 // CronJobSpec wraps a JobSpec with a schedule. Apply registers the

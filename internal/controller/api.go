@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 
 	"go.voodu.clowk.in/internal/plugins"
@@ -54,6 +56,21 @@ type API struct {
 	// interface so tests can stub the runner without spinning up
 	// docker.
 	Jobs JobRunner
+
+	// Logs powers /logs streaming. Nil means the endpoint returns 503
+	// ("log streaming not configured"); production wires the
+	// ContainerManager (which satisfies LogStreamer through its Logs
+	// method). Kept as a single-method interface so tests don't need
+	// to implement the whole ContainerManager just to assert the
+	// streamer is wired correctly.
+	Logs LogStreamer
+}
+
+// LogStreamer is the seam /logs dispatches through. The production
+// implementation is ContainerManager (its Logs method matches the
+// signature exactly); tests substitute a fake reader.
+type LogStreamer interface {
+	Logs(name string, opts LogsOptions) (io.ReadCloser, error)
 }
 
 // JobRunner is the seam /jobs/run dispatches through. JobHandler is
@@ -72,6 +89,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/status", a.handleStatus)
 	mux.HandleFunc("/describe", a.handleDescribe)
 	mux.HandleFunc("/pods", a.handlePods)
+	mux.HandleFunc("GET /pods/{name}", a.handlePodDescribe)
 	mux.HandleFunc("/exec", a.handleExec)
 	mux.HandleFunc("/logs", a.handleLogs)
 	mux.HandleFunc("/plugins", a.handlePlugins)
@@ -729,6 +747,66 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePodDescribe returns the rich `docker inspect` view of one
+// container, scoped to the per-pod detail the CLI's `voodu describe
+// pod <name>` renders.
+//
+// GET /pods/{name}
+//
+// {name} is the docker container name as it appears in `voodu get
+// pods` (e.g. "test-web.a3f9"). Pods don't share the kind/scope/name
+// shape because more than one replica can match the same identity —
+// the operator points at a specific container.
+//
+// Returns 404 when the container doesn't exist on this host, 503 when
+// the API was wired without a PodDescriber (test setups), 500 on any
+// other inspect failure.
+func (a *API) handlePodDescribe(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	// Hostile names — slashes, leading dots — would either confuse
+	// docker or escape into adjacent paths. Guard at the surface so a
+	// typo doesn't turn into a strange daemon error.
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
+	// PodDescriber is a separate interface from PodsLister so tests
+	// that only wire one or the other don't have to satisfy both.
+	// Production's DockerPodsLister satisfies both — fall back to it
+	// when neither field is set.
+	describer, ok := a.Pods.(PodDescriber)
+	if !ok {
+		if a.Pods == nil {
+			describer = DockerPodsLister{}
+		} else {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("pod describer not configured"))
+			return
+		}
+	}
+
+	detail, err := describer.GetPod(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if detail == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("pod %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"pod": detail},
+	})
+}
+
 // handleExec dispatches unknown CLI commands to a plugin. Body is
 // {"args": ["<plugin>", "<cmd>", ...]} plus optional env. The CLI's
 // colon rewriter already split "postgres:create" into two args.
@@ -829,10 +907,170 @@ func pluginExitToHTTP(code int) int {
 	return http.StatusInternalServerError
 }
 
-// handleLogs is a placeholder for M4+. We reserve the shape now so the
-// CLI can be wired against it today.
+// handleLogs streams stdout+stderr of one voodu-managed container back
+// to the caller. The endpoint resolves a (kind, scope, name[, run])
+// tuple to a single container name, then asks the LogStreamer to
+// drain docker logs for it.
+//
+// GET /logs?kind=&scope=&name=&run=&follow=&tail=
+//
+// `kind` and `name` are required. Scoped kinds auto-resolve scope when
+// unambiguous (mirrors describe / delete).
+//
+// `run` selects a specific replica id. When omitted: prefer running
+// containers; among those (or among stopped ones if none are running),
+// pick the most recently created. That matches the operator intent of
+// `voodu logs job <name>` ("show me the latest run") without forcing
+// a CLI-side ListPods round-trip.
+//
+// `follow=true` keeps the stream open until the container exits or the
+// caller disconnects (chunked transfer with periodic Flush so the CLI
+// sees lines as they arrive).
+//
+// Response body is the raw log stream (text/plain). Errors from
+// resolution / lookup land on a JSON envelope BEFORE any byte of the
+// stream is written so the CLI's JSON path stays usable.
 func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, http.StatusNotImplemented, fmt.Errorf("log streaming arrives with the reconciler in M4"))
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+
+		return
+	}
+
+	if a.Logs == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("log streaming not configured"))
+		return
+	}
+
+	q := r.URL.Query()
+	kindStr := strings.TrimSpace(q.Get("kind"))
+	name := strings.TrimSpace(q.Get("name"))
+	scope := strings.TrimSpace(q.Get("scope"))
+	run := strings.TrimSpace(q.Get("run"))
+	follow := q.Get("follow") == "true"
+
+	tail := 0
+	if t := strings.TrimSpace(q.Get("tail")); t != "" {
+		n, err := strconv.Atoi(t)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("tail must be a non-negative integer"))
+			return
+		}
+
+		tail = n
+	}
+
+	if kindStr == "" || name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("kind and name are required"))
+		return
+	}
+
+	kind, err := ParseKind(kindStr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if IsScoped(kind) && scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+
+		scope = resolved
+	}
+
+	pods := a.matchingPods(kind, scope, name)
+	if len(pods) == 0 {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no containers found for %s/%s/%s", kind, scope, name))
+		return
+	}
+
+	target, err := pickLogTarget(pods, run)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+
+	stream, err := a.Logs.Logs(target.Name, LogsOptions{Follow: follow, Tail: tail})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("open log stream: %w", err))
+		return
+	}
+
+	defer stream.Close()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Voodu-Container", target.Name)
+
+	if target.ReplicaID != "" {
+		w.Header().Set("X-Voodu-Run", target.ReplicaID)
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+
+	// Small buffer + Flush after every read keeps `voodu logs -f` lines
+	// from sitting in the chunked-transfer buffer until the next page
+	// boundary. Non-follow reads still benefit (faster TTFB) without
+	// extra cost.
+	buf := make([]byte, 4096)
+
+	for {
+		n, readErr := stream.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+// pickLogTarget chooses one pod from the candidate list. When run is
+// non-empty, only an exact ReplicaID match qualifies. Otherwise prefer
+// running pods, breaking ties by the latest CreatedAt so the operator
+// sees the most recent activity by default.
+func pickLogTarget(pods []Pod, run string) (Pod, error) {
+	if run != "" {
+		for _, p := range pods {
+			if p.ReplicaID == run {
+				return p, nil
+			}
+		}
+
+		return Pod{}, fmt.Errorf("no run %q found among %d candidate(s)", run, len(pods))
+	}
+
+	// Sort: running first, then by CreatedAt desc. Stable so equal
+	// keys keep ListPods's secondary order.
+	sorted := make([]Pod, len(pods))
+	copy(sorted, pods)
+
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Running != sorted[j].Running {
+			return sorted[i].Running
+		}
+
+		return sorted[i].CreatedAt > sorted[j].CreatedAt
+	})
+
+	return sorted[0], nil
 }
 
 // handlePlugins lists plugins currently installed under PluginsRoot.

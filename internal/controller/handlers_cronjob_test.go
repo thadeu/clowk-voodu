@@ -156,8 +156,8 @@ func TestCronJobHandler_TickSpawnsContainerAndRecordsSuccess(t *testing.T) {
 		t.Errorf("container name: got %q, want test-purge.<run_id>", got.Name)
 	}
 
-	if !got.AutoRemove {
-		t.Errorf("cronjob container must run with AutoRemove=true so successful runs disappear")
+	if got.AutoRemove {
+		t.Errorf("cronjob container must run with AutoRemove=false so docker keeps the stopped container (and its logs) for `voodu logs cronjob`")
 	}
 
 	id := identityFromSpec(got)

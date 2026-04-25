@@ -109,6 +109,10 @@ func (s *Server) Start(ctx context.Context) error {
 		EtcdClient:  s.cfg.EtcdClient,
 		Invoker:     invoker,
 		Pods:        DockerPodsLister{},
+		// DockerContainerManager satisfies LogStreamer via its Logs
+		// method — same instance the deployment/job/cronjob handlers
+		// already use, so /logs and the runners agree on docker access.
+		Logs: DockerContainerManager{},
 	}
 
 	dbHandler := &DatabaseHandler{

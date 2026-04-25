@@ -185,7 +185,7 @@ func TestDescribeAutoResolveScope(t *testing.T) {
 func TestDescribeReturnsManifestStatusAndPods(t *testing.T) {
 	api, store := newTestAPI(t)
 
-	api.Pods = fakePodsLister{
+	api.Pods = &fakePodsLister{
 		pods: []Pod{
 			{Name: "test-api.aaaa", Kind: "deployment", Scope: "test", ResourceName: "api", ReplicaID: "aaaa", Image: "img:1", Running: true},
 			{Name: "test-api.bbbb", Kind: "deployment", Scope: "test", ResourceName: "api", ReplicaID: "bbbb", Image: "img:1", Running: true},
@@ -295,7 +295,7 @@ func TestDescribeUnscopedKind(t *testing.T) {
 func TestDescribePodListerErrorTolerated(t *testing.T) {
 	api, store := newTestAPI(t)
 
-	api.Pods = fakePodsLister{err: errFakePodsBroken}
+	api.Pods = &fakePodsLister{err: errFakePodsBroken}
 
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
