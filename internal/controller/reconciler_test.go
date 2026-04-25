@@ -239,7 +239,7 @@ func TestReconcilerGivesUpAfterMaxAttempts(t *testing.T) {
 func TestReconcilerNilHandlerIsNoop(t *testing.T) {
 	store := newMemStore()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindService, Name: "web"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "web"})
 
 	rec := &Reconciler{Store: store}
 

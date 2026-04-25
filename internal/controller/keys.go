@@ -8,7 +8,7 @@ import (
 // KV layout in etcd.
 //
 //	/desired/<kind>s/<scope>/<name>  # scoped kinds (deployment, ingress)
-//	/desired/<kind>s/<name>          # unscoped kinds (database, service)
+//	/desired/<kind>s/<name>          # unscoped kinds (database)
 //	/actual/nodes/<node>/health      # health beacons per node
 //	/actual/nodes/<node>/containers/<id>
 //	/config/<app>/<key>              # per-app config (optional; CLI writes .env directly)
@@ -25,21 +25,23 @@ const (
 )
 
 // Kind is the type of a declared resource. New kinds added in later
-// milestones (e.g. "certificate", "cronjob") append here.
+// milestones (e.g. "certificate") append here.
 type Kind string
 
 const (
 	KindDeployment Kind = "deployment"
 	KindDatabase   Kind = "database"
-	KindService    Kind = "service"
 	KindIngress    Kind = "ingress"
+	KindJob        Kind = "job"
+	KindCronJob    Kind = "cronjob"
 )
 
 var validKinds = map[Kind]bool{
 	KindDeployment: true,
 	KindDatabase:   true,
-	KindService:    true,
 	KindIngress:    true,
+	KindJob:        true,
+	KindCronJob:    true,
 }
 
 // ParseKind returns the canonical Kind for either the singular or plural
@@ -58,7 +60,7 @@ func ParseKind(s string) (Kind, error) {
 		return trimmed, nil
 	}
 
-	return "", fmt.Errorf("unknown kind %q (valid: deployment, database, service, ingress)", s)
+	return "", fmt.Errorf("unknown kind %q (valid: deployment, database, ingress, job, cronjob)", s)
 }
 
 // DesiredPrefix returns "/desired/<kind>s/" — the prefix covering every

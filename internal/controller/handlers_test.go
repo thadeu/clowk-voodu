@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -261,9 +262,20 @@ type envWrite struct {
 // fakeContainers records Ensure/Restart/Recreate calls and lets tests
 // pretend a container already exists (+ a current image tag) so we can
 // assert idempotent reconcile and drift detection.
+//
+// Post-M0: identity is in labels, not names. Pre-seed via seedSlot so
+// ListByIdentity finds the same containers the production handler
+// would. Pre-M0 containers (no labels, name-based detection) live in
+// `legacy` and are surfaced by ListLegacyByApp.
 type fakeContainers struct {
-	exists    map[string]bool
-	images    map[string]string
+	// slots is the live runtime — the source of truth for what
+	// ListByIdentity returns. Keyed by container name.
+	slots map[string]*ContainerSlot
+
+	// legacy tracks pre-M0 container names per AppID, exactly the
+	// shape ListLegacyByApp returns.
+	legacy map[string][]string
+
 	ensures   []ContainerSpec
 	restarts  []string
 	recreates []ContainerSpec
@@ -276,12 +288,54 @@ type fakeContainers struct {
 	// keeps its original ID even if the tag is rebuilt under it.
 	containerImageIDs map[string]string
 	tagImageIDs       map[string]string
+
+	// waitExits maps container name → the exit code Wait should report
+	// when the job runner blocks on it. waitErrs lets a test inject a
+	// docker-side failure (already-removed, daemon error). Both default
+	// to absent (exit 0, no error) so deployment tests keep their
+	// existing zero-config setup.
+	waitExits map[string]int
+	waitErrs  map[string]error
+
+	// waits records every Wait(name) call so tests can assert the job
+	// runner blocked on the exact replica it spawned.
+	waits []string
 }
 
-func (f *fakeContainers) Exists(name string) (bool, error) { return f.exists[name], nil }
+// seedSlot inserts a pre-existing M0-labeled container into the fake.
+// Tests that need to model "container already running before this
+// reconcile" use this instead of the old `exists: map{...}` shorthand.
+func (f *fakeContainers) seedSlot(slot ContainerSlot) {
+	if f.slots == nil {
+		f.slots = map[string]*ContainerSlot{}
+	}
+
+	s := slot
+	f.slots[slot.Name] = &s
+}
+
+// seedLegacy declares pre-M0 containers (no labels) under the given
+// AppID. ListLegacyByApp returns them; the reconciler removes them
+// during the M0 transition.
+func (f *fakeContainers) seedLegacy(app string, names ...string) {
+	if f.legacy == nil {
+		f.legacy = map[string][]string{}
+	}
+
+	f.legacy[app] = append(f.legacy[app], names...)
+}
+
+func (f *fakeContainers) Exists(name string) (bool, error) {
+	_, ok := f.slots[name]
+	return ok, nil
+}
 
 func (f *fakeContainers) Image(name string) (string, error) {
-	return f.images[name], nil
+	if s, ok := f.slots[name]; ok {
+		return s.Image, nil
+	}
+
+	return "", nil
 }
 
 func (f *fakeContainers) ImageIDsDiffer(container, tag string) (bool, error) {
@@ -300,11 +354,12 @@ func (f *fakeContainers) ImageIDsDiffer(container, tag string) (bool, error) {
 func (f *fakeContainers) Recreate(spec ContainerSpec) error {
 	f.recreates = append(f.recreates, spec)
 
-	if f.images == nil {
-		f.images = map[string]string{}
-	}
-
-	f.images[spec.Name] = spec.Image
+	f.seedSlot(ContainerSlot{
+		Name:     spec.Name,
+		Image:    spec.Image,
+		Identity: identityFromSpec(spec),
+		Running:  true,
+	})
 
 	return nil
 }
@@ -312,18 +367,19 @@ func (f *fakeContainers) Recreate(spec ContainerSpec) error {
 func (f *fakeContainers) Ensure(spec ContainerSpec) (bool, error) {
 	f.ensures = append(f.ensures, spec)
 
-	if f.exists == nil {
-		f.exists = map[string]bool{}
-	}
-
 	// Mirror the production contract: Ensure reports true only when it
-	// actually created a container. Tests that pre-populate exists get
-	// a "no-op" return, which is what the restart branch keys off.
-	if f.exists[spec.Name] {
+	// actually created a container. Pre-seeded slots get a "no-op"
+	// return, which is what the restart branch keys off.
+	if _, exists := f.slots[spec.Name]; exists {
 		return false, nil
 	}
 
-	f.exists[spec.Name] = true
+	f.seedSlot(ContainerSlot{
+		Name:     spec.Name,
+		Image:    spec.Image,
+		Identity: identityFromSpec(spec),
+		Running:  true,
+	})
 
 	return true, nil
 }
@@ -336,51 +392,92 @@ func (f *fakeContainers) Restart(name string) error {
 func (f *fakeContainers) Remove(name string) error {
 	f.removes = append(f.removes, name)
 
-	if f.exists != nil {
-		delete(f.exists, name)
-	}
+	delete(f.slots, name)
 
-	if f.images != nil {
-		delete(f.images, name)
+	for app, names := range f.legacy {
+		kept := make([]string, 0, len(names))
+
+		for _, n := range names {
+			if n != name {
+				kept = append(kept, n)
+			}
+		}
+
+		f.legacy[app] = kept
 	}
 
 	return nil
 }
 
-func (f *fakeContainers) ListByAppPrefix(app string) ([]string, error) {
-	out := []string{}
+func (f *fakeContainers) ListByIdentity(kind, scope, name string) ([]ContainerSlot, error) {
+	out := make([]ContainerSlot, 0)
 
-	for name, present := range f.exists {
-		if !present {
-			continue
-		}
-
-		if name == app {
-			out = append(out, name)
-			continue
-		}
-
-		rest, ok := strings.CutPrefix(name, app+"-")
-		if !ok {
-			continue
-		}
-
-		allDigits := rest != ""
-		for _, r := range rest {
-			if r < '0' || r > '9' {
-				allDigits = false
-				break
-			}
-		}
-
-		if allDigits {
-			out = append(out, name)
+	for _, s := range f.slots {
+		if s.Identity.Matches(kind, scope, name) {
+			out = append(out, *s)
 		}
 	}
 
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
+func (f *fakeContainers) Wait(name string) (int, error) {
+	f.waits = append(f.waits, name)
+
+	if err, ok := f.waitErrs[name]; ok && err != nil {
+		return 0, err
+	}
+
+	if code, ok := f.waitExits[name]; ok {
+		return code, nil
+	}
+
+	return 0, nil
+}
+
+func (f *fakeContainers) ListLegacyByApp(app string) ([]string, error) {
+	out := append([]string(nil), f.legacy[app]...)
 	sort.Strings(out)
 
 	return out, nil
+}
+
+// identityFromSpec recovers the Identity the handler intended by parsing
+// the "k=v" label strings the production code feeds to docker run.
+// Lets the fake reconstruct the same view ListByIdentity surfaces in
+// production without duplicating the construction logic.
+func identityFromSpec(spec ContainerSpec) containers.Identity {
+	m := map[string]string{}
+
+	for _, lab := range spec.Labels {
+		if eq := strings.IndexByte(lab, '='); eq >= 0 {
+			m[lab[:eq]] = lab[eq+1:]
+		}
+	}
+
+	id, _ := containers.ParseLabels(m)
+
+	return id
+}
+
+// deploymentSlot is a small helper for tests that pre-seed a deployment
+// replica before invoking the handler. The replicaID is opaque hex in
+// production; tests pick a fixed value so assertions on cm.removes can
+// reference the exact name.
+func deploymentSlot(scope, name, image, replicaID string) ContainerSlot {
+	return ContainerSlot{
+		Name:  containers.ContainerName(scope, name, replicaID),
+		Image: image,
+		Identity: containers.Identity{
+			Kind:      containers.KindDeployment,
+			Scope:     scope,
+			Name:      name,
+			ReplicaID: replicaID,
+		},
+		Running: true,
+	}
 }
 
 func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
@@ -419,12 +516,21 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	}
 
 	got := cm.ensures[0]
-	if got.Name != "test-api-0" || got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/test-api.env" {
+	if !strings.HasPrefix(got.Name, "test-api.") {
+		t.Errorf("ensure name should be test-api.<replica_id>, got %q", got.Name)
+	}
+
+	if got.Image != "ghcr.io/acme/api:1.2.3" || got.EnvFile != "/tmp/test-api.env" {
 		t.Errorf("unexpected ensure spec: %+v", got)
 	}
 
 	if got.Restart != "unless-stopped" || len(got.Networks) != 1 || got.Networks[0] != "voodu0" {
 		t.Errorf("runtime flags not forwarded: %+v", got)
+	}
+
+	id := identityFromSpec(got)
+	if id.Kind != containers.KindDeployment || id.Scope != "test" || id.Name != "api" || id.ReplicaID == "" {
+		t.Errorf("identity labels missing or wrong: %+v", id)
 	}
 
 	// Env write still happens alongside the container ensure.
@@ -718,15 +824,13 @@ func TestDeploymentHandler_EnsureIsIdempotent(t *testing.T) {
 	h.Handle(context.Background(), ev)
 	h.Handle(context.Background(), ev) // replay
 
-	// First call creates; second call hits the exists-short-circuit and
-	// returns created=false. Both calls still hit the fake's Ensure
-	// slice — the slice is the contract surface tests rely on.
-	if len(cm.ensures) != 2 {
-		t.Fatalf("expected 2 ensure calls on replay, got %d", len(cm.ensures))
-	}
-
-	if cm.ensures[0].Image != cm.ensures[1].Image {
-		t.Errorf("spec drifted between replays: %+v vs %+v", cm.ensures[0], cm.ensures[1])
+	// First call ensures one replica; replay sees ListByIdentity already
+	// returns 1 slot and skips Ensure entirely (count diff is zero).
+	// Pre-M0 the handler called Ensure on every reconcile and relied on
+	// the manager's idempotency; post-M0 the count diff makes the
+	// handler the gate, so replays don't re-touch the runtime at all.
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure across reconciles, got %d", len(cm.ensures))
 	}
 
 	// Critically: env did not change (WriteEnv reports false), so we
@@ -740,12 +844,20 @@ func TestDeploymentHandler_EnsureIsIdempotent(t *testing.T) {
 func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T) {
 	store := newMemStore()
 
-	cm := &fakeContainers{
-		// Pretend the indexed slot already exists (e.g. a previous
-		// reconcile) so Ensure returns created=false and the restart
-		// branch fires for an env change.
-		exists: map[string]bool{"test-api-0": true},
-	}
+	// Pretend a replica already exists (e.g. a previous reconcile) so
+	// Ensure returns created=false and the restart branch fires for an
+	// env change. Use a fixed replica id so the assertion can name it.
+	existing := deploymentSlot("test", "api", "img:1", "abcd")
+
+	// Baseline status so the spec-hash drift check is a no-op — we want
+	// the test to exercise the env-change → restart path, not the
+	// recreate path.
+	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
+
+	cm := &fakeContainers{}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -762,8 +874,8 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 
 	h.Handle(context.Background(), ev)
 
-	if got, want := cm.restarts, []string{"test-api-0"}; len(got) != len(want) || got[0] != want[0] {
-		t.Errorf("expected restart of test-api-0, got %+v", got)
+	if got, want := cm.restarts, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected restart of %s, got %+v", existing.Name, got)
 	}
 }
 
@@ -777,10 +889,10 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	pre, _ := json.Marshal(DeploymentStatus{Image: "ghcr.io/acme/api:1.0.0", SpecHash: prevHash})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
-	cm := &fakeContainers{
-		exists: map[string]bool{"test-api-0": true},
-		images: map[string]string{"test-api-0": "ghcr.io/acme/api:1.0.0"},
-	}
+	existing := deploymentSlot("test", "api", "ghcr.io/acme/api:1.0.0", "old1")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -798,12 +910,23 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.recreates) != 1 {
-		t.Fatalf("expected 1 recreate on image drift, got %d", len(cm.recreates))
+	// Post-M0 the recreate path is Remove + Ensure (no in-place
+	// Recreate call). The old replica is gone and a fresh one with a
+	// new opaque id takes its place.
+	if got, want := cm.removes, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected remove of %s during recreate, got %+v", existing.Name, got)
 	}
 
-	if cm.recreates[0].Image != "ghcr.io/acme/api:2.0.0" {
-		t.Errorf("recreate spec image: got %q", cm.recreates[0].Image)
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure for replacement, got %d", len(cm.ensures))
+	}
+
+	if cm.ensures[0].Image != "ghcr.io/acme/api:2.0.0" {
+		t.Errorf("replacement image: got %q", cm.ensures[0].Image)
+	}
+
+	if cm.ensures[0].Name == existing.Name {
+		t.Errorf("replacement should reuse a fresh replica id, but kept old name %q", cm.ensures[0].Name)
 	}
 
 	// Recreate absorbs env pickup — a trailing restart would stop the
@@ -833,10 +956,10 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 	pre, _ := json.Marshal(DeploymentStatus{Image: prevSpec.Image, SpecHash: prevHash})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-web", pre)
 
-	cm := &fakeContainers{
-		exists: map[string]bool{"test-web-0": true},
-		images: map[string]string{"test-web-0": "nginx:latest"},
-	}
+	existing := deploymentSlot("test", "web", "nginx:latest", "w001")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -854,15 +977,19 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.recreates) != 1 {
-		t.Fatalf("expected 1 recreate on ports drift, got %d", len(cm.recreates))
+	if got, want := cm.removes, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected remove of %s, got %+v", existing.Name, got)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure for replacement, got %d", len(cm.ensures))
 	}
 
 	// Port is normalized to loopback-bound by the handler's private-by-
 	// default policy — raw "80:80" becomes "127.0.0.1:80:80" in the
 	// spec that reaches the container manager.
-	if got := cm.recreates[0].Ports; len(got) != 1 || got[0] != "127.0.0.1:80:80" {
-		t.Errorf("recreate spec ports: got %+v", got)
+	if got := cm.ensures[0].Ports; len(got) != 1 || got[0] != "127.0.0.1:80:80" {
+		t.Errorf("replacement spec ports: got %+v", got)
 	}
 }
 
@@ -878,14 +1005,17 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
+	existing := deploymentSlot("test", "vd-web", "vd-web:latest", "vw01")
+
 	cm := &fakeContainers{
-		exists: map[string]bool{"test-vd-web-0": true},
-		// Slot 0 is still running the layer sha it was created with, but
-		// the tag "vd-web:latest" now points at a freshly-built layer.
-		// The reconciler checks slot 0 as the canary for image-id drift.
-		containerImageIDs: map[string]string{"test-vd-web-0": "sha256:oldlayer"},
+		// Existing replica is still running the layer sha it was
+		// created with, but the tag "vd-web:latest" now points at a
+		// freshly-built layer. The reconciler picks the first replica
+		// as the canary for image-id drift.
+		containerImageIDs: map[string]string{existing.Name: "sha256:oldlayer"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:newlayer"},
 	}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -901,12 +1031,16 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 		t.Fatalf("handle: %v", err)
 	}
 
-	if len(cm.recreates) != 1 {
-		t.Fatalf("expected 1 recreate on image-id drift, got %d", len(cm.recreates))
+	if got, want := cm.removes, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected remove of %s on image-id drift, got %+v", existing.Name, got)
 	}
 
-	if cm.recreates[0].Image != "vd-web:latest" {
-		t.Errorf("recreate image: got %q", cm.recreates[0].Image)
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure for replacement, got %d", len(cm.ensures))
+	}
+
+	if cm.ensures[0].Image != "vd-web:latest" {
+		t.Errorf("replacement image: got %q", cm.ensures[0].Image)
 	}
 }
 
@@ -921,11 +1055,13 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
+	existing := deploymentSlot("test", "vd-web", "vd-web:latest", "vw01")
+
 	cm := &fakeContainers{
-		exists:            map[string]bool{"test-vd-web-0": true},
-		containerImageIDs: map[string]string{"test-vd-web-0": "sha256:same"},
+		containerImageIDs: map[string]string{existing.Name: "sha256:same"},
 		tagImageIDs:       map[string]string{"vd-web:latest": "sha256:same"},
 	}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -939,8 +1075,12 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.recreates) != 0 {
-		t.Errorf("matching image IDs must not recreate, got %+v", cm.recreates)
+	if len(cm.removes) != 0 {
+		t.Errorf("matching image IDs must not remove anything, got %+v", cm.removes)
+	}
+
+	if len(cm.ensures) != 0 {
+		t.Errorf("matching image IDs must not ensure anything, got %+v", cm.ensures)
 	}
 }
 
@@ -957,10 +1097,10 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
-	cm := &fakeContainers{
-		exists: map[string]bool{"test-api-0": true},
-		images: map[string]string{"test-api-0": "img:1"},
-	}
+	existing := deploymentSlot("test", "api", "img:1", "rep1")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -977,8 +1117,12 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.recreates) != 0 {
-		t.Errorf("no recreate expected when image matches, got %+v", cm.recreates)
+	if len(cm.removes) != 0 {
+		t.Errorf("no remove expected when image matches, got %+v", cm.removes)
+	}
+
+	if len(cm.ensures) != 0 {
+		t.Errorf("no ensure expected when image matches and replica exists, got %+v", cm.ensures)
 	}
 
 	// Env changed, container existed → plain restart picks up the env.
@@ -990,12 +1134,10 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) {
 	store := newMemStore()
 
-	cm := &fakeContainers{
-		// Slot already exists (imagine: controller upgrade onto a server
-		// where deployments ran under the pre-hash code path).
-		exists: map[string]bool{"test-api-0": true},
-		images: map[string]string{"test-api-0": "img:old"},
-	}
+	existing := deploymentSlot("test", "api", "img:old", "old1")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(existing)
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -1012,8 +1154,12 @@ func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) 
 	// First-time reconcile with no status must not recreate — the
 	// running container might predate status persistence entirely, and
 	// churning every pre-existing deploy on upgrade is a surprise.
-	if len(cm.recreates) != 0 {
-		t.Errorf("first reconcile without status must not recreate, got %+v", cm.recreates)
+	if len(cm.removes) != 0 {
+		t.Errorf("first reconcile without status must not remove, got %+v", cm.removes)
+	}
+
+	if len(cm.ensures) != 0 {
+		t.Errorf("first reconcile without status must not ensure (replica already running), got %+v", cm.ensures)
 	}
 
 	// But it MUST persist a baseline hash so the next real drift gets
@@ -1122,10 +1268,13 @@ func TestDeploymentHandler_EmptyImageDefaultsToAppLatest(t *testing.T) {
 	}
 }
 
-func TestDeploymentHandler_ReplicasSpawnsEveryIndexedSlot(t *testing.T) {
+func TestDeploymentHandler_ReplicasSpawnsEveryReplica(t *testing.T) {
 	// A deployment with replicas=3 must yield exactly three Ensure calls,
-	// one per `<app>-<N>` slot, in index order. Without this the ingress
-	// would only have slot 0 to dial, defeating the point of replicas.
+	// one per replica. Post-M0 names are opaque (`<app>.<replica_id>`),
+	// not ordered — so the assertion is "three distinct names, all
+	// matching the (kind, scope, name) identity tuple". Without this,
+	// the ingress would only have one upstream to dial, defeating the
+	// point of replicas.
 	store := newMemStore()
 
 	cm := &fakeContainers{}
@@ -1149,33 +1298,41 @@ func TestDeploymentHandler_ReplicasSpawnsEveryIndexedSlot(t *testing.T) {
 		t.Fatalf("expected 3 ensures for replicas=3, got %d", len(cm.ensures))
 	}
 
-	for i, e := range cm.ensures {
-		want := fmt.Sprintf("test-api-%d", i)
+	seen := map[string]struct{}{}
 
-		if e.Name != want {
-			t.Errorf("ensure[%d] name: got %q want %q", i, e.Name, want)
+	for i, e := range cm.ensures {
+		if !strings.HasPrefix(e.Name, "test-api.") {
+			t.Errorf("ensure[%d] name should be test-api.<replica_id>, got %q", i, e.Name)
+		}
+
+		if _, dup := seen[e.Name]; dup {
+			t.Errorf("ensure[%d] reused name %q — replicas must be distinct", i, e.Name)
+		}
+
+		seen[e.Name] = struct{}{}
+
+		id := identityFromSpec(e)
+		if id.Kind != containers.KindDeployment || id.Scope != "test" || id.Name != "api" {
+			t.Errorf("ensure[%d] identity wrong: %+v", i, id)
 		}
 	}
 }
 
-func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
-	// replicas went 3 → 1. The two extra slots must be Removed; the
-	// surviving slot stays untouched. Runs before any spec-drift work
-	// so the rollout loop doesn't churn slots that are already gone.
+func TestDeploymentHandler_ScaleDownRemovesExtraReplicas(t *testing.T) {
+	// replicas went 3 → 1. The two extra replicas must be Removed; one
+	// survives, no specific identity required (replicas are
+	// interchangeable). Runs before any spec-drift work so the rollout
+	// loop doesn't churn replicas that are already gone.
 	store := newMemStore()
 
-	cm := &fakeContainers{
-		exists: map[string]bool{
-			"test-api-0": true,
-			"test-api-1": true,
-			"test-api-2": true,
-		},
-		images: map[string]string{
-			"test-api-0": "img:1",
-			"test-api-1": "img:1",
-			"test-api-2": "img:1",
-		},
-	}
+	r0 := deploymentSlot("test", "api", "img:1", "r000")
+	r1 := deploymentSlot("test", "api", "img:1", "r111")
+	r2 := deploymentSlot("test", "api", "img:1", "r222")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(r0)
+	cm.seedSlot(r1)
+	cm.seedSlot(r2)
 
 	// Baseline status so no spec-drift recreate triggers.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
@@ -1194,27 +1351,34 @@ func TestDeploymentHandler_ScaleDownRemovesExtraSlots(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	sort.Strings(cm.removes)
-
-	if want := []string{"test-api-1", "test-api-2"}; len(cm.removes) != len(want) ||
-		cm.removes[0] != want[0] || cm.removes[1] != want[1] {
-		t.Errorf("scale-down removes: got %+v want %+v", cm.removes, want)
+	if len(cm.removes) != 2 {
+		t.Fatalf("scale-down removes: want 2, got %d (%+v)", len(cm.removes), cm.removes)
 	}
 
-	if len(cm.recreates) != 0 {
-		t.Errorf("scale-down must not recreate surviving slots, got %+v", cm.recreates)
+	// Sort uses container name; the deterministic survivor is the
+	// lexicographically smallest. Without that contract the test would
+	// be flaky against map-iteration order.
+	sort.Strings(cm.removes)
+
+	if cm.removes[0] != r1.Name || cm.removes[1] != r2.Name {
+		t.Errorf("scale-down removes: got %+v, want [%s %s]", cm.removes, r1.Name, r2.Name)
+	}
+
+	// No re-ensure for surviving replica — it was already running with
+	// the same spec hash.
+	if len(cm.ensures) != 0 {
+		t.Errorf("scale-down must not re-ensure surviving replica, got %+v", cm.ensures)
 	}
 }
 
 func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
-	// A pre-slot deployment left behind a bare-name `<app>` container.
-	// The new reconciler must remove it (port/volume collisions with
-	// `<app>-0` are inevitable) and spawn the indexed slot cleanly.
+	// A pre-M0 deployment left behind a bare-name `<app>` container
+	// (no voodu.* labels). The new reconciler detects it via legacy
+	// name pattern, removes it, and spawns a labeled M0 replica.
 	store := newMemStore()
 
-	cm := &fakeContainers{
-		exists: map[string]bool{"test-api": true},
-	}
+	cm := &fakeContainers{}
+	cm.seedLegacy("test-api", "test-api")
 
 	h := &DeploymentHandler{
 		Store:       store,
@@ -1232,8 +1396,8 @@ func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
 		t.Errorf("expected legacy removal of %q, got %+v", "test-api", cm.removes)
 	}
 
-	if len(cm.ensures) != 1 || cm.ensures[0].Name != "test-api-0" {
-		t.Errorf("expected ensure of test-api-0 after legacy prune, got %+v", cm.ensures)
+	if len(cm.ensures) != 1 || !strings.HasPrefix(cm.ensures[0].Name, "test-api.") {
+		t.Errorf("expected ensure of test-api.<replica_id> after legacy prune, got %+v", cm.ensures)
 	}
 }
 
@@ -1246,15 +1410,17 @@ func TestDeploymentHandler_PrunesLegacyBareNameContainer(t *testing.T) {
 func TestDeploymentHandler_DeleteRemovesSlotsAndClearsStatus(t *testing.T) {
 	store := newMemStore()
 
-	cm := &fakeContainers{
-		exists: map[string]bool{
-			"test-api-0": true,
-			"test-api-1": true,
-			// A slot in another scope that happens to share the deployment
-			// name — must be untouched.
-			"other-api-0": true,
-		},
-	}
+	r0 := deploymentSlot("test", "api", "img:1", "rep0")
+	r1 := deploymentSlot("test", "api", "img:1", "rep1")
+
+	// A replica in another scope that happens to share the deployment
+	// name — must be untouched.
+	otherSlot := deploymentSlot("other", "api", "img:1", "ot00")
+
+	cm := &fakeContainers{}
+	cm.seedSlot(r0)
+	cm.seedSlot(r1)
+	cm.seedSlot(otherSlot)
 
 	pre, _ := json.Marshal(DeploymentStatus{Image: "img:1", SpecHash: "hash"})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
@@ -1282,7 +1448,9 @@ func TestDeploymentHandler_DeleteRemovesSlotsAndClearsStatus(t *testing.T) {
 
 	sort.Strings(cm.removes)
 
-	want := []string{"test-api-0", "test-api-1"}
+	want := []string{r0.Name, r1.Name}
+	sort.Strings(want)
+
 	if len(cm.removes) != len(want) || cm.removes[0] != want[0] || cm.removes[1] != want[1] {
 		t.Errorf("delete removes: got %+v want %+v", cm.removes, want)
 	}
@@ -1296,7 +1464,7 @@ func TestDeploymentHandler_DeleteRemovesSlotsAndClearsStatus(t *testing.T) {
 		t.Errorf("sibling scope's status was cleared — delete leaked across scopes")
 	}
 
-	if !cm.exists["other-api-0"] {
+	if _, ok := cm.slots[otherSlot.Name]; !ok {
 		t.Errorf("sibling scope's container was removed — delete leaked across scopes")
 	}
 }

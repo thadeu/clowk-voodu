@@ -176,8 +176,9 @@ type hclRoot struct {
 	Apps        []hclApp        `hcl:"app,block"`
 	Deployments []hclDeployment `hcl:"deployment,block"`
 	Databases   []hclDatabase   `hcl:"database,block"`
-	Services    []hclService    `hcl:"service,block"`
 	Ingresses   []hclIngress    `hcl:"ingress,block"`
+	Jobs        []hclJob        `hcl:"job,block"`
+	CronJobs    []hclCronJob    `hcl:"cronjob,block"`
 }
 
 type hclDeployment struct {
@@ -264,16 +265,15 @@ func (b hclDeployment) spec() DeploymentSpec {
 //     • `service` would always equal the app's own name (same
 //       identity), so making the user repeat it is busywork. The
 //       ingress handler already defaults service to the ingress
-//       name (handlers_service.go:202) — that default lands on the
-//       deployment we synthesise next to it.
+//       name — that default lands on the deployment we synthesise
+//       next to it.
 //
 //     • `port` would normally come from the ingress, but the
 //       deployment's `ports` is right here in the same block. The
 //       ingress handler derives the upstream port from the
-//       deployment's first container port when ingress.Port == 0
-//       (handlers_service.go#firstContainerPort). One source of
-//       truth — the user types `ports = ["3000"]` once and both
-//       sides agree.
+//       deployment's first container port when ingress.Port == 0.
+//       One source of truth — the user types `ports = ["3000"]`
+//       once and both sides agree.
 //
 // If you genuinely need two ingresses on the same deployment, or a
 // custom service-name pointer, drop the `app` shorthand and write
@@ -353,9 +353,9 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 }
 
 // ingressSpec extracts the ingress half. Service is left empty so
-// the controller's default-service-to-name path (handlers_service.go:
-// 202) lands on the deployment we just emitted alongside. Port stays
-// zero so the deployment's ports[0] is auto-picked at reconcile.
+// the controller's default-service-to-name path lands on the
+// deployment we just emitted alongside. Port stays zero so the
+// deployment's ports[0] is auto-picked at reconcile.
 func (b hclApp) ingressSpec() IngressSpec {
 	out := IngressSpec{Host: b.Host}
 
@@ -411,17 +411,6 @@ func (b hclDatabase) spec() DatabaseSpec {
 	}
 
 	return out
-}
-
-type hclService struct {
-	Name   string   `hcl:"name,label"`
-	Target string   `hcl:"target"`
-	Port   int      `hcl:"port,optional"`
-	Ports  []string `hcl:"ports,optional"`
-}
-
-func (b hclService) spec() ServiceSpec {
-	return ServiceSpec{Target: b.Target, Port: b.Port, Ports: b.Ports}
 }
 
 type hclIngress struct {
@@ -483,6 +472,130 @@ func (b hclIngress) spec() IngressSpec {
 	return out
 }
 
+// hclJob is the HCL surface for a one-shot container. Two labels —
+// scope and name — match the deployment shape so identity is consistent
+// across kinds. Build-mode fields (Workdir/Dockerfile/Path/Lang) ride
+// alongside Image because jobs frequently reuse the surrounding repo's
+// build pipeline (rake task, alembic migration, …) without wanting a
+// separate registry image.
+type hclJob struct {
+	Scope       string            `hcl:"scope,label"`
+	Name        string            `hcl:"name,label"`
+	Image       string            `hcl:"image,optional"`
+	Workdir     string            `hcl:"workdir,optional"`
+	Dockerfile  string            `hcl:"dockerfile,optional"`
+	Path        string            `hcl:"path,optional"`
+	Command     []string          `hcl:"command,optional"`
+	Env         map[string]string `hcl:"env,optional"`
+	Volumes     []string          `hcl:"volumes,optional"`
+	Network     string            `hcl:"network,optional"`
+	Networks    []string          `hcl:"networks,optional"`
+	NetworkMode string            `hcl:"network_mode,optional"`
+	Timeout     string            `hcl:"timeout,optional"`
+
+	Lang *hclLangBlock `hcl:"lang,block"`
+}
+
+func (b hclJob) spec() JobSpec {
+	s := JobSpec{
+		Image:       b.Image,
+		Workdir:     b.Workdir,
+		Dockerfile:  b.Dockerfile,
+		Path:        b.Path,
+		Command:     b.Command,
+		Env:         b.Env,
+		Volumes:     b.Volumes,
+		Network:     b.Network,
+		Networks:    b.Networks,
+		NetworkMode: b.NetworkMode,
+		Timeout:     b.Timeout,
+	}
+
+	if b.Lang != nil {
+		s.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+			BuildArgs:  b.Lang.BuildArgs,
+		}
+	}
+
+	return s
+}
+
+// hclCronJob is the HCL surface for a scheduled job. The shape mirrors
+// the standalone job — same 2-label scope/name and same execution
+// fields ride at the block root — but adds the schedule controls
+// (schedule, timezone, suspend, concurrency_policy, history limits).
+//
+// We deliberately flatten the job spec into the cronjob root rather
+// than nesting a `job { ... }` sub-block: from an authoring POV the
+// "this is a job that runs on a schedule" mental model produces a
+// single block, and HCL's optional nested blocks make the alternative
+// noisy. The handler reconstructs a JobSpec at apply time by copying
+// the matching fields.
+type hclCronJob struct {
+	Scope string `hcl:"scope,label"`
+	Name  string `hcl:"name,label"`
+
+	Schedule          string `hcl:"schedule"`
+	Timezone          string `hcl:"timezone,optional"`
+	Suspend           bool   `hcl:"suspend,optional"`
+	ConcurrencyPolicy string `hcl:"concurrency_policy,optional"`
+
+	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
+	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
+
+	Image       string            `hcl:"image,optional"`
+	Workdir     string            `hcl:"workdir,optional"`
+	Dockerfile  string            `hcl:"dockerfile,optional"`
+	Path        string            `hcl:"path,optional"`
+	Command     []string          `hcl:"command,optional"`
+	Env         map[string]string `hcl:"env,optional"`
+	Volumes     []string          `hcl:"volumes,optional"`
+	Network     string            `hcl:"network,optional"`
+	Networks    []string          `hcl:"networks,optional"`
+	NetworkMode string            `hcl:"network_mode,optional"`
+	Timeout     string            `hcl:"timeout,optional"`
+
+	Lang *hclLangBlock `hcl:"lang,block"`
+}
+
+func (b hclCronJob) spec() CronJobSpec {
+	job := JobSpec{
+		Image:       b.Image,
+		Workdir:     b.Workdir,
+		Dockerfile:  b.Dockerfile,
+		Path:        b.Path,
+		Command:     b.Command,
+		Env:         b.Env,
+		Volumes:     b.Volumes,
+		Network:     b.Network,
+		Networks:    b.Networks,
+		NetworkMode: b.NetworkMode,
+		Timeout:     b.Timeout,
+	}
+
+	if b.Lang != nil {
+		job.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+			BuildArgs:  b.Lang.BuildArgs,
+		}
+	}
+
+	return CronJobSpec{
+		Schedule:               b.Schedule,
+		Job:                    job,
+		ConcurrencyPolicy:      b.ConcurrencyPolicy,
+		Timezone:               b.Timezone,
+		Suspend:                b.Suspend,
+		SuccessfulHistoryLimit: b.SuccessfulHistoryLimit,
+		FailedHistoryLimit:     b.FailedHistoryLimit,
+	}
+}
+
 func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 	// hclsimple.Decode hard-codes its dispatch on ".hcl" / ".hcl.json",
 	// so any other extension (our branded .voodu/.vdu/.vd, or a stdin
@@ -541,8 +654,8 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 		out = append(out, m)
 	}
 
-	for _, b := range root.Services {
-		m, err := encode(controller.KindService, "", b.Name, b.spec())
+	for _, b := range root.Ingresses {
+		m, err := encode(controller.KindIngress, b.Scope, b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -550,8 +663,17 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 		out = append(out, m)
 	}
 
-	for _, b := range root.Ingresses {
-		m, err := encode(controller.KindIngress, b.Scope, b.Name, b.spec())
+	for _, b := range root.Jobs {
+		m, err := encode(controller.KindJob, b.Scope, b.Name, b.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, m)
+	}
+
+	for _, b := range root.CronJobs {
+		m, err := encode(controller.KindCronJob, b.Scope, b.Name, b.spec())
 		if err != nil {
 			return nil, err
 		}
@@ -677,12 +799,16 @@ func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, err
 		var s DatabaseSpec
 		return s, node.Decode(&s)
 
-	case controller.KindService:
-		var s ServiceSpec
-		return s, node.Decode(&s)
-
 	case controller.KindIngress:
 		var s IngressSpec
+		return s, node.Decode(&s)
+
+	case controller.KindJob:
+		var s JobSpec
+		return s, node.Decode(&s)
+
+	case controller.KindCronJob:
+		var s CronJobSpec
 		return s, node.Decode(&s)
 
 	default:

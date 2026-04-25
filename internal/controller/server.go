@@ -41,6 +41,10 @@ type Server struct {
 
 	cancelRec context.CancelFunc
 	recDone   chan struct{}
+
+	cronSched   *CronScheduler
+	cancelCron  context.CancelFunc
+	cronDone    chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -104,6 +108,7 @@ func (s *Server) Start(ctx context.Context) error {
 		NodeName:    s.cfg.NodeName,
 		EtcdClient:  s.cfg.EtcdClient,
 		Invoker:     invoker,
+		Pods:        DockerPodsLister{},
 	}
 
 	dbHandler := &DatabaseHandler{
@@ -133,18 +138,60 @@ func (s *Server) Start(ctx context.Context) error {
 		Containers:  DockerContainerManager{},
 	}
 
-	svcHandler := &ServiceHandler{
-		Store: store,
-		Log:   s.cfg.Logger,
-	}
-
 	ingHandler := &IngressHandler{
-		Store:   store,
-		Invoker: invoker,
-		Log:     s.cfg.Logger,
+		Store:      store,
+		Invoker:    invoker,
+		Log:        s.cfg.Logger,
+		Containers: DockerContainerManager{},
 		// PluginName left empty → defaults to "caddy". Operators with a
 		// non-Caddy router install their own plugin and set this via a
 		// future Config field.
+	}
+
+	jobHandler := &JobHandler{
+		Store:      store,
+		Log:        s.cfg.Logger,
+		Containers: DockerContainerManager{},
+		// Jobs read the same env file as their AppID-twinned deployment
+		// would (apps/<scope>-<name>/.env), so `voodu config set` lands
+		// where job runs read from.
+		EnvFilePath: paths.AppEnvFile,
+		WriteEnv: func(app string, pairs []string) (bool, error) {
+			envFile := paths.AppEnvFile(app)
+
+			before, _ := envfile.Load(envFile)
+
+			after, err := secrets.Set(app, pairs)
+			if err != nil {
+				return false, err
+			}
+
+			return !stringMapsEqual(before, after), nil
+		},
+	}
+
+	// Expose the job runner to the API so `voodu run job` has a target
+	// for /jobs/run. The reconciler still sees jobHandler.Handle for
+	// apply / delete events.
+	s.api.Jobs = jobHandler
+
+	cronJobHandler := &CronJobHandler{
+		Store:       store,
+		Log:         s.cfg.Logger,
+		Containers:  DockerContainerManager{},
+		EnvFilePath: paths.AppEnvFile,
+		WriteEnv: func(app string, pairs []string) (bool, error) {
+			envFile := paths.AppEnvFile(app)
+
+			before, _ := envfile.Load(envFile)
+
+			after, err := secrets.Set(app, pairs)
+			if err != nil {
+				return false, err
+			}
+
+			return !stringMapsEqual(before, after), nil
+		},
 	}
 
 	s.rec = &Reconciler{
@@ -153,9 +200,20 @@ func (s *Server) Start(ctx context.Context) error {
 		Handlers: map[Kind]HandlerFunc{
 			KindDatabase:   dbHandler.Handle,
 			KindDeployment: depHandler.Handle,
-			KindService:    svcHandler.Handle,
 			KindIngress:    ingHandler.Handle,
+			KindJob:        jobHandler.Handle,
+			KindCronJob:    cronJobHandler.Handle,
 		},
+	}
+
+	// Wall-clock dispatcher. Lives on its own goroutine so a slow tick
+	// can't block reconciles, and so Stop() can shut it down
+	// independently. Interval defaults to 1m (cron resolution); Now and
+	// Dispatch take their production defaults — tests inject mocks.
+	s.cronSched = &CronScheduler{
+		Store:   store,
+		Handler: cronJobHandler,
+		Logger:  s.cfg.Logger,
 	}
 
 	s.recDone = make(chan struct{})
@@ -166,6 +224,16 @@ func (s *Server) Start(ctx context.Context) error {
 		if err := s.rec.Run(recCtx); err != nil {
 			s.cfg.Logger.Printf("reconciler exited: %v", err)
 		}
+	}()
+
+	cronCtx, cancelCron := context.WithCancel(context.Background())
+	s.cancelCron = cancelCron
+	s.cronDone = make(chan struct{})
+
+	go func() {
+		defer close(s.cronDone)
+
+		s.cronSched.Run(cronCtx)
 	}()
 
 	s.http = &http.Server{
@@ -230,6 +298,14 @@ func (s *Server) Stop(timeout time.Duration) error {
 }
 
 func (s *Server) teardown() {
+	if s.cancelCron != nil {
+		s.cancelCron()
+	}
+
+	if s.cronDone != nil {
+		<-s.cronDone
+	}
+
 	if s.cancelRec != nil {
 		s.cancelRec()
 	}

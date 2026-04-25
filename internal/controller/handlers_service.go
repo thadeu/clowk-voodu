@@ -5,21 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
 	"go.voodu.clowk.in/pkg/plugin"
 )
 
-// serviceSpec / ingressSpec mirror internal/manifest shapes for the
-// same reason as databaseSpec/deploymentSpec (see handlers.go): avoid
-// an import cycle and keep the reconciler's view of each kind explicit.
-type serviceSpec struct {
-	Target string   `json:"target"`
-	Port   int      `json:"port,omitempty"`
-	Ports  []string `json:"ports,omitempty"`
-}
-
+// ingressSpec mirrors internal/manifest's IngressSpec for the same
+// reason as databaseSpec/deploymentSpec (see handlers.go): avoid an
+// import cycle and keep the reconciler's view of each kind explicit.
 type ingressSpec struct {
 	Host      string            `json:"host"`
 	Service   string            `json:"service,omitempty"`
@@ -53,102 +48,6 @@ type ingressTLS struct {
 	Ask      string `json:"ask,omitempty"`
 }
 
-// ServiceHandler reconciles service manifests into a metadata-only
-// status blob. No plugin, no container — services in Voodu are a
-// stable name + port over a deployment that already has its own
-// docker network identity. The status blob exists for two reasons:
-//
-//  1. Validation: failing `voodu apply` at desired-state-write time is
-//     better than failing silently at runtime. We don't validate here
-//     (the API handler does), but persisting the target is useful for
-//     downstream consumers (ingress, voodu status).
-//  2. Reference resolution: ingress manifests can say
-//     `service: api` and a future deployment could read
-//     `${ref.service.api.target}` to cross-link names.
-type ServiceHandler struct {
-	Store Store
-	Log   *log.Logger
-}
-
-// ServiceStatus persists the resolved service info under
-// /status/services/<name>. The Data map follows the standard
-// statusEnvelope convention so refLookup can read it without per-kind
-// code.
-type ServiceStatus struct {
-	Data map[string]any `json:"data,omitempty"`
-}
-
-func (h *ServiceHandler) Handle(ctx context.Context, ev WatchEvent) error {
-	switch ev.Type {
-	case WatchPut:
-		return h.apply(ctx, ev)
-	case WatchDelete:
-		return h.remove(ctx, ev)
-	}
-
-	return nil
-}
-
-func (h *ServiceHandler) apply(ctx context.Context, ev WatchEvent) error {
-	if ev.Manifest == nil {
-		return fmt.Errorf("put event without manifest")
-	}
-
-	var spec serviceSpec
-	if err := json.Unmarshal(ev.Manifest.Spec, &spec); err != nil {
-		return fmt.Errorf("decode service spec: %w", err)
-	}
-
-	if spec.Target == "" {
-		return fmt.Errorf("service/%s: target is required", ev.Name)
-	}
-
-	status := ServiceStatus{
-		Data: map[string]any{
-			"target": spec.Target,
-		},
-	}
-
-	if spec.Port > 0 {
-		status.Data["port"] = spec.Port
-	}
-
-	if len(spec.Ports) > 0 {
-		status.Data["ports"] = spec.Ports
-	}
-
-	blob, err := json.Marshal(status)
-	if err != nil {
-		return err
-	}
-
-	if err := h.Store.PutStatus(ctx, KindService, ev.Name, blob); err != nil {
-		return err
-	}
-
-	h.logf("service/%s registered (target=%s)", ev.Name, spec.Target)
-
-	return nil
-}
-
-func (h *ServiceHandler) remove(ctx context.Context, ev WatchEvent) error {
-	if err := h.Store.DeleteStatus(ctx, KindService, ev.Name); err != nil {
-		return err
-	}
-
-	h.logf("service/%s unregistered", ev.Name)
-
-	return nil
-}
-
-func (h *ServiceHandler) logf(format string, args ...any) {
-	if h.Log == nil {
-		return
-	}
-
-	h.Log.Printf(format, args...)
-}
-
 // IngressHandler dispatches ingress manifests to the ingress plugin
 // (voodu-caddy by default). Same shape as DatabaseHandler — the
 // reconciler doesn't know how to terminate TLS or route hosts, but
@@ -162,6 +61,16 @@ type IngressHandler struct {
 	// PluginName lets operators swap the default ingress plugin. Empty
 	// defaults to "caddy", matching the milestone's reference plugin.
 	PluginName string
+
+	// Containers lets the upstream resolver list live deployment
+	// replicas by label. Optional — when nil, deployment upstreams
+	// fall back to the bare AppID (single-replica routing). Required
+	// for replicas>1 to produce the correct fan-out.
+	//
+	// Post-M0 deployment replicas have non-deterministic names
+	// (`<app>.<replica_id>`), so the resolver can no longer
+	// synthesize them from a count; it has to ask the runtime.
+	Containers ContainerManager
 }
 
 // IngressStatus persists whatever the ingress plugin returned. As with
@@ -194,9 +103,9 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 	// ingress-per-app is the overwhelmingly common shape: one
 	// `deployment "api"` paired with one `ingress "api"`. When the
-	// ingress name matches the target service, the HCL is pure
+	// ingress name matches the target deployment, the HCL is pure
 	// boilerplate — so we default Service to the ingress name. Operators
-	// who actually want a cross-app route (ingress "public" → service
+	// who actually want a cross-app route (ingress "public" → deployment
 	// "api") still declare `service = "..."` explicitly; we only fill the
 	// blank, never override.
 	if spec.Service == "" {
@@ -396,20 +305,19 @@ func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[s
 	return env
 }
 
-// resolveUpstream validates that the target service/deployment actually
-// exists in /desired and fills in spec.Port when the operator left it
-// blank. Two goals:
+// resolveUpstream validates that the target deployment actually exists
+// in /desired and fills in spec.Port when the operator left it blank.
+// Two goals:
 //
-//  1. Fail-fast on typos — applying an ingress that names a service
+//  1. Fail-fast on typos — applying an ingress that names a deployment
 //     nobody applied produces a clean error instead of a mystery 502
 //     at request time.
-//  2. Let manifests omit `port` when the service/deployment already
-//     declares it. Cuts redundancy from the common case.
+//  2. Let manifests omit `port` when the deployment already declares
+//     it. Cuts redundancy from the common case.
 //
 // Precedence when port is missing:
 //
 //	spec.Port (explicit)
-//	  > service "<name>".port
 //	  > deployment "<name>".ports[0]  (container port, after `host:` split)
 //	  > 80 (default)
 //
@@ -428,90 +336,88 @@ func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[s
 const defaultIngressPort = 80
 
 // resolveUpstream validates the target exists and builds the upstream
-// list for caddy. Two sources feed the list:
-//
-//   - service: serviceSpec has no replicas concept; it's a single
-//     target (or an explicit list, if Ports was set). We return the
-//     single `target:port` pair.
-//   - deployment: we look up the deployment spec to read its replica
-//     count and health_check path, then emit one upstream per slot:
-//     `<app>-0:<port>, <app>-1:<port>, ...`. Caddy does not resolve
-//     stale bare-name DNS anymore; it sees exactly the set of running
-//     containers.
+// list for caddy. Deployments are scope-local: an ingress in scope X
+// only resolves deployments declared under scope X. We look up the
+// deployment spec to read its replica count and health_check path,
+// then emit one upstream per slot via the runtime's container list.
 //
 // spec.Port is filled in from whichever source provides it (explicit >
-// service.port > deployment.ports[0] > 80). See the port-fallback
-// rationale on the old implementation.
+// deployment.ports[0] > 80). See the port-fallback rationale above.
 func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string, spec *ingressSpec) (upstreamResolution, error) {
-	svc, err := h.lookupServiceSpec(ctx, spec.Service)
-	if err != nil {
-		return upstreamResolution{}, err
-	}
-
-	if svc != nil {
-		if spec.Port == 0 {
-			if svc.Port > 0 {
-				spec.Port = svc.Port
-			} else {
-				spec.Port = defaultIngressPort
-			}
-		}
-
-		return upstreamResolution{
-			Upstreams: []string{fmt.Sprintf("%s:%d", svc.Target, spec.Port)},
-		}, nil
-	}
-
-	// Deployments are scope-local: an ingress in scope X only resolves
-	// deployments declared under scope X. Same-named deployments in a
-	// different scope are deliberately invisible here.
 	dep, err := h.lookupDeploymentSpec(ctx, scope, spec.Service)
 	if err != nil {
 		return upstreamResolution{}, err
 	}
 
-	if dep != nil {
-		if spec.Port == 0 {
-			if port, ok := firstContainerPort(dep.Ports); ok {
-				spec.Port = port
-			} else {
-				spec.Port = defaultIngressPort
-			}
-		}
-
-		replicas := effectiveReplicas(*dep)
-		slots := slotNames(AppID(scope, spec.Service), replicas)
-		upstreams := make([]string, len(slots))
-
-		for i, slot := range slots {
-			upstreams[i] = fmt.Sprintf("%s:%d", slot, spec.Port)
-		}
-
-		return upstreamResolution{
-			Upstreams:       upstreams,
-			HealthCheckPath: dep.HealthCheck,
-		}, nil
+	if dep == nil {
+		return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no deployment named %q yet — will retry", name, spec.Service))
 	}
 
-	return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no service or deployment named %q yet — will retry", name, spec.Service))
+	if spec.Port == 0 {
+		if port, ok := firstContainerPort(dep.Ports); ok {
+			spec.Port = port
+		} else {
+			spec.Port = defaultIngressPort
+		}
+	}
+
+	upstreams, err := h.deploymentUpstreams(scope, spec.Service, spec.Port, *dep)
+	if err != nil {
+		return upstreamResolution{}, err
+	}
+
+	return upstreamResolution{
+		Upstreams:       upstreams,
+		HealthCheckPath: dep.HealthCheck,
+	}, nil
 }
 
-func (h *IngressHandler) lookupServiceSpec(ctx context.Context, name string) (*serviceSpec, error) {
-	m, err := h.Store.Get(ctx, KindService, "", name)
+// deploymentUpstreams produces the list of `<container>:<port>`
+// targets caddy will load-balance across. Pre-M0 we synthesised them
+// from the replica count using deterministic slot names; with opaque
+// replica ids the runtime is the only source of truth, so we ask
+// docker via labels.
+//
+// Three retry-friendly cases the caller has to absorb:
+//
+//   - Containers nil — handler wired without a manager. Falls back to
+//     the bare AppID, which works for replicas=1 and degrades
+//     predictably for replicas>1 (caddy hits the wrong name once).
+//
+//   - List error — wrap as Transient so the reconciler retries. A
+//     transient docker hiccup mid-apply is more common than the
+//     handler being misconfigured.
+//
+//   - List returns zero containers — the deployment exists in
+//     /desired but the reconciler hasn't created replicas yet (the
+//     ingress event landed first). Same Transient retry.
+func (h *IngressHandler) deploymentUpstreams(scope, name string, port int, dep deploymentSpec) ([]string, error) {
+	app := AppID(scope, name)
+
+	if h.Containers == nil {
+		return []string{fmt.Sprintf("%s:%d", app, port)}, nil
+	}
+
+	slots, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
 	if err != nil {
-		return nil, err
+		return nil, Transient(fmt.Errorf("list deployment %s replicas: %w", app, err))
 	}
 
-	if m == nil {
-		return nil, nil
+	if len(slots) == 0 {
+		return nil, Transient(fmt.Errorf("ingress: deployment %s has no live replicas yet — will retry", app))
 	}
 
-	var spec serviceSpec
-	if err := json.Unmarshal(m.Spec, &spec); err != nil {
-		return nil, fmt.Errorf("decode service/%s: %w", name, err)
+	out := make([]string, 0, len(slots))
+	for _, s := range slots {
+		out = append(out, fmt.Sprintf("%s:%d", s.Name, port))
 	}
 
-	return &spec, nil
+	// Sort for determinism so caddy plugin diff is stable across
+	// reconciles even when docker returns the list in a different
+	// order. The set is what matters; the order doesn't.
+	sort.Strings(out)
+
+	return out, nil
 }
 
 func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, scope, name string) (*deploymentSpec, error) {

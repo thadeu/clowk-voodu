@@ -52,6 +52,8 @@ func AppID(scope, name string) string {
 var ScopedKinds = map[Kind]bool{
 	KindDeployment: true,
 	KindIngress:    true,
+	KindJob:        true,
+	KindCronJob:    true,
 }
 
 // IsScoped returns true when manifests of kind k must carry a scope.

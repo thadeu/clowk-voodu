@@ -220,9 +220,6 @@ ingress "test" "api" {
   host    = "api.example.com"
   service = "api"
 }
-service "web" {
-  target = "api"
-}
 `
 	tmp := writeTemp(t, "stack.hcl", src)
 
@@ -231,8 +228,8 @@ service "web" {
 		t.Fatal(err)
 	}
 
-	if len(mans) != 4 {
-		t.Fatalf("want 4 manifests, got %d", len(mans))
+	if len(mans) != 3 {
+		t.Fatalf("want 3 manifests, got %d", len(mans))
 	}
 }
 
@@ -485,7 +482,7 @@ func TestParseDirMixedFormats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	writeAt(t, filepath.Join(sub, "c.yml"), "kind: service\nname: web\nspec:\n  target: api\n")
+	writeAt(t, filepath.Join(sub, "c.yml"), "kind: deployment\nscope: test\nname: worker\nspec:\n  image: worker:1\n")
 
 	mans, err := ParseDir(dir, nil)
 	if err != nil {
@@ -603,6 +600,305 @@ func TestParseUnknownExtension(t *testing.T) {
 	_, err := ParseFile(tmp, nil)
 	if err == nil {
 		t.Fatal("want error for unknown extension")
+	}
+}
+
+// TestParseHCLJob locks in the M3 surface for the `job` block: same
+// 2-label scope/name shape as deployment, image + command + env are the
+// fields the imperative `voodu run job` consumes. Without this the
+// hclJob struct could silently lose a field on refactor.
+func TestParseHCLJob(t *testing.T) {
+	src := `
+job "api" "migrate" {
+  image   = "ghcr.io/acme/api:1.0.0"
+  command = ["./migrate.sh", "--up"]
+  env     = { DATABASE_URL = "postgres://u:p@h:5432/db" }
+  volumes = ["/opt/voodu/migrations:/migrations"]
+  networks = ["voodu0"]
+  timeout  = "5m"
+}
+`
+	tmp := writeTemp(t, "job.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	if mans[0].Kind != controller.KindJob || mans[0].Scope != "api" || mans[0].Name != "migrate" {
+		t.Errorf("unexpected header: %+v", mans[0])
+	}
+
+	var spec JobSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Image != "ghcr.io/acme/api:1.0.0" {
+		t.Errorf("image: %q", spec.Image)
+	}
+
+	if len(spec.Command) != 2 || spec.Command[0] != "./migrate.sh" || spec.Command[1] != "--up" {
+		t.Errorf("command: %+v", spec.Command)
+	}
+
+	if spec.Env["DATABASE_URL"] != "postgres://u:p@h:5432/db" {
+		t.Errorf("env: %+v", spec.Env)
+	}
+
+	if len(spec.Networks) != 1 || spec.Networks[0] != "voodu0" {
+		t.Errorf("networks: %+v", spec.Networks)
+	}
+
+	if spec.Timeout != "5m" {
+		t.Errorf("timeout: %q", spec.Timeout)
+	}
+}
+
+// TestParseHCLJobMissingScope mirrors the deployment validator: jobs
+// are scoped, so a single-label `job "name" {}` must error loudly with
+// the suggested fix in the message.
+func TestParseHCLJobMissingScope(t *testing.T) {
+	// HCL strictly types the labels list, so a single-label decl fails
+	// at parse time. The error message comes from hclsimple — we just
+	// assert the parse rejects, since the label-arity is the schema
+	// invariant we care about.
+	src := `job "migrate" { image = "img:1" }`
+
+	tmp := writeTemp(t, "bad.hcl", src)
+
+	if _, err := ParseFile(tmp, nil); err == nil {
+		t.Fatal("expected single-label job decl to fail HCL parse")
+	}
+}
+
+// TestParseYAMLJob covers the YAML variant. spec.image / spec.command /
+// spec.env all decode into JobSpec via the generic decodeYAMLSpec
+// dispatch. Tests the kind switch in decodeYAMLSpec.
+func TestParseYAMLJob(t *testing.T) {
+	src := `
+kind: job
+scope: api
+name: migrate
+spec:
+  image: ghcr.io/acme/api:1.0.0
+  command:
+    - ./migrate.sh
+    - --up
+  env:
+    DATABASE_URL: postgres://u:p@h:5432/db
+  timeout: 5m
+`
+	tmp := writeTemp(t, "job.yaml", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	if mans[0].Kind != controller.KindJob || mans[0].Scope != "api" || mans[0].Name != "migrate" {
+		t.Errorf("unexpected header: %+v", mans[0])
+	}
+
+	var spec JobSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Image != "ghcr.io/acme/api:1.0.0" {
+		t.Errorf("image: %q", spec.Image)
+	}
+
+	if len(spec.Command) != 2 || spec.Command[0] != "./migrate.sh" {
+		t.Errorf("command: %+v", spec.Command)
+	}
+
+	if spec.Env["DATABASE_URL"] != "postgres://u:p@h:5432/db" {
+		t.Errorf("env: %+v", spec.Env)
+	}
+
+	if spec.Timeout != "5m" {
+		t.Errorf("timeout: %q", spec.Timeout)
+	}
+}
+
+// TestParseHCLCronJob locks in the M4 surface for `cronjob`. The
+// schedule + concurrency knobs sit at the block root next to the
+// flattened job spec — no nested `job {}` — so authoring stays
+// single-block. Without this an accidental rename of an HCL field
+// (e.g. `concurrency_policy` → `concurrency`) would silently drop
+// the value.
+func TestParseHCLCronJob(t *testing.T) {
+	src := `
+cronjob "ops" "purge" {
+  schedule           = "*/15 * * * *"
+  timezone           = "America/Sao_Paulo"
+  suspend            = false
+  concurrency_policy = "Forbid"
+
+  successful_history_limit = 5
+  failed_history_limit     = 2
+
+  image    = "ghcr.io/acme/api:1.0.0"
+  command  = ["./purge.sh", "--retention=30d"]
+  env      = { DATABASE_URL = "postgres://u:p@h:5432/db" }
+  networks = ["voodu0"]
+  timeout  = "10m"
+}
+`
+	tmp := writeTemp(t, "cron.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	if mans[0].Kind != controller.KindCronJob || mans[0].Scope != "ops" || mans[0].Name != "purge" {
+		t.Errorf("unexpected header: %+v", mans[0])
+	}
+
+	var spec CronJobSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Schedule != "*/15 * * * *" {
+		t.Errorf("schedule: %q", spec.Schedule)
+	}
+
+	if spec.Timezone != "America/Sao_Paulo" {
+		t.Errorf("timezone: %q", spec.Timezone)
+	}
+
+	if spec.ConcurrencyPolicy != "Forbid" {
+		t.Errorf("concurrency_policy: %q", spec.ConcurrencyPolicy)
+	}
+
+	if spec.SuccessfulHistoryLimit != 5 || spec.FailedHistoryLimit != 2 {
+		t.Errorf("history limits: succ=%d fail=%d", spec.SuccessfulHistoryLimit, spec.FailedHistoryLimit)
+	}
+
+	if spec.Job.Image != "ghcr.io/acme/api:1.0.0" {
+		t.Errorf("job.image: %q", spec.Job.Image)
+	}
+
+	if len(spec.Job.Command) != 2 || spec.Job.Command[0] != "./purge.sh" {
+		t.Errorf("job.command: %+v", spec.Job.Command)
+	}
+
+	if spec.Job.Env["DATABASE_URL"] != "postgres://u:p@h:5432/db" {
+		t.Errorf("job.env: %+v", spec.Job.Env)
+	}
+
+	if len(spec.Job.Networks) != 1 || spec.Job.Networks[0] != "voodu0" {
+		t.Errorf("job.networks: %+v", spec.Job.Networks)
+	}
+
+	if spec.Job.Timeout != "10m" {
+		t.Errorf("job.timeout: %q", spec.Job.Timeout)
+	}
+}
+
+// TestParseHCLCronJobMissingScope mirrors the job test: cronjobs are
+// scoped, so a single-label decl must fail HCL parse. The label arity
+// is the schema invariant we care about.
+func TestParseHCLCronJobMissingScope(t *testing.T) {
+	src := `cronjob "purge" { schedule = "* * * * *" image = "img:1" }`
+
+	tmp := writeTemp(t, "bad.hcl", src)
+
+	if _, err := ParseFile(tmp, nil); err == nil {
+		t.Fatal("expected single-label cronjob decl to fail HCL parse")
+	}
+}
+
+// TestParseHCLCronJobScheduleRequired ensures a cronjob without a
+// schedule is rejected at parse time, not silently turned into a
+// "fires never" manifest.
+func TestParseHCLCronJobScheduleRequired(t *testing.T) {
+	src := `cronjob "ops" "purge" { image = "img:1" }`
+
+	tmp := writeTemp(t, "noschedule.hcl", src)
+
+	if _, err := ParseFile(tmp, nil); err == nil {
+		t.Fatal("expected error when schedule is missing")
+	}
+}
+
+// TestParseYAMLCronJob covers the YAML variant. Note YAML's CronJobSpec
+// shape: the job fields nest under `spec.job` because YAML doesn't
+// give us the flattening sugar the HCL block does, and the wire shape
+// the controller decodes already mirrors that.
+func TestParseYAMLCronJob(t *testing.T) {
+	src := `
+kind: cronjob
+scope: ops
+name: purge
+spec:
+  schedule: "*/15 * * * *"
+  timezone: America/Sao_Paulo
+  concurrency_policy: Forbid
+  successful_history_limit: 5
+  failed_history_limit: 2
+  job:
+    image: ghcr.io/acme/api:1.0.0
+    command:
+      - ./purge.sh
+      - --retention=30d
+    env:
+      DATABASE_URL: postgres://u:p@h:5432/db
+    timeout: 10m
+`
+	tmp := writeTemp(t, "cron.yaml", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	if mans[0].Kind != controller.KindCronJob || mans[0].Scope != "ops" || mans[0].Name != "purge" {
+		t.Errorf("unexpected header: %+v", mans[0])
+	}
+
+	var spec CronJobSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Schedule != "*/15 * * * *" {
+		t.Errorf("schedule: %q", spec.Schedule)
+	}
+
+	if spec.ConcurrencyPolicy != "Forbid" {
+		t.Errorf("concurrency_policy: %q", spec.ConcurrencyPolicy)
+	}
+
+	if spec.Job.Image != "ghcr.io/acme/api:1.0.0" {
+		t.Errorf("job.image: %q", spec.Job.Image)
+	}
+
+	if len(spec.Job.Command) != 2 {
+		t.Errorf("job.command: %+v", spec.Job.Command)
+	}
+
+	if spec.SuccessfulHistoryLimit != 5 || spec.FailedHistoryLimit != 2 {
+		t.Errorf("history limits: succ=%d fail=%d", spec.SuccessfulHistoryLimit, spec.FailedHistoryLimit)
 	}
 }
 

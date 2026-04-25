@@ -66,6 +66,20 @@ type ContainerConfig struct {
 	Volumes       []string
 	WorkingDir    string
 	Command       []string
+
+	// Labels are extra `--label k=v` flags appended after the umbrella
+	// createdby=voodu marker. Controller-managed containers populate
+	// this with the structured voodu.* identity (scope, name, kind,
+	// replica_id) so the reconciler can list-by-labels instead of
+	// parsing names. Build-mode and the legacy DeploymentConfig path
+	// can leave it empty — the umbrella label still lands.
+	Labels []string
+
+	// AutoRemove sets `--rm` so the container is deleted as soon as the
+	// process exits. Used by job-kind runs that should not leave
+	// stopped artifacts behind. Defaults to false (long-running
+	// deployments must persist across restarts).
+	AutoRemove bool
 }
 
 // DeploymentConfig represents deployment configuration.
@@ -85,7 +99,18 @@ type DeploymentConfig struct {
 func CreateContainer(cfg ContainerConfig) error {
 	args := []string{"run", "-d", "--name", cfg.Name}
 
+	if cfg.AutoRemove {
+		args = append(args, "--rm")
+	}
+
 	for _, label := range GetVooduLabels() {
+		args = append(args, "--label", label)
+	}
+
+	// Caller-supplied labels (typically voodu.scope=…, voodu.name=…,
+	// voodu.kind=…). The umbrella createdby=voodu above stays for the
+	// existing ListContainers filter; structured labels ride alongside.
+	for _, label := range cfg.Labels {
 		args = append(args, "--label", label)
 	}
 
@@ -194,10 +219,33 @@ func ConnectNetwork(container, network string) error {
 // ListContainers returns list of containers in JSON format.
 // By default, only lists containers with Voodu labels to avoid conflicts.
 func ListContainers(all bool) ([]ContainerInfo, error) {
-	args := []string{"ps", "--format", "json", "--filter", fmt.Sprintf("label=%s=%s", VooduLabelKey, VooduLabelValue)}
+	return ListContainersFiltered(all, nil)
+}
+
+// ListContainersFiltered runs `docker ps` scoped to voodu-managed
+// containers (via createdby=voodu) plus any extra label filters the
+// caller supplies.
+//
+// Each entry in extraLabels is a `key=value` pair appended as
+// `--filter label=…`. Docker AND-combines multiple label filters, so
+// passing `[voodu.kind=deployment, voodu.scope=softphone]` returns
+// only the deployment containers in that scope. Used by the
+// reconciler (ListByIdentity) and `voodu get pods`.
+func ListContainersFiltered(all bool, extraLabels []string) ([]ContainerInfo, error) {
+	args := []string{"ps"}
 
 	if all {
-		args = []string{"ps", "-a", "--format", "json", "--filter", fmt.Sprintf("label=%s=%s", VooduLabelKey, VooduLabelValue)}
+		args = append(args, "-a")
+	}
+
+	args = append(args, "--format", "json", "--filter", fmt.Sprintf("label=%s=%s", VooduLabelKey, VooduLabelValue))
+
+	for _, lbl := range extraLabels {
+		if lbl == "" {
+			continue
+		}
+
+		args = append(args, "--filter", "label="+lbl)
 	}
 
 	cmd := exec.Command("docker", args...)
@@ -225,6 +273,39 @@ func ListContainers(all bool) ([]ContainerInfo, error) {
 	}
 
 	return containers, nil
+}
+
+// InspectLabels returns the labels of a single container as a flat
+// map. Used by the reconciler / `voodu describe` to recover the
+// structured voodu.* identity. `docker ps --format json` does not
+// emit labels, so this is the second hop.
+//
+// Returns (nil, nil) when the container does not exist — distinct
+// from (nil, err) which is a real failure to inspect.
+func InspectLabels(name string) (map[string]string, error) {
+	if !ContainerExists(name) {
+		return nil, nil
+	}
+
+	cmd := exec.Command("docker", "inspect", name, "--format", "{{json .Config.Labels}}")
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s labels: %w", name, err)
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" || trimmed == "null" {
+		return map[string]string{}, nil
+	}
+
+	var labels map[string]string
+
+	if err := json.Unmarshal([]byte(trimmed), &labels); err != nil {
+		return nil, fmt.Errorf("parse labels for %s: %w", name, err)
+	}
+
+	return labels, nil
 }
 
 // ContainerExists checks if a container exists.
@@ -392,6 +473,34 @@ func UpdateRestartPolicy(name, policy string) error {
 	}
 
 	return nil
+}
+
+// WaitContainer blocks until the named container exits and returns the
+// process exit code. Backed by `docker wait`, which prints the integer
+// exit code on stdout when the container terminates. Used by the job
+// runner: jobs are containers we spawn synchronously and observe to
+// completion.
+//
+// Returns an error when docker can't wait on the container (already
+// removed, daemon down) or when the output isn't a parseable integer
+// — the caller treats that as a failed run distinct from a non-zero
+// exit, since we can't trust any value.
+func WaitContainer(name string) (int, error) {
+	cmd := exec.Command("docker", "wait", name)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("docker wait %s: %w", name, err)
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+
+	code, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("parse exit code from docker wait %s: %q: %w", name, trimmed, err)
+	}
+
+	return code, nil
 }
 
 // RemoveContainer removes a container.

@@ -2,7 +2,7 @@
 // the on-the-wire controller.Manifest shape. The controller never sees
 // HCL/YAML — it only stores the JSON produced here.
 //
-// Supported kinds: deployment, database, service, ingress. Each kind has
+// Supported kinds: deployment, database, ingress, job. Each kind has
 // a typed Spec; the parser validates the shape before handing off to the
 // controller, which keeps /apply errors local and readable.
 //
@@ -141,15 +141,6 @@ type DatabaseBackup struct {
 	Target    string `yaml:"target,omitempty"    json:"target,omitempty"`
 }
 
-// ServiceSpec exposes a deployment (or external endpoint) under a stable
-// name inside the cluster. Thin on purpose in M4 — plugin-facing contract
-// will grow with M6 (ingress) and M7 (database bindings).
-type ServiceSpec struct {
-	Target string   `yaml:"target"         json:"target"`
-	Port   int      `yaml:"port,omitempty" json:"port,omitempty"`
-	Ports  []string `yaml:"ports,omitempty" json:"ports,omitempty"`
-}
-
 // IngressSpec describes an externally reachable hostname. M6's voodu-caddy
 // plugin reconciles these into a running Caddy config. Route rewriting
 // and advanced matchers are out of scope for M4 — the caddy plugin will
@@ -158,7 +149,7 @@ type ServiceSpec struct {
 // `service` is optional: when omitted, the controller defaults it to the
 // ingress name (so `ingress "api" { host = "api.example.com" }` just
 // works). Explicit `service = "..."` still wins — use it for cross-app
-// routing (ingress "public" → service "api").
+// routing (ingress "public" → deployment "api").
 //
 // Path-based routing is expressed as zero-or-more `location {}` blocks.
 // An empty Locations means "match everything for this host", which is
@@ -206,6 +197,98 @@ type IngressLocation struct {
 	// they live under a basePath. Set true when routing a generic image
 	// (static nginx, arbitrary upstream) that expects root-relative URIs.
 	Strip bool `yaml:"strip,omitempty" json:"strip,omitempty"`
+}
+
+// JobSpec is a one-shot container declaration. The controller registers
+// the manifest at apply time but does NOT auto-execute — running a
+// declared job is an explicit, imperative act (`voodu run job`).
+// Apply-side responsibilities are limited to validation and persisting
+// the spec so subsequent runs reuse it.
+//
+// The spec is a deliberately narrow subset of DeploymentSpec — the
+// fields that have meaning for a process that exits:
+//
+//   - Image is required (build-from-source via `lang {}` is forwarded
+//     to the standard build pipeline, but registry-mode is the M3
+//     supported path; build-mode is best-effort).
+//   - Replicas / Restart / HealthCheck / Ports are intentionally
+//     absent: a job runs once, has no listening endpoint, and either
+//     succeeds or fails. Restart-on-exit would defeat the point.
+//   - Timeout caps execution. The reconciler honours it best-effort
+//     (kills the container when the deadline passes); M4's cron
+//     scheduler shares this knob.
+type JobSpec struct {
+	Image       string            `yaml:"image,omitempty"         json:"image,omitempty"`
+	Workdir     string            `yaml:"workdir,omitempty"       json:"workdir,omitempty"`
+	Dockerfile  string            `yaml:"dockerfile,omitempty"    json:"dockerfile,omitempty"`
+	Path        string            `yaml:"path,omitempty"          json:"path,omitempty"`
+	Command     []string          `yaml:"command,omitempty"       json:"command,omitempty"`
+	Env         map[string]string `yaml:"env,omitempty"           json:"env,omitempty"`
+	Volumes     []string          `yaml:"volumes,omitempty"       json:"volumes,omitempty"`
+	Network     string            `yaml:"network,omitempty"       json:"network,omitempty"`
+	Networks    []string          `yaml:"networks,omitempty"      json:"networks,omitempty"`
+	NetworkMode string            `yaml:"network_mode,omitempty"  json:"network_mode,omitempty"`
+
+	// Lang mirrors the deployment's lang block — same handler dispatch,
+	// same escape-hatch via build_args. Jobs typically reuse a
+	// deployment's image via `image = "my-app:latest"`, so the lang
+	// block is rarely needed in practice.
+	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
+
+	// Timeout is a Go duration string (`"30s"`, `"5m"`). Empty means
+	// no enforced cap. The controller kills + records a non-zero exit
+	// when the deadline passes.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// CronJobSpec wraps a JobSpec with a schedule. Apply registers the
+// schedule; the controller's internal scheduler watches the wall clock
+// and dispatches a JobHandler.RunOnce on each tick.
+//
+// Schedule grammar (M4): standard 5-field cron expression
+//
+//	"<min> <hour> <dom> <month> <dow>"
+//
+// Each field accepts a literal, "*", a comma-separated list, a step
+// ("*\/15"), or a range ("0-30"). Seconds aren't supported (k8s parity
+// — sub-minute schedules are almost never what an operator wants in a
+// PaaS context).
+//
+// ConcurrencyPolicy mirrors k8s: "Allow" (default — overlapping runs
+// are fine) or "Forbid" (skip a tick if the previous run hasn't
+// finished). "Replace" — kill the in-flight run and start a new one
+// — is reserved for a later milestone; until then the parser rejects
+// it loudly so the manifest doesn't silently degrade.
+//
+// SuccessfulHistoryLimit / FailedHistoryLimit cap the JobStatus
+// history bucket per cronjob (the same bucket JobHandler.RunOnce
+// writes into). Defaults: 3 / 1, matching k8s defaults.
+type CronJobSpec struct {
+	// Schedule is the 5-field cron expression. Required.
+	Schedule string `yaml:"schedule"            json:"schedule"`
+
+	// Job is the spec each tick runs. Same shape as a standalone job —
+	// it inherits the same image / command / env / network handling.
+	Job JobSpec `yaml:"job"                 json:"job"`
+
+	// ConcurrencyPolicy: "Allow" (default) or "Forbid".
+	ConcurrencyPolicy string `yaml:"concurrency_policy,omitempty" json:"concurrency_policy,omitempty"`
+
+	// Timezone is an IANA tz name ("UTC", "America/Sao_Paulo"). Empty
+	// → UTC. The scheduler uses this when interpreting the schedule.
+	Timezone string `yaml:"timezone,omitempty"  json:"timezone,omitempty"`
+
+	// Suspend pauses dispatch without removing the manifest. Useful for
+	// "stop running this for now without forgetting it exists".
+	Suspend bool `yaml:"suspend,omitempty"   json:"suspend,omitempty"`
+
+	// SuccessfulHistoryLimit caps successful runs in JobStatus.History.
+	// Zero (the default) → 3.
+	SuccessfulHistoryLimit int `yaml:"successful_history_limit,omitempty" json:"successful_history_limit,omitempty"`
+
+	// FailedHistoryLimit caps failed runs in JobStatus.History.
+	// Zero (the default) → 1.
+	FailedHistoryLimit int `yaml:"failed_history_limit,omitempty" json:"failed_history_limit,omitempty"`
 }
 
 type IngressTLS struct {

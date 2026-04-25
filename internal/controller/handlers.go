@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -93,24 +94,19 @@ func effectiveReplicas(spec deploymentSpec) int {
 	return spec.Replicas
 }
 
-// slotName turns (app, index) into the container name Docker sees.
-// Indexing is zero-based and always applied — even `replicas = 1`
-// produces `<app>-0` — so the reconciler has one uniform code path.
-// Legacy non-indexed containers (created before this was introduced)
-// are detected and removed at reconcile time; see pruneLegacy().
-func slotName(app string, index int) string {
-	return fmt.Sprintf("%s-%d", app, index)
-}
-
-// slotNames returns every slot name for a given replica count.
-func slotNames(app string, replicas int) []string {
-	out := make([]string, replicas)
-
-	for i := 0; i < replicas; i++ {
-		out[i] = slotName(app, i)
-	}
-
-	return out
+// newSlotName produces a fresh container name for a deployment
+// replica. The replica id is opaque hex (4 chars) and exists only to
+// disambiguate sibling containers in docker's flat namespace —
+// replicas of the same deployment are interchangeable, and the
+// reconciler should never depend on a specific id surviving across
+// reconciles.
+//
+// Pre-M0 voodu used `<app>-<N>` with a numeric suffix (slot 0, slot
+// 1, ...). Existing code that needs to look up a deployment's
+// running containers must now query labels (Containers.ListByIdentity)
+// instead of constructing names — names are no longer deterministic.
+func newSlotName(scope, name string) string {
+	return containers.ContainerName(scope, name, containers.NewReplicaID())
 }
 
 // DatabaseHandler reconciles database manifests by dispatching to the
@@ -463,13 +459,29 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 	app := AppID(ev.Scope, ev.Name)
 
 	if h.Containers != nil {
-		existing, err := h.Containers.ListByAppPrefix(app)
+		// Two passes: live (M0-labeled) replicas, then any pre-M0
+		// containers still around. Both must go on a delete — the
+		// user's mental model is "manifest gone, runtime gone".
+		slots, err := h.Containers.ListByIdentity(string(KindDeployment), ev.Scope, ev.Name)
 		if err != nil {
-			return fmt.Errorf("list slots: %w", err)
+			return fmt.Errorf("list replicas: %w", err)
 		}
 
-		for _, name := range existing {
-			h.logf("deployment/%s deleting slot %s", ev.Name, name)
+		for _, slot := range slots {
+			h.logf("deployment/%s removing replica %s", ev.Name, slot.Name)
+
+			if err := h.Containers.Remove(slot.Name); err != nil {
+				return fmt.Errorf("remove %s: %w", slot.Name, err)
+			}
+		}
+
+		legacy, err := h.Containers.ListLegacyByApp(app)
+		if err != nil {
+			return fmt.Errorf("list legacy replicas: %w", err)
+		}
+
+		for _, name := range legacy {
+			h.logf("deployment/%s removing legacy replica %s", ev.Name, name)
 
 			if err := h.Containers.Remove(name); err != nil {
 				return fmt.Errorf("remove %s: %w", name, err)
@@ -587,30 +599,44 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	}
 
 	replicas := effectiveReplicas(spec)
-	slots := slotNames(app, replicas)
 
-	// Prune the legacy bare-name container (pre-slot era) before
-	// anything else. Leaving it around collides on ports/volumes with
-	// the new `<app>-0` slot and leaks a detached process that ingress
-	// has no way to reach.
+	// Pre-M0 containers (no voodu.* labels, names like `<app>` or
+	// `<app>-<N>`) are detected by name pattern and removed up front.
+	// They can't be adopted in place — labels are set at create time
+	// — so the only safe path is replace-on-next-apply. The rolling
+	// recreate below handles any visible churn.
 	if spec.Image != "" {
-		if err := h.pruneLegacyContainer(app); err != nil {
+		if err := h.pruneLegacyContainers(app); err != nil {
 			h.logf("deployment/%s legacy prune failed: %v", ev.Name, err)
 		}
 	}
 
-	createdSlots, err := h.ensureSlots(app, slots, spec)
+	// Identity-based replica reconcile. Three signals from the live
+	// runtime drive the decision:
+	//
+	//   live  — M0-labeled containers matching (kind, scope, name)
+	//   want  — desired replica count
+	//   delta — sign tells us whether to add, remove, or hold steady
+	//
+	// Replicas are interchangeable, so removal picks any extras and
+	// addition picks fresh names. No notion of "which slot index" —
+	// that was the pre-M0 model and it carried the wrong implication.
+	live, err := h.Containers.ListByIdentity(string(KindDeployment), ev.Scope, ev.Name)
+	if err != nil {
+		return fmt.Errorf("list deployment %s replicas: %w", app, err)
+	}
+
+	hash := deploymentSpecHash(spec)
+
+	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash)
 	if err != nil {
 		return err
 	}
 
-	createdAny := len(createdSlots) > 0
+	createdSet := setOf(createdNames)
+	createdAny := len(createdNames) > 0
 
-	// Scale-down: anything above the desired replica count is a slot
-	// from a previous apply that must go. Runs before drift detection
-	// so the rollout loop doesn't churn through containers that are
-	// about to be removed anyway.
-	if err := h.pruneExtraSlots(app, replicas); err != nil {
+	if err := h.pruneExtraReplicas(ev.Name, app, live, replicas, createdSet); err != nil {
 		h.logf("deployment/%s scale-down failed: %v", ev.Name, err)
 	}
 
@@ -618,7 +644,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		// Baseline the spec hash so the next reconcile has something
 		// to compare against. Without this, the very next apply would
 		// see no persisted status and treat a real drift as first-seen.
-		if err := h.putDeploymentStatus(ctx, app, spec); err != nil {
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
 			h.logf("deployment/%s status persist failed: %v", ev.Name, err)
 		}
 	}
@@ -627,12 +653,29 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// (image, ports, volumes, network, restart policy, command) means
 	// the running containers have the wrong shape — Recreate absorbs
 	// env changes, so no follow-up restart either. Rollout is
-	// sequential, one slot at a time, with a short pause so ingress
-	// always has at least one healthy replica to route to.
+	// sequential, one replica at a time, with a short pause so ingress
+	// always has at least one healthy peer to route to.
 	recreatedAny := false
 
 	if spec.Image != "" {
-		r, err := h.recreateSlotsIfSpecChanged(ctx, app, slots, spec)
+		// Re-list after the create+prune passes so the drift loop
+		// targets the post-scale set, not stale candidates that have
+		// already been removed.
+		current, err := h.Containers.ListByIdentity(string(KindDeployment), ev.Scope, ev.Name)
+		if err != nil {
+			return fmt.Errorf("list deployment %s replicas (post-scale): %w", app, err)
+		}
+
+		// The just-created replicas already carry the desired
+		// manifest_hash — they don't need to be recreated again. Skip
+		// them so a fresh deployment doesn't churn through its brand
+		// new containers.
+		toCheck := filterSlots(current, func(s ContainerSlot) bool {
+			_, justCreated := createdSet[s.Name]
+			return !justCreated
+		})
+
+		r, err := h.recreateReplicasIfSpecChanged(ctx, ev.Scope, ev.Name, app, toCheck, spec, hash)
 		if err != nil {
 			return err
 		}
@@ -642,70 +685,66 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 	// Fresh/recreated containers come up with the current .env already
 	// mounted, so restarting right after is redundant churn. Only
-	// cycle the slots that were neither freshly created this reconcile
+	// cycle the replicas that were neither freshly created this reconcile
 	// nor just recreated (recreate already absorbed the env), and only
 	// when env actually moved.
 	if envChanged && !recreatedAny {
-		h.restartSlots(app, excludeSlots(slots, createdSlots))
+		// Re-query because recreate may have left the live set
+		// untouched but env-only restart still needs a fresh view.
+		current, err := h.Containers.ListByIdentity(string(KindDeployment), ev.Scope, ev.Name)
+		if err == nil {
+			h.restartReplicas(ev.Name, current, createdSet)
+		}
 	}
 
 	return nil
 }
 
-// excludeSlots returns `all` minus anything in `skip`. Preserves the
-// order of `all` so restart logs read in slot-index order.
-func excludeSlots(all, skip []string) []string {
-	if len(skip) == 0 {
-		return all
-	}
+// setOf is the obvious string-slice → set helper. Used by apply() to
+// remember which container names this reconcile JUST created so the
+// drift / restart paths can skip them.
+func setOf(names []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(names))
 
-	skipSet := make(map[string]struct{}, len(skip))
-	for _, s := range skip {
-		skipSet[s] = struct{}{}
-	}
-
-	out := make([]string, 0, len(all))
-
-	for _, s := range all {
-		if _, ok := skipSet[s]; ok {
-			continue
-		}
-
-		out = append(out, s)
+	for _, n := range names {
+		out[n] = struct{}{}
 	}
 
 	return out
 }
 
-// ensureSlots creates every missing slot container and returns the
-// names of the ones that were actually freshly created. Slots are
-// created in index order so on first apply the logs read top-down;
-// for existing deployments the loop is effectively free (Ensure
-// short-circuits). The caller uses the returned list to skip redundant
-// restarts — fresh containers pick up the current .env at spawn time.
-func (h *DeploymentHandler) ensureSlots(app string, slots []string, spec deploymentSpec) ([]string, error) {
-	var created []string
+// filterSlots returns the ContainerSlots for which keep returns true.
+// Preserves order of the input so logs read predictably.
+func filterSlots(in []ContainerSlot, keep func(ContainerSlot) bool) []ContainerSlot {
+	out := make([]ContainerSlot, 0, len(in))
 
-	for _, slot := range slots {
-		wasCreated, err := h.ensureSlot(app, slot, spec)
-		if err != nil {
-			return created, err
-		}
-
-		if wasCreated {
-			created = append(created, slot)
+	for _, s := range in {
+		if keep(s) {
+			out = append(out, s)
 		}
 	}
 
-	return created, nil
+	return out
 }
 
-// ensureSlot is the single-slot version of the old ensureContainer.
-// Returns whether this call actually spawned a container (vs. found
-// one already present).
-func (h *DeploymentHandler) ensureSlot(app, slot string, spec deploymentSpec) (bool, error) {
-	if spec.Image == "" || h.Containers == nil {
-		return false, nil
+// ensureReplicaCount creates `want - len(live)` new replicas when the
+// deployment is short, no-ops otherwise. Returns the names of the
+// just-created containers so the caller can skip restart/recreate on
+// them (they came up with the current spec already).
+//
+// Each new replica gets a fresh opaque replica id (4-char hex) and
+// the full voodu.* label set, so the next reconcile finds it by
+// label without needing the controller to remember the names.
+func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []ContainerSlot, want int, spec deploymentSpec, hash string) ([]string, error) {
+	if spec.Image == "" {
+		// Build-mode without an image is the receive-pack pipeline's
+		// territory; the handler stays env-only here.
+		return nil, nil
+	}
+
+	have := len(live)
+	if have >= want {
+		return nil, nil
 	}
 
 	envFile := ""
@@ -713,124 +752,172 @@ func (h *DeploymentHandler) ensureSlot(app, slot string, spec deploymentSpec) (b
 		envFile = h.EnvFilePath(app)
 	}
 
-	created, err := h.Containers.Ensure(ContainerSpec{
-		Name:        slot,
-		Image:       spec.Image,
-		Command:     spec.Command,
-		Ports:       spec.Ports,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
-		Restart:     spec.Restart,
-		EnvFile:     envFile,
-	})
-	if err != nil {
-		return false, fmt.Errorf("ensure %s: %w", slot, err)
-	}
+	created := make([]string, 0, want-have)
 
-	if created {
-		h.logf("deployment/%s slot %s created (image=%s)", app, slot, spec.Image)
+	for i := have; i < want; i++ {
+		replicaID := containers.NewReplicaID()
+		cname := containers.ContainerName(scope, name, replicaID)
+
+		labels := containers.BuildLabels(containers.Identity{
+			Kind:         containers.KindDeployment,
+			Scope:        scope,
+			Name:         name,
+			ReplicaID:    replicaID,
+			ManifestHash: hash,
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		})
+
+		_, err := h.Containers.Ensure(ContainerSpec{
+			Name:        cname,
+			Image:       spec.Image,
+			Command:     spec.Command,
+			Ports:       spec.Ports,
+			Volumes:     spec.Volumes,
+			Networks:    spec.Networks,
+			NetworkMode: spec.NetworkMode,
+			Restart:     spec.Restart,
+			EnvFile:     envFile,
+			Labels:      labels,
+		})
+		if err != nil {
+			return created, fmt.Errorf("ensure %s: %w", cname, err)
+		}
+
+		h.logf("deployment/%s replica %s created (image=%s)", name, cname, spec.Image)
+
+		created = append(created, cname)
 	}
 
 	return created, nil
 }
 
-// pruneLegacyContainer removes a pre-slot `<app>` container if one
-// survived the switch to indexed names. Silently no-ops on fresh
-// deployments (nothing to prune). We don't scan via ListByAppPrefix
-// here — Exists is enough and cheaper.
-func (h *DeploymentHandler) pruneLegacyContainer(app string) error {
+// pruneLegacyContainers removes pre-M0 containers (`<app>`,
+// `<app>-<N>`) that lack voodu.* labels. The reconcile path that
+// follows then provisions M0 replicas to take their place. We do
+// not try to adopt them in place — labels can't be applied to a
+// stopped container.
+func (h *DeploymentHandler) pruneLegacyContainers(app string) error {
 	if h.Containers == nil {
 		return nil
 	}
 
-	exists, err := h.Containers.Exists(app)
+	legacy, err := h.Containers.ListLegacyByApp(app)
 	if err != nil {
 		return err
 	}
 
-	if !exists {
-		return nil
-	}
-
-	h.logf("deployment/%s removing legacy non-indexed container %s", app, app)
-
-	return h.Containers.Remove(app)
-}
-
-// pruneExtraSlots removes any indexed slot whose index is >= replicas.
-// Called after ensureSlots so the list of existing containers already
-// reflects the just-added slots (if any); we just filter out the ones
-// that belong and Remove the rest.
-func (h *DeploymentHandler) pruneExtraSlots(app string, replicas int) error {
-	if h.Containers == nil {
-		return nil
-	}
-
-	existing, err := h.Containers.ListByAppPrefix(app)
-	if err != nil {
-		return fmt.Errorf("list slots: %w", err)
-	}
-
-	keep := make(map[string]struct{}, replicas)
-	for _, s := range slotNames(app, replicas) {
-		keep[s] = struct{}{}
-	}
-
-	for _, name := range existing {
-		if _, ok := keep[name]; ok {
-			continue
-		}
-
-		// Bare-name legacy containers are handled by pruneLegacyContainer
-		// at the top of apply(); skipping here avoids a double-remove
-		// race if the reconciler runs twice before status updates.
-		if name == app {
-			continue
-		}
-
-		h.logf("deployment/%s scale-down: removing %s", app, name)
+	for _, name := range legacy {
+		h.logf("deployment/%s removing legacy non-M0 container %s", app, name)
 
 		if err := h.Containers.Remove(name); err != nil {
-			return fmt.Errorf("remove %s: %w", name, err)
+			return fmt.Errorf("remove legacy %s: %w", name, err)
 		}
 	}
 
 	return nil
 }
 
-// restartSlots cycles each slot in sequence with a short pause between
-// cycles so ingress load-balances onto the still-running peers during
-// the rollout. Restart errors are logged but do not abort the loop —
-// env is already on disk, the next apply or manual restart recovers.
-func (h *DeploymentHandler) restartSlots(app string, slots []string) {
-	for i, slot := range slots {
-		if err := h.Containers.Restart(slot); err != nil {
-			h.logf("deployment/%s slot %s restart failed (env already written): %v", app, slot, err)
+// pruneExtraReplicas removes any live replicas above the desired
+// count. Selection of which to kill is intentionally not based on
+// "highest index" anymore — replicas are interchangeable. We sort by
+// container name for determinism (stable ordering across reconciles
+// helps log diffs) and keep the first `want`, dropping the rest.
+//
+// The just-created replicas (createdSet) are guaranteed to survive
+// this pass: they're new, the operator just asked for them, and we
+// already counted them in the live set when computing `have`.
+func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []ContainerSlot, want int, createdSet map[string]struct{}) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	if len(live) <= want {
+		return nil
+	}
+
+	// Sort by name so the same set of containers always picks the
+	// same survivors. Without this the choice would depend on docker
+	// ps ordering, which can shuffle between calls.
+	candidates := append([]ContainerSlot(nil), live...)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Name < candidates[j].Name
+	})
+
+	keep := make(map[string]struct{}, want)
+
+	// Always keep just-created replicas first — they're the freshest
+	// and the operator's most recent intent.
+	for cname := range createdSet {
+		keep[cname] = struct{}{}
+	}
+
+	// Fill remaining slots from the sorted candidates.
+	for _, s := range candidates {
+		if len(keep) >= want {
+			break
+		}
+
+		if _, already := keep[s.Name]; already {
 			continue
 		}
 
-		h.logf("deployment/%s slot %s restarted (env changed)", app, slot)
+		keep[s.Name] = struct{}{}
+	}
 
-		if i < len(slots)-1 {
+	for _, s := range candidates {
+		if _, k := keep[s.Name]; k {
+			continue
+		}
+
+		h.logf("deployment/%s scale-down: removing %s", name, s.Name)
+
+		if err := h.Containers.Remove(s.Name); err != nil {
+			return fmt.Errorf("remove %s: %w", s.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// restartReplicas cycles each replica in sequence with a short pause
+// between cycles so ingress load-balances onto the still-running
+// peers during the rollout. Skips just-created replicas in `skip`
+// since fresh containers already carry the current env.
+func (h *DeploymentHandler) restartReplicas(name string, live []ContainerSlot, skip map[string]struct{}) {
+	targets := filterSlots(live, func(s ContainerSlot) bool {
+		_, just := skip[s.Name]
+		return !just
+	})
+
+	for i, s := range targets {
+		if err := h.Containers.Restart(s.Name); err != nil {
+			h.logf("deployment/%s replica %s restart failed (env already written): %v", name, s.Name, err)
+			continue
+		}
+
+		h.logf("deployment/%s replica %s restarted (env changed)", name, s.Name)
+
+		if i < len(targets)-1 {
 			time.Sleep(slotRolloutPause)
 		}
 	}
 }
 
-// recreateSlotsIfSpecChanged detects drift against the persisted spec
-// hash and image ID, then rolls the fleet one slot at a time when drift
-// is real. Single shared hash across slots — slots are siblings, their
-// runtime spec is identical by construction.
+// recreateReplicasIfSpecChanged detects drift against the persisted
+// spec hash and image ID, then rolls the fleet one replica at a time
+// when drift is real. Single shared hash across replicas — they're
+// siblings by construction.
 //
 // When no status exists yet (first reconcile after a controller upgrade
 // that introduced status persistence) we baseline the hash without
 // recreating: the running containers may well match the spec, and
 // churning every pre-existing deploy on upgrade is exactly the kind of
 // surprise this handler is meant to avoid.
-func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app string, slots []string, spec deploymentSpec) (bool, error) {
-	hash := deploymentSpecHash(spec)
-
+//
+// On recreate we generate a fresh replica id for the new container —
+// the old one is gone, so there's no name to reuse, and the opaque
+// id keeps emphasising that replicas are interchangeable.
+func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash string) (bool, error) {
 	raw, err := h.Store.GetStatus(ctx, KindDeployment, app)
 	if err != nil {
 		return false, fmt.Errorf("read deployment status: %w", err)
@@ -865,15 +952,16 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 
 	if recreateNeeded {
 		reason = fmt.Sprintf("spec drift (hash %s → %s)", shortHash(prev.SpecHash), shortHash(hash))
-	} else if len(slots) > 0 {
+	} else if len(live) > 0 {
 		// Spec text is stable, but build-mode rebuilds `<app>:latest` on
 		// every apply — the tag string is identical yet the underlying
 		// image ID changes. Containers freeze the image ID at create
 		// time, so the running process stays on the old layers until we
 		// explicitly recreate. Spec-hash can't catch this (manifest text
-		// didn't move); only an image-ID comparison can. Slot 0 is the
-		// canary — all slots share the image, so checking one is enough.
-		differ, err := h.Containers.ImageIDsDiffer(slots[0], spec.Image)
+		// didn't move); only an image-ID comparison can. The first live
+		// replica is the canary — all replicas share the image, so
+		// checking one is enough.
+		differ, err := h.Containers.ImageIDsDiffer(live[0].Name, spec.Image)
 		if err != nil {
 			// Treat ID-check errors as "no drift" to avoid unnecessary
 			// recreates on transient docker CLI failures. The next apply
@@ -892,16 +980,39 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 		return false, nil
 	}
 
-	h.logf("deployment/%s %s, recreating %d slot(s)", app, reason, len(slots))
+	h.logf("deployment/%s %s, recreating %d replica(s)", app, reason, len(live))
 
 	envFile := ""
 	if h.EnvFilePath != nil {
 		envFile = h.EnvFilePath(app)
 	}
 
-	for i, slot := range slots {
-		if err := h.Containers.Recreate(ContainerSpec{
-			Name:        slot,
+	for i, s := range live {
+		// Replace the old container with a brand-new one bearing a
+		// fresh replica id — the old name disappears, so we don't
+		// have to deal with the docker `--name` collision that an
+		// in-place recreate would trip on.
+		newReplicaID := containers.NewReplicaID()
+		newName := containers.ContainerName(scope, name, newReplicaID)
+
+		labels := containers.BuildLabels(containers.Identity{
+			Kind:         containers.KindDeployment,
+			Scope:        scope,
+			Name:         name,
+			ReplicaID:    newReplicaID,
+			ManifestHash: hash,
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		})
+
+		// Remove old, then create new. Recreate's atomic stop+remove+
+		// create wants the same name; here we want a different one,
+		// so we do the steps explicitly.
+		if err := h.Containers.Remove(s.Name); err != nil {
+			return false, fmt.Errorf("remove %s during recreate: %w", s.Name, err)
+		}
+
+		if _, err := h.Containers.Ensure(ContainerSpec{
+			Name:        newName,
 			Image:       spec.Image,
 			Command:     spec.Command,
 			Ports:       spec.Ports,
@@ -910,13 +1021,14 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 			NetworkMode: spec.NetworkMode,
 			Restart:     spec.Restart,
 			EnvFile:     envFile,
+			Labels:      labels,
 		}); err != nil {
-			return false, fmt.Errorf("recreate %s: %w", slot, err)
+			return false, fmt.Errorf("create replacement %s: %w", newName, err)
 		}
 
-		h.logf("deployment/%s slot %s recreated", app, slot)
+		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
 
-		if i < len(slots)-1 {
+		if i < len(live)-1 {
 			time.Sleep(slotRolloutPause)
 		}
 	}
@@ -934,9 +1046,9 @@ func (h *DeploymentHandler) recreateSlotsIfSpecChanged(ctx context.Context, app 
 // changed any value — used to gate restart.
 //
 // scope is the deployment's scope — used by refLookup to AppID-ify
-// lookups for scoped kinds (service, ingress) so a deployment in scope
-// "clowk-lp" resolves `${ref.service.api}` against its own scope's
-// service, not another scope's same-named one.
+// lookups for scoped kinds (ingress) so a deployment in scope
+// "clowk-lp" resolves `${ref.ingress.api}` against its own scope's
+// ingress, not another scope's same-named one.
 func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, app string, env map[string]string) (bool, error) {
 	lookup := h.refLookup(ctx, scope)
 
@@ -970,7 +1082,7 @@ func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, app string, env 
 //
 // The status shape is deliberately uniform: every kind persists a blob
 // that has a top-level `data` object. That way this closure doesn't
-// need to switch on kind — any future kind (service, ingress, queue)
+// need to switch on kind — any future kind (ingress, queue, job)
 // becomes referenceable just by following the convention.
 //
 // Scoped-kind status is keyed by AppID, so the closure prefixes `name`

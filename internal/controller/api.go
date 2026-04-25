@@ -42,6 +42,25 @@ type API struct {
 	// envelope parsing). Nil means /exec falls back to loading plugins
 	// directly from PluginsRoot; production wires DirInvoker.
 	Invoker PluginInvoker
+
+	// Pods is the source of /pods listings. Nil means the endpoint
+	// falls back to a default DockerPodsLister; tests inject a fake
+	// to avoid shelling out to docker.
+	Pods PodsLister
+
+	// Jobs powers /jobs/run — the imperative entry point for executing
+	// a declared job. Nil means the endpoint returns 503 ("job runner
+	// not configured"); production wires JobHandler. Kept as an
+	// interface so tests can stub the runner without spinning up
+	// docker.
+	Jobs JobRunner
+}
+
+// JobRunner is the seam /jobs/run dispatches through. JobHandler is
+// the production implementation; tests substitute a fake to avoid
+// docker.
+type JobRunner interface {
+	RunOnce(ctx context.Context, scope, name string) (JobRun, error)
 }
 
 // Handler returns an http.Handler with all endpoints registered.
@@ -51,11 +70,14 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/apply", a.handleApply)
 	mux.HandleFunc("/status", a.handleStatus)
+	mux.HandleFunc("/describe", a.handleDescribe)
+	mux.HandleFunc("/pods", a.handlePods)
 	mux.HandleFunc("/exec", a.handleExec)
 	mux.HandleFunc("/logs", a.handleLogs)
 	mux.HandleFunc("/plugins", a.handlePlugins)
 	mux.HandleFunc("POST /plugins/install", a.handlePluginInstall)
 	mux.HandleFunc("DELETE /plugins/{name}", a.handlePluginRemove)
+	mux.HandleFunc("POST /jobs/run", a.handleJobRun)
 
 	return logRequests(mux)
 }
@@ -516,6 +538,197 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDescribe returns the full picture for a single declared
+// resource: the source manifest, its persisted status blob, and any
+// voodu-managed containers matching the (kind, scope, name) identity.
+//
+// GET /describe?kind=<k>&name=<n>[&scope=<s>]
+//
+// Scoped kinds without an explicit scope are auto-resolved when
+// unambiguous (single match across scopes); ambiguous matches return
+// 400 with the candidate scopes named so the operator can re-issue
+// with ?scope=. Missing manifest → 404.
+//
+// Pod listing failures are tolerated: docker-side issues shouldn't
+// black-hole the whole describe — the manifest+status part is still
+// useful. The CLI renders an empty pods section in that case.
+func (a *API) handleDescribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+
+		return
+	}
+
+	kindStr := strings.TrimSpace(r.URL.Query().Get("kind"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+
+	if kindStr == "" || name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("kind and name are required"))
+		return
+	}
+
+	kind, err := ParseKind(kindStr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if IsScoped(kind) && scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+
+			return
+		}
+
+		scope = resolved
+	}
+
+	manifest, err := a.Store.Get(r.Context(), kind, scope, name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if manifest == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("%s/%s/%s not found", kind, scope, name))
+		return
+	}
+
+	// Status blob is keyed by AppID(scope,name) for scoped kinds and by
+	// the bare name for unscoped ones — AppID returns the right shape
+	// either way (empty scope → bare name).
+	appID := AppID(scope, name)
+
+	statusBlob, err := a.Store.GetStatus(r.Context(), kind, appID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	var status json.RawMessage
+	if len(statusBlob) > 0 {
+		status = statusBlob
+	}
+
+	// Pod listing: filter the host's voodu-labeled containers down to
+	// those matching this resource. Pod failures are intentionally
+	// non-fatal here — the manifest + status carry most of the value
+	// of describe, and an operator with a broken docker daemon already
+	// knows to look at `voodu get pods` for runtime issues.
+	pods := a.matchingPods(kind, scope, name)
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"manifest": manifest,
+			"status":   status,
+			"pods":     pods,
+		},
+	})
+}
+
+// matchingPods filters the host's voodu-labeled containers to the
+// (kind, scope, name) identity. Returns an empty slice on lister
+// failure so handleDescribe stays useful when docker is degraded.
+func (a *API) matchingPods(kind Kind, scope, name string) []Pod {
+	lister := a.Pods
+	if lister == nil {
+		lister = DockerPodsLister{}
+	}
+
+	all, err := lister.ListPods()
+	if err != nil {
+		return nil
+	}
+
+	out := make([]Pod, 0)
+
+	for _, p := range all {
+		if string(kind) != p.Kind {
+			continue
+		}
+
+		if p.ResourceName != name {
+			continue
+		}
+
+		if IsScoped(kind) && scope != p.Scope {
+			continue
+		}
+
+		out = append(out, p)
+	}
+
+	return out
+}
+
+// handlePods returns every voodu-managed container on the host with
+// its structured identity (kind, scope, name, replica id) plus the
+// runtime status fields the CLI needs to render `voodu get pods`.
+//
+// Optional ?kind=<deployment|job|cronjob> filters the result on the
+// label vocabulary. ?scope=<scope> narrows further. Both filters apply
+// post-listing so the docker call stays a single shot — pod counts on
+// a single host are tiny by k8s standards (tens, not thousands).
+func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+
+		return
+	}
+
+	lister := a.Pods
+	if lister == nil {
+		lister = DockerPodsLister{}
+	}
+
+	pods, err := lister.ListPods()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	wantKind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	wantScope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	wantName := strings.TrimSpace(r.URL.Query().Get("name"))
+
+	if wantKind != "" || wantScope != "" || wantName != "" {
+		filtered := pods[:0]
+
+		for _, p := range pods {
+			if wantKind != "" && p.Kind != wantKind {
+				continue
+			}
+
+			if wantScope != "" && p.Scope != wantScope {
+				continue
+			}
+
+			if wantName != "" && p.ResourceName != wantName {
+				continue
+			}
+
+			filtered = append(filtered, p)
+		}
+
+		pods = filtered
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"pods": pods},
+	})
+}
+
 // handleExec dispatches unknown CLI commands to a plugin. Body is
 // {"args": ["<plugin>", "<cmd>", ...]} plus optional env. The CLI's
 // colon rewriter already split "postgres:create" into two args.
@@ -720,6 +933,68 @@ func (a *API) handlePluginRemove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+// handleJobRun executes a previously-applied job synchronously and
+// returns the run record (run id, exit code, duration). Two query
+// parameters drive it:
+//
+//	?scope=<scope>&name=<name>
+//
+// `scope` may be omitted when only one job in the store carries the
+// requested name; we resolve it via resolveScope, the same disambiguator
+// the delete path uses. Body is unused — the spec to run comes from
+// the persisted manifest, not the request — so the call is a plain
+// POST with no payload.
+//
+// Synchronous on purpose (M3): the connection stays open until the job
+// completes. Long-running jobs benefit from a kick-off + poll shape
+// (M5+) but the migration / one-shot script use cases this kind
+// targets fit in a single round-trip.
+func (a *API) handleJobRun(w http.ResponseWriter, r *http.Request) {
+	if a.Jobs == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("job runner not configured"))
+		return
+	}
+
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+
+	if scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, KindJob, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+
+		scope = resolved
+	}
+
+	run, err := a.Jobs.RunOnce(r.Context(), scope, name)
+	if err != nil {
+		// The runner already wrote the failure into status. Return the
+		// run record alongside the error so the CLI can render exit
+		// code + duration even when the response is a 500.
+		writeJSON(w, http.StatusInternalServerError, envelope{
+			Status: "error",
+			Error:  err.Error(),
+			Data:   run,
+		})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: run})
 }
 
 // decodeManifests accepts either a single-object or array-of-objects body.
