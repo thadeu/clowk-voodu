@@ -768,16 +768,17 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 		})
 
 		_, err := h.Containers.Ensure(ContainerSpec{
-			Name:        cname,
-			Image:       spec.Image,
-			Command:     spec.Command,
-			Ports:       spec.Ports,
-			Volumes:     spec.Volumes,
-			Networks:    spec.Networks,
-			NetworkMode: spec.NetworkMode,
-			Restart:     spec.Restart,
-			EnvFile:     envFile,
-			Labels:      labels,
+			Name:           cname,
+			Image:          spec.Image,
+			Command:        spec.Command,
+			Ports:          spec.Ports,
+			Volumes:        spec.Volumes,
+			Networks:       spec.Networks,
+			NetworkMode:    spec.NetworkMode,
+			NetworkAliases: BuildNetworkAliases(scope, name),
+			Restart:        spec.Restart,
+			EnvFile:        envFile,
+			Labels:         labels,
 		})
 		if err != nil {
 			return created, fmt.Errorf("ensure %s: %w", cname, err)
@@ -1012,16 +1013,17 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 		}
 
 		if _, err := h.Containers.Ensure(ContainerSpec{
-			Name:        newName,
-			Image:       spec.Image,
-			Command:     spec.Command,
-			Ports:       spec.Ports,
-			Volumes:     spec.Volumes,
-			Networks:    spec.Networks,
-			NetworkMode: spec.NetworkMode,
-			Restart:     spec.Restart,
-			EnvFile:     envFile,
-			Labels:      labels,
+			Name:           newName,
+			Image:          spec.Image,
+			Command:        spec.Command,
+			Ports:          spec.Ports,
+			Volumes:        spec.Volumes,
+			Networks:       spec.Networks,
+			NetworkMode:    spec.NetworkMode,
+			NetworkAliases: BuildNetworkAliases(scope, name),
+			Restart:        spec.Restart,
+			EnvFile:        envFile,
+			Labels:         labels,
 		}); err != nil {
 			return false, fmt.Errorf("create replacement %s: %w", newName, err)
 		}

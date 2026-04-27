@@ -538,6 +538,14 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 		t.Errorf("runtime flags not forwarded: %+v", got)
 	}
 
+	// Network aliases must be derived from (scope, name) so apps
+	// resolve siblings via Docker's embedded DNS without hardcoding
+	// replica ids. Both the short form and the .voodu FQDN must land.
+	wantAliases := []string{"api.test", "api.test.voodu"}
+	if strings.Join(got.NetworkAliases, ",") != strings.Join(wantAliases, ",") {
+		t.Errorf("NetworkAliases: got %v, want %v", got.NetworkAliases, wantAliases)
+	}
+
 	id := identityFromSpec(got)
 	if id.Kind != containers.KindDeployment || id.Scope != "test" || id.Name != "api" || id.ReplicaID == "" {
 		t.Errorf("identity labels missing or wrong: %+v", id)

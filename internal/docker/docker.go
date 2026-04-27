@@ -77,6 +77,19 @@ type ContainerConfig struct {
 	// can leave it empty — the umbrella label still lands.
 	Labels []string
 
+	// NetworkAliases optionally registers DNS names other containers
+	// can use to reach this one inside its networks. Voodu populates
+	// these from the resource's (scope, name) so apps can resolve each
+	// other without hardcoding replica IDs — e.g. every replica of
+	// `clowk-lp/web` gets aliases `web.clowk-lp` and `web.clowk-lp.voodu`,
+	// and Docker DNS round-robins between them.
+	//
+	// Aliases are applied to every network the container joins:
+	// the primary one via `--network-alias` on `docker run`, and any
+	// secondary ones via `docker network connect --alias`. Ignored in
+	// host/none network mode (no docker bridge to register against).
+	NetworkAliases []string
+
 	// AutoRemove sets `--rm` so the container is deleted as soon as the
 	// process exits. Used by job-kind runs that should not leave
 	// stopped artifacts behind. Defaults to false (long-running
@@ -137,6 +150,18 @@ func CreateContainer(cfg ContainerConfig) error {
 		args = append(args, "--network", primaryNet)
 	}
 
+	// Network aliases register DNS names other containers can resolve
+	// over Docker's embedded resolver. Only meaningful in bridge mode
+	// (host/none have no embedded DNS to register against). At create
+	// time `--network-alias` only applies to the primary --network;
+	// secondary networks pick up their own --alias flags via
+	// ConnectNetwork below.
+	if cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
+		for _, alias := range cfg.NetworkAliases {
+			args = append(args, "--network-alias", alias)
+		}
+	}
+
 	// Port publishing is meaningless (and rejected with a warning by
 	// modern docker) when the container shares the host's net stack:
 	// in host mode the container's listening ports ARE the host's
@@ -193,7 +218,7 @@ func CreateContainer(cfg ContainerConfig) error {
 				continue
 			}
 
-			if err := ConnectNetwork(cfg.Name, net); err != nil {
+			if err := ConnectNetwork(cfg.Name, net, cfg.NetworkAliases); err != nil {
 				_ = RemoveContainer(cfg.Name, true)
 				return fmt.Errorf("failed to connect container %s to network %s: %w", cfg.Name, net, err)
 			}
@@ -207,8 +232,23 @@ func CreateContainer(cfg ContainerConfig) error {
 // network. Used by CreateContainer to fan out multi-network specs, but
 // exported so the reconciler (or future drift logic) can rewire
 // membership without recreating the container.
-func ConnectNetwork(container, network string) error {
-	cmd := exec.Command("docker", "network", "connect", network, container)
+//
+// aliases register DNS names on the new network — equivalent to the
+// `--network-alias` set at `docker run` for the primary network.
+// Pass nil/empty to attach without any alias (the container is still
+// reachable by its docker name, just not by the synthetic <name>.<scope>
+// shape). Aliases must be repeated per-network because Docker scopes
+// them to the network they were declared on.
+func ConnectNetwork(container, network string, aliases []string) error {
+	args := []string{"network", "connect"}
+
+	for _, a := range aliases {
+		args = append(args, "--alias", a)
+	}
+
+	args = append(args, network, container)
+
+	cmd := exec.Command("docker", args...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

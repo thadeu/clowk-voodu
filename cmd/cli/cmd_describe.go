@@ -39,13 +39,20 @@ identity.
 <ref>  is "<scope>/<name>" for scoped kinds, or "<name>" for an
 unambiguous match. Unscoped kinds (database) take "<name>" only.
 
-The "pod" (alias "pd") kind is the runtime view of a single
-voodu-managed container. Its <ref> is the container name as it
-appears in 'voodu get pods' (e.g. test-web.a3f9) — pods don't share
-the kind/scope/name shape because more than one replica can match
-the same identity.
+The "pod" (alias "pd") kind is the runtime view of voodu-managed
+containers. <ref> accepts three shapes:
 
-For 'describe pod', env vars are listed by name only (values hidden).
+  <scope>           every container in this scope, across kinds —
+                    "what's running for app X right now?"
+  <scope>/<name>    every container matching the (scope, name)
+                    identity — all replicas of one resource.
+  <container_name>  single rich detail by docker container name —
+                    the natural shape coming out of 'voodu get pods'.
+
+The discriminator is mechanical: a slash means scope/name, a dot
+means container name (replica suffix), bare → scope.
+
+For 'describe pod', env vars are hidden by default (count only).
 Pass --show-env to reveal values — useful when actively debugging,
 risky on a screen-share or in a recorded terminal session.
 
@@ -54,8 +61,10 @@ Examples:
   voodu describe job api/migrate
   voodu describe cronjob ops/purge
   voodu describe database main
-  voodu describe pod test-web.a3f9
-  voodu desc pd test-web.a3f9 --show-env
+  voodu describe pod clowk-lp                        every pod in scope
+  voodu describe pod clowk-lp/web                    all web replicas
+  voodu describe pod clowk-lp-web.a3f9               one replica
+  voodu desc pd clowk-lp --show-env
 
 Output formats:
   -o text  (default) human-friendly summary, no raw spec dump
@@ -630,10 +639,28 @@ type describePodResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// runDescribePod fetches GET /pods/{name} and renders the rich detail.
-// `ref` here is the docker container name (e.g. "test-web.a3f9") —
-// pods don't share the kind/scope/name shape because more than one
-// replica can match the same identity.
+// runDescribePod is the rich-detail entry point for `voodu describe
+// pod` and its `get pod` alias. Three ref shapes are accepted:
+//
+//   - "<scope>"            — every container in this scope, across
+//                            kinds (deployments, jobs, cronjobs, …).
+//                            Useful for the "what's running for app X?"
+//                            sweep, e.g. `vd get pd clowk-lp`.
+//   - "<scope>/<name>"     — every container matching the (scope, name)
+//                            identity. All replicas of one resource,
+//                            e.g. `vd get pd clowk-lp/web`.
+//   - "<container_name>"   — single rich detail by docker name, e.g.
+//                            `vd get pd clowk-lp-web.a3f9`.
+//
+// Discriminators:
+//   - has `/` → scope/name (split on first slash)
+//   - has `.` → container name (replica id suffix is the giveaway —
+//               every voodu container ends in ".<replicaID>")
+//   - else    → bare scope filter
+//
+// The dot heuristic is safe because voodu enforces dot-less scope
+// and resource names at the manifest layer. A bare token without a
+// dot is unambiguously NOT a container name in the wild.
 //
 // Output formats follow the same -o text|json|yaml|spec contract as
 // the other describe variants. "spec" falls through to text since
@@ -647,24 +674,62 @@ func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error 
 	ref = strings.TrimSpace(ref)
 
 	if ref == "" {
-		return fmt.Errorf("pod name is empty")
+		return fmt.Errorf("pod ref is empty")
 	}
 
-	// Defensive: a slash here means the operator typed "pod scope/name"
-	// expecting the same ref shape as the other kinds. Tell them
-	// explicitly what we expect — pods are addressed by container name.
-	if strings.Contains(ref, "/") {
-		return fmt.Errorf("pod ref %q contains a slash — pods are addressed by container name (e.g. test-web.a3f9), not scope/name", ref)
+	switch {
+	case strings.Contains(ref, "/"):
+		scope, name := splitJobRef(ref)
+
+		return runDescribePodByFilter(cmd, ref, scope, name, opts)
+
+	case strings.Contains(ref, "."):
+		return runDescribePodByContainerName(cmd, ref, opts)
+
+	default:
+		return runDescribePodByFilter(cmd, ref, ref /* scope */, "" /* name */, opts)
+	}
+}
+
+// runDescribePodByContainerName is the original single-pod path:
+// fetch /pods/{name}, decode envelope, render. Kept as its own
+// function so the scope/name path can reuse it once it has resolved
+// the matching container names — DRY and a single source of truth
+// for the rich-detail rendering.
+func runDescribePodByContainerName(cmd *cobra.Command, name string, opts describeOptions) error {
+	detail, err := fetchPodDetail(cmd, name)
+	if err != nil {
+		return err
 	}
 
 	root := cmd.Root()
 
-	// PathEscape the name in case it contains characters URL-special
-	// characters. Container names from voodu are safe (alphanum + dash
-	// + dot), but the legacy / non-voodu path could surface anything.
-	resp, err := controllerDo(root, http.MethodGet, "/pods/"+url.PathEscape(ref), "", nil)
+	switch describeOutputMode(root) {
+	case "json":
+		out := json.NewEncoder(os.Stdout)
+		out.SetIndent("", "  ")
+
+		return out.Encode(map[string]any{"pod": detail})
+
+	case "yaml":
+		return yaml.NewEncoder(os.Stdout).Encode(map[string]any{"pod": detail})
+	}
+
+	return renderPodDetail(os.Stdout, detail, opts.showEnv)
+}
+
+// fetchPodDetail does the GET /pods/{name} round-trip and decodes
+// the envelope. Returns the parsed PodDetail or an error with the
+// server's message verbatim (no opaque "controller returned 404").
+func fetchPodDetail(cmd *cobra.Command, name string) (*controller.PodDetail, error) {
+	root := cmd.Root()
+
+	// PathEscape the name in case it contains URL-special characters.
+	// Container names from voodu are safe (alphanum + dash + dot), but
+	// the legacy / non-voodu path could surface anything.
+	resp, err := controllerDo(root, http.MethodGet, "/pods/"+url.PathEscape(name), "", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
@@ -673,19 +738,106 @@ func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error 
 
 	var env describePodResponse
 	if jsonErr := json.Unmarshal(raw, &env); jsonErr != nil {
-		return fmt.Errorf("decode response (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, fmt.Errorf("decode response (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	if env.Status == "error" || resp.StatusCode >= 400 {
 		if env.Error != "" {
-			return fmt.Errorf("%s", env.Error)
+			return nil, fmt.Errorf("%s", env.Error)
 		}
 
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	if env.Data.Pod == nil {
-		return fmt.Errorf("empty response: no pod detail returned")
+		return nil, fmt.Errorf("empty response: no pod detail returned")
+	}
+
+	return env.Data.Pod, nil
+}
+
+// podsListResponse mirrors the /pods envelope. Local copy so the
+// describe-side resolution stays decoupled from cmd_get_pods.go's
+// own podsResponse — they happen to be identical today, but a
+// future divergence (extra fields on /pods) shouldn't ripple here.
+type podsListResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Pods []controller.Pod `json:"pods"`
+	} `json:"data"`
+	Error string `json:"error,omitempty"`
+}
+
+// runDescribePodByFilter is the shared enumerator: list /pods with
+// whatever filter combination the caller built up (scope-only,
+// scope+name, name-only), then fetch /pods/{name} for each match
+// and render rich detail.
+//
+// Two-phase: list call for the matching container names, then one
+// detail fetch per name. N+1 calls, but pod counts per resource /
+// scope are small (typically <20 across a whole scope) and the
+// alternative would require a new server endpoint for marginal
+// value. If a scope ever grows large enough to feel slow here, the
+// fix is server-side (`/pods?expand=detail` returning PodDetail[]),
+// not client-side parallelization.
+//
+// `ref` is carried purely for error messages — the operator types
+// it and expects to see it echoed back when nothing matches.
+func runDescribePodByFilter(cmd *cobra.Command, ref, scope, name string, opts describeOptions) error {
+	if scope == "" && name == "" {
+		return fmt.Errorf("ref %q: at least one of scope or name is required", ref)
+	}
+
+	root := cmd.Root()
+
+	q := url.Values{}
+
+	if scope != "" {
+		q.Set("scope", scope)
+	}
+
+	if name != "" {
+		q.Set("name", name)
+	}
+
+	resp, err := controllerDo(root, http.MethodGet, "/pods", q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var env podsListResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("decode pods list: %w", err)
+	}
+
+	if env.Status == "error" {
+		return fmt.Errorf("%s", env.Error)
+	}
+
+	if len(env.Data.Pods) == 0 {
+		return fmt.Errorf("no pods match %q (scope=%q, name=%q)", ref, scope, name)
+	}
+
+	// Fetch rich detail for each matching pod. Bail early on the
+	// first failure — partial output would be confusing ("did the
+	// rest succeed or fail?").
+	details := make([]*controller.PodDetail, 0, len(env.Data.Pods))
+
+	for _, p := range env.Data.Pods {
+		d, err := fetchPodDetail(cmd, p.Name)
+		if err != nil {
+			return fmt.Errorf("pod %s: %w", p.Name, err)
+		}
+
+		details = append(details, d)
 	}
 
 	switch describeOutputMode(root) {
@@ -693,15 +845,29 @@ func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error 
 		out := json.NewEncoder(os.Stdout)
 		out.SetIndent("", "  ")
 
-		return out.Encode(env.Data)
+		return out.Encode(map[string]any{"pods": details})
 
 	case "yaml":
-		return yaml.NewEncoder(os.Stdout).Encode(env.Data)
+		return yaml.NewEncoder(os.Stdout).Encode(map[string]any{"pods": details})
 	}
 
-	// "spec" falls through to text — runtime containers have no
-	// manifest spec to dump. The text view is already complete.
-	return renderPodDetail(os.Stdout, env.Data.Pod, opts.showEnv)
+	// Text mode: render each detail block separated by a thin rule
+	// so the operator can visually scan replica-by-replica. The
+	// header banner counts pods first so the operator knows up
+	// front "I'm about to scroll past 3 blocks, not 1".
+	fmt.Fprintf(os.Stdout, "matched %d pod(s) for %s\n\n", len(details), ref)
+
+	for i, d := range details {
+		if i > 0 {
+			fmt.Fprintln(os.Stdout, "\n---")
+		}
+
+		if err := renderPodDetail(os.Stdout, d, opts.showEnv); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // renderPodDetail prints the runtime view of one container as
@@ -880,15 +1046,13 @@ func renderPodDetail(w io.Writer, p *controller.PodDetail, showEnv bool) error {
 
 	// Env last. Both names and values are hidden by default — even key
 	// names leak intent (STRIPE_SECRET_KEY, AWS_ACCESS_KEY_ID, etc. tell
-	// an attacker watching a screen-share what to look for next). Only
-	// the count is surfaced so the operator knows env vars exist; the
-	// --show-env opt-in reveals the full list when actively debugging.
-	if len(p.Env) > 0 {
-		if !showEnv {
-			fmt.Fprintf(w, "\nenv: %d var(s) hidden (pass --show-env to reveal)\n", len(p.Env))
-			return nil
-		}
-
+	// an attacker watching a screen-share what to look for next). The
+	// section is elided entirely when --show-env isn't set: no count,
+	// no banner, nothing. The presence of env vars is itself sometimes
+	// signal an attacker can use, and the absence of the section is a
+	// clearer "describe pod is safe to paste" guarantee than a hint
+	// line nudging the operator toward --show-env.
+	if len(p.Env) > 0 && showEnv {
 		keys := make([]string, 0, len(p.Env))
 		for k := range p.Env {
 			keys = append(keys, k)

@@ -281,14 +281,15 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 	}
 
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:        cname,
-		Image:       spec.Image,
-		Command:     spec.Command,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
-		EnvFile:     envFile,
-		Labels:      labels,
+		Name:           cname,
+		Image:          spec.Image,
+		Command:        spec.Command,
+		Volumes:        spec.Volumes,
+		Networks:       spec.Networks,
+		NetworkMode:    spec.NetworkMode,
+		NetworkAliases: BuildNetworkAliases(scope, name),
+		EnvFile:        envFile,
+		Labels:         labels,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs job <name>`
 		// can read them post-exit. The runner GCs old run containers

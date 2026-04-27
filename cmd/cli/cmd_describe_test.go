@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -633,21 +634,172 @@ func TestDescribePodRoutesToPodsName(t *testing.T) {
 	}
 }
 
-// TestDescribePodRejectsScopeRefShape makes sure an operator who
-// accidentally types "pod scope/name" gets a clear error pointing at
-// the container-name shape instead of a confusing 404 from the
-// controller.
-func TestDescribePodRejectsScopeRefShape(t *testing.T) {
-	ts, _ := newDescribeMockServer(t, map[string]any{"status": "ok"})
+// TestDescribePodAcceptsScopeNameRef locks in the "all replicas of
+// an app" shape: `vd describe pod clowk-lp/web` lists matching pods
+// via /pods?scope=&name=, then fetches /pods/{name} for each. The
+// operator types the scope/name they already know — no need to
+// 'voodu get pods | grep' first to copy a replica id.
+func TestDescribePodAcceptsScopeNameRef(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		listQuery      string
+		fetchedDetails []string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.URL.Path == "/pods":
+			listQuery = r.URL.RawQuery
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pods": []controller.Pod{
+						{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "aaaa"},
+						{Name: "clowk-lp-web.bbbb", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "bbbb"},
+					},
+				},
+			})
+
+		case strings.HasPrefix(r.URL.Path, "/pods/"):
+			name := strings.TrimPrefix(r.URL.Path, "/pods/")
+			fetchedDetails = append(fetchedDetails, name)
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pod": &controller.PodDetail{
+						Pod: controller.Pod{
+							Name: name, Kind: "deployment", Scope: "clowk-lp",
+							ResourceName: "web",
+						},
+					},
+				},
+			})
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
 	defer ts.Close()
 
-	err := runDescribeCmd(t, ts, "pod", "test/web")
-	if err == nil {
-		t.Fatal("expected error for slash-style ref")
+	if err := runDescribeCmd(t, ts, "pod", "clowk-lp/web"); err != nil {
+		t.Fatalf("execute: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "container name") {
-		t.Errorf("error should mention container name, got %q", err.Error())
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, want := range []string{"scope=clowk-lp", "name=web"} {
+		if !strings.Contains(listQuery, want) {
+			t.Errorf("list query missing %q: %q", want, listQuery)
+		}
+	}
+
+	wantDetails := []string{"clowk-lp-web.aaaa", "clowk-lp-web.bbbb"}
+	if strings.Join(fetchedDetails, ",") != strings.Join(wantDetails, ",") {
+		t.Errorf("fetched details: got %v, want %v", fetchedDetails, wantDetails)
+	}
+}
+
+// TestDescribePodAcceptsBareScopeRef locks in the third ref shape:
+// `vd describe pod clowk-lp` (no slash, no dot) lists every pod in
+// the scope across all kinds, then renders the detail for each one.
+// The discriminator hinges on the dot-vs-no-dot heuristic — if a
+// future refactor accidentally treats bare refs as container names
+// again, this test catches it before the operator does.
+func TestDescribePodAcceptsBareScopeRef(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		listQuery      string
+		fetchedDetails []string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.URL.Path == "/pods":
+			listQuery = r.URL.RawQuery
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pods": []controller.Pod{
+						{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web"},
+						{Name: "clowk-lp-crawler1.bbbb", Kind: "cronjob", Scope: "clowk-lp", ResourceName: "crawler1"},
+						{Name: "clowk-lp-migrate.cccc", Kind: "job", Scope: "clowk-lp", ResourceName: "migrate"},
+					},
+				},
+			})
+
+		case strings.HasPrefix(r.URL.Path, "/pods/"):
+			name := strings.TrimPrefix(r.URL.Path, "/pods/")
+			fetchedDetails = append(fetchedDetails, name)
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pod": &controller.PodDetail{
+						Pod: controller.Pod{Name: name, Scope: "clowk-lp"},
+					},
+				},
+			})
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	if err := runDescribeCmd(t, ts, "pod", "clowk-lp"); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The list query should carry the scope but no name — bare ref
+	// means "every container in this scope regardless of resource".
+	if !strings.Contains(listQuery, "scope=clowk-lp") {
+		t.Errorf("list query missing scope filter: %q", listQuery)
+	}
+
+	if strings.Contains(listQuery, "name=") {
+		t.Errorf("bare scope ref must NOT carry a name filter, got %q", listQuery)
+	}
+
+	wantDetails := []string{"clowk-lp-web.aaaa", "clowk-lp-crawler1.bbbb", "clowk-lp-migrate.cccc"}
+	if strings.Join(fetchedDetails, ",") != strings.Join(wantDetails, ",") {
+		t.Errorf("fetched details: got %v, want %v", fetchedDetails, wantDetails)
+	}
+}
+
+// TestDescribePodScopeNameNoMatchErrors is the friendly-error
+// counterpart: zero matching containers produces a clear "no pods
+// match" message instead of a successful empty render.
+func TestDescribePodScopeNameNoMatchErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data":   map[string]any{"pods": []controller.Pod{}},
+		})
+	}))
+	defer ts.Close()
+
+	err := runDescribeCmd(t, ts, "pod", "missing/app")
+	if err == nil {
+		t.Fatal("expected error for unmatched scope/name")
+	}
+
+	if !strings.Contains(err.Error(), "no pods match") {
+		t.Errorf("error should mention no match, got %q", err.Error())
 	}
 }
 
@@ -675,10 +827,13 @@ func TestDescribePodSurfacesEnvelopeError(t *testing.T) {
 }
 
 // TestRenderPodDetailHidesEnvByDefault is the security regression
-// guard: NEITHER values NOR names appear in default text output.
+// guard: NOTHING about env appears in default text output. Not
+// values, not names, not a count, not a hint about --show-env.
 // Names alone leak intent — STRIPE_SECRET_KEY, AWS_ACCESS_KEY_ID,
-// SENTRY_DSN tell an attacker watching the screen what to look for.
-// Only the count is exposed so the operator knows env exists.
+// SENTRY_DSN tell an attacker watching a screen-share what to look
+// for. The presence-or-absence of an "env" section is itself signal,
+// so we elide the whole block; --show-env is the only way to see
+// any env-related content.
 func TestRenderPodDetailHidesEnvByDefault(t *testing.T) {
 	pod := &controller.PodDetail{
 		Pod: controller.Pod{
@@ -699,26 +854,18 @@ func TestRenderPodDetailHidesEnvByDefault(t *testing.T) {
 
 	out := buf.String()
 
-	// Neither names nor values may appear in the default output.
+	// Nothing env-related may appear in the default output.
 	for _, leak := range []string{
 		// names
 		"NODE_ENV", "DATABASE_URL", "STRIPE_SECRET_KEY",
 		// values
 		"production", "s3cret", "sk-live-AAAA",
+		// banner / count / hint — all elided
+		"env", "var(s)", "--show-env",
 	} {
 		if strings.Contains(out, leak) {
 			t.Errorf("%q leaked in default output:\n%s", leak, out)
 		}
-	}
-
-	// Count is exposed so the operator can tell env vars are set.
-	if !strings.Contains(out, "3 var(s) hidden") {
-		t.Errorf("output should expose count, got:\n%s", out)
-	}
-
-	// Hint so the operator knows they can opt in.
-	if !strings.Contains(out, "--show-env") {
-		t.Errorf("output should mention --show-env hint:\n%s", out)
 	}
 }
 

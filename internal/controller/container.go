@@ -174,6 +174,15 @@ type ContainerSpec struct {
 	// fresh voodu.replica_id (or run id for jobs).
 	Labels []string
 
+	// NetworkAliases are DNS names other containers can resolve to
+	// reach this one over Docker's embedded resolver. Built by the
+	// handler from (scope, name) — typically `<name>.<scope>` and
+	// `<name>.<scope>.voodu`. When multiple replicas share the same
+	// (scope, name), Docker DNS round-robins between them, giving
+	// voodu a Service-like abstraction without an external registry.
+	// Empty for unscoped resources or host/none network mode.
+	NetworkAliases []string
+
 	// AutoRemove sets `--rm` on docker run. Set by the job runner so
 	// completed runs disappear from `docker ps -a` automatically;
 	// long-running deployments leave it false (default).
@@ -232,17 +241,18 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 	}
 
 	cfg := docker.ContainerConfig{
-		Name:          spec.Name,
-		Image:         spec.Image,
-		Command:       spec.Command,
-		Ports:         spec.Ports,
-		Volumes:       spec.Volumes,
-		NetworkMode:   spec.NetworkMode,
-		Networks:      spec.Networks,
-		RestartPolicy: spec.Restart,
-		EnvFile:       spec.EnvFile,
-		Labels:        spec.Labels,
-		AutoRemove:    spec.AutoRemove,
+		Name:           spec.Name,
+		Image:          spec.Image,
+		Command:        spec.Command,
+		Ports:          spec.Ports,
+		Volumes:        spec.Volumes,
+		NetworkMode:    spec.NetworkMode,
+		Networks:       spec.Networks,
+		NetworkAliases: spec.NetworkAliases,
+		RestartPolicy:  spec.Restart,
+		EnvFile:        spec.EnvFile,
+		Labels:         spec.Labels,
+		AutoRemove:     spec.AutoRemove,
 	}
 
 	if err := docker.CreateContainer(cfg); err != nil {
@@ -457,17 +467,18 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 	}
 
 	cfg := docker.ContainerConfig{
-		Name:          spec.Name,
-		Image:         spec.Image,
-		Command:       spec.Command,
-		Ports:         spec.Ports,
-		Volumes:       spec.Volumes,
-		NetworkMode:   spec.NetworkMode,
-		Networks:      spec.Networks,
-		RestartPolicy: spec.Restart,
-		EnvFile:       spec.EnvFile,
-		Labels:        spec.Labels,
-		AutoRemove:    spec.AutoRemove,
+		Name:           spec.Name,
+		Image:          spec.Image,
+		Command:        spec.Command,
+		Ports:          spec.Ports,
+		Volumes:        spec.Volumes,
+		NetworkMode:    spec.NetworkMode,
+		Networks:       spec.Networks,
+		NetworkAliases: spec.NetworkAliases,
+		RestartPolicy:  spec.Restart,
+		EnvFile:        spec.EnvFile,
+		Labels:         spec.Labels,
+		AutoRemove:     spec.AutoRemove,
 	}
 
 	return docker.CreateContainer(cfg)

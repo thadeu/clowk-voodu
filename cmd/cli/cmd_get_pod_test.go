@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"go.voodu.clowk.in/internal/controller"
@@ -61,6 +62,97 @@ func TestGetPodRoutesToPodsName(t *testing.T) {
 				t.Errorf("path=%q want /pods/test-web.a3f9", gotPath)
 			}
 		})
+	}
+}
+
+// TestGetPodNoArgsListsPods locks in the alias semantics: `vd get
+// pd` (no ref) hits GET /pods, exactly like `vd get pods`. Without
+// this, a refactor of the argc-routing in newGetPodCmd could silently
+// turn the no-arg path into "pod ref is empty" without anyone
+// noticing until an operator complains.
+func TestGetPodNoArgsListsPods(t *testing.T) {
+	cases := []struct {
+		name   string
+		subcmd string
+	}{
+		{"long form", "pod"},
+		{"short form", "pd"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				gotPath  string
+				gotQuery string
+			)
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotQuery = r.URL.RawQuery
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "ok",
+					"data":   map[string]any{"pods": []controller.Pod{}},
+				})
+			}))
+			defer ts.Close()
+
+			root := newRootCmd()
+			_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetErr(&buf)
+			root.SetArgs([]string{"get", tc.subcmd})
+
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+
+			if gotPath != "/pods" {
+				t.Errorf("path=%q want /pods", gotPath)
+			}
+
+			if gotQuery != "" {
+				t.Errorf("no filter flags should mean empty query, got %q", gotQuery)
+			}
+		})
+	}
+}
+
+// TestGetPodNoArgsForwardsFilters confirms the listing-mode flags
+// (-k/-s/-n) actually reach the /pods query string when no ref is
+// given. Without this, someone could rename the flag bindings on
+// the singular command and break the alias silently.
+func TestGetPodNoArgsForwardsFilters(t *testing.T) {
+	var gotQuery string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data":   map[string]any{"pods": []controller.Pod{}},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get", "pd", "-k", "cronjob", "-s", "clowk-lp", "-n", "crawler1"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	for _, want := range []string{"kind=cronjob", "scope=clowk-lp", "name=crawler1"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("query missing %q: %q", want, gotQuery)
+		}
 	}
 }
 

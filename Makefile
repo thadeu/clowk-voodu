@@ -51,6 +51,11 @@ build-linux-amd64: ## Cross-compile both binaries for linux/amd64 into bin/linux
 build-linux: build-linux-arm64 build-linux-amd64 ## Cross-compile both binaries for linux (arm64 + amd64)
 
 install: build-cli ## Install voodu to /usr/local/bin (with vd symlink)
+	# Pre-clean the symlink and the binary. `install` below already
+	# does unlink+create internally, but doing it explicitly makes the
+	# AMFI signature-cache invalidation deterministic on macOS arm64
+	# (`|| true` so a fresh box without prior install still proceeds).
+	sudo rm -f /usr/local/bin/vd /usr/local/bin/$(BINARY_CLI) 2>/dev/null || true
 	# `install` does unlink + create, giving the destination a fresh
 	# inode every time. macOS AMFI (Apple Mobile File Integrity) caches
 	# code-signature metadata per inode on arm64 — a plain `cp` over an
