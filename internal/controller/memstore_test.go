@@ -14,13 +14,118 @@ type memStore struct {
 	mu     sync.Mutex
 	kv     map[string]*Manifest
 	status map[string][]byte
+	config map[string]map[string]string // bucket → key:value
 	rev    int64
 
 	watchers []chan WatchEvent
 }
 
 func newMemStore() *memStore {
-	return &memStore{kv: map[string]*Manifest{}, status: map[string][]byte{}}
+	return &memStore{
+		kv:     map[string]*Manifest{},
+		status: map[string][]byte{},
+		config: map[string]map[string]string{},
+	}
+}
+
+// configBucketKey is the in-memory equivalent of the etcd
+// (scope, name) prefix — flat for the test store, since we never
+// need prefix scans here.
+func configBucketKey(scope, name string) string {
+	if name == "" {
+		name = "_"
+	}
+
+	return scope + "/" + name
+}
+
+func (m *memStore) SetConfig(_ context.Context, scope, name string, vars map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bucket := make(map[string]string, len(vars))
+	for k, v := range vars {
+		bucket[k] = v
+	}
+
+	m.config[configBucketKey(scope, name)] = bucket
+
+	return nil
+}
+
+func (m *memStore) PatchConfig(_ context.Context, scope, name string, vars map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := configBucketKey(scope, name)
+
+	bucket, ok := m.config[key]
+	if !ok {
+		bucket = map[string]string{}
+		m.config[key] = bucket
+	}
+
+	for k, v := range vars {
+		if v == "" {
+			delete(bucket, k)
+			continue
+		}
+
+		bucket[k] = v
+	}
+
+	return nil
+}
+
+func (m *memStore) GetConfig(_ context.Context, scope, name string) (map[string]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bucket, ok := m.config[configBucketKey(scope, name)]
+	if !ok {
+		return map[string]string{}, nil
+	}
+
+	out := make(map[string]string, len(bucket))
+	for k, v := range bucket {
+		out[k] = v
+	}
+
+	return out, nil
+}
+
+func (m *memStore) ResolveConfig(ctx context.Context, scope, name string) (map[string]string, error) {
+	scopeLevel, _ := m.GetConfig(ctx, scope, "")
+	appLevel, _ := m.GetConfig(ctx, scope, name)
+
+	merged := make(map[string]string, len(scopeLevel)+len(appLevel))
+	for k, v := range scopeLevel {
+		merged[k] = v
+	}
+
+	for k, v := range appLevel {
+		merged[k] = v
+	}
+
+	return merged, nil
+}
+
+func (m *memStore) DeleteConfigKey(_ context.Context, scope, name, key string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bucket, ok := m.config[configBucketKey(scope, name)]
+	if !ok {
+		return false, nil
+	}
+
+	if _, exists := bucket[key]; !exists {
+		return false, nil
+	}
+
+	delete(bucket, key)
+
+	return true, nil
 }
 
 func (m *memStore) PutStatus(ctx context.Context, kind Kind, name string, data []byte) error {

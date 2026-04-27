@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -57,6 +56,19 @@ type API struct {
 	// docker.
 	Jobs JobRunner
 
+	// CronJobs powers /cronjobs/run — the imperative "trigger this
+	// cronjob NOW, don't wait for the schedule" entry point. Nil
+	// means the endpoint returns 503; production wires CronJobHandler.
+	// Same shape as JobRunner so tests can re-use a single fake.
+	CronJobs CronJobRunner
+
+	// Execer powers /pods/{name}/exec — the kubectl-exec-style "run a
+	// command inside a running container" path. Nil → 503. Production
+	// wires DockerContainerManager (which satisfies the interface via
+	// its Exec method); tests substitute a fake to avoid spinning up
+	// a real docker daemon.
+	Execer Execer
+
 	// Logs powers /logs streaming. Nil means the endpoint returns 503
 	// ("log streaming not configured"); production wires the
 	// ContainerManager (which satisfies LogStreamer through its Logs
@@ -80,22 +92,65 @@ type JobRunner interface {
 	RunOnce(ctx context.Context, scope, name string) (JobRun, error)
 }
 
+// CronJobRunner is the seam /cronjobs/run dispatches through.
+// CronJobHandler.Tick implements this — same shape as the scheduler
+// uses when a tick fires, but called imperatively from the CLI to
+// force a run "now". Distinct from JobRunner because the underlying
+// store key + handler differ (KindCronJob vs KindJob), even though
+// the user-facing semantics are nearly identical.
+type CronJobRunner interface {
+	Tick(ctx context.Context, scope, name string) (JobRun, error)
+}
+
+// Execer is the seam /pods/{name}/exec dispatches through. Production:
+// DockerContainerManager.Exec. Tests: a fake that captures the
+// command + opts. Stream wiring is intentionally on the value (not
+// the interface method) so a single Exec call can attach to the
+// hijacked HTTP connection without buffering.
+type Execer interface {
+	Exec(name string, command []string, opts ExecOptions) (int, error)
+}
+
+// ExecOptions mirrors docker.ExecOptions field-for-field but lives
+// in the controller package so callers (handlers, CLI when running
+// in-process) don't need to import internal/docker just to pass
+// options through. The handler converts to docker.ExecOptions
+// before invoking the runtime — that's the only translation point.
+type ExecOptions struct {
+	TTY         bool
+	Interactive bool
+	WorkingDir  string
+	User        string
+	Env         []string
+
+	// Cols/Rows describe the operator's terminal size. Forwarded to
+	// pty.Setsize on the docker side when TTY=true; ignored otherwise.
+	Cols uint16
+	Rows uint16
+
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
 // Handler returns an http.Handler with all endpoints registered.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/apply", a.handleApply)
-	mux.HandleFunc("/status", a.handleStatus)
 	mux.HandleFunc("/describe", a.handleDescribe)
 	mux.HandleFunc("/pods", a.handlePods)
 	mux.HandleFunc("GET /pods/{name}", a.handlePodDescribe)
-	mux.HandleFunc("/exec", a.handleExec)
-	mux.HandleFunc("/logs", a.handleLogs)
+	mux.HandleFunc("POST /plugins/exec", a.handleExec)
+	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
+	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
 	mux.HandleFunc("/plugins", a.handlePlugins)
 	mux.HandleFunc("POST /plugins/install", a.handlePluginInstall)
 	mux.HandleFunc("DELETE /plugins/{name}", a.handlePluginRemove)
 	mux.HandleFunc("POST /jobs/run", a.handleJobRun)
+	mux.HandleFunc("POST /cronjobs/run", a.handleCronJobRun)
+	mux.HandleFunc("/config", a.handleConfig)
 
 	return logRequests(mux)
 }
@@ -530,31 +585,6 @@ func resolveScope(ctx context.Context, store Store, kind Kind, name string) (str
 	}
 }
 
-// handleStatus is a union of /desired and (later) /actual. In M3 we only
-// have desired state; actual state lands once the reconciler records
-// container state in /actual/nodes/*.
-func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
-
-		return
-	}
-
-	desired, err := a.Store.ListAll(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, envelope{
-		Status: "ok",
-		Data: map[string]any{
-			"desired": desired,
-			"actual":  []any{},
-		},
-	})
-}
 
 // handleDescribe returns the full picture for a single declared
 // resource: the source manifest, its persisted status blob, and any
@@ -907,47 +937,44 @@ func pluginExitToHTTP(code int) int {
 	return http.StatusInternalServerError
 }
 
-// handleLogs streams stdout+stderr of one voodu-managed container back
-// to the caller. The endpoint resolves a (kind, scope, name[, run])
-// tuple to a single container name, then asks the LogStreamer to
-// drain docker logs for it.
+// handlePodLogs streams stdout+stderr of one voodu-managed container
+// back to the caller, addressed by docker container name.
 //
-// GET /logs?kind=&scope=&name=&run=&follow=&tail=
+// GET /pods/{name}/logs?follow=&tail=
 //
-// `kind` and `name` are required. Scoped kinds auto-resolve scope when
-// unambiguous (mirrors describe / delete).
+// {name} is the docker container name as it appears in `voodu get pods`
+// (e.g. "clowk-lp-web.a3f9"). The kind-aware /logs endpoint that used
+// to do scope/name/run resolution server-side is gone — the CLI now
+// resolves to a list of container names client-side via /pods?...,
+// then opens one stream per match. Centralising fan-out on the client
+// keeps the server's job stupid (one container, one stream) and makes
+// multi-replica `vd logs <scope>/<name>` natural.
 //
-// `run` selects a specific replica id. When omitted: prefer running
-// containers; among those (or among stopped ones if none are running),
-// pick the most recently created. That matches the operator intent of
-// `voodu logs job <name>` ("show me the latest run") without forcing
-// a CLI-side ListPods round-trip.
-//
-// `follow=true` keeps the stream open until the container exits or the
-// caller disconnects (chunked transfer with periodic Flush so the CLI
-// sees lines as they arrive).
+// `follow=true` keeps the stream open until the container exits or
+// the caller disconnects (chunked transfer with periodic Flush so the
+// CLI sees lines as they arrive).
 //
 // Response body is the raw log stream (text/plain). Errors from
-// resolution / lookup land on a JSON envelope BEFORE any byte of the
-// stream is written so the CLI's JSON path stays usable.
-func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
-
-		return
-	}
-
+// lookup / open land on a JSON envelope BEFORE any byte of the stream
+// is written so the CLI's JSON path stays usable.
+func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 	if a.Logs == nil {
 		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("log streaming not configured"))
 		return
 	}
 
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
 	q := r.URL.Query()
-	kindStr := strings.TrimSpace(q.Get("kind"))
-	name := strings.TrimSpace(q.Get("name"))
-	scope := strings.TrimSpace(q.Get("scope"))
-	run := strings.TrimSpace(q.Get("run"))
 	follow := q.Get("follow") == "true"
 
 	tail := 0
@@ -961,45 +988,7 @@ func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 		tail = n
 	}
 
-	if kindStr == "" || name == "" {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("kind and name are required"))
-		return
-	}
-
-	kind, err := ParseKind(kindStr)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	if IsScoped(kind) && scope == "" {
-		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
-		if err != nil {
-			if errors.Is(err, errScopeNotFound) {
-				writeErr(w, http.StatusNotFound, err)
-				return
-			}
-
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-
-		scope = resolved
-	}
-
-	pods := a.matchingPods(kind, scope, name)
-	if len(pods) == 0 {
-		writeErr(w, http.StatusNotFound, fmt.Errorf("no containers found for %s/%s/%s", kind, scope, name))
-		return
-	}
-
-	target, err := pickLogTarget(pods, run)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
-		return
-	}
-
-	stream, err := a.Logs.Logs(target.Name, LogsOptions{Follow: follow, Tail: tail})
+	stream, err := a.Logs.Logs(name, LogsOptions{Follow: follow, Tail: tail})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("open log stream: %w", err))
 		return
@@ -1008,11 +997,7 @@ func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 	defer stream.Close()
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Voodu-Container", target.Name)
-
-	if target.ReplicaID != "" {
-		w.Header().Set("X-Voodu-Run", target.ReplicaID)
-	}
+	w.Header().Set("X-Voodu-Container", name)
 
 	w.WriteHeader(http.StatusOK)
 
@@ -1040,37 +1025,6 @@ func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-// pickLogTarget chooses one pod from the candidate list. When run is
-// non-empty, only an exact ReplicaID match qualifies. Otherwise prefer
-// running pods, breaking ties by the latest CreatedAt so the operator
-// sees the most recent activity by default.
-func pickLogTarget(pods []Pod, run string) (Pod, error) {
-	if run != "" {
-		for _, p := range pods {
-			if p.ReplicaID == run {
-				return p, nil
-			}
-		}
-
-		return Pod{}, fmt.Errorf("no run %q found among %d candidate(s)", run, len(pods))
-	}
-
-	// Sort: running first, then by CreatedAt desc. Stable so equal
-	// keys keep ListPods's secondary order.
-	sorted := make([]Pod, len(pods))
-	copy(sorted, pods)
-
-	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].Running != sorted[j].Running {
-			return sorted[i].Running
-		}
-
-		return sorted[i].CreatedAt > sorted[j].CreatedAt
-	})
-
-	return sorted[0], nil
 }
 
 // handlePlugins lists plugins currently installed under PluginsRoot.
@@ -1223,6 +1177,406 @@ func (a *API) handleJobRun(w http.ResponseWriter, r *http.Request) {
 		// The runner already wrote the failure into status. Return the
 		// run record alongside the error so the CLI can render exit
 		// code + duration even when the response is a 500.
+		writeJSON(w, http.StatusInternalServerError, envelope{
+			Status: "error",
+			Error:  err.Error(),
+			Data:   run,
+		})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: run})
+}
+
+// handlePodExec runs a command inside a running container —
+// kubectl-exec-style streaming. Uses HTTP hijack to take over the
+// raw connection because the chunked-transfer model behind a normal
+// http.ResponseWriter doesn't carry stdin (data only flows server →
+// client). Hijack gives us the underlying TCP/TLS conn, and we can
+// run a bidirectional stream over it.
+//
+//	POST /pods/{name}/exec?tty=&interactive=&user=&workdir=
+//
+// Body: JSON `{"command": ["/bin/sh", "-c", "ls"]}` — the command
+// to exec. Empty/missing command → 400.
+//
+// Wire protocol: after the handshake (HTTP 101 Switching Protocols),
+// the connection becomes a raw bidi stream. Client → server payload
+// is the child's stdin; server → client is multiplexed
+// stdout+stderr (TTY mode merges them, non-TTY keeps stdout only —
+// stderr is dropped to keep the wire simple, since 99% of exec
+// targets are interactive shells where the distinction doesn't
+// matter).
+//
+// Exit code is communicated via the connection close: clean close
+// = 0, otherwise the child's exit code is logged server-side and
+// the close happens after stdout drains. The CLI can probe by
+// observing the close, or rely on the underlying shell exit.
+func (a *API) handlePodExec(w http.ResponseWriter, r *http.Request) {
+	if a.Execer == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("exec not configured"))
+		return
+	}
+
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
+	body, err := readBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	var req struct {
+		Command []string `json:"command"`
+		Env     []string `json:"env,omitempty"`
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+
+	if len(req.Command) == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("command is required"))
+		return
+	}
+
+	q := r.URL.Query()
+	tty := q.Get("tty") == "true"
+	interactive := q.Get("interactive") == "true"
+	workdir := strings.TrimSpace(q.Get("workdir"))
+	user := strings.TrimSpace(q.Get("user"))
+
+	// Window size for PTY allocation. Best-effort: malformed values
+	// just default to zero, in which case the kernel picks the pty's
+	// default (24x80). Cols/Rows are uint16 in the kernel; clamp on
+	// parse to avoid surprising overflows.
+	cols := parseUint16Query(q.Get("cols"))
+	rows := parseUint16Query(q.Get("rows"))
+
+	// Hijack the connection so we can stream stdin/stdout bidirectionally.
+	// Without hijack the response writer can only push bytes one-way; the
+	// client's stdin would be stuck in the request body which Go's HTTP
+	// stack closes once the handler returns.
+	//
+	// Hijack BEFORE writing headers — that's the canonical pattern. Go's
+	// net/http buffers the response writer in a way that interleaves
+	// awkwardly with raw conn writes; hijacking first gives us full
+	// ownership and we craft the response status line manually.
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("hijack not supported"))
+		return
+	}
+
+	conn, brw, err := hijacker.Hijack()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("hijack: %w", err))
+		return
+	}
+
+	defer conn.Close()
+
+	// Manually write the HTTP/1.1 response head. Connection: close so
+	// the client knows the body is close-delimited; X-Voodu-Container
+	// echoes back the resolved target for the operator to confirm.
+	statusLine := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/octet-stream\r\n" +
+		"X-Voodu-Container: " + name + "\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"
+
+	if _, err := brw.Writer.WriteString(statusLine); err != nil {
+		return
+	}
+
+	if err := brw.Writer.Flush(); err != nil {
+		return
+	}
+
+	opts := ExecOptions{
+		TTY:         tty,
+		Interactive: interactive,
+		WorkingDir:  workdir,
+		User:        user,
+		Env:         req.Env,
+		Cols:        cols,
+		Rows:        rows,
+		Stdin:       conn,
+		Stdout:      conn,
+		Stderr:      conn,
+	}
+
+	// Block until docker exec exits; the connection close signals
+	// completion to the client. Exit code is logged but not propagated
+	// over the wire today — the CLI relies on the spawned shell's own
+	// exit semantics. A future protocol version could prefix a status
+	// frame, but for `vd exec -- bash` the current shape is enough.
+	_, _ = a.Execer.Exec(name, req.Command, opts)
+}
+
+// handleConfig is the multi-method dispatcher for /config — the
+// CRUD surface for env vars stored in etcd. Replaces the old
+// filesystem-based secrets.* path so an operator can `vd config
+// set FOO=bar` from their dev Mac without SSHing into the server.
+//
+// GET    /config?scope=&name=               list keys (merged scope+app)
+// GET    /config?scope=&name=&key=KEY        single value
+// POST   /config?scope=&name=                patch keys (body: {KEY: VAL, ...})
+// DELETE /config?scope=&name=&key=KEY        unset one key
+//
+// Scope is required for all operations. name is optional — when
+// omitted, ops target the scope-level bucket (shared env across
+// resources in scope). On GET/list with name set, the response is
+// the MERGED config (scope-level + app-level overrides), since
+// that's what the operator usually wants to inspect ("what env
+// will my container see?"). Set ?merge=false to get only the
+// app-specific bucket.
+//
+// Auto-restart: a successful POST or DELETE re-emits Apply events
+// for every resource the change affects, which the reconciler
+// picks up and restarts (Recreate). Operators can opt out with
+// ?restart=false on the request.
+func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.configGet(w, r)
+	case http.MethodPost:
+		a.configPost(w, r)
+	case http.MethodDelete:
+		a.configDelete(w, r)
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+	}
+}
+
+func (a *API) configGet(w http.ResponseWriter, r *http.Request) {
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+
+	if scope == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope is required"))
+		return
+	}
+
+	merge := r.URL.Query().Get("merge") != "false"
+
+	var (
+		vars map[string]string
+		err  error
+	)
+
+	if name != "" && merge {
+		vars, err = a.Store.ResolveConfig(r.Context(), scope, name)
+	} else {
+		vars, err = a.Store.GetConfig(r.Context(), scope, name)
+	}
+
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if key != "" {
+		v, ok := vars[key]
+		if !ok {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("key %q not set", key))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data:   map[string]string{key: v},
+		})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"vars": vars},
+	})
+}
+
+func (a *API) configPost(w http.ResponseWriter, r *http.Request) {
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+
+	if scope == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope is required"))
+		return
+	}
+
+	body, err := readBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	var payload map[string]string
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+
+	if len(payload) == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("body must be a non-empty {KEY: VALUE} object"))
+		return
+	}
+
+	if err := a.Store.PatchConfig(r.Context(), scope, name, payload); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	a.maybeRestartAffected(r, scope, name)
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+func (a *API) configDelete(w http.ResponseWriter, r *http.Request) {
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+
+	if scope == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope is required"))
+		return
+	}
+
+	if key == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("key is required for DELETE"))
+		return
+	}
+
+	if _, err := a.Store.DeleteConfigKey(r.Context(), scope, name, key); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	a.maybeRestartAffected(r, scope, name)
+
+	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+// maybeRestartAffected re-emits Apply events for every container-
+// producing manifest the config change touches. When name is set,
+// only that resource. When name is empty (scope-level), every
+// deployment / job / cronjob in the scope. The reconciler's
+// existing change detection handles the "no actual env changed →
+// no-op" case so it's safe to over-trigger.
+//
+// The ?restart=false query param turns this off — useful when the
+// operator wants to batch multiple set/unset calls and only restart
+// once at the end.
+func (a *API) maybeRestartAffected(r *http.Request, scope, name string) {
+	if r.URL.Query().Get("restart") == "false" {
+		return
+	}
+
+	if a.Store == nil {
+		return
+	}
+
+	ctx := r.Context()
+
+	kinds := []Kind{KindDeployment, KindJob, KindCronJob}
+
+	for _, kind := range kinds {
+		mans, err := a.Store.ListByScope(ctx, kind, scope)
+		if err != nil {
+			continue
+		}
+
+		for _, m := range mans {
+			if name != "" && m.Name != name {
+				continue
+			}
+
+			// Re-Put the manifest unchanged to fire a watch event.
+			// The reconciler will see PUT, fetch fresh config, and
+			// Recreate when env actually differs.
+			_, _ = a.Store.Put(ctx, m)
+		}
+	}
+}
+
+// parseUint16Query is a forgiving uint16 parser for query params:
+// blank or malformed values return 0 (which the pty path treats as
+// "use the kernel default"), valid integers clamp to uint16's range
+// before returning. Wider values (negative, >65535) silently fall
+// to zero — callers that care about validation should do their own.
+func parseUint16Query(s string) uint16 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 65535 {
+		return 0
+	}
+
+	return uint16(n)
+}
+
+// handleCronJobRun forces an immediate execution of a previously-
+// applied cronjob, bypassing the scheduler. Mirror shape of
+// handleJobRun: synchronous, returns the run record alongside any
+// error so the CLI can render exit code + duration.
+//
+//	POST /cronjobs/run?scope=<scope>&name=<name>
+//
+// Use case: an operator just shipped a fix to a cronjob and wants to
+// verify it works before waiting for the next scheduled tick. The
+// scheduler's normal cadence is unaffected — this just triggers one
+// extra run synchronously.
+func (a *API) handleCronJobRun(w http.ResponseWriter, r *http.Request) {
+	if a.CronJobs == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("cronjob runner not configured"))
+		return
+	}
+
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+
+	if scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, KindCronJob, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+
+		scope = resolved
+	}
+
+	run, err := a.CronJobs.Tick(r.Context(), scope, name)
+	if err != nil {
+		// Same as job run: status carries the failure already, return
+		// the run record alongside the error so the CLI's --output
+		// can render exit code + duration.
 		writeJSON(w, http.StatusInternalServerError, envelope{
 			Status: "error",
 			Error:  err.Error(),

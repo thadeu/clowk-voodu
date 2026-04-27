@@ -73,6 +73,12 @@ install: build-cli ## Install voodu to /usr/local/bin (with vd symlink)
 	fi
 	sudo ln -sf /usr/local/bin/$(BINARY_CLI) /usr/local/bin/vd
 
+deploy-controller: build-linux-arm64
+	scp bin/linux-arm64/voodu-controller $(HOST):/tmp/voodu-controller
+	ssh $(HOST) 'sudo systemctl stop voodu-controller && \
+		sudo install -m 0755 /tmp/voodu-controller /usr/local/bin/ && \
+		sudo systemctl start voodu-controller'
+
 check: fmt vet lint test ## Run all checks
 	@echo "All checks passed"
 

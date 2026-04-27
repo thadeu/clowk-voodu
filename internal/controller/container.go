@@ -94,10 +94,16 @@ type ContainerManager interface {
 	// caller is responsible for Close()ing the returned reader to reap
 	// the underlying docker process — leaving it open leaks a process.
 	//
-	// Used by the /logs endpoint to power `voodu logs <kind> <ref>`.
-	// Job and cronjob runs are kept post-exit (no AutoRemove) so this
-	// is the operator's window into "why did the last run fail?".
+	// Used by the /pods/{name}/logs endpoint. Job and cronjob runs are
+	// kept post-exit (no AutoRemove) so this is the operator's window
+	// into "why did the last run fail?".
 	Logs(name string, opts LogsOptions) (io.ReadCloser, error)
+
+	// Exec runs a command inside an already-running container —
+	// kubectl-exec semantics. Streams (stdin/stdout/stderr) come from
+	// the caller via opts so the API handler can wire them to a
+	// hijacked HTTP connection. Returns the child's exit code.
+	Exec(name string, command []string, opts ExecOptions) (int, error)
 }
 
 // LogsOptions tunes the docker logs invocation. Both fields are
@@ -453,6 +459,25 @@ func (DockerContainerManager) Wait(name string) (int, error) {
 // ContainerManager so the API handler stays testable with a fake.
 func (DockerContainerManager) Logs(name string, opts LogsOptions) (io.ReadCloser, error) {
 	return docker.LogsStream(name, opts.Follow, opts.Tail)
+}
+
+// Exec is a thin shim over docker.ExecContainer. Translates the
+// controller-side ExecOptions to docker.ExecOptions (same shape but
+// lives in a different package so callers don't have to import
+// internal/docker for one struct).
+func (DockerContainerManager) Exec(name string, command []string, opts ExecOptions) (int, error) {
+	return docker.ExecContainer(name, command, docker.ExecOptions{
+		TTY:         opts.TTY,
+		Interactive: opts.Interactive,
+		WorkingDir:  opts.WorkingDir,
+		User:        opts.User,
+		Env:         opts.Env,
+		Cols:        opts.Cols,
+		Rows:        opts.Rows,
+		Stdin:       opts.Stdin,
+		Stdout:      opts.Stdout,
+		Stderr:      opts.Stderr,
+	})
 }
 
 func (DockerContainerManager) Recreate(spec ContainerSpec) error {

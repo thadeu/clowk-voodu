@@ -395,6 +395,14 @@ func (f *fakeContainers) Restart(name string) error {
 	return nil
 }
 
+// Exec is a no-op stub for tests that don't exercise the exec path.
+// Returns 0 (clean exit) so test harnesses don't accidentally see
+// non-zero from a fake. The api-level exec test in api_exec_test.go
+// uses a dedicated fakeExecer that records calls.
+func (f *fakeContainers) Exec(name string, command []string, opts ExecOptions) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeContainers) Remove(name string) error {
 	f.removes = append(f.removes, name)
 

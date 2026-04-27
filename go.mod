@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/creack/pty v1.1.18
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/moby/patternmatcher v0.6.1
 	github.com/muesli/termenv v0.16.0

@@ -230,7 +230,7 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		return JobRun{}, fmt.Errorf("cronjob runner has no container manager configured")
 	}
 
-	envFile, err := h.linkEnv(app, spec.Job.Env)
+	envFile, err := h.linkEnv(ctx, scope, name, app, spec.Job.Env)
 	if err != nil {
 		return JobRun{}, err
 	}
@@ -423,7 +423,25 @@ func historyLimits(spec cronJobSpec) (successCap, failureCap int) {
 	return successCap, failureCap
 }
 
-func (h *CronJobHandler) linkEnv(app string, env map[string]string) (string, error) {
+// linkEnv merges controller-managed config with the cronjob's
+// static Env block. Same shape and precedence as JobHandler.linkEnv —
+// scope config → app config → manifest spec.Job.Env (last wins).
+func (h *CronJobHandler) linkEnv(ctx context.Context, scope, name, app string, env map[string]string) (string, error) {
+	merged := map[string]string{}
+
+	if h.Store != nil {
+		ctrlConfig, err := h.Store.ResolveConfig(ctx, scope, name)
+		if err == nil {
+			for k, v := range ctrlConfig {
+				merged[k] = v
+			}
+		}
+	}
+
+	for k, v := range env {
+		merged[k] = v
+	}
+
 	if h.WriteEnv == nil {
 		if h.EnvFilePath == nil {
 			return "", nil
@@ -432,7 +450,7 @@ func (h *CronJobHandler) linkEnv(app string, env map[string]string) (string, err
 		return h.EnvFilePath(app), nil
 	}
 
-	pairs := envMapToPairs(env)
+	pairs := envMapToPairs(merged)
 
 	if _, err := h.WriteEnv(app, pairs); err != nil {
 		return "", fmt.Errorf("write cronjob env: %w", err)

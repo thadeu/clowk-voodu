@@ -15,7 +15,7 @@ func TestForwardPostsArgsAndRendersJSON(t *testing.T) {
 	var got forwardRequest
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/exec" {
+		if r.Method != http.MethodPost || r.URL.Path != "/plugins/exec" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 

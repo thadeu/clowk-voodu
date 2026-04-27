@@ -11,7 +11,8 @@ import (
 //	/desired/<kind>s/<name>          # unscoped kinds (database)
 //	/actual/nodes/<node>/health      # health beacons per node
 //	/actual/nodes/<node>/containers/<id>
-//	/config/<app>/<key>              # per-app config (optional; CLI writes .env directly)
+//	/config/<scope>/_/<KEY>          # scope-level config (shared across resources in scope)
+//	/config/<scope>/<name>/<KEY>     # app-level config (overrides scope on conflict)
 //	/plugins/<name>/manifest
 //	/status/<kind>s/<name>           # plugin-produced status (always keyed by
 //	                                 # name; uniqueness of (kind, name) across
@@ -112,4 +113,48 @@ func PluginsPrefix() string { return prefixPlugins }
 // state the plugin generated.
 func StatusKey(kind Kind, name string) string {
 	return prefixStatus + string(kind) + "s/" + name
+}
+
+// Config keys.
+//
+// scope-level config (shared across all resources in a scope) lives
+// under "/config/<scope>/_/<KEY>" — the literal "_" is reserved as
+// the synthetic "all apps" name to keep prefix listing trivial.
+// app-level config lives under "/config/<scope>/<name>/<KEY>" and
+// overrides scope-level on conflict at injection time.
+//
+// Why one tree per (scope, name) bucket:
+//   - prefix listing is O(N) on the bucket, not on the whole config
+//     space, so `vd config list -s clowk-lp -n web` is fast even
+//     when there are many other apps
+//   - the watch on a single bucket triggers exactly one reconcile per
+//     mutated app, no fan-out filtering on the reconciler side
+const configScopeAllName = "_"
+
+// ConfigKey returns the etcd key for one config entry. scope is
+// required; when name is empty the entry is scope-level (shared
+// across resources in scope). KEY is the env-var name uppercased on
+// the way in (the resolver case-folds anyway, but we normalise so
+// the listing is deterministic).
+func ConfigKey(scope, name, key string) string {
+	return ConfigPrefix(scope, name) + key
+}
+
+// ConfigPrefix returns the prefix that covers every key under one
+// (scope, name) bucket. Scope-only configs live under the synthetic
+// "_" name segment so the prefix is well-formed even without an app.
+func ConfigPrefix(scope, name string) string {
+	if name == "" {
+		name = configScopeAllName
+	}
+
+	return prefixConfig + scope + "/" + name + "/"
+}
+
+// ConfigScopeRoot returns "/config/<scope>/" — the prefix covering
+// every config bucket inside a scope, used by handlers that want to
+// resolve "all config relevant to this resource" (scope-level + the
+// resource's own name-level).
+func ConfigScopeRoot(scope string) string {
+	return prefixConfig + scope + "/"
 }

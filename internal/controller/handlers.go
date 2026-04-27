@@ -589,7 +589,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	//   2. `voodu config set` writes to the same file; linkEnv's Load/
 	//      Save round-trip preserves those values when the spec declares
 	//      no Env block of its own.
-	envChanged, err := h.linkEnv(ctx, ev.Scope, app, spec.Env)
+	envChanged, err := h.linkEnv(ctx, ev.Scope, ev.Name, app, spec.Env)
 	if err != nil {
 		return err
 	}
@@ -1051,10 +1051,39 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 // lookups for scoped kinds (ingress) so a deployment in scope
 // "clowk-lp" resolves `${ref.ingress.api}` against its own scope's
 // ingress, not another scope's same-named one.
-func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, app string, env map[string]string) (bool, error) {
+func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, name, app string, env map[string]string) (bool, error) {
 	lookup := h.refLookup(ctx, scope)
 
-	resolved, err := InterpolateRefsMap(env, lookup)
+	// Pull controller-managed config (scope-level + app-level merged)
+	// and overlay the manifest's declared env on top. Precedence:
+	//
+	//   scope config (via /config -s scope)
+	//   ↓
+	//   app config (via /config -s scope -n name)
+	//   ↓
+	//   manifest spec.env (HCL `env = { ... }`)
+	//
+	// Manifest wins because the HCL is the declarative source of
+	// truth; config fills in everything the manifest deliberately
+	// left out (secrets, per-environment values). If the operator
+	// wants config to override a manifest key, they should remove
+	// it from the manifest.
+	merged := map[string]string{}
+
+	if h.Store != nil {
+		ctrlConfig, err := h.Store.ResolveConfig(ctx, scope, name)
+		if err == nil {
+			for k, v := range ctrlConfig {
+				merged[k] = v
+			}
+		}
+	}
+
+	for k, v := range env {
+		merged[k] = v
+	}
+
+	resolved, err := InterpolateRefsMap(merged, lookup)
 	if err != nil {
 		// Unresolved refs are almost always a timing race: the
 		// referenced resource hasn't been reconciled yet. Mark
@@ -1078,6 +1107,7 @@ func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, app string, env 
 
 	return changed, nil
 }
+
 
 // refLookup closes over the store so InterpolateRefsMap can resolve
 // ${ref.<kind>.<name>.<field>} by reading /status/<kind>s/<name>.

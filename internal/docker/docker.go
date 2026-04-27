@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 const (
@@ -782,6 +784,225 @@ func WaitContainer(name string) (int, error) {
 	}
 
 	return code, nil
+}
+
+// ExecOptions tunes the `docker exec` invocation. TTY allocates a
+// pty (kubectl exec -t style); Interactive keeps stdin open
+// (kubectl exec -i). Working/User let the caller override the
+// runtime defaults baked into the container's image. WorkingDir
+// defaults to whatever the image declared.
+type ExecOptions struct {
+	TTY         bool
+	Interactive bool
+	WorkingDir  string
+	User        string
+	Env         []string
+
+	// Stdin/Stdout/Stderr wire the streams to the docker exec child.
+	// Leave any nil to inherit the parent's; for TTY mode the caller
+	// typically points all three at the local terminal.
+	//
+	// In TTY mode, stderr is merged into stdout by the pty (the
+	// kernel's tty discipline doesn't keep them separate). The
+	// Stderr field is ignored; we route everything to Stdout —
+	// matches how `docker exec -t` and kubectl-exec behave.
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+
+	// Cols/Rows describe the operator's terminal size for PTY
+	// allocation. Only consulted when TTY=true. Both zero → use the
+	// pty's default (24x80 from the kernel). Sticky for the duration
+	// of the session — mid-session resizes (SIGWINCH) need a wire
+	// protocol that doesn't exist yet, so the operator's window
+	// dimensions at exec start are what the remote shell sees.
+	Cols uint16
+	Rows uint16
+}
+
+// ExecContainer runs a command inside an already-running container —
+// kubectl exec semantics. Returns the child's exit code via the
+// usual exec.ExitError conversion: 0 on clean exit, non-zero when the
+// command exits with a status, error when docker itself fails to
+// start (container missing, daemon down).
+//
+// The function blocks until the command exits. Streaming back to the
+// caller happens through opts.Stdout/Stderr — the API handler points
+// these at hijacked HTTP connections so the CLI sees output in real
+// time. With TTY enabled, a single multiplexed stream is used and
+// stderr is unset; without TTY, stdout and stderr are separate so
+// CLI consumers can keep them apart.
+func ExecContainer(name string, command []string, opts ExecOptions) (int, error) {
+	if name == "" {
+		return 0, fmt.Errorf("exec: container name is required")
+	}
+
+	if len(command) == 0 {
+		return 0, fmt.Errorf("exec: command is required")
+	}
+
+	args := []string{"exec"}
+
+	if opts.Interactive {
+		args = append(args, "-i")
+	}
+
+	if opts.TTY {
+		args = append(args, "-t")
+	}
+
+	if opts.WorkingDir != "" {
+		args = append(args, "-w", opts.WorkingDir)
+	}
+
+	if opts.User != "" {
+		args = append(args, "-u", opts.User)
+	}
+
+	for _, kv := range opts.Env {
+		args = append(args, "-e", kv)
+	}
+
+	args = append(args, name)
+	args = append(args, command...)
+
+	cmd := exec.Command("docker", args...)
+
+	if opts.TTY {
+		return execContainerTTY(cmd, name, opts)
+	}
+
+	return execContainerPipe(cmd, name, opts)
+}
+
+// execContainerPipe is the non-TTY path: stdout/stderr stay separate,
+// stdin is wired through a pipe we own (StdinPipe) so cmd.Wait
+// doesn't deadlock on a never-EOFing opts.Stdin (typically the
+// hijacked HTTP conn). See ExecContainer for the full rationale.
+func execContainerPipe(cmd *exec.Cmd, name string, opts ExecOptions) (int, error) {
+	if opts.Stdout != nil {
+		cmd.Stdout = opts.Stdout
+	}
+
+	if opts.Stderr != nil {
+		cmd.Stderr = opts.Stderr
+	}
+
+	var stdinWriter io.WriteCloser
+
+	if opts.Stdin != nil {
+		var err error
+
+		stdinWriter, err = cmd.StdinPipe()
+		if err != nil {
+			return 1, fmt.Errorf("stdin pipe: %w", err)
+		}
+	}
+
+	if err := cmd.Start(); err != nil {
+		if stdinWriter != nil {
+			_ = stdinWriter.Close()
+		}
+
+		return 1, fmt.Errorf("docker exec %s: %w", name, err)
+	}
+
+	if stdinWriter != nil {
+		// Fire-and-forget. The goroutine exits when EITHER:
+		//   - opts.Stdin returns EOF/error (operator typed Ctrl-D,
+		//     or the upstream conn was closed by the API handler);
+		//   - stdinWriter.Write fails because the docker exec
+		//     process closed its stdin pipe on exit.
+		//
+		// Either way, no shared state with cmd.Wait below.
+		go func() {
+			_, _ = io.Copy(stdinWriter, opts.Stdin)
+			_ = stdinWriter.Close()
+		}()
+	}
+
+	err := cmd.Wait()
+
+	if stdinWriter != nil {
+		_ = stdinWriter.Close()
+	}
+
+	if err == nil {
+		return 0, nil
+	}
+
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode(), nil
+	}
+
+	return 1, fmt.Errorf("docker exec %s: %w", name, err)
+}
+
+// execContainerTTY is the PTY-mode path: docker exec is launched
+// with -it, and we allocate a pty pair so its stdin/stdout/stderr
+// are all genuine ttys. The master end of the pty becomes the
+// bidirectional channel between the operator's terminal (over the
+// hijacked HTTP conn) and the remote shell.
+//
+// Two goroutines bridge bytes:
+//
+//	conn → ptmx → docker stdin → shell stdin    (operator's keypresses)
+//	shell stdout → docker stdout → ptmx → conn  (program output)
+//
+// Stderr is merged into stdout by the kernel pty (tty discipline
+// doesn't multiplex), so opts.Stderr is ignored. Same shape kubectl
+// exec -t produces.
+//
+// Window size: when opts.Cols/Rows are non-zero, we set the pty
+// dimensions before any output is written so the shell starts up
+// at the operator's terminal size. Mid-session resize (SIGWINCH)
+// needs a wire protocol that doesn't exist yet — the dimensions
+// at exec start are sticky for the session.
+func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error) {
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return 1, fmt.Errorf("pty start %s: %w", name, err)
+	}
+
+	defer func() { _ = ptmx.Close() }()
+
+	if opts.Cols > 0 || opts.Rows > 0 {
+		_ = pty.Setsize(ptmx, &pty.Winsize{
+			Rows: opts.Rows,
+			Cols: opts.Cols,
+		})
+	}
+
+	// pty → conn (output). Exits when ptmx returns EOF (the slave
+	// end was closed by the kernel after the child exited).
+	if opts.Stdout != nil {
+		go func() {
+			_, _ = io.Copy(opts.Stdout, ptmx)
+		}()
+	}
+
+	// conn → pty (input). Same lifecycle gotcha as the non-TTY
+	// path: opts.Stdin (hijacked HTTP conn) only EOFs when the
+	// upstream handler closes the conn. The goroutine parks on
+	// conn.Read; cmd.Wait doesn't see this goroutine because it's
+	// ours, not Go's internal stdin-feeder. Once the handler's
+	// deferred conn.Close runs, the goroutine wakes up and exits.
+	if opts.Stdin != nil {
+		go func() {
+			_, _ = io.Copy(ptmx, opts.Stdin)
+		}()
+	}
+
+	err = cmd.Wait()
+	if err == nil {
+		return 0, nil
+	}
+
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode(), nil
+	}
+
+	return 1, fmt.Errorf("docker exec %s: %w", name, err)
 }
 
 // LogsStream spawns `docker logs [-f] [--tail N] <name>` and returns

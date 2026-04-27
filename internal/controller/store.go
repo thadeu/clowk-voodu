@@ -41,6 +41,31 @@ type Store interface {
 	PutStatus(ctx context.Context, kind Kind, name string, data []byte) error
 	GetStatus(ctx context.Context, kind Kind, name string) ([]byte, error)
 	DeleteStatus(ctx context.Context, kind Kind, name string) error
+
+	// Config I/O. scope is required; name="" addresses scope-level
+	// config (shared across resources in scope). Set replaces every
+	// supplied key at once and removes any key in the bucket that's
+	// not present in the input — pass an empty map to wipe the bucket.
+	SetConfig(ctx context.Context, scope, name string, vars map[string]string) error
+
+	// PatchConfig merges keys without removing others — used by
+	// `vd config set` which only sets the listed pairs. Empty value
+	// removes the key (idiomatic shell-style "unset").
+	PatchConfig(ctx context.Context, scope, name string, vars map[string]string) error
+
+	// GetConfig returns every key:value in the (scope, name) bucket.
+	// nil/empty when nothing is set.
+	GetConfig(ctx context.Context, scope, name string) (map[string]string, error)
+
+	// ResolveConfig returns the merged scope-level + app-level env
+	// for a resource. App-level keys override scope-level keys on
+	// conflict — same precedence apps already expect from /etc/
+	// environment vs ~/.profile.
+	ResolveConfig(ctx context.Context, scope, name string) (map[string]string, error)
+
+	// DeleteConfigKey removes a single key from a bucket. Returns
+	// (true, nil) when the key existed, (false, nil) when it didn't.
+	DeleteConfigKey(ctx context.Context, scope, name, key string) (bool, error)
 }
 
 // WatchEvent is a single change observed on /desired/*.
@@ -189,6 +214,113 @@ func (s *EtcdStore) DeleteStatus(ctx context.Context, kind Kind, name string) er
 	}
 
 	return nil
+}
+
+// SetConfig replaces every key in the (scope, name) bucket with the
+// supplied set. Keys present in etcd but not in `vars` are removed —
+// idempotent "make the bucket equal to this map" semantics.
+func (s *EtcdStore) SetConfig(ctx context.Context, scope, name string, vars map[string]string) error {
+	current, err := s.GetConfig(ctx, scope, name)
+	if err != nil {
+		return err
+	}
+
+	prefix := ConfigPrefix(scope, name)
+
+	// Delete keys not in the input.
+	for k := range current {
+		if _, keep := vars[k]; !keep {
+			if _, err := s.client.Delete(ctx, prefix+k); err != nil {
+				return fmt.Errorf("etcd delete config %s: %w", k, err)
+			}
+		}
+	}
+
+	// Upsert the rest.
+	for k, v := range vars {
+		if _, err := s.client.Put(ctx, prefix+k, v); err != nil {
+			return fmt.Errorf("etcd put config %s: %w", k, err)
+		}
+	}
+
+	return nil
+}
+
+// PatchConfig merges keys without removing others. Empty values
+// remove the key (matches shell `unset` ergonomics).
+func (s *EtcdStore) PatchConfig(ctx context.Context, scope, name string, vars map[string]string) error {
+	prefix := ConfigPrefix(scope, name)
+
+	for k, v := range vars {
+		if v == "" {
+			if _, err := s.client.Delete(ctx, prefix+k); err != nil {
+				return fmt.Errorf("etcd delete config %s: %w", k, err)
+			}
+
+			continue
+		}
+
+		if _, err := s.client.Put(ctx, prefix+k, v); err != nil {
+			return fmt.Errorf("etcd put config %s: %w", k, err)
+		}
+	}
+
+	return nil
+}
+
+// GetConfig returns every key:value in the (scope, name) bucket.
+func (s *EtcdStore) GetConfig(ctx context.Context, scope, name string) (map[string]string, error) {
+	prefix := ConfigPrefix(scope, name)
+
+	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("etcd get config: %w", err)
+	}
+
+	out := make(map[string]string, resp.Count)
+
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)[len(prefix):]
+		out[key] = string(kv.Value)
+	}
+
+	return out, nil
+}
+
+// ResolveConfig returns scope-level + app-level merged. App-level
+// wins on conflict.
+func (s *EtcdStore) ResolveConfig(ctx context.Context, scope, name string) (map[string]string, error) {
+	scopeLevel, err := s.GetConfig(ctx, scope, "")
+	if err != nil {
+		return nil, err
+	}
+
+	appLevel, err := s.GetConfig(ctx, scope, name)
+	if err != nil {
+		return nil, err
+	}
+
+	merged := make(map[string]string, len(scopeLevel)+len(appLevel))
+
+	for k, v := range scopeLevel {
+		merged[k] = v
+	}
+
+	for k, v := range appLevel {
+		merged[k] = v
+	}
+
+	return merged, nil
+}
+
+// DeleteConfigKey removes one key from a bucket.
+func (s *EtcdStore) DeleteConfigKey(ctx context.Context, scope, name, key string) (bool, error) {
+	resp, err := s.client.Delete(ctx, ConfigKey(scope, name, key))
+	if err != nil {
+		return false, fmt.Errorf("etcd delete config: %w", err)
+	}
+
+	return resp.Deleted > 0, nil
 }
 
 // Watch returns a channel of events on /desired/*. The channel is closed

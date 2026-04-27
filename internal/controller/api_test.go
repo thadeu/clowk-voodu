@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -410,7 +409,7 @@ func TestExecReturns404WhenPluginSystemDisabled(t *testing.T) {
 
 	body := `{"args":["postgres","create","main"]}`
 
-	resp, err := http.Post(ts.URL+"/exec", "application/json", strings.NewReader(body))
+	resp, err := http.Post(ts.URL+"/plugins/exec", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,23 +448,3 @@ func TestHealthReportsVersion(t *testing.T) {
 	}
 }
 
-func TestStatusReturnsDesiredAndActual(t *testing.T) {
-	api, store := newTestAPI(t)
-	ts := httptest.NewServer(api.Handler())
-	defer ts.Close()
-
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
-
-	resp, err := http.Get(ts.URL + "/status")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(resp.Body)
-
-	if !strings.Contains(buf.String(), "desired") || !strings.Contains(buf.String(), "actual") {
-		t.Errorf("status body missing keys: %s", buf.String())
-	}
-}

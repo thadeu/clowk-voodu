@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -111,8 +113,12 @@ func (s *Server) Start(ctx context.Context) error {
 		Pods:        DockerPodsLister{},
 		// DockerContainerManager satisfies LogStreamer via its Logs
 		// method — same instance the deployment/job/cronjob handlers
-		// already use, so /logs and the runners agree on docker access.
+		// already use, so /pods/{name}/logs and the runners agree on
+		// docker access.
 		Logs: DockerContainerManager{},
+
+		// Same instance — its Exec method satisfies the Execer seam.
+		Execer: DockerContainerManager{},
 	}
 
 	dbHandler := &DatabaseHandler{
@@ -197,6 +203,12 @@ func (s *Server) Start(ctx context.Context) error {
 			return !stringMapsEqual(before, after), nil
 		},
 	}
+
+	// Expose the cronjob runner to the API so `voodu run cronjob` has
+	// a target for /cronjobs/run. The scheduler still sees
+	// cronJobHandler directly for scheduled tick dispatches; this is
+	// purely the imperative "run now" path.
+	s.api.CronJobs = cronJobHandler
 
 	s.rec = &Reconciler{
 		Store:  store,
@@ -346,5 +358,29 @@ type loggingResponseWriter struct {
 func (l *loggingResponseWriter) WriteHeader(code int) {
 	l.status = code
 	l.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack forwards the http.Hijacker call to the wrapped writer when
+// the underlying connection supports it. /pods/{name}/exec relies on
+// hijack to take over the conn for bidirectional streaming; without
+// this method the embedded ResponseWriter would mask the Hijacker
+// interface and the exec path would 500 with "hijack not supported"
+// even though net/http natively supports it.
+func (l *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := l.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support Hijack")
+	}
+
+	return hijacker.Hijack()
+}
+
+// Flush forwards the http.Flusher call. Needed for /pods/{name}/logs
+// streaming so chunked transfer pushes lines to the client without
+// waiting for the page boundary. Same masking issue as Hijack above.
+func (l *loggingResponseWriter) Flush() {
+	if flusher, ok := l.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 

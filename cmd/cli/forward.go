@@ -57,7 +57,7 @@ func forwardToController(root *cobra.Command, args []string) error {
 	// we are not going to hand off to cobra's Execute path.
 	_ = root.PersistentFlags().Parse(filterFlags(args))
 
-	url := strings.TrimRight(controllerURL(root), "/") + "/exec"
+	url := strings.TrimRight(controllerURL(root), "/") + "/plugins/exec"
 
 	body, err := json.Marshal(forwardRequest{Args: args})
 	if err != nil {

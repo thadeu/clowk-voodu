@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,97 +12,234 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 
 	"go.voodu.clowk.in/internal/controller"
 )
 
-// newLogsCmd builds `voodu logs <kind> <ref>` — the read-side counterpart
-// to `voodu run job` and the recurring cronjob ticks. The CLI fans the
-// request out to GET /logs and copies the streamed body straight to
-// stdout so a `voodu logs -f` feels like `docker logs -f` underneath.
+// newLogsCmd builds `voodu logs <ref>` — the read-side counterpart
+// to `voodu run job` and the recurring cronjob ticks. The CLI fans
+// the request out to GET /pods/{name}/logs (one stream per matching
+// container) and copies the streamed bodies straight to stdout, with
+// per-line prefixes when more than one container is in the picture.
 //
-// Two-arg shape mirrors describe: <kind> and <ref>. <ref> is
-// `scope/name` or bare `name` (controller resolves the scope when
-// unambiguous). Kind is one of deployment / job / cronjob — exactly the
-// kinds that produce containers.
+// Single-arg shape mirrors `voodu get pd`: <ref> is one of
 //
-// Default behaviour picks the most recent run/replica. --run lets the
-// operator point at a specific replica id (visible in `voodu describe`
-// history or `voodu get pods`).
+//	<scope>             every container in this scope
+//	<scope>/<name>      all replicas of one resource
+//	<container_name>    a specific replica (e.g. clowk-lp-web.a3f9)
+//
+// Discriminator is the same as describe pod / get pd: slash → split,
+// dot → container name, bare → scope filter. The kind argument the
+// previous shape required is gone — `vd logs cronjob clowk-lp/foo`
+// becomes `vd logs clowk-lp/foo`, with the controller no longer
+// caring which kind produced the container.
 func newLogsCmd() *cobra.Command {
 	var (
-		runID  string
 		follow bool
 		tail   int
 	)
 
 	cmd := &cobra.Command{
-		Use:   "logs <kind> <ref>",
-		Short: "Stream container logs for a deployment, job, or cronjob run",
-		Long: `Stream stdout+stderr from a voodu-managed container.
+		Use:   "logs <ref>",
+		Short: "Stream container logs by ref (scope, scope/name, or container name)",
+		Long: `Stream stdout+stderr from voodu-managed containers.
 
-Kinds accepted: deployment, job, cronjob. <ref> is "<scope>/<name>" or
-bare "<name>" (the controller resolves the scope when unambiguous).
+<ref> accepts the same three shapes as 'voodu get pd':
 
-By default, the latest run / replica is selected — running containers
-are preferred, falling back to the most recent stopped one. Use --run
-to pin a specific replica id (those appear in 'voodu describe' history
-and 'voodu get pods').
+  <scope>             every container in this scope, across kinds
+  <scope>/<name>      all replicas of one resource (deployment / job /
+                      cronjob)
+  <container_name>    a specific replica, copied from 'voodu get pods'
 
-Job and cronjob run containers are kept around per their
-successful_history_limit / failed_history_limit (defaults: 3 / 1), so
-'voodu logs job <name>' replays the most recent execution without
-re-running it.
+When the ref matches more than one container, every line is prefixed
+with the container name in brackets so it stays visually distinguishable
+in the merged stream:
+
+  [clowk-lp-web.a3f9] starting on :3000
+  [clowk-lp-web.bb01] starting on :3000
+
+Use --tail to cap each stream's history and --follow / -f to keep
+them open. Job and cronjob run containers are kept around per their
+successful_history_limit / failed_history_limit so 'voodu logs
+clowk-lp/migrate' replays the most recent execution without re-running.
 
 Examples:
-  voodu logs job api/migrate                       latest run
-  voodu logs job api/migrate --run 7e2a            specific run
-  voodu logs cronjob crawler1 --tail 100           last 100 lines
-  voodu logs deployment web -f                     follow live`,
-		Args: cobra.ExactArgs(2),
+  voodu logs clowk-lp                              every pod in scope
+  voodu logs clowk-lp/web                          all replicas of web
+  voodu logs clowk-lp/web -f                       follow live
+  voodu logs clowk-lp/web --tail 100               last 100 lines each
+  voodu logs clowk-lp-web.a3f9                     one specific replica`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLogs(cmd, args[0], args[1], runID, follow, tail)
+			return runLogs(cmd, args[0], follow, tail)
 		},
 	}
 
-	cmd.Flags().StringVar(&runID, "run", "", "specific replica id (default: latest)")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "stream new lines as they arrive")
-	cmd.Flags().IntVar(&tail, "tail", 0, "limit output to the last N lines (0 = all)")
+	cmd.Flags().IntVarP(&tail, "tail", "t", 0, "limit output to the last N lines per container (0 = all)")
 
 	return cmd
 }
 
-func runLogs(cmd *cobra.Command, kindArg, ref, runID string, follow bool, tail int) error {
-	kindArg = strings.TrimSpace(strings.ToLower(kindArg))
+func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
+	ref = strings.TrimSpace(ref)
 
-	kind, err := controller.ParseKind(kindArg)
+	if ref == "" {
+		return fmt.Errorf("logs ref is empty")
+	}
+
+	containers, err := resolveLogsTargets(cmd, ref)
 	if err != nil {
-		return fmt.Errorf("kind %q: %w", kindArg, err)
+		return err
 	}
 
-	if !logsKindSupported(kind) {
-		return fmt.Errorf("kind %q does not produce containers (try deployment, job, or cronjob)", kind)
+	if len(containers) == 0 {
+		return fmt.Errorf("no containers match %q", ref)
 	}
 
-	scope, name := splitJobRef(ref)
+	// Single container: copy verbatim, no prefix. The header banner on
+	// stderr surfaces which container produced the stream so an operator
+	// who passed a scope/name and got a single hit can still confirm.
+	if len(containers) == 1 {
+		return streamOneLog(cmd.Context(), cmd, containers[0], follow, tail, os.Stdout, "" /* no prefix */)
+	}
 
-	if name == "" {
-		return fmt.Errorf("ref %q is empty", ref)
+	// Multi-container: fan out N goroutines, each writing to a shared
+	// stdout under a mutex (so per-line prefixes don't interleave) with
+	// the container name as a `[name] ` lead. Every stream gets its
+	// own context derived from the parent so a Ctrl-C stops all of them.
+	fmt.Fprintf(os.Stderr, "==> tailing %d container(s) for %q\n", len(containers), ref)
+
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+
+	errs := make(chan error, len(containers))
+
+	for _, name := range containers {
+		wg.Add(1)
+
+		go func(name string) {
+			defer wg.Done()
+
+			prefix := "[" + name + "] "
+			writer := &lockedPrefixWriter{w: os.Stdout, mu: &mu, prefix: prefix}
+
+			if err := streamOneLog(ctx, cmd, name, follow, tail, writer, prefix); err != nil {
+				errs <- fmt.Errorf("%s: %w", name, err)
+			}
+		}(name)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	// Collect non-cancellation errors. Cancellation (the parent ctx
+	// firing) is the normal Ctrl-C exit and should not be surfaced as
+	// a failure of the command.
+	var firstErr error
+	for e := range errs {
+		if firstErr == nil && !errors.Is(e, context.Canceled) {
+			firstErr = e
+		}
+	}
+
+	return firstErr
+}
+
+// resolveLogsTargets translates the ref into a list of docker container
+// names. Three shapes:
+//
+//   - has '.'  → already a container name, return as-is (1 element)
+//   - has '/'  → splitJobRef → /pods?scope=&name=
+//   - bare     → /pods?scope=
+//
+// Mirrors the dispatch in runDescribePod so users get one consistent
+// mental model across get pd / describe pod / logs.
+func resolveLogsTargets(cmd *cobra.Command, ref string) ([]string, error) {
+	if strings.Contains(ref, ".") && !strings.Contains(ref, "/") {
+		return []string{ref}, nil
 	}
 
 	q := url.Values{}
-	q.Set("kind", string(kind))
-	q.Set("name", name)
 
-	if scope != "" {
-		q.Set("scope", scope)
+	if strings.Contains(ref, "/") {
+		scope, name := splitJobRef(ref)
+		if name == "" {
+			return nil, fmt.Errorf("ref %q: name is empty", ref)
+		}
+
+		if scope != "" {
+			q.Set("scope", scope)
+		}
+
+		q.Set("name", name)
+	} else {
+		// Bare token → scope filter
+		q.Set("scope", ref)
 	}
 
-	if runID != "" {
-		q.Set("run", runID)
+	pods, err := fetchPodsList(cmd, q)
+	if err != nil {
+		return nil, err
 	}
+
+	out := make([]string, 0, len(pods))
+	for _, p := range pods {
+		out = append(out, p.Name)
+	}
+
+	return out, nil
+}
+
+// fetchPodsList GETs /pods with the given filter and returns the
+// matching Pod entries. Shared between logs and describe pod's
+// scope/name resolution paths so any wire-shape change ripples to
+// both at the same time.
+func fetchPodsList(cmd *cobra.Command, q url.Values) ([]controller.Pod, error) {
+	root := cmd.Root()
+
+	resp, err := controllerDo(root, http.MethodGet, "/pods", q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var env podsListResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode pods list: %w", err)
+	}
+
+	if env.Status == "error" {
+		return nil, fmt.Errorf("%s", env.Error)
+	}
+
+	return env.Data.Pods, nil
+}
+
+// streamOneLog opens GET /pods/{name}/logs and copies the body into
+// `out`. When prefix is non-empty, each line gets the prefix prepended;
+// when empty, the body is copied verbatim. The streaming is bounded
+// by the supplied context so multi-pod fan-out can cancel siblings on
+// the first failure / Ctrl-C.
+func streamOneLog(ctx context.Context, cmd *cobra.Command, name string, follow bool, tail int, out io.Writer, prefix string) error {
+	root := cmd.Root()
+
+	q := url.Values{}
 
 	if follow {
 		q.Set("follow", "true")
@@ -109,16 +249,14 @@ func runLogs(cmd *cobra.Command, kindArg, ref, runID string, follow bool, tail i
 		q.Set("tail", strconv.Itoa(tail))
 	}
 
-	root := cmd.Root()
-
-	// Logs are streamed for as long as the container runs (with -f) or
-	// until docker hits EOF (without). The shared controllerDo helper
-	// hard-codes a 30s client timeout; we issue the request directly so
-	// `voodu logs -f` can stay open for hours without tripping it.
 	base := strings.TrimRight(controllerURL(root), "/")
-	full := base + "/logs?" + q.Encode()
+	full := base + "/pods/" + url.PathEscape(name) + "/logs"
 
-	req, err := http.NewRequest(http.MethodGet, full, nil)
+	if encoded := q.Encode(); encoded != "" {
+		full += "?" + encoded
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
 	if err != nil {
 		return err
 	}
@@ -127,16 +265,12 @@ func runLogs(cmd *cobra.Command, kindArg, ref, runID string, follow bool, tail i
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("controller GET /logs: %w", err)
+		return fmt.Errorf("controller GET /pods/%s/logs: %w", name, err)
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		// Errors come back as JSON envelopes (resolution failures,
-		// streamer not configured). Decode-and-render so the operator
-		// sees the same message the controller logged. If the body
-		// isn't JSON, fall through to a raw dump.
 		raw, _ := io.ReadAll(resp.Body)
 
 		var env struct {
@@ -150,35 +284,65 @@ func runLogs(cmd *cobra.Command, kindArg, ref, runID string, follow bool, tail i
 		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
-	// X-Voodu-Container / X-Voodu-Run let the operator confirm which
-	// run is being tailed when --run is omitted (especially useful for
-	// cronjobs where the latest tick changes minute by minute).
-	if container := resp.Header.Get("X-Voodu-Container"); container != "" {
-		fmt.Fprintf(os.Stderr, "==> %s", container)
-
-		if run := resp.Header.Get("X-Voodu-Run"); run != "" {
-			fmt.Fprintf(os.Stderr, " (run %s)", run)
+	if prefix == "" {
+		_, err := io.Copy(out, resp.Body)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
 		}
 
-		fmt.Fprintln(os.Stderr)
+		return nil
 	}
 
-	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
-		return fmt.Errorf("stream logs: %w", err)
+	// Line-buffered copy so the prefix lands once per line, not once
+	// per read chunk. bufio.Scanner with default buf would truncate
+	// at 64 KiB lines — bump to 1 MiB which is generous enough for any
+	// reasonable container log line.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		if _, err := fmt.Fprintf(out, "%s\n", scanner.Text()); err != nil {
+			return err
+		}
+	}
+
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
 	}
 
 	return nil
 }
 
-// logsKindSupported is the per-kind allowlist for `voodu logs`. The
-// /logs endpoint will refuse anything else (database/ingress don't
-// produce voodu-managed run containers), but failing client-side gives
-// a friendlier error.
-func logsKindSupported(kind controller.Kind) bool {
-	switch kind {
-	case controller.KindDeployment, controller.KindJob, controller.KindCronJob:
-		return true
+// lockedPrefixWriter serializes Write calls so multi-goroutine
+// streaming can write to the same os.Stdout without interleaving
+// mid-line. The prefix is added to every Write — assumes the caller
+// already buffered to line granularity (streamOneLog uses Scanner's
+// Text which strips the trailing newline; we re-add it on Fprintf).
+type lockedPrefixWriter struct {
+	w      io.Writer
+	mu     *sync.Mutex
+	prefix string
+}
+
+func (l *lockedPrefixWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Compose prefix + payload in one Write so no other writer can
+	// sneak between them under the mutex (the mutex protects against
+	// other goroutines, but a partial Write underneath could still
+	// fragment if the underlying writer isn't atomic).
+	buf := make([]byte, 0, len(l.prefix)+len(p))
+	buf = append(buf, l.prefix...)
+	buf = append(buf, p...)
+
+	n, err := l.w.Write(buf)
+
+	// Report bytes consumed from the caller's payload, not including
+	// the prefix bytes we added.
+	if n > len(l.prefix) {
+		return n - len(l.prefix), err
 	}
 
-	return false
+	return 0, err
 }

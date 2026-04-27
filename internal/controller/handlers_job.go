@@ -245,7 +245,7 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		return JobRun{}, fmt.Errorf("job runner has no container manager configured")
 	}
 
-	envFile, err := h.linkEnv(app, spec.Env)
+	envFile, err := h.linkEnv(ctx, scope, name, app, spec.Env)
 	if err != nil {
 		return JobRun{}, err
 	}
@@ -397,10 +397,31 @@ func (h *JobHandler) gcRuns(ctx context.Context, scope, name string) error {
 	return gcRunContainers(h.Containers, string(KindJob), scope, name, keep)
 }
 
-// linkEnv writes the job's static Env block to its app env file when a
-// WriteEnv hook is configured. Returns the env file path the container
-// should mount; empty when no hook is wired (tests, env-less jobs).
-func (h *JobHandler) linkEnv(app string, env map[string]string) (string, error) {
+// linkEnv merges controller-managed config (etcd /config bucket)
+// with the job's static Env block and writes the result to the
+// app's env file. Returns the env file path the container should
+// mount; empty when no hook is wired (tests, env-less jobs).
+//
+// Precedence: scope config → app config → manifest spec.Env (last
+// wins). Mirrors the deployment handler — manifest is the
+// declarative source of truth, config fills in everything the
+// manifest deliberately left out (per-environment values, secrets).
+func (h *JobHandler) linkEnv(ctx context.Context, scope, name, app string, env map[string]string) (string, error) {
+	merged := map[string]string{}
+
+	if h.Store != nil {
+		ctrlConfig, err := h.Store.ResolveConfig(ctx, scope, name)
+		if err == nil {
+			for k, v := range ctrlConfig {
+				merged[k] = v
+			}
+		}
+	}
+
+	for k, v := range env {
+		merged[k] = v
+	}
+
 	if h.WriteEnv == nil {
 		if h.EnvFilePath == nil {
 			return "", nil
@@ -409,7 +430,7 @@ func (h *JobHandler) linkEnv(app string, env map[string]string) (string, error) 
 		return h.EnvFilePath(app), nil
 	}
 
-	pairs := envMapToPairs(env)
+	pairs := envMapToPairs(merged)
 
 	if _, err := h.WriteEnv(app, pairs); err != nil {
 		return "", fmt.Errorf("write job env: %w", err)

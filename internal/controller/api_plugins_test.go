@@ -73,7 +73,7 @@ func TestPluginLifecycleEndToEnd(t *testing.T) {
 	}
 
 	// exec plain text
-	resp, err = http.Post(ts.URL+"/exec", "application/json",
+	resp, err = http.Post(ts.URL+"/plugins/exec", "application/json",
 		strings.NewReader(`{"args":["hello","say","world"]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestPluginLifecycleEndToEnd(t *testing.T) {
 	}
 
 	// exec JSON envelope
-	resp, err = http.Post(ts.URL+"/exec", "application/json",
+	resp, err = http.Post(ts.URL+"/plugins/exec", "application/json",
 		strings.NewReader(`{"args":["hello","json","earth"]}`))
 	if err != nil {
 		t.Fatal(err)
