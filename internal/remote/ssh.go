@@ -74,7 +74,14 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 		remoteBin = "voodu"
 	}
 
-	sshArgs := []string{}
+	// LogLevel=QUIET silences the OpenSSH client's own informational
+	// chatter — most visibly the "Connection to <host> closed." banner
+	// it prints to stderr after a -tt session ends. That banner has
+	// nothing to do with voodu's output but visually pollutes every
+	// `vd logs`, `vd describe`, `vd get pods` invocation. QUIET still
+	// lets real errors (auth failures, host key changes, network drops)
+	// reach the user — it only suppresses the INFO/banner chatter.
+	sshArgs := []string{"-o", "LogLevel=QUIET"}
 
 	if opts.Identity != "" {
 		sshArgs = append(sshArgs, "-i", opts.Identity)

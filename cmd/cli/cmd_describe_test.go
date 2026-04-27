@@ -673,3 +673,82 @@ func TestDescribePodSurfacesEnvelopeError(t *testing.T) {
 		t.Errorf("error should surface server message, got %q", err.Error())
 	}
 }
+
+// TestRenderPodDetailHidesEnvByDefault is the security regression
+// guard: NEITHER values NOR names appear in default text output.
+// Names alone leak intent — STRIPE_SECRET_KEY, AWS_ACCESS_KEY_ID,
+// SENTRY_DSN tell an attacker watching the screen what to look for.
+// Only the count is exposed so the operator knows env exists.
+func TestRenderPodDetailHidesEnvByDefault(t *testing.T) {
+	pod := &controller.PodDetail{
+		Pod: controller.Pod{
+			Name: "test-web.a3f9", Kind: "deployment", Scope: "test",
+			ResourceName: "web", ReplicaID: "a3f9", Image: "vd-web:latest",
+		},
+		Env: map[string]string{
+			"NODE_ENV":          "production",
+			"DATABASE_URL":      "postgres://app:s3cret@db/app",
+			"STRIPE_SECRET_KEY": "sk-live-AAAA-BBBB-CCCC",
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := renderPodDetail(&buf, pod, false); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+
+	// Neither names nor values may appear in the default output.
+	for _, leak := range []string{
+		// names
+		"NODE_ENV", "DATABASE_URL", "STRIPE_SECRET_KEY",
+		// values
+		"production", "s3cret", "sk-live-AAAA",
+	} {
+		if strings.Contains(out, leak) {
+			t.Errorf("%q leaked in default output:\n%s", leak, out)
+		}
+	}
+
+	// Count is exposed so the operator can tell env vars are set.
+	if !strings.Contains(out, "3 var(s) hidden") {
+		t.Errorf("output should expose count, got:\n%s", out)
+	}
+
+	// Hint so the operator knows they can opt in.
+	if !strings.Contains(out, "--show-env") {
+		t.Errorf("output should mention --show-env hint:\n%s", out)
+	}
+}
+
+// TestRenderPodDetailShowsEnvWhenFlagged confirms --show-env actually
+// reveals values — without this the flag could silently no-op.
+func TestRenderPodDetailShowsEnvWhenFlagged(t *testing.T) {
+	pod := &controller.PodDetail{
+		Pod: controller.Pod{Name: "test-web.a3f9"},
+		Env: map[string]string{
+			"NODE_ENV": "production",
+			"PORT":     "3000",
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := renderPodDetail(&buf, pod, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+
+	for _, want := range []string{"NODE_ENV=production", "PORT=3000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in --show-env output:\n%s", want, out)
+		}
+	}
+
+	// The hint disappears once values are already shown — would just
+	// be noise.
+	if strings.Contains(out, "--show-env") {
+		t.Errorf("--show-env hint should not appear when already revealed:\n%s", out)
+	}
+}

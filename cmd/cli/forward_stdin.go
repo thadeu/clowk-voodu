@@ -37,10 +37,16 @@ type buildModeDep struct {
 // build-mode deployments whose source must reach the server before the
 // controller reconciles (empty when every deployment in the apply is
 // image-mode).
+//
+// manifests is the parsed list of every -f input — handed back so
+// client-side orchestrators (apply, delete) can render plans without
+// re-decoding the JSON body. Populated whenever rewriteForStdinStream
+// actually parsed files; nil for the as-is path (stdin pipe, no -f).
 type streamResult struct {
 	args             []string
 	stdin            io.Reader
 	buildModeDeploys []buildModeDep
+	manifests        []controller.Manifest
 }
 
 // rewriteForStdinStream inspects argv for a manifest-consuming command;
@@ -100,8 +106,9 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 	rest = append(rest, "-f", "-", "--format", "json")
 
 	result := streamResult{
-		args:  rest,
-		stdin: bytes.NewReader(body),
+		args:      rest,
+		stdin:     bytes.NewReader(body),
+		manifests: mans,
 	}
 
 	if cmdName == "apply" {

@@ -97,16 +97,20 @@ func TestForwardInvokesSSH(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected host + command, got %v", lines)
+
+	// argv: [-o LogLevel=QUIET <host> <remote-cmd>] — the host and
+	// remote command are always the last two entries; LogLevel and any
+	// future ssh-side flags are prepended.
+	if len(lines) < 2 {
+		t.Fatalf("expected at least host + command, got %v", lines)
 	}
 
-	if lines[0] != "ubuntu@example.com" {
-		t.Errorf("host arg: %q", lines[0])
+	if host := lines[len(lines)-2]; host != "ubuntu@example.com" {
+		t.Errorf("host arg: %q", host)
 	}
 
-	if lines[1] != "voodu config set K=V -a api" {
-		t.Errorf("remote cmd: %q", lines[1])
+	if remoteCmd := lines[len(lines)-1]; remoteCmd != "voodu config set K=V -a api" {
+		t.Errorf("remote cmd: %q", remoteCmd)
 	}
 }
 
@@ -260,6 +264,46 @@ func TestForwardPassesIdentityAndTTY(t *testing.T) {
 	joined := strings.Join(lines, " ")
 
 	for _, want := range []string{"-i", "/tmp/key.pem", "-tt", "u@h", "voodu logs -f"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in argv: %v", want, lines)
+		}
+	}
+}
+
+// TestForwardSetsLogLevelQuiet locks in the OpenSSH -o LogLevel=QUIET
+// flag we use to suppress the client's "Connection to <host> closed."
+// banner. Without this every interactive forward (logs, describe, get
+// pods) would tail an extra noise line that has nothing to do with
+// voodu's output.
+func TestForwardSetsLogLevelQuiet(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "args.txt")
+
+	stub := filepath.Join(tmp, "ssh-stub")
+
+	script := "#!/bin/bash\nprintf '%s\\n' \"$@\" > " + out + "\n"
+	if err := os.WriteFile(stub, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	info := &Info{Host: "u@h"}
+
+	force := false
+
+	_, err := Forward(info, []string{"version"}, ForwardOptions{
+		SSHBin:   stub,
+		ForceTTY: &force,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(out)
+
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	joined := strings.Join(lines, " ")
+
+	for _, want := range []string{"-o", "LogLevel=QUIET"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing %q in argv: %v", want, lines)
 		}

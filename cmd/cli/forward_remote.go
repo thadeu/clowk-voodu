@@ -94,6 +94,27 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return code, true
 	}
 
+	// `voodu delete` is destructive — render the plan locally and
+	// prompt y/N on the user's actual terminal before any SSH. The
+	// orchestrator injects -y into the forwarded argv on approval so
+	// the server's runDelete doesn't try to prompt over a stdin that
+	// is already carrying the manifest stream.
+	if isDeleteCommand(stream.args) {
+		flags, cleanedArgs := extractDeleteClientFlags(stream.args)
+		stream.args = cleanedArgs
+
+		code, err := runDeleteForwarded(info, identity, stream, flags)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+
+			if code == 0 {
+				code = 1
+			}
+		}
+
+		return code, true
+	}
+
 	// Build-mode deployments need their source on the server before
 	// the controller can reconcile. We stream a gzipped tar per
 	// deployment into `voodu receive-pack <scope>/<name>` over SSH —

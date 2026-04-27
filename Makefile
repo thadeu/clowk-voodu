@@ -51,7 +51,21 @@ build-linux-amd64: ## Cross-compile both binaries for linux/amd64 into bin/linux
 build-linux: build-linux-arm64 build-linux-amd64 ## Cross-compile both binaries for linux (arm64 + amd64)
 
 install: build-cli ## Install voodu to /usr/local/bin (with vd symlink)
-	sudo cp bin/$(BINARY_CLI) /usr/local/bin/
+	# `install` does unlink + create, giving the destination a fresh
+	# inode every time. macOS AMFI (Apple Mobile File Integrity) caches
+	# code-signature metadata per inode on arm64 — a plain `cp` over an
+	# existing target keeps the inode but rewrites the bytes, leaving
+	# the cached signature invalid → SIGKILL on next exec, no stderr.
+	# Using `install` (or mv) sidesteps that entire class of bug.
+	sudo install -m 0755 bin/$(BINARY_CLI) /usr/local/bin/$(BINARY_CLI)
+	# Belt-and-suspenders: re-sign ad-hoc after copy. The Go linker
+	# auto-signs darwin/arm64 binaries since 1.16, but build flags or
+	# any future post-link tooling that mutates the Mach-O would break
+	# the signature. `codesign --force --sign -` is idempotent and
+	# only takes a few ms — cheap insurance against the next regression.
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		sudo codesign --force --sign - /usr/local/bin/$(BINARY_CLI); \
+	fi
 	sudo ln -sf /usr/local/bin/$(BINARY_CLI) /usr/local/bin/vd
 
 check: fmt vet lint test ## Run all checks

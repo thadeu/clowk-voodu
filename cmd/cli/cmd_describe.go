@@ -24,6 +24,8 @@ import (
 // on with this thing?" — manifest, status blob, matching pods, run
 // history (when applicable), all in one screen.
 func newDescribeCmd() *cobra.Command {
+	var showEnv bool
+
 	cmd := &cobra.Command{
 		Use:     "describe <kind> <ref>",
 		Aliases: []string{"desc"},
@@ -43,13 +45,17 @@ appears in 'voodu get pods' (e.g. test-web.a3f9) — pods don't share
 the kind/scope/name shape because more than one replica can match
 the same identity.
 
+For 'describe pod', env vars are listed by name only (values hidden).
+Pass --show-env to reveal values — useful when actively debugging,
+risky on a screen-share or in a recorded terminal session.
+
 Examples:
   voodu describe deployment clowk/web
   voodu describe job api/migrate
   voodu describe cronjob ops/purge
   voodu describe database main
   voodu describe pod test-web.a3f9
-  voodu desc pd test-web.a3f9
+  voodu desc pd test-web.a3f9 --show-env
 
 Output formats:
   -o text  (default) human-friendly summary, no raw spec dump
@@ -58,11 +64,22 @@ Output formats:
   -o yaml  raw envelope as YAML (machine-readable)`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDescribe(cmd, args[0], args[1])
+			return runDescribe(cmd, args[0], args[1], describeOptions{showEnv: showEnv})
 		},
 	}
 
+	cmd.Flags().BoolVar(&showEnv, "show-env", false,
+		"reveal env var values for 'describe pod' (default: list names only)")
+
 	return cmd
+}
+
+// describeOptions threads command-level flags into the runners
+// without polluting every helper's signature with bool soup. Today
+// only describe pod cares about showEnv; future flags (e.g.
+// --no-history for jobs) can join here.
+type describeOptions struct {
+	showEnv bool
 }
 
 // describeOutputMode reads --output and maps it onto the four modes
@@ -97,13 +114,13 @@ type describeResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-func runDescribe(cmd *cobra.Command, kindStr, ref string) error {
+func runDescribe(cmd *cobra.Command, kindStr, ref string, opts describeOptions) error {
 	// "pod" / "pd" is the runtime-only kind. It doesn't go through the
 	// Kind enum (no manifest, no scope/name shape) — its <ref> is the
 	// container name and it has its own dedicated endpoint.
 	switch strings.ToLower(strings.TrimSpace(kindStr)) {
 	case "pod", "pd":
-		return runDescribePod(cmd, ref)
+		return runDescribePod(cmd, ref, opts)
 	}
 
 	kind, err := controller.ParseKind(kindStr)
@@ -621,7 +638,12 @@ type describePodResponse struct {
 // Output formats follow the same -o text|json|yaml|spec contract as
 // the other describe variants. "spec" falls through to text since
 // there's no manifest spec to dump for a runtime container.
-func runDescribePod(cmd *cobra.Command, ref string) error {
+//
+// opts.showEnv toggles env-var value visibility in text mode. JSON
+// and YAML modes pass the server response through verbatim — anyone
+// asking for machine-readable output is presumed to know they're
+// getting the full dump.
+func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error {
 	ref = strings.TrimSpace(ref)
 
 	if ref == "" {
@@ -679,7 +701,7 @@ func runDescribePod(cmd *cobra.Command, ref string) error {
 
 	// "spec" falls through to text — runtime containers have no
 	// manifest spec to dump. The text view is already complete.
-	return renderPodDetail(os.Stdout, env.Data.Pod)
+	return renderPodDetail(os.Stdout, env.Data.Pod, opts.showEnv)
 }
 
 // renderPodDetail prints the runtime view of one container as
@@ -691,7 +713,14 @@ func runDescribePod(cmd *cobra.Command, ref string) error {
 // first": identity → state → image → command → networks → ports →
 // mounts → env. Env is last because it's typically the longest
 // section and pushes everything else off-screen if printed earlier.
-func renderPodDetail(w io.Writer, p *controller.PodDetail) error {
+//
+// showEnv toggles env-var value visibility. Default false because
+// env vars routinely carry secrets (DATABASE_URL with a password,
+// API keys, JWT secrets) and a screen-share / recorded session is
+// the worst place to discover that. Operators who need the values
+// pass --show-env explicitly; everyone else gets a name-only listing
+// they can scan for "is FOO_BAR set?" without leaking the value.
+func renderPodDetail(w io.Writer, p *controller.PodDetail, showEnv bool) error {
 	// Header: container name. When voodu identity labels are present
 	// we prefix with kind/scope/name so the operator knows which
 	// declared resource this replica belongs to.
@@ -849,12 +878,16 @@ func renderPodDetail(w io.Writer, p *controller.PodDetail) error {
 		_ = tw.Flush()
 	}
 
-	// Env last, sorted by key for deterministic output. Values are
-	// printed verbatim — no truncation, no redaction. The operator
-	// asked for the full picture; truncating would just send them
-	// looking for a flag to turn truncation off.
+	// Env last. Both names and values are hidden by default — even key
+	// names leak intent (STRIPE_SECRET_KEY, AWS_ACCESS_KEY_ID, etc. tell
+	// an attacker watching a screen-share what to look for next). Only
+	// the count is surfaced so the operator knows env vars exist; the
+	// --show-env opt-in reveals the full list when actively debugging.
 	if len(p.Env) > 0 {
-		fmt.Fprintf(w, "\nenv (%d):\n", len(p.Env))
+		if !showEnv {
+			fmt.Fprintf(w, "\nenv: %d var(s) hidden (pass --show-env to reveal)\n", len(p.Env))
+			return nil
+		}
 
 		keys := make([]string, 0, len(p.Env))
 		for k := range p.Env {
@@ -862,6 +895,8 @@ func renderPodDetail(w io.Writer, p *controller.PodDetail) error {
 		}
 
 		sort.Strings(keys)
+
+		fmt.Fprintf(w, "\nenv (%d):\n", len(p.Env))
 
 		for _, k := range keys {
 			fmt.Fprintf(w, "  %s=%s\n", k, p.Env[k])

@@ -21,6 +21,7 @@ is honored for scripting.`,
 	}
 
 	cmd.AddCommand(newGetPodsCmd())
+	cmd.AddCommand(newGetPodCmd())
 
 	return cmd
 }

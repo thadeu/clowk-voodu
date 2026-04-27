@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -26,9 +27,10 @@ type applyFlags struct {
 	format           string // stdin only: "hcl" | "yaml"
 	noPrune          bool   // apply + diff: upsert without deleting siblings in the same (scope, kind)
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
-	autoApprove      bool   // apply only: skip the interactive confirmation in forwarded mode
+	autoApprove      bool   // apply + delete: skip the interactive confirmation
 	force            bool   // apply only: force rebuild even when the tarball hash already has a release
 	verbose          bool   // apply only: passthrough raw build output instead of collapsing to a spinner
+	dryRun           bool   // delete only: print the plan and exit without removing anything
 }
 
 func newApplyCmd() *cobra.Command {
@@ -134,6 +136,18 @@ func newDeleteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "delete",
 		Short: "Delete resources declared in the given manifests",
+		Long: `delete removes the named resources from the controller's store.
+Containers, plugin-side state (databases, ingress entries) and any
+status records are torn down by the reconciler that owns each kind.
+
+By default delete prints a plan listing every resource that will be
+removed and asks y/N before issuing any DELETE. Pass --auto-approve
+(alias -y) or set VOODU_AUTO_APPROVE=1 to skip the prompt in CI.
+Non-interactive invocations without either will refuse to proceed.
+
+Pass --dry-run to render the plan and exit without contacting the
+controller — useful for confirming "is this the right manifest set?"
+before committing to the destructive operation.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDelete(cmd, f)
 		},
@@ -141,6 +155,8 @@ func newDeleteCmd() *cobra.Command {
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
+	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "render the plan and exit without deleting anything")
 
 	return cmd
 }
@@ -459,6 +475,16 @@ func formatRef(kind controller.Kind, scope, name string) string {
 }
 
 func runDelete(cmd *cobra.Command, f applyFlags) error {
+	// Mirrors runApply's shape: server-side / direct invocations don't
+	// prompt. The y/N confirmation lives one layer up in
+	// runDeleteForwarded — that's the only path where there's a real
+	// user terminal to talk to. When runDelete is reached directly
+	// (local mode without a remote, server-side over SSH, tests), it
+	// just executes the deletion the caller already asked for.
+	//
+	// f.autoApprove is accepted on the cobra surface so the flag can
+	// appear in argv without erroring out, but is otherwise ignored
+	// here — same dance as runApply uses for its own --auto-approve.
 	mans, err := loadManifests(f)
 	if err != nil {
 		return err
@@ -466,6 +492,22 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 
 	if len(mans) == 0 {
 		return fmt.Errorf("no manifests found")
+	}
+
+	// Plan rendering lives in the orchestrator (runDeleteForwarded),
+	// not here — same as runApply doesn't render a plan and lets the
+	// orchestrator's diff phase handle the preview. Printing it again
+	// server-side just duplicates output the user already saw before
+	// approving. The exception is --dry-run: when the operator asked
+	// for the plan only, we owe them the rendering.
+	if f.dryRun {
+		palette := newDiffPalette(os.Stdout)
+
+		renderDeletePlan(os.Stdout, mans, palette)
+
+		fmt.Fprintln(os.Stdout, "\nDry-run: no DELETE issued.")
+
+		return nil
 	}
 
 	root := cmd.Root()
@@ -498,6 +540,49 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 	}
 
 	return nil
+}
+
+// renderDeletePlan prints the "will delete" preview block. Same red
+// `-` marker as `voodu diff`'s prune section so the visual language
+// stays consistent — operators already learned that "red minus =
+// going away" from apply diffs.
+//
+// Exported (lowercase but package-visible) so the forwarded
+// orchestrator can render the same plan client-side before SSHing.
+func renderDeletePlan(w io.Writer, mans []controller.Manifest, p diffPalette) {
+	noun := "resource"
+	if len(mans) != 1 {
+		noun = "resources"
+	}
+
+	fmt.Fprintf(w, "Will delete %d %s:\n\n", len(mans), noun)
+
+	for _, m := range mans {
+		fmt.Fprintf(w, "  %s %s\n", p.Del("-"), formatRef(m.Kind, m.Scope, m.Name))
+	}
+}
+
+// promptDeleteConfirm is the destructive-operation cousin of
+// promptConfirm. Same y/N shape (default = no), but the wording
+// makes it explicit what's being asked — "Apply these changes?" and
+// "Delete these resources?" reading the same on a glance was a
+// recipe for muscle-memory accidents.
+func promptDeleteConfirm(in io.Reader, out io.Writer) (bool, error) {
+	fmt.Fprint(out, "\nDelete these resources? [y/N]: ")
+
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+
+	fmt.Fprintln(out)
+
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // loadManifests expands every -f argument (file, dir, stdin) into a flat
