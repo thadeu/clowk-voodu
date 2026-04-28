@@ -558,7 +558,7 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 	if len(live) > 0 {
 		fmt.Fprintf(output, "-----> Release %s: rolling restart of %d replica(s)\n", releaseID, len(live))
 
-		if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash); err != nil {
+		if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, releaseID); err != nil {
 			record.Status = ReleaseStatusFailed
 			record.Error = fmt.Sprintf("rolling restart: %v", err)
 			record.EndedAt = time.Now().UTC()
@@ -687,7 +687,7 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 	// The release-phase commands (pre/main/post) are NOT re-run
 	// because the target's hash already has a Succeeded record (set
 	// at the original release time). Only the rolling restart fires.
-	if err := h.rolloutRollback(ctx, scope, name, app, &rollback, target); err != nil {
+	if err := h.rolloutRollback(ctx, scope, name, app, &rollback, target, newID); err != nil {
 		h.logf("deployment/%s rollback rolling restart failed: %v", app, err)
 		return newID, fmt.Errorf("rollback rolling restart: %w", err)
 	}
@@ -697,16 +697,36 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 	return newID, nil
 }
 
-// rolloutRollback decodes the just-applied snapshot, normalises its
-// shape (image fallback, voodu0 auto-join, etc.), and rolling-replaces
-// every live replica so they pick up the rolled-back image / env /
-// command. Persists the new spec hash in deployment status afterward
-// so the next reconcile pass sees no drift and doesn't redo the work.
+// rolloutRollback brings the running fleet to whatever the snapshot
+// declared — image, env, command, AND replica count. Three phases:
 //
-// No-op when there are no live replicas — the manifest is already in
-// the store, so the next ensureReplicaCount pass spawns fresh ones
-// against the rolled-back spec automatically.
-func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, app string, rollback *Manifest, target *ReleaseRecord) error {
+//  1. Scale down: if the snapshot wants fewer replicas than are
+//     currently live, prune the extras first. (`replicas=1` rolled
+//     back from `replicas=3` would otherwise leave the operator
+//     with three rolled-back replicas instead of one.)
+//
+//  2. Rolling-replace whatever's left: each surviving replica
+//     swaps to a new container with the rolled-back image / env /
+//     command. The target's release-phase commands DO NOT re-run
+//     because the target's spec hash already has a Succeeded
+//     record (idempotency).
+//
+//  3. Scale up: if the snapshot wants MORE replicas than are
+//     currently live (rolling back a scale-down), ensure the
+//     missing ones get spawned with the rolled-back spec.
+//
+// Status is baselined at the end so the reconciler's next pass
+// sees the rolled-back hash and skips its own drift detection —
+// without this, the reconciler would compute the snapshot hash,
+// compare against the OLD persisted hash, and fire ANOTHER
+// rolling restart for nothing.
+//
+// Doing the full scale dance inline (not relying on the
+// reconciler picking up the Store.Put watch) makes Rollback
+// synchronous and self-contained: when the function returns, the
+// runtime already matches the snapshot. The reconciler's eventual
+// watch event becomes a no-op confirmation.
+func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, app string, rollback *Manifest, target *ReleaseRecord, newReleaseID string) error {
 	if h.Containers == nil {
 		return nil
 	}
@@ -720,24 +740,54 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 		return fmt.Errorf("apply defaults: %w", err)
 	}
 
+	want := effectiveReplicas(spec)
+
 	live, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
 	if err != nil {
 		return fmt.Errorf("list replicas: %w", err)
 	}
 
-	if len(live) == 0 {
-		return nil
+	// Phase 1: scale down before replacing. Pruning extras first
+	// minimises churn — we don't want to rolling-replace replicas
+	// we're about to remove anyway.
+	if len(live) > want {
+		if err := h.pruneExtraReplicas(name, app, live, want, nil); err != nil {
+			return fmt.Errorf("scale down for rollback: %w", err)
+		}
+
+		// Re-list so Phase 2 sees the post-prune set.
+		live, err = h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+		if err != nil {
+			return fmt.Errorf("list replicas (post scale-down): %w", err)
+		}
 	}
 
-	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, target.SpecHash); err != nil {
-		return err
+	// Phase 2: rolling-replace whatever survived (or all of them
+	// if no scale-down happened) so the rolled-back image/env/etc.
+	// is what's actually running. New replicas carry the rollback's
+	// own release_id (newReleaseID) so `vd describe` correlates
+	// pods to "release te6kxxx (rollback)" instead of the rolled-
+	// back-FROM target.
+	if len(live) > 0 {
+		if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, target.SpecHash, newReleaseID); err != nil {
+			return err
+		}
 	}
 
-	// Baseline the spec hash so the reconciler's next pass sees the
-	// rolled-back hash and skips its own drift detection. Without
-	// this, the reconciler would compute the snapshot hash, compare
-	// against the OLD persisted hash, and fire ANOTHER rolling
-	// restart for nothing.
+	// Phase 3: scale up if the snapshot wants more replicas than
+	// we currently have. Re-list because Phase 2 swapped names —
+	// ensureReplicaCount uses len(live) to compute the delta.
+	live, err = h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+	if err != nil {
+		return fmt.Errorf("list replicas (post replace): %w", err)
+	}
+
+	if len(live) < want {
+		if _, err := h.ensureReplicaCount(scope, name, app, live, want, spec, target.SpecHash, newReleaseID); err != nil {
+			return fmt.Errorf("scale up for rollback: %w", err)
+		}
+	}
+
 	if err := h.writeDeploymentStatus(ctx, app, spec.Image, target.SpecHash); err != nil {
 		h.logf("deployment/%s rollback status persist failed: %v", app, err)
 	}

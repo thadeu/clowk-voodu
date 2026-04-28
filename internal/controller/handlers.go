@@ -596,7 +596,12 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 	hash := deploymentSpecHash(spec)
 
-	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash)
+	// Apply-time creation has no release context — release-block
+	// deployments get their release_id stamp from the orchestrator
+	// (Release / Rollback) which replaces these initial replicas
+	// shortly after. Non-release-block deployments simply have no
+	// release identity; an empty label is the right thing.
+	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash, "")
 	if err != nil {
 		return err
 	}
@@ -675,7 +680,10 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 			})
 
 			if len(toCycle) > 0 {
-				if err := h.rollingReplaceReplicas(ctx, ev.Scope, ev.Name, app, toCycle, spec, hash); err != nil {
+				// Env-change rolling restart from the reconciler
+				// path; no release record is being orchestrated, so
+				// no release_id to stamp.
+				if err := h.rollingReplaceReplicas(ctx, ev.Scope, ev.Name, app, toCycle, spec, hash, ""); err != nil {
 					h.logf("deployment/%s env-change rolling restart failed: %v", ev.Name, err)
 				}
 			}
@@ -720,7 +728,13 @@ func filterSlots(in []ContainerSlot, keep func(ContainerSlot) bool) []ContainerS
 // Each new replica gets a fresh opaque replica id (4-char hex) and
 // the full voodu.* label set, so the next reconcile finds it by
 // label without needing the controller to remember the names.
-func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []ContainerSlot, want int, spec deploymentSpec, hash string) ([]string, error) {
+//
+// `releaseID` is stamped into the container labels when non-empty.
+// Apply-time creation passes "" (no release context yet — the
+// release-phase orchestrator replaces these replicas right after).
+// Release()/Rollback paths pass their record's ID so `vd describe`
+// can correlate pods to their release at a glance.
+func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []ContainerSlot, want int, spec deploymentSpec, hash, releaseID string) ([]string, error) {
 	if spec.Image == "" {
 		// Build-mode without an image is the receive-pack pipeline's
 		// territory; the handler stays env-only here.
@@ -750,6 +764,7 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			ReplicaID:    replicaID,
 			ManifestHash: hash,
 			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+			ReleaseID:    releaseID,
 		})
 
 		_, err := h.Containers.Ensure(ContainerSpec{
@@ -959,7 +974,9 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 
 	h.logf("deployment/%s %s, recreating %d replica(s)", app, reason, len(live))
 
-	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash); err != nil {
+	// Reconciler-driven recreate (non-release-block deployment) —
+	// no release record exists, so no release_id to stamp.
+	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, ""); err != nil {
 		return false, err
 	}
 
@@ -980,7 +997,12 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 // the spec — image, command, networks, env file, labels — comes
 // from the same source the apply path uses, so a restart never
 // drifts from what apply would produce.
-func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash string) error {
+//
+// `releaseID` is stamped onto the new containers when non-empty.
+// Reconciler-driven restarts (no release context) pass ""; the
+// release-phase orchestrator and rollback path pass their record
+// ID so `vd describe` can correlate pods to releases.
+func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash, releaseID string) error {
 	envFile := ""
 	if h.EnvFilePath != nil {
 		envFile = h.EnvFilePath(app)
@@ -997,6 +1019,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, nam
 			ReplicaID:    newReplicaID,
 			ManifestHash: hash,
 			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+			ReleaseID:    releaseID,
 		})
 
 		if err := h.Containers.Remove(s.Name); err != nil {
@@ -1082,7 +1105,9 @@ func (h *DeploymentHandler) Restart(ctx context.Context, scope, name string) err
 
 	h.logf("deployment/%s rolling restart of %d replica(s) requested", app, len(live))
 
-	return h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash)
+	// Imperative `vd restart` — operator-driven, no release
+	// orchestration, so no release_id to stamp on the new replicas.
+	return h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, "")
 }
 
 // linkEnv resolves refs and writes the result to the app's env file.

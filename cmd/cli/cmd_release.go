@@ -648,7 +648,8 @@ func releaseHistory(cmd *cobra.Command, ref string) error {
 
 	var env struct {
 		Data struct {
-			Status json.RawMessage `json:"status,omitempty"`
+			Status json.RawMessage  `json:"status,omitempty"`
+			Pods   []controller.Pod `json:"pods"`
 		} `json:"data"`
 	}
 
@@ -672,15 +673,43 @@ func releaseHistory(cmd *cobra.Command, ref string) error {
 		return nil
 	}
 
-	renderReleaseHistory(os.Stdout, st.Releases)
+	renderReleaseHistory(os.Stdout, st.Releases, env.Data.Pods)
 
 	return nil
 }
 
-func renderReleaseHistory(w io.Writer, records []controller.ReleaseRecord) {
+// podCountByRelease tallies how many live pods carry each
+// release_id label. Used by the history table to show which
+// releases are still serving traffic. Pods without a release_id
+// (initial creation, non-release-block deployments) don't
+// contribute to any bucket — they show as "0" against every
+// release.
+func podCountByRelease(pods []controller.Pod) map[string]int {
+	out := make(map[string]int)
+
+	for _, p := range pods {
+		if p.ReleaseID == "" {
+			continue
+		}
+
+		out[p.ReleaseID]++
+	}
+
+	return out
+}
+
+// renderReleaseHistory tabulates the deployment's release log,
+// newest first. PODS counts live containers that carry each
+// release's id in the voodu.release_id label — so the operator
+// can tell at a glance which release is currently serving traffic
+// (PODS > 0) vs. which ones were superseded (PODS = 0). Releases
+// with no live pods are typically older or rolled-back-from.
+func renderReleaseHistory(w io.Writer, records []controller.ReleaseRecord, pods []controller.Pod) {
+	counts := podCountByRelease(pods)
+
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(tw, "RELEASE\tSTATUS\tHASH\tIMAGE\tROLLED_BACK_FROM\tSTARTED\tDURATION")
+	fmt.Fprintln(tw, "RELEASE\tSTATUS\tHASH\tIMAGE\tPODS\tROLLED_BACK_FROM\tSTARTED\tDURATION")
 
 	for _, r := range records {
 		duration := "-"
@@ -703,8 +732,8 @@ func renderReleaseHistory(w io.Writer, records []controller.ReleaseRecord) {
 			image = "-"
 		}
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.ID, r.Status, shortHashCLI(r.SpecHash), image, rolledBackFrom, started, duration)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			r.ID, r.Status, shortHashCLI(r.SpecHash), image, counts[r.ID], rolledBackFrom, started, duration)
 	}
 
 	_ = tw.Flush()

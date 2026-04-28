@@ -66,6 +66,15 @@ const (
 	// get pods` show an age column without an extra `docker inspect`
 	// per container.
 	LabelCreatedAt = "voodu.created_at"
+
+	// LabelReleaseID stamps the deployment-release record this
+	// container was spawned from. Set by paths that orchestrate a
+	// release (Release / Rollback / runReleaseIfNeeded) and left
+	// empty for paths that just scale (`vd apply` initial create
+	// of a release-block deployment, non-release-block apply).
+	// Empty is fine — `vd describe` renders a "-" and `vd release`
+	// just shows zero pods for that record.
+	LabelReleaseID = "voodu.release_id"
 )
 
 // Kind values used in LabelKind. Mirror controller.Kind constants —
@@ -87,6 +96,12 @@ type Identity struct {
 	ReplicaID    string
 	ManifestHash string
 	CreatedAt    string
+
+	// ReleaseID is the deployment-release record this container
+	// belongs to. Optional — empty when the spawn path doesn't
+	// run inside a release orchestrator (initial replica creation,
+	// non-release-block deployments).
+	ReleaseID string
 }
 
 // NewReplicaID returns a 4-char hex string for use as a container
@@ -158,6 +173,10 @@ func BuildLabels(id Identity) []string {
 		out = append(out, fmt.Sprintf("%s=%s", LabelCreatedAt, id.CreatedAt))
 	}
 
+	if id.ReleaseID != "" {
+		out = append(out, fmt.Sprintf("%s=%s", LabelReleaseID, id.ReleaseID))
+	}
+
 	return out
 }
 
@@ -182,6 +201,7 @@ func ParseLabels(m map[string]string) (Identity, bool) {
 		ReplicaID:    m[LabelReplicaID],
 		ManifestHash: m[LabelManifestHash],
 		CreatedAt:    m[LabelCreatedAt],
+		ReleaseID:    m[LabelReleaseID],
 	}, true
 }
 

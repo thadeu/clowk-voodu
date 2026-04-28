@@ -30,6 +30,13 @@ type Pod struct {
 	ResourceName string `json:"resource_name"`
 	ReplicaID    string `json:"replica_id,omitempty"`
 
+	// ReleaseID correlates this pod to the deployment-release
+	// record it was spawned from. Empty when the pod was created
+	// outside a release orchestration (initial replica creation,
+	// non-release-block deployments). Renderers display "-" in
+	// that case.
+	ReleaseID string `json:"release_id,omitempty"`
+
 	Image     string `json:"image"`
 	Status    string `json:"status"`
 	Running   bool   `json:"running"`
@@ -90,6 +97,7 @@ func (DockerPodsLister) ListPods() ([]Pod, error) {
 			Scope:        id.Scope,
 			ResourceName: id.Name,
 			ReplicaID:    id.ReplicaID,
+			ReleaseID:    id.ReleaseID,
 			Image:        c.Image,
 			Status:       c.Status,
 			Running:      running,

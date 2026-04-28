@@ -290,10 +290,16 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 // renderDescribePodsTable prints the same columns as `voodu get pods`,
 // minus the kind/scope/name (already in the describe header) — the
 // extra context would just push the useful columns off the screen.
+//
+// RELEASE column correlates each pod to the deployment-release record
+// it was spawned from (label voodu.release_id). Empty for pods
+// created outside a release orchestrator (initial replica before the
+// release-phase ran, non-release-block deployments) — rendered as
+// "-" so the column width stays stable.
 func renderDescribePodsTable(w io.Writer, pods []controller.Pod) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(tw, "  NAME\tREPLICA\tIMAGE\tSTATUS\tCREATED")
+	fmt.Fprintln(tw, "  NAME\tREPLICA\tRELEASE\tIMAGE\tSTATUS\tCREATED")
 
 	for _, p := range pods {
 		status := p.Status
@@ -305,8 +311,8 @@ func renderDescribePodsTable(w io.Writer, pods []controller.Pod) error {
 			}
 		}
 
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n",
-			p.Name, dashIfEmpty(p.ReplicaID), p.Image, status, p.CreatedAt)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n",
+			p.Name, dashIfEmpty(p.ReplicaID), dashIfEmpty(p.ReleaseID), p.Image, status, p.CreatedAt)
 	}
 
 	return tw.Flush()
@@ -322,6 +328,116 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage) {
 
 	fmt.Fprintf(w, "  image:     %s\n", dashIfEmpty(st.Image))
 	fmt.Fprintf(w, "  spec_hash: %s\n", dashIfEmpty(st.SpecHash))
+
+	if len(st.Releases) > 0 {
+		renderReleaseSummaryInline(w, st.Releases)
+	}
+}
+
+// renderReleaseSummaryInline drops a compact release block right
+// inside the deployment status — the operator's most-asked
+// questions ("what's running now? what was running before? how
+// do I roll back?") answered without a separate `vd release`
+// invocation.
+//
+// Surface contract:
+//
+//	release:
+//	  current:    <id>   <status>   <age>     image=<img>  [rolled-back-from: <id>]
+//	  previous:   <id>   <status>   <age>     image=<img>
+//	  rollback:   vd rollback <ref> <id>       # last non-rollback succeeded
+//
+// `previous` is omitted when there's only one release record.
+// `rollback` hint is omitted when there's no useful target (single
+// release in history, or all records are rollbacks of each other).
+func renderReleaseSummaryInline(w io.Writer, records []controller.ReleaseRecord) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  release:")
+	fmt.Fprintf(w, "    current:    %s\n", formatReleaseLine(records[0]))
+
+	if len(records) >= 2 {
+		fmt.Fprintf(w, "    previous:   %s\n", formatReleaseLine(records[1]))
+	}
+
+	if hint := rollbackHint(records); hint != "" {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "    rollback:   %s\n", hint)
+	}
+}
+
+// formatReleaseLine renders one release row inline-style for the
+// describe block. Compact on purpose — operator scans these fast,
+// long URLs and timestamps don't help here.
+func formatReleaseLine(r controller.ReleaseRecord) string {
+	age := "-"
+	if !r.StartedAt.IsZero() {
+		age = humanizeAge(time.Since(r.StartedAt))
+	}
+
+	out := fmt.Sprintf("%s   %s   %s   image=%s",
+		r.ID, r.Status, age, dashIfEmpty(r.Image))
+
+	if r.RolledBackFrom != "" {
+		out += "   rolled-back-from=" + r.RolledBackFrom
+	}
+
+	return out
+}
+
+// rollbackHint suggests a copy-pasteable `vd rollback` command
+// pointing at the latest non-rollback succeeded release that
+// isn't the current one. Returns "" when there's no useful
+// target — when current is the only record, or when every
+// other record was itself a rollback.
+//
+// Skipping rollback records as targets is intentional: the
+// operator usually wants to revert to a "real" release, not
+// chain rollbacks. The original (non-rollback) release the
+// current one descended from is the natural target.
+func rollbackHint(records []controller.ReleaseRecord) string {
+	if len(records) < 2 {
+		return ""
+	}
+
+	for _, r := range records[1:] {
+		if r.Status != controller.ReleaseStatusSucceeded {
+			continue
+		}
+
+		if r.RolledBackFrom != "" {
+			continue
+		}
+
+		// "ref" is unknown to the renderer — operator copies the
+		// whole line and substitutes <ref> with the deployment
+		// they're describing. Keeping it as a placeholder is more
+		// honest than fabricating a wrong scope/name.
+		return "vd rollback <ref> " + r.ID
+	}
+
+	return ""
+}
+
+// humanizeAge formats a duration as the kind of "5m ago" /
+// "2h ago" / "3d ago" string operators expect from k8s-style
+// CLIs. Sub-second durations collapse to "0s" — release records
+// taken back-to-back during a burst of applies don't deserve
+// millisecond precision in the describe summary.
+func humanizeAge(d time.Duration) string {
+	if d < time.Second {
+		return "0s ago"
+	}
+
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }
 
 func renderDatabaseSummary(w io.Writer, blob json.RawMessage) {
