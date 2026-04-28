@@ -158,14 +158,18 @@ func ensureRemoteReady(info *remote.Info, identity string, autoApprove bool) err
 
 	// Label-prefixed announce so the preflight section reads as
 	// its own contextual block, matching the `[voodu/install]`
-	// shape the install script uses for its own logs. Internal
-	// probe details ("voodu binary missing", "controller down")
-	// are operator-noise on the happy path; the install script's
-	// own logs surface the real progress as it runs. If anything
-	// fails, the error from bootstrapRemote / waitForController
-	// carries enough context.
+	// shape the install script uses. Internal probe details
+	// ("voodu binary missing", "controller down") are operator-
+	// noise on the happy path; the install script's own logs
+	// surface the real progress.
+	//
+	// We surface the installer URL (not the full ssh+curl line)
+	// because the URL is the one piece worth debugging — operators
+	// using a fork or pinned version need to confirm which script
+	// is being fetched. The ssh target is already obvious from
+	// the --remote flag the operator just typed.
 	preflightLog("First-time setup will run the voodu installer over SSH:")
-	preflightLog(fmt.Sprintf("  ssh %s 'curl -fsSL %s | bash -s -- --server'", info.Host, currentInstallURL()))
+	preflightLog(fmt.Sprintf("  curl -fsSL %s | bash -s -- --server", currentInstallURL()))
 	fmt.Fprintln(os.Stderr)
 
 	if !autoApprove && !envAutoApprove() {
