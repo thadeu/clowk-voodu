@@ -58,9 +58,9 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 
 	// A new scope or a renamed deployment produces an AppID the server
 	// has never seen. Materialise the app tree lazily so the operator
-	// doesn't have to run `voodu apps create` every time — the
-	// MkdirAll is idempotent, so re-deploys pay nothing.
-	if err := ensureAppLayout(app); err != nil {
+	// doesn't have to bootstrap each app explicitly — paths.EnsureAppLayout
+	// is idempotent, so re-deploys pay nothing.
+	if err := paths.EnsureAppLayout(app); err != nil {
 		r.StepEnd("receive", progress.StatusFail, err)
 
 		return err
@@ -137,29 +137,6 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		// prefix, NDJSON clients render it as a ✓ from the typed
 		// event).
 		opts.reporter().Summary(fmt.Sprintf("Pruned %d old release(s)", pruned))
-	}
-
-	return nil
-}
-
-// ensureAppLayout creates the filesystem tree a deployment needs:
-// the app dir, its releases/ and shared/ children, and the per-app
-// volumes dir. Mirrors what `voodu apps create` does so the first
-// receive-pack for a brand-new AppID doesn't require an explicit
-// bootstrap step. MkdirAll is idempotent, so subsequent deploys pay
-// only the stat syscalls.
-func ensureAppLayout(app string) error {
-	dirs := []string{
-		paths.AppDir(app),
-		paths.AppReleasesDir(app),
-		paths.AppSharedDir(app),
-		paths.AppVolumeDir(app),
-	}
-
-	for _, d := range dirs {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", d, err)
-		}
 	}
 
 	return nil

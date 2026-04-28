@@ -15,7 +15,20 @@ import (
 
 // Set merges the given KEY=VALUE pairs into the app's .env file.
 // Returns the parsed map that was written.
+//
+// Calls paths.EnsureAppLayout first so every code path that writes
+// env (deployment apply, job run, cronjob tick, vd config set) gets
+// the per-app filesystem tree (apps/<app>/{releases,shared} and
+// volumes/<app>/) materialised before the env file lands. Without
+// this, image-mode deployments that declare `volumes = [...]` in
+// HCL would let docker create the host volume path at container-
+// start time with daemon-default ownership (root:root), and apps
+// inside the container would trip "permission denied" on writes.
 func Set(app string, pairs []string) (map[string]string, error) {
+	if err := paths.EnsureAppLayout(app); err != nil {
+		return nil, fmt.Errorf("ensure app layout: %w", err)
+	}
+
 	envFile := paths.AppEnvFile(app)
 
 	vars, err := envfile.Load(envFile)
