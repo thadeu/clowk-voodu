@@ -1429,8 +1429,20 @@ func (h *DeploymentHandler) putDeploymentStatus(ctx context.Context, app string,
 	return h.writeDeploymentStatus(ctx, app, spec.Image, deploymentSpecHash(spec))
 }
 
+// writeDeploymentStatus persists Image+SpecHash while preserving
+// the Releases history that lives on the same blob. A naive marshal
+// of `{Image, SpecHash}` would erase the release-phase records every
+// time the reconciler baselined the spec — a release run + an
+// immediate reconcile pass would leave the operator with an empty
+// `vd release <ref>` history. Load-modify-write keeps the two
+// concerns from clobbering each other.
 func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, image, hash string) error {
-	blob, err := json.Marshal(DeploymentStatus{Image: image, SpecHash: hash})
+	prev, _ := h.loadDeploymentStatus(ctx, app)
+
+	prev.Image = image
+	prev.SpecHash = hash
+
+	blob, err := json.Marshal(prev)
 	if err != nil {
 		return err
 	}

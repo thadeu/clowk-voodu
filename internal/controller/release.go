@@ -667,9 +667,82 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 		h.logf("deployment/%s rollback record persist failed: %v", app, err)
 	}
 
+	// Drive the rolling restart inline. Two reasons it can't be left
+	// to the reconciler the way a vanilla `vd apply` works:
+	//
+	//   1. For deployments WITH a release block, the reconciler
+	//      explicitly skips the restart (recreateReplicasIfSpecChanged
+	//      logs "awaiting `vd release run`" and returns). Rollback
+	//      IS the orchestrator for the rollback case — without an
+	//      inline restart the snapshot lands in etcd but the running
+	//      pods stay on the old spec, exactly the bug report:
+	//      "rollback doesn't generate new pods".
+	//
+	//   2. For deployments without a release block, the reconciler
+	//      WOULD restart on its own, but doing it inline here keeps
+	//      the rollback synchronous — the caller can chain commands
+	//      ("rollback then check pods") without racing against the
+	//      reconciler tick.
+	//
+	// The release-phase commands (pre/main/post) are NOT re-run
+	// because the target's hash already has a Succeeded record (set
+	// at the original release time). Only the rolling restart fires.
+	if err := h.rolloutRollback(ctx, scope, name, app, &rollback, target); err != nil {
+		h.logf("deployment/%s rollback rolling restart failed: %v", app, err)
+		return newID, fmt.Errorf("rollback rolling restart: %w", err)
+	}
+
 	h.logf("deployment/%s rolled back to %s (new release %s)", app, target.ID, newID)
 
 	return newID, nil
+}
+
+// rolloutRollback decodes the just-applied snapshot, normalises its
+// shape (image fallback, voodu0 auto-join, etc.), and rolling-replaces
+// every live replica so they pick up the rolled-back image / env /
+// command. Persists the new spec hash in deployment status afterward
+// so the next reconcile pass sees no drift and doesn't redo the work.
+//
+// No-op when there are no live replicas — the manifest is already in
+// the store, so the next ensureReplicaCount pass spawns fresh ones
+// against the rolled-back spec automatically.
+func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, app string, rollback *Manifest, target *ReleaseRecord) error {
+	if h.Containers == nil {
+		return nil
+	}
+
+	spec, err := decodeDeploymentSpec(rollback)
+	if err != nil {
+		return fmt.Errorf("decode rollback spec: %w", err)
+	}
+
+	if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
+		return fmt.Errorf("apply defaults: %w", err)
+	}
+
+	live, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+	if err != nil {
+		return fmt.Errorf("list replicas: %w", err)
+	}
+
+	if len(live) == 0 {
+		return nil
+	}
+
+	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, target.SpecHash); err != nil {
+		return err
+	}
+
+	// Baseline the spec hash so the reconciler's next pass sees the
+	// rolled-back hash and skips its own drift detection. Without
+	// this, the reconciler would compute the snapshot hash, compare
+	// against the OLD persisted hash, and fire ANOTHER rolling
+	// restart for nothing.
+	if err := h.writeDeploymentStatus(ctx, app, spec.Image, target.SpecHash); err != nil {
+		h.logf("deployment/%s rollback status persist failed: %v", app, err)
+	}
+
+	return nil
 }
 
 // pickRollbackTarget walks the release history and finds the

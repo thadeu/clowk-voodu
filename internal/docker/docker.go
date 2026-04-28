@@ -177,9 +177,9 @@ func CreateContainer(cfg ContainerConfig) error {
 	// modern docker) when the container shares the host's net stack:
 	// in host mode the container's listening ports ARE the host's
 	// ports, so there's no NAT rule to install. Same for `none` mode
-	// where the container has no network namespace at all. Gokku had
-	// this same guard (legacy/pkg/docker.go) — keep it to avoid the
-	// "Published ports are discarded" warning + confused operators.
+	// where the container has no network namespace at all. Skipping
+	// here avoids the "Published ports are discarded" warning that
+	// confuses operators reading the daemon log.
 	if cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
 		for _, port := range cfg.Ports {
 			args = append(args, "-p", port)

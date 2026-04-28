@@ -12,9 +12,9 @@ import (
 )
 
 // TestConfigSet_PostsKeyValuePairs locks in the wire shape of `vd
-// config set`: POST to /config?scope=&name= with a JSON object body.
-// Without this, an encoding bug could send the pairs as form data
-// or array, and the controller would reject silently.
+// config <ref> set`: POST to /config?scope=&name= with a JSON object
+// body. Without this, an encoding bug could send the pairs as form
+// data or array, and the controller would reject silently.
 func TestConfigSet_PostsKeyValuePairs(t *testing.T) {
 	var (
 		gotMethod string
@@ -39,7 +39,7 @@ func TestConfigSet_PostsKeyValuePairs(t *testing.T) {
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"config", "set", "FOO=bar", "NODE_ENV=production", "-s", "clowk-lp", "-n", "web"})
+	root.SetArgs([]string{"config", "clowk-lp/web", "set", "FOO=bar", "NODE_ENV=production"})
 
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -67,10 +67,29 @@ func TestConfigSet_PostsKeyValuePairs(t *testing.T) {
 	}
 }
 
-// TestConfigSet_RequiresScope guards the CLI input contract: scope
-// is mandatory; without it the controller can't compute a key
-// prefix and the error from the server would be late and confusing.
-func TestConfigSet_RequiresScope(t *testing.T) {
+// TestConfigSet_RequiresRef guards the CLI input contract: ref is
+// mandatory; without it the controller can't compute a key prefix
+// and the error from the server would be late and confusing.
+func TestConfigSet_RequiresRef(t *testing.T) {
+	root := newRootCmd()
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"config"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected ref-required error")
+	}
+}
+
+// TestConfigSet_RejectsBareSetWithoutRef catches the most likely
+// muscle-memory mistake from operators coming off the old `-s/-n`
+// shape: typing `vd config set FOO=bar` (verb first, no ref). With
+// the new ref-first parse, that maps to ref="set" verb="FOO=bar"
+// which lands as "unknown verb" — surface a clear-er error.
+func TestConfigSet_RejectsBareSetWithoutRef(t *testing.T) {
 	root := newRootCmd()
 
 	var buf bytes.Buffer
@@ -80,52 +99,99 @@ func TestConfigSet_RequiresScope(t *testing.T) {
 
 	err := root.Execute()
 	if err == nil {
-		t.Fatal("expected scope-required error")
+		t.Fatal("expected error for missing ref")
 	}
 
-	if !strings.Contains(err.Error(), "scope") {
-		t.Errorf("error should mention scope: %q", err.Error())
+	// "set" was parsed as the ref (a bare scope), and "FOO=bar"
+	// became the verb — landing on the unknown-verb branch. The
+	// exact error wording isn't load-bearing; just confirm we don't
+	// silently accept the legacy shape.
+	if !strings.Contains(err.Error(), "unknown") && !strings.Contains(err.Error(), "verb") {
+		t.Errorf("error should call out unknown verb / wrong shape: %q", err.Error())
 	}
 }
 
 // TestConfigSet_NoRestartFlagPropagates confirms --no-restart
 // flips restart=false on the wire so the operator can batch edits
-// without triggering a reconcile per call.
+// without triggering a reconcile per call. Three invocation shapes
+// are exercised — long form, colon shorthand with the flag before
+// the ref, colon shorthand with the flag after the args — because
+// each goes through a different rewrite path and a regression in
+// any of them would silently leave the operator restarting on
+// every set.
 func TestConfigSet_NoRestartFlagPropagates(t *testing.T) {
-	var gotQuery string
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
-
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	}))
-	defer ts.Close()
-
-	root := newRootCmd()
-	_ = root.PersistentFlags().Set("controller-url", ts.URL)
-
-	var buf bytes.Buffer
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-	root.SetArgs([]string{"config", "set", "FOO=bar", "-s", "clowk-lp", "--no-restart"})
-
-	if err := root.Execute(); err != nil {
-		t.Fatalf("execute: %v", err)
+	cases := []struct {
+		name string
+		// argv is what the user typed (post-`voodu` prefix). We run
+		// rewriteColonSyntax over it the same way main() does, so
+		// the colon shorthand reaches cobra in its rewritten shape.
+		argv []string
+	}{
+		{
+			name: "long form",
+			argv: []string{"voodu", "config", "clowk-lp", "set", "FOO=bar", "--no-restart"},
+		},
+		{
+			name: "colon shorthand: flag before ref",
+			argv: []string{"voodu", "config:set", "--no-restart", "clowk-lp", "FOO=bar"},
+		},
+		{
+			name: "colon shorthand: flag after args",
+			argv: []string{"voodu", "config:set", "clowk-lp", "FOO=bar", "--no-restart"},
+		},
 	}
 
-	if !strings.Contains(gotQuery, "restart=false") {
-		t.Errorf("--no-restart should add restart=false: %q", gotQuery)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var gotQuery string
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			}))
+			defer ts.Close()
+
+			root := newRootCmd()
+			_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+			rewritten := rewriteColonSyntax(c.argv)
+
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetErr(&buf)
+			root.SetArgs(rewritten[1:]) // drop the `voodu` argv[0]
+
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+
+			if !strings.Contains(gotQuery, "restart=false") {
+				t.Errorf("--no-restart should add restart=false: %q (argv=%v rewritten=%v)",
+					gotQuery, c.argv, rewritten)
+			}
+		})
 	}
 }
 
-// TestConfigGet_ReturnsValueFromServer covers the GET path: the
-// CLI prints the returned `KEY=VALUE` and exits cleanly. Stub
-// returns the single-key shape that ?key= produces.
-func TestConfigGet_ReturnsValueFromServer(t *testing.T) {
+// TestConfigGet_FiltersBySubstring covers the substring-match
+// contract: `vd config <ref> get LOG` returns every key whose name
+// contains LOG (case-insensitive). Match-all rather than exact-key
+// because operators usually remember "the var about logging" not
+// the exact spelling.
+func TestConfigGet_FiltersBySubstring(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data":   map[string]string{"FOO": "bar"},
+			"data": map[string]any{
+				"vars": map[string]string{
+					"LOG_LEVEL":   "debug",
+					"RAILS_LOG":   "stdout",
+					"DATABASE":    "postgres",
+					"NODE_ENV":    "production",
+					"BUNDLE_PATH": "vendor",
+				},
+			},
 		})
 	}))
 	defer ts.Close()
@@ -137,22 +203,61 @@ func TestConfigGet_ReturnsValueFromServer(t *testing.T) {
 		var buf bytes.Buffer
 		root.SetOut(&buf)
 		root.SetErr(&buf)
-		root.SetArgs([]string{"config", "get", "FOO", "-s", "clowk-lp"})
+		root.SetArgs([]string{"config", "clowk-lp/web", "get", "LOG"})
 
 		if err := root.Execute(); err != nil {
 			t.Fatalf("execute: %v", err)
 		}
 	})
 
-	if !strings.Contains(out, "FOO=bar") {
-		t.Errorf("output should contain FOO=bar: %q", out)
+	for _, want := range []string{"LOG_LEVEL=debug", "RAILS_LOG=stdout"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("substring match should include %q: %q", want, out)
+		}
+	}
+
+	for _, banned := range []string{"DATABASE", "NODE_ENV", "BUNDLE_PATH"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("substring match should NOT include %q: %q", banned, out)
+		}
 	}
 }
 
-// TestConfigList_PrintsAllKeysSorted confirms list order is
-// deterministic — operators piping to grep/diff appreciate stable
-// output that doesn't shuffle between invocations.
-func TestConfigList_PrintsAllKeysSorted(t *testing.T) {
+// TestConfigGet_NoMatchErrors confirms an explicit pattern with
+// zero hits returns an error (not silent empty output) — operator
+// typos like `get LIG` should land as "no keys match" instead of
+// being indistinguishable from "no env vars set at all".
+func TestConfigGet_NoMatchErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data":   map[string]any{"vars": map[string]string{"FOO": "bar"}},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"config", "clowk-lp", "get", "DOESNOTEXIST"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error for no-match pattern")
+	}
+
+	if !strings.Contains(err.Error(), "DOESNOTEXIST") {
+		t.Errorf("error should mention the pattern: %q", err.Error())
+	}
+}
+
+// TestConfigDefaultVerbIsList covers the bareword shape:
+// `vd config clowk-lp/web` (no verb) defaults to list. Same
+// ergonomic move release/rollback already make.
+func TestConfigDefaultVerbIsList(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
@@ -174,7 +279,7 @@ func TestConfigList_PrintsAllKeysSorted(t *testing.T) {
 		var buf bytes.Buffer
 		root.SetOut(&buf)
 		root.SetErr(&buf)
-		root.SetArgs([]string{"config", "list", "-s", "clowk-lp"})
+		root.SetArgs([]string{"config", "clowk-lp"})
 
 		if err := root.Execute(); err != nil {
 			t.Fatalf("execute: %v", err)
@@ -195,41 +300,37 @@ func TestConfigList_PrintsAllKeysSorted(t *testing.T) {
 	}
 }
 
-// TestConfigAppFlag_SplitsScopeAndName covers the -a shorthand:
-// `vd config X -a clowk-lp/web` must split into scope=clowk-lp,
-// name=web on the wire — same shape as the long -s/-n form. A
-// regression in the splitter would silently send half the address
-// and the operator would mutate the wrong bucket.
-func TestConfigAppFlag_SplitsScopeAndName(t *testing.T) {
+// TestConfigRef_SplitsScopeAndName covers the positional ref
+// parser: `clowk-lp/web` becomes scope=clowk-lp, name=web; bare
+// `clowk-lp` is scope-only. Same disambiguation rule the rest of
+// the CLI uses, so muscle memory transfers between commands.
+func TestConfigRef_SplitsScopeAndName(t *testing.T) {
 	cases := []struct {
 		name      string
 		args      []string
 		wantQuery []string
+		bannedQ   []string
 	}{
 		{
 			name:      "scope/name shape",
-			args:      []string{"config", "set", "FOO=bar", "-a", "clowk-lp/web"},
+			args:      []string{"config", "clowk-lp/web", "set", "FOO=bar"},
 			wantQuery: []string{"scope=clowk-lp", "name=web"},
 		},
 		{
 			name:      "bare scope shape",
-			args:      []string{"config", "set", "FOO=bar", "-a", "clowk-lp"},
+			args:      []string{"config", "clowk-lp", "set", "FOO=bar"},
 			wantQuery: []string{"scope=clowk-lp"},
+			bannedQ:   []string{"name="},
 		},
 		{
-			name:      "list with -a",
-			args:      []string{"config", "list", "-a", "clowk-lp/web"},
+			name:      "default verb (list) with scope/name",
+			args:      []string{"config", "clowk-lp/web"},
 			wantQuery: []string{"scope=clowk-lp", "name=web"},
 		},
 		{
-			name:      "get with -a",
-			args:      []string{"config", "get", "FOO", "-a", "clowk-lp/web"},
+			name:      "get without pattern targets ref correctly",
+			args:      []string{"config", "clowk-lp/web", "get"},
 			wantQuery: []string{"scope=clowk-lp", "name=web"},
-		},
-		{
-			name:      "explicit -n overrides -a's name segment",
-			args:      []string{"config", "set", "FOO=bar", "-a", "clowk-lp/web", "-n", "worker"},
-			wantQuery: []string{"scope=clowk-lp", "name=worker"},
 		},
 	}
 
@@ -268,11 +369,9 @@ func TestConfigAppFlag_SplitsScopeAndName(t *testing.T) {
 				}
 			}
 
-			// "name=worker" override case: confirm the original "web"
-			// from -a does NOT show up.
-			if c.name == "explicit -n overrides -a's name segment" {
-				if strings.Contains(gotQuery, "name=web") {
-					t.Errorf("explicit -n should win over -a, got %q", gotQuery)
+			for _, banned := range c.bannedQ {
+				if strings.Contains(gotQuery, banned) {
+					t.Errorf("query should NOT contain %q: %q", banned, gotQuery)
 				}
 			}
 		})
@@ -309,7 +408,7 @@ func TestConfigUnset_DeletesEachKey(t *testing.T) {
 		var buf bytes.Buffer
 		root.SetOut(&buf)
 		root.SetErr(&buf)
-		root.SetArgs([]string{"config", "unset", "FOO", "BAR", "BAZ", "-s", "clowk-lp"})
+		root.SetArgs([]string{"config", "clowk-lp", "unset", "FOO", "BAR", "BAZ"})
 
 		if err := root.Execute(); err != nil {
 			t.Fatalf("execute: %v", err)

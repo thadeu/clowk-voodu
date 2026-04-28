@@ -27,6 +27,11 @@ func rewriteColonSyntax(argv []string) []string {
 	// must not be split.
 	skipFlagValue := false
 
+	// consumed tracks indices already emitted out-of-order by the
+	// `config:set <ref>` reorder so the outer loop doesn't re-emit
+	// them when iteration reaches their natural position.
+	var consumed []int
+
 	for i := 1; i < len(argv); i++ {
 		tok := argv[i]
 
@@ -48,7 +53,36 @@ func rewriteColonSyntax(argv []string) []string {
 		}
 
 		if left, right, ok := splitCommandColon(tok); ok {
+			// Heroku-style `config:set <ref> KEY=VAL` shorthand. The
+			// underlying command surface is ref-first
+			// (`config <ref> set KEY=VAL`), so a naive split would
+			// land as `config set <ref> KEY=VAL` and the ref-parser
+			// would treat "set" as the scope. Swap the next non-flag
+			// token (the ref) into position so the muscle-memory
+			// shape works without growing a new subcommand.
+			//
+			// Limited to config on purpose: other umbrella commands
+			// either keep their verb-first shape (`plugins:install`)
+			// or never gained a positional ref. When more verbs
+			// adopt the ref-first pattern this list grows.
+			if left == "config" && isRefFirstConfigVerb(right) {
+				if next, idx, found := nextPositional(argv, i+1); found && !looksLikeKeyValue(next) {
+					out = append(out, left, next, right)
+					// Mark the ref-token as already consumed so the
+					// outer loop doesn't re-emit it. We can't simply
+					// `i = idx` because the loop's `i++` would skip
+					// one too many on the next iteration; instead we
+					// stash it in a small skip-set.
+					consumeIndex(&consumed, idx)
+					continue
+				}
+			}
+
 			out = append(out, left, right)
+			continue
+		}
+
+		if isConsumed(consumed, i) {
 			continue
 		}
 
@@ -56,6 +90,70 @@ func rewriteColonSyntax(argv []string) []string {
 	}
 
 	return out
+}
+
+// isRefFirstConfigVerb names the config verbs that accept the
+// ref-first shape via colon shorthand. Kept tiny on purpose — only
+// commands whose canonical surface is `config <ref> <verb>` should
+// trigger the reorder. `list` and `get` are excluded (the bareword
+// `vd config <ref>` already covers list, and `get` without a ref
+// has no useful colon form to support).
+func isRefFirstConfigVerb(verb string) bool {
+	return verb == "set" || verb == "unset"
+}
+
+// looksLikeKeyValue reports whether tok looks like a `KEY=VALUE`
+// arg rather than a ref. Env var names can't contain `=` (it's the
+// separator), and scope/name refs are conventionally lowercase
+// identifiers without `=` either — so the `=` is a reliable
+// "definitely not a ref" signal. Used by the colon-rewrite so
+// `config:set FOO=bar` (operator forgot the ref) doesn't get
+// silently mis-parsed as ref="FOO=bar".
+func looksLikeKeyValue(tok string) bool {
+	return strings.Contains(tok, "=")
+}
+
+// nextPositional finds the next non-flag token in argv starting at
+// `start`. Returns (token, index, true) when found and (_, _, false)
+// otherwise. Skips flag values for known value-taking flags so
+// `config:set --remote prod <ref>` still detects <ref> correctly.
+func nextPositional(argv []string, start int) (string, int, bool) {
+	skipNext := false
+
+	for j := start; j < len(argv); j++ {
+		tok := argv[j]
+
+		if skipNext {
+			skipNext = false
+			continue
+		}
+
+		if strings.HasPrefix(tok, "-") {
+			if !strings.Contains(tok, "=") && takesValue(tok) {
+				skipNext = true
+			}
+
+			continue
+		}
+
+		return tok, j, true
+	}
+
+	return "", -1, false
+}
+
+func consumeIndex(set *[]int, i int) {
+	*set = append(*set, i)
+}
+
+func isConsumed(set []int, i int) bool {
+	for _, x := range set {
+		if x == i {
+			return true
+		}
+	}
+
+	return false
 }
 
 // splitCommandColon returns (left, right, true) when `tok` looks like a

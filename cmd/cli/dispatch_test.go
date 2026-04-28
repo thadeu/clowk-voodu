@@ -22,12 +22,32 @@ func TestRewriteColonSyntax(t *testing.T) {
 			want: []string{"voodu", "get", "pods"},
 		},
 		{
-			name: "simple colon rewrite",
-			in:   []string{"voodu", "config:set", "FOO=bar"},
-			want: []string{"voodu", "config", "set", "FOO=bar"},
+			name: "config:set reorders ref before verb",
+			in:   []string{"voodu", "config:set", "clowk-lp/web", "FOO=bar"},
+			want: []string{"voodu", "config", "clowk-lp/web", "set", "FOO=bar"},
 		},
 		{
-			name: "plugin-style colon rewrite",
+			name: "config:unset reorders ref before verb",
+			in:   []string{"voodu", "config:unset", "clowk-lp", "FOO"},
+			want: []string{"voodu", "config", "clowk-lp", "unset", "FOO"},
+		},
+		{
+			name: "config:set with multiple KEY=VALUE pairs",
+			in:   []string{"voodu", "config:set", "clowk-lp/web", "FOO=bar", "BAZ=qux"},
+			want: []string{"voodu", "config", "clowk-lp/web", "set", "FOO=bar", "BAZ=qux"},
+		},
+		{
+			name: "config:set with --no-restart flag in front of ref",
+			in:   []string{"voodu", "config:set", "--no-restart", "clowk-lp", "FOO=bar"},
+			want: []string{"voodu", "config", "clowk-lp", "set", "--no-restart", "FOO=bar"},
+		},
+		{
+			name: "config:set with --remote flag (takes value)",
+			in:   []string{"voodu", "config:set", "--remote", "staging", "clowk-lp", "FOO=bar"},
+			want: []string{"voodu", "config", "clowk-lp", "set", "--remote", "staging", "FOO=bar"},
+		},
+		{
+			name: "plugin-style colon rewrite (non-config) keeps simple split",
 			in:   []string{"voodu", "postgres:create", "main"},
 			want: []string{"voodu", "postgres", "create", "main"},
 		},

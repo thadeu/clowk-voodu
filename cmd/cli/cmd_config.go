@@ -13,280 +13,264 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newConfigCmd is the M-4 successor to the filesystem-backed
-// `vd config`. Every operation now goes through the controller's
-// /config endpoint so an operator on their dev Mac can manipulate
-// env vars without SSHing into the server.
+// newConfigCmd manages env vars stored in etcd via the controller's
+// /config endpoint. Shape mirrors `vd release` and `vd rollback` —
+// ref-first positional, optional verb, verb-specific args after:
 //
-// Two namespace levels:
+//	vd config <ref>                   list (default verb)
+//	vd config <ref> list              same, explicit
+//	vd config <ref> set KEY=VAL...    upsert one or more keys
+//	vd config <ref> get [PATTERN]     read all (or substring-match
+//	                                  PATTERN against key names)
+//	vd config <ref> unset KEY...      delete one or more keys
 //
-//   - scope-level config (`-s clowk-lp`): shared across every
-//     resource in the scope.
-//   - app-level config (`-s clowk-lp -n web`): per-resource,
-//     overrides scope-level keys on conflict.
+// Ref shape (same disambiguation rule the rest of the CLI uses):
 //
-// `-a clowk-lp/web` is a one-flag shortcut that splits scope/name
-// in the same shape `vd describe` and `vd logs` use. Mix-and-match
-// with `-s`/`-n` is permissive (explicit -s/-n wins) so muscle
-// memory transfers cleanly between commands.
+//   - "<scope>"           scope-level config (shared by every
+//                         resource in the scope)
+//   - "<scope>/<name>"    app-level config (overrides scope-level
+//                         keys on conflict)
 //
-// On set/unset the server fires reconcile events for affected
-// resources so the changes land in running containers without an
-// explicit `vd config reload`. Pass --no-restart to batch multiple
-// edits before triggering the reconcile.
+// On set/unset the controller fires reconcile events for affected
+// resources so the new env reaches running pods without a manual
+// `vd restart`. Pass --no-restart to batch edits before triggering.
+//
+// Examples:
+//
+//	vd config clowk-lp/web                       list every var visible to web
+//	vd config clowk-lp/web set LOG_LEVEL=debug   set on the app level
+//	vd config clowk-lp set LOG_LEVEL=info        set on the scope level
+//	vd config clowk-lp/web get LOG               match-all keys containing LOG
+//	vd config clowk-lp/web unset LOG_LEVEL       remove + restart
 func newConfigCmd() *cobra.Command {
+	var noRestart bool
+
 	cmd := &cobra.Command{
-		Use:   "config",
+		Use:   "config <ref> [verb] [args...]",
 		Short: "Manage env vars for scopes and resources via the controller",
-		Long: `Read and write environment variables stored in etcd. Two
-addressing levels:
+		Long: `Read and write environment variables stored in etcd. The ref
+positional follows the same shape as vd release / vd rollback:
 
-  vd config set FOO=bar -s clowk-lp                  scope-level (shared)
-  vd config set FOO=bar -s clowk-lp -n web           app-level (overrides scope)
-  vd config set FOO=bar -a clowk-lp/web              same as above (one flag)
-  vd config set FOO=bar -a clowk-lp                  scope-level via -a
+  <scope>             scope-level (shared across the scope)
+  <scope>/<name>      app-level   (overrides scope-level keys)
 
-App-level keys override scope-level on conflict — same precedence
-shells use for /etc/environment vs ~/.profile.
+Verbs:
+
+  list (default)         list all keys visible to <ref>
+  set KEY=VALUE [...]    upsert one or more keys
+  get [PATTERN]          list keys; if PATTERN is given, only keys
+                         whose name contains PATTERN (case-insensitive)
+  unset KEY [...]        delete one or more keys
 
 By default, set / unset trigger an automatic reconcile of every
 container the change affects so the new env reaches running pods
 without manual intervention. Pass --no-restart to batch edits and
-defer the restart.`,
+defer the restart.
+
+Examples:
+  vd config clowk-lp/web                       # list (default verb)
+  vd config clowk-lp/web set LOG_LEVEL=debug
+  vd config clowk-lp set DATABASE_URL=...      # scope-level
+  vd config clowk-lp/web get LOG               # substring match
+  vd config clowk-lp/web unset LOG_LEVEL`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := parseConfigRef(args[0])
+			if err != nil {
+				return err
+			}
+
+			verb := "list"
+			verbArgs := []string{}
+
+			if len(args) > 1 {
+				verb = strings.ToLower(strings.TrimSpace(args[1]))
+				verbArgs = args[2:]
+			}
+
+			switch verb {
+			case "list", "":
+				return runConfigList(cmd, target)
+			case "set":
+				if len(verbArgs) == 0 {
+					return fmt.Errorf("set: at least one KEY=VALUE is required")
+				}
+
+				return runConfigSet(cmd, target, verbArgs, !noRestart)
+			case "get":
+				pattern := ""
+				if len(verbArgs) > 0 {
+					pattern = verbArgs[0]
+				}
+
+				return runConfigGet(cmd, target, pattern)
+			case "unset":
+				if len(verbArgs) == 0 {
+					return fmt.Errorf("unset: at least one KEY is required")
+				}
+
+				return runConfigUnset(cmd, target, verbArgs, !noRestart)
+			default:
+				return fmt.Errorf("unknown config verb %q (want list, set, get, unset)", verb)
+			}
+		},
 	}
 
-	cmd.AddCommand(
-		configSetCmd(),
-		configGetCmd(),
-		configListCmd(),
-		configUnsetCmd(),
-	)
+	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not auto-restart affected containers (set/unset only)")
 
 	return cmd
 }
 
-// configTarget bundles the (scope, name) pair every config command
-// needs to compute. Three input shapes folded into one place:
-//
-//   -s SCOPE -n NAME         classic, both flags
-//   -s SCOPE                 scope-level (no name)
-//   -a SCOPE/NAME            shorthand, splits on first slash
-//   -a SCOPE                 shorthand, scope-level
-//
-// When both -a and -s/-n are passed, explicit -s/-n wins on each
-// field so muscle-memory invocations like
-// `vd config set X=y -a clowk-lp -n web` still work intuitively
-// (the operator wrote -n explicitly, that wins).
+// configTarget is the (scope, name) tuple the /config endpoint
+// addresses by. name="" means scope-level config.
 type configTarget struct {
 	scope string
 	name  string
 }
 
-func resolveConfigTarget(cmd *cobra.Command, scope, name, app string) (configTarget, error) {
-	target := configTarget{scope: scope, name: name}
-
-	if app != "" {
-		// `-a` is config-specific and uses the inverse default of
-		// splitJobRef: a bare token (no slash) is the SCOPE, not a
-		// name. Operators reach for `-a clowk-lp` when they mean
-		// "scope-level config" — so the bare form must populate
-		// scope, leaving name empty.
-		var appScope, appName string
-
-		if i := strings.Index(app, "/"); i >= 0 {
-			appScope = app[:i]
-			appName = app[i+1:]
-		} else {
-			appScope = app
-		}
-
-		if !cmd.Flags().Changed("scope") {
-			target.scope = appScope
-		}
-
-		if !cmd.Flags().Changed("name") {
-			target.name = appName
-		}
+// parseConfigRef splits "<scope>" or "<scope>/<name>" into the
+// addressable target. Bare token is a scope; first slash is the
+// boundary. Errors on empty input so a stray `vd config` doesn't
+// silently target the empty scope.
+//
+// Inverse default vs splitJobRef: a bare token here means SCOPE,
+// not name. Operators reach for `vd config clowk-lp` when they
+// want "scope-level config", so the bare form populates scope and
+// leaves name empty. The slash is the explicit "narrow to one
+// resource" signal.
+func parseConfigRef(ref string) (configTarget, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return configTarget{}, fmt.Errorf("ref is required (use <scope> or <scope>/<name>)")
 	}
 
-	if target.scope == "" {
-		return configTarget{}, fmt.Errorf("--scope/-s (or --app/-a) is required")
+	if strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") {
+		return configTarget{}, fmt.Errorf("invalid ref %q (leading/trailing slash)", ref)
 	}
 
-	return target, nil
+	if i := strings.Index(ref, "/"); i >= 0 {
+		return configTarget{scope: ref[:i], name: ref[i+1:]}, nil
+	}
+
+	return configTarget{scope: ref}, nil
 }
 
-func configSetCmd() *cobra.Command {
-	var (
-		scope     string
-		name      string
-		app       string
-		noRestart bool
-	)
-
-	cmd := &cobra.Command{
-		Use:   "set KEY=VALUE [KEY=VALUE ...]",
-		Short: "Set one or more env vars on the controller",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			target, err := resolveConfigTarget(cmd, scope, name, app)
-			if err != nil {
-				return err
-			}
-
-			payload, err := parseKeyValuePairs(args)
-			if err != nil {
-				return err
-			}
-
-			if err := configPatch(cmd, target.scope, target.name, payload, !noRestart); err != nil {
-				return err
-			}
-
-			for k, v := range payload {
-				fmt.Printf("%s=%s\n", k, v)
-			}
-
-			return nil
-		},
+// runConfigList prints every var visible to the target. App-level
+// targets get the merged scope+app view; scope-level targets get
+// the bucket directly.
+func runConfigList(cmd *cobra.Command, target configTarget) error {
+	vars, err := configFetch(cmd, target.scope, target.name, "")
+	if err != nil {
+		return err
 	}
 
-	addConfigTargetFlags(cmd, &scope, &name, &app)
-	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not auto-restart affected containers")
-
-	return cmd
-}
-
-func configGetCmd() *cobra.Command {
-	var (
-		scope string
-		name  string
-		app   string
-	)
-
-	cmd := &cobra.Command{
-		Use:   "get KEY",
-		Short: "Read one env var",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			target, err := resolveConfigTarget(cmd, scope, name, app)
-			if err != nil {
-				return err
-			}
-
-			vars, err := configFetch(cmd, target.scope, target.name, args[0])
-			if err != nil {
-				return err
-			}
-
-			v, ok := vars[args[0]]
-			if !ok {
-				return fmt.Errorf("key %q not set", args[0])
-			}
-
-			fmt.Printf("%s=%s\n", args[0], v)
-
-			return nil
-		},
+	if len(vars) == 0 {
+		fmt.Println("No environment variables set")
+		return nil
 	}
 
-	addConfigTargetFlags(cmd, &scope, &name, &app)
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
 
-	return cmd
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		fmt.Printf("%s=%s\n", k, vars[k])
+	}
+
+	return nil
 }
 
-func configListCmd() *cobra.Command {
-	var (
-		scope string
-		name  string
-		app   string
-	)
+// runConfigSet posts the parsed KEY=VALUE pairs to /config. Empty
+// VALUE is allowed (set-to-empty intent); a missing `=` errors so
+// the operator doesn't accidentally pass a bare key.
+func runConfigSet(cmd *cobra.Command, target configTarget, args []string, restart bool) error {
+	payload, err := parseKeyValuePairs(args)
+	if err != nil {
+		return err
+	}
 
-	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List env vars (merged scope+app when --name is set)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			target, err := resolveConfigTarget(cmd, scope, name, app)
-			if err != nil {
-				return err
-			}
+	if err := configPatch(cmd, target.scope, target.name, payload, restart); err != nil {
+		return err
+	}
 
-			vars, err := configFetch(cmd, target.scope, target.name, "")
-			if err != nil {
-				return err
-			}
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
 
-			if len(vars) == 0 {
-				fmt.Println("No environment variables set")
-				return nil
-			}
+	sort.Strings(keys)
 
-			keys := make([]string, 0, len(vars))
-			for k := range vars {
+	for _, k := range keys {
+		fmt.Printf("%s=%s\n", k, payload[k])
+	}
+
+	return nil
+}
+
+// runConfigGet reads vars and filters by PATTERN. Empty PATTERN is
+// equivalent to list (mirrors `git remote` / `git remote -v`).
+//
+// Match is case-insensitive substring against the key name —
+// `get LOG` returns LOG_LEVEL, RAILS_LOG, anything containing LOG.
+// Operators rarely want exact-match for env reads (they're
+// remembering "the var about logging" not the exact spelling), and
+// substring is a strict superset: an exact key is a substring of
+// itself.
+func runConfigGet(cmd *cobra.Command, target configTarget, pattern string) error {
+	vars, err := configFetch(cmd, target.scope, target.name, "")
+	if err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, len(vars))
+
+	if pattern == "" {
+		for k := range vars {
+			keys = append(keys, k)
+		}
+	} else {
+		needle := strings.ToUpper(pattern)
+		for k := range vars {
+			if strings.Contains(strings.ToUpper(k), needle) {
 				keys = append(keys, k)
 			}
-
-			sort.Strings(keys)
-
-			for _, k := range keys {
-				fmt.Printf("%s=%s\n", k, vars[k])
-			}
-
-			return nil
-		},
+		}
 	}
 
-	addConfigTargetFlags(cmd, &scope, &name, &app)
-
-	return cmd
-}
-
-func configUnsetCmd() *cobra.Command {
-	var (
-		scope     string
-		name      string
-		app       string
-		noRestart bool
-	)
-
-	cmd := &cobra.Command{
-		Use:   "unset KEY [KEY ...]",
-		Short: "Delete one or more env vars",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			target, err := resolveConfigTarget(cmd, scope, name, app)
-			if err != nil {
-				return err
-			}
-
-			for _, key := range args {
-				if err := configDelete(cmd, target.scope, target.name, key, !noRestart); err != nil {
-					return err
-				}
-
-				fmt.Printf("Unset %s\n", key)
-			}
-
+	if len(keys) == 0 {
+		if pattern == "" {
+			fmt.Println("No environment variables set")
 			return nil
-		},
+		}
+
+		return fmt.Errorf("no keys match %q", pattern)
 	}
 
-	addConfigTargetFlags(cmd, &scope, &name, &app)
-	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not auto-restart affected containers")
+	sort.Strings(keys)
 
-	return cmd
+	for _, k := range keys {
+		fmt.Printf("%s=%s\n", k, vars[k])
+	}
+
+	return nil
 }
 
-// addConfigTargetFlags wires the standard scope/name/app trio onto
-// a config subcommand. Centralised so help text and flag shorthands
-// stay identical across set / get / list / unset — divergence here
-// would be the kind of bug that surfaces only as "why does -a work
-// on set but not on list".
-func addConfigTargetFlags(cmd *cobra.Command, scope, name, app *string) {
-	cmd.Flags().StringVarP(scope, "scope", "s", "", "scope (required, or use -a)")
-	cmd.Flags().StringVarP(name, "name", "n", "", "resource name (omit for scope-level)")
-	cmd.Flags().StringVarP(app, "app", "a", "",
-		"shorthand for --scope/--name (e.g. clowk-lp/web), or just <scope> for scope-level")
+// runConfigUnset deletes one or more keys, one per /config DELETE.
+// The server fires reconcile events for affected resources unless
+// --no-restart is set.
+func runConfigUnset(cmd *cobra.Command, target configTarget, keys []string, restart bool) error {
+	for _, key := range keys {
+		if err := configDelete(cmd, target.scope, target.name, key, restart); err != nil {
+			return err
+		}
+
+		fmt.Printf("Unset %s\n", key)
+	}
+
+	return nil
 }
 
 // parseKeyValuePairs splits "KEY=VALUE" tokens into a map. Empty
