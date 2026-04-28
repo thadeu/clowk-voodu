@@ -42,6 +42,21 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		return 1, fmt.Errorf("buffer manifest: %w", err)
 	}
 
+	// Phase 0: preflight. A fresh VM with no voodu binary should
+	// auto-bootstrap on the operator's first apply — they
+	// configured SSH, wrote the HCL, installed the local CLI, and
+	// the next thing they expect to type is `vd apply`. Forcing a
+	// separate `vd remote setup` here would break that flow.
+	//
+	// Fast path: probe is a single SSH round-trip (~50ms warm),
+	// returns immediately when the remote is healthy. Slow path:
+	// installer runs over SSH, controller comes up, then the
+	// usual diff/apply continues. Confirm gate matches the
+	// destructive-op pattern (autoApprove / VOODU_AUTO_APPROVE).
+	if err := ensureRemoteReady(info, identity, flags.autoApprove); err != nil {
+		return 1, err
+	}
+
 	env := remoteEnv()
 
 	// Phase 1: diff with -o json, capture stdout.

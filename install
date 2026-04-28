@@ -330,7 +330,16 @@ download_and_install_binary() {
   sudo_ install -m 0755 "$tmp/$binary" "$BIN_DIR/$binary"
   rm -rf "$tmp"
 
-  success "installed $BIN_DIR/$binary"
+  # `vd` shorthand for the voodu CLI — every command in the docs and
+  # help text uses it, and operators expect both names to work. Only
+  # symlinked for the user-facing `voodu` binary; the controller
+  # daemon doesn't need an alias.
+  if [ "$binary" = "voodu" ]; then
+    sudo_ ln -sf "$BIN_DIR/voodu" "$BIN_DIR/vd"
+    success "installed $BIN_DIR/$binary (alias: $BIN_DIR/vd)"
+  else
+    success "installed $BIN_DIR/$binary"
+  fi
 }
 
 server_setup() {
@@ -434,38 +443,23 @@ enable_controller() {
 print_next_steps() {
   echo
   if [ "$MODE" = "server" ]; then
-    local host
-    host="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname)"
-
     cat <<EOF
 ${GREEN}Voodu server ready.${NC}
 
   State:        $VOODU_ROOT (owned by $TARGET_USER)
   Controller:   http://${VOODU_HTTP_ADDR}   (unit: voodu-controller.service)
-  Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller
+  Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller (alias: $BIN_DIR/vd)
   Docker:       $(docker --version 2>/dev/null || echo "not installed")
-
-${CYAN}Next steps:${NC}
-  1. (if you weren't root) log out and back in so docker group membership applies
-  2. On your laptop:      voodu remote add voodu ${TARGET_USER}@${host}
-  3. Write voodu.hcl, then: voodu apply -f voodu.hcl --remote voodu
 
 EOF
   else
     cat <<EOF
 ${GREEN}Voodu CLI installed.${NC}
 
-  Binary:  $BIN_DIR/voodu
-
-${CYAN}Next steps:${NC}
-  1. Install voodu on a Linux server (same installer, --server is default there).
-  2. Register the target:      voodu remote add voodu user@server
-  3. Write api.voodu, then:    voodu apply -f api.voodu
+  Binary:  $BIN_DIR/voodu (alias: $BIN_DIR/vd)
 
 EOF
   fi
-
-  "$BIN_DIR/voodu" version || true
 }
 
 main() {
