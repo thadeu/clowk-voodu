@@ -2,7 +2,9 @@ package remote
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -11,13 +13,16 @@ import (
 // constant at /opt/voodu, kept as a field so future per-host
 // overrides don't require a struct change.
 //
-// Identity (which app to act on) lives entirely in the HCL
-// manifest (scope + name), not in the remote URL. The remote
-// reduces to "which server do I ssh to".
+// Identity is the path to an SSH private key (e.g. an EC2 .pem
+// file) when the remote URL embedded one via the
+// `user@host:/path/to/key` form. Empty means "let ssh pick from
+// ~/.ssh/config / agent / default keys" — the same behaviour
+// every other CLI command preserves.
 type Info struct {
 	RemoteName string // git remote label that resolved to this info
 	Host       string // user@hostname (passed verbatim to ssh)
 	BaseDir    string // /opt/voodu by default
+	Identity   string // optional ssh -i target, parsed out of the URL
 }
 
 // DefaultRemote is the name of the git remote voodu looks up first
@@ -31,12 +36,25 @@ const DefaultRemote = "voodu"
 // filesystem layout.
 const DefaultBaseDir = "/opt/voodu"
 
-// ParseRemoteURL parses the `user@host` form that `git remote add`
-// stores. The URL is not a real URL (no scheme) — voodu reuses the git
-// remote config as a lightweight key/value store for SSH targets,
-// nothing more. Normal git URLs (https://, git@github.com:..., etc.)
-// are rejected so ListAll can scan a repo with mixed remotes and keep
-// only the voodu ones.
+// ParseRemoteURL parses the `user@host[:identity]` form that `git
+// remote add` stores. The URL is not a real URL (no scheme) — voodu
+// reuses the git remote config as a lightweight key/value store
+// for SSH targets, nothing more. Normal git URLs (https://, git@
+// github.com:..., etc.) are rejected so ListAll can scan a repo
+// with mixed remotes and keep only the voodu ones.
+//
+// Two accepted shapes:
+//
+//	user@host                                 default key (~/.ssh/config / agent)
+//	user@host:/path/to/key.pem                explicit ssh -i target
+//	user@host:~/.ssh/ec2-prod.pem             tilde expanded at parse time
+//
+// The path discriminator is conservative: we only treat the suffix
+// after `:` as an identity when it starts with `/`, `~`, `./`, or
+// `../`. A bare token after `:` (e.g. `user@host:api`) was the
+// legacy app shape — reject it loudly so an operator with stale
+// git config gets a clear "update your remote URL" error instead
+// of voodu silently treating "api" as an SSH key path.
 func ParseRemoteURL(url string) (Info, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
@@ -47,25 +65,79 @@ func ParseRemoteURL(url string) (Info, error) {
 	// test is conservative: anything containing "://" or ending in ".git"
 	// is definitely not a voodu remote.
 	if strings.Contains(url, "://") || strings.HasSuffix(url, ".git") {
-		return Info{}, fmt.Errorf("invalid remote URL %q: want user@host", url)
+		return Info{}, fmt.Errorf("invalid remote URL %q: want user@host or user@host:/path/to/key.pem", url)
 	}
 
 	if !strings.Contains(url, "@") {
 		return Info{}, fmt.Errorf("invalid remote URL %q: host must be user@hostname", url)
 	}
 
-	// Legacy `user@host:app` form — the :app is redundant now that HCL
-	// carries the identity, so reject it loudly. No silent strip: the
-	// operator's git config is stale and needs a manual fix (one-line
-	// `git remote set-url NAME user@host`).
-	if strings.Contains(url, ":") {
-		return Info{}, fmt.Errorf("invalid remote URL %q: drop the ':app' suffix — HCL now owns the app identity. Update with: git remote set-url NAME user@host", url)
+	host, identity, hasIdentity := strings.Cut(url, ":")
+
+	if !hasIdentity {
+		return Info{
+			Host:    host,
+			BaseDir: DefaultBaseDir,
+		}, nil
+	}
+
+	if !looksLikeIdentityPath(identity) {
+		return Info{}, fmt.Errorf("invalid remote URL %q: the part after ':' must be a path to an ssh key (start with /, ~, ./, or ../). Bare tokens are rejected — drop the suffix or rewrite as user@host:/path/to/key.pem", url)
+	}
+
+	expanded, err := expandHome(identity)
+	if err != nil {
+		return Info{}, fmt.Errorf("invalid remote URL %q: expand identity: %w", url, err)
 	}
 
 	return Info{
-		Host:    url,
-		BaseDir: DefaultBaseDir,
+		Host:     host,
+		BaseDir:  DefaultBaseDir,
+		Identity: expanded,
 	}, nil
+}
+
+// looksLikeIdentityPath reports whether s is path-shaped (vs. the
+// legacy bare app token). Used by ParseRemoteURL to disambiguate
+// `user@host:/path/to/key` (identity) from `user@host:api`
+// (legacy, rejected).
+func looksLikeIdentityPath(s string) bool {
+	switch {
+	case strings.HasPrefix(s, "/"),
+		strings.HasPrefix(s, "~"),
+		strings.HasPrefix(s, "./"),
+		strings.HasPrefix(s, "../"):
+		return true
+	}
+
+	return false
+}
+
+// expandHome resolves a leading `~` or `~/` to the current user's
+// home directory. ssh's own `~` expansion only kicks in for
+// shell-quoted paths in the config file; when we pass the path as
+// a `-i` argument from Go's exec.Command, no shell is involved, so
+// we have to expand it ourselves or ssh sees a literal `~/...`
+// path that doesn't exist.
+func expandHome(p string) (string, error) {
+	if !strings.HasPrefix(p, "~") {
+		return p, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	if p == "~" {
+		return home, nil
+	}
+
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:]), nil
+	}
+
+	return p, nil
 }
 
 // Lookup returns the Info for a git remote by name. Errors when the

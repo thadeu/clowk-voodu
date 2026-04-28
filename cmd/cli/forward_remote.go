@@ -62,7 +62,16 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return 0, false
 	}
 
+	// Identity precedence:
+	//   1. VOODU_SSH_IDENTITY env (explicit override, highest priority)
+	//   2. Identity embedded in the remote URL (user@host:/path/to/key.pem)
+	//   3. ssh's defaults (~/.ssh/config, agent, ~/.ssh/id_rsa, ...)
+	// EC2-style .pem keys live in (2) by far most often — a pem
+	// per VPS that the operator set in `voodu remote add`.
 	identity := os.Getenv("VOODU_SSH_IDENTITY")
+	if identity == "" {
+		identity = info.Identity
+	}
 
 	// Manifest commands (apply/diff/delete) consume local files. We
 	// parse them here — on the dev machine where ${VAR} can resolve —

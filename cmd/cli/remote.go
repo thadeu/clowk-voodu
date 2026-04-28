@@ -43,9 +43,25 @@ the HCL declares.`,
 
 func newRemoteAddCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "add NAME user@host",
+		Use:   "add NAME user@host[:identity]",
 		Short: "Register a new Voodu remote (delegates to git remote add)",
-		Args:  cobra.ExactArgs(2),
+		Long: `Adds a git remote pointing at user@host. Voodu reuses git
+remotes as a lightweight key/value store for SSH targets — no
+separate registry, no extra config file.
+
+The optional :identity suffix embeds an SSH private key path so
+voodu can use ssh -i automatically on every command (no need to
+set VOODU_SSH_IDENTITY env or pass --identity each time):
+
+  voodu remote add prod ubuntu@vps.example.com
+  voodu remote add prod ubuntu@ec2.example.com:~/.ssh/ec2-prod.pem
+  voodu remote add prod ubuntu@ec2.example.com:/etc/voodu/keys/prod.pem
+
+Tilde (~) expands to the operator's home dir at parse time. The
+suffix must look like a path (start with /, ~, ./, or ../) — bare
+tokens are rejected to avoid confusion with the legacy app-shape
+URLs older voodu versions used.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, url := args[0], args[1]
 

@@ -444,8 +444,6 @@ print_next_steps() {
   echo
   if [ "$MODE" = "server" ]; then
     cat <<EOF
-${GREEN}Voodu server ready.${NC}
-
   State:        $VOODU_ROOT (owned by $TARGET_USER)
   Controller:   http://${VOODU_HTTP_ADDR}   (unit: voodu-controller.service)
   Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller (alias: $BIN_DIR/vd)
@@ -454,8 +452,6 @@ ${GREEN}Voodu server ready.${NC}
 EOF
   else
     cat <<EOF
-${GREEN}Voodu CLI installed.${NC}
-
   Binary:  $BIN_DIR/voodu (alias: $BIN_DIR/vd)
 
 EOF

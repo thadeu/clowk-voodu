@@ -11,9 +11,11 @@ import (
 
 func TestParseRemoteURL(t *testing.T) {
 	ok := map[string]Info{
-		"ubuntu@server":          {Host: "ubuntu@server", BaseDir: "/opt/voodu"},
-		"root@10.0.0.1":          {Host: "root@10.0.0.1", BaseDir: "/opt/voodu"},
-		"deploy@ec2.example.com": {Host: "deploy@ec2.example.com", BaseDir: "/opt/voodu"},
+		"ubuntu@server":                            {Host: "ubuntu@server", BaseDir: "/opt/voodu"},
+		"root@10.0.0.1":                            {Host: "root@10.0.0.1", BaseDir: "/opt/voodu"},
+		"deploy@ec2.example.com":                   {Host: "deploy@ec2.example.com", BaseDir: "/opt/voodu"},
+		"deploy@ec2.example.com:/etc/keys/prod.pem": {Host: "deploy@ec2.example.com", BaseDir: "/opt/voodu", Identity: "/etc/keys/prod.pem"},
+		"deploy@ec2.example.com:./keys/dev.pem":     {Host: "deploy@ec2.example.com", BaseDir: "/opt/voodu", Identity: "./keys/dev.pem"},
 	}
 
 	for url, want := range ok {
@@ -31,18 +33,46 @@ func TestParseRemoteURL(t *testing.T) {
 	bad := []string{
 		"",
 		"notarealurl",
-		"ubuntu@server:api",              // legacy :app suffix — rejected
-		"root@10.0.0.1:pg-0",             // legacy :app suffix — rejected
-		":api",                           // no host
-		"https://github.com/foo/bar",     // git URL, not voodu
-		"git@github.com:foo/bar.git",     // github-style SSH
-		"server",                         // missing user@
+		"ubuntu@server:api",          // legacy :app suffix — rejected (bare token)
+		"root@10.0.0.1:pg-0",         // legacy :app suffix — rejected
+		":api",                       // no host
+		"https://github.com/foo/bar", // git URL, not voodu
+		"git@github.com:foo/bar.git", // github-style SSH
+		"server",                     // missing user@
 	}
 
 	for _, url := range bad {
 		if _, err := ParseRemoteURL(url); err == nil {
 			t.Errorf("ParseRemoteURL(%q) should have failed", url)
 		}
+	}
+}
+
+// TestParseRemoteURLExpandsTilde covers the ergonomic case the
+// operator types most often: `user@host:~/.ssh/key.pem`. The
+// parser must expand `~` to the running user's home dir so ssh -i
+// receives an absolute path. Without expansion ssh sees a literal
+// `~/.ssh/...` string (no shell unfolding when the path is a Go
+// argv element) and bails with "permission denied (publickey)".
+func TestParseRemoteURLExpandsTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("UserHomeDir unavailable on this platform")
+	}
+
+	got, err := ParseRemoteURL("deploy@ec2.example.com:~/.ssh/ec2-prod.pem")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	want := filepath.Join(home, ".ssh", "ec2-prod.pem")
+
+	if got.Identity != want {
+		t.Errorf("identity expansion: got %q, want %q", got.Identity, want)
+	}
+
+	if got.Host != "deploy@ec2.example.com" {
+		t.Errorf("host: got %q", got.Host)
 	}
 }
 
