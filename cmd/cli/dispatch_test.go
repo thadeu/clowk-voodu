@@ -18,8 +18,8 @@ func TestRewriteColonSyntax(t *testing.T) {
 		},
 		{
 			name: "no colon passes through",
-			in:   []string{"voodu", "apps", "list"},
-			want: []string{"voodu", "apps", "list"},
+			in:   []string{"voodu", "get", "pods"},
+			want: []string{"voodu", "get", "pods"},
 		},
 		{
 			name: "simple colon rewrite",
@@ -48,8 +48,8 @@ func TestRewriteColonSyntax(t *testing.T) {
 		},
 		{
 			name: "user@host:app token (git remote) is not rewritten",
-			in:   []string{"voodu", "apps", "create", "ubuntu@server.com:api"},
-			want: []string{"voodu", "apps", "create", "ubuntu@server.com:api"},
+			in:   []string{"voodu", "remote", "add", "ubuntu@server.com:api"},
+			want: []string{"voodu", "remote", "add", "ubuntu@server.com:api"},
 		},
 		{
 			name: "KEY=VALUE with colon inside value is not rewritten",
@@ -84,8 +84,8 @@ func TestIsKnownCommand(t *testing.T) {
 	}{
 		{"empty is root (known)", []string{}, true},
 		{"only flags is root (known)", []string{"--help"}, true},
-		{"flag value skipped", []string{"--controller-url", "http://x", "apps"}, true},
-		{"builtin apps", []string{"apps"}, true},
+		{"flag value skipped", []string{"--controller-url", "http://x", "get"}, true},
+		{"builtin get", []string{"get"}, true},
 		{"builtin config", []string{"config", "set"}, true},
 		{"builtin version", []string{"version"}, true},
 		{"unknown plugin verb", []string{"postgres", "create", "main"}, false},

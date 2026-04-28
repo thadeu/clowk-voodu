@@ -40,7 +40,6 @@ Use ":" syntax as shorthand for subcommands:
 	root.AddCommand(
 		newVersionCmd(),
 		newSetupCmd(),
-		newAppsCmd(),
 		newReceivePackCmd(),
 		newConfigCmd(),
 		newApplyCmd(),

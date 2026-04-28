@@ -191,7 +191,17 @@ type envelope struct {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+
+	// SetEscapeHTML(false): keep `<`, `>`, `&` literal in the JSON
+	// output. Default Go encoder escapes them to `<`, `>`,
+	// `&` for HTML-embed safety — we never embed in HTML, and
+	// the escapes show up verbatim when the CLI prints an error
+	// like `need at least <plugin> <command>`. The literal angle
+	// brackets are far more readable for the operator.
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+
+	_ = enc.Encode(v)
 }
 
 func writeErr(w http.ResponseWriter, code int, err error) {

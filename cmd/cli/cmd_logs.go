@@ -216,7 +216,7 @@ func fetchPodsList(cmd *cobra.Command, q url.Values) ([]controller.Pod, error) {
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, formatControllerError(resp.StatusCode, raw)
 	}
 
 	var env podsListResponse
@@ -281,7 +281,7 @@ func streamOneLog(ctx context.Context, cmd *cobra.Command, name string, follow b
 			return fmt.Errorf("%s", env.Error)
 		}
 
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	if prefix == "" {

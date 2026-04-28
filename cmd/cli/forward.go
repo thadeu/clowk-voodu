@@ -48,6 +48,39 @@ type forwardResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+// formatControllerError turns a non-2xx response from the controller
+// into a human-readable error. The server speaks the envelope
+// `{"status":"error","error":"<message>"}` for every failure path,
+// so the CLI extracts the inner message and drops the JSON wrapper —
+// otherwise the operator sees `controller returned 400:
+// {"status":"error","error":"need at least <plugin> <command>"}`
+// instead of the actual diagnostic.
+//
+// Falls back to the raw body when the response isn't a parseable
+// envelope (network proxy 502, malformed server crash, etc.) so
+// genuinely strange failures still surface their bytes.
+//
+// Status code is omitted on purpose: the inner message already names
+// the specific problem, and the bare number ("400", "503") is noise
+// most of the time. The shorter form reads as a sentence.
+func formatControllerError(statusCode int, raw []byte) error {
+	trimmed := strings.TrimSpace(string(raw))
+
+	if trimmed == "" {
+		return fmt.Errorf("controller returned %d (empty body)", statusCode)
+	}
+
+	if trimmed[0] == '{' {
+		var env forwardResponse
+
+		if err := json.Unmarshal([]byte(trimmed), &env); err == nil && env.Error != "" {
+			return fmt.Errorf("%s", env.Error)
+		}
+	}
+
+	return fmt.Errorf("controller returned %d: %s", statusCode, trimmed)
+}
+
 // forwardToController POSTs unknown-command args to the controller and
 // prints whatever it returns. In M2 there is no controller yet, so this
 // will fail with a clear "plugin not found or controller unreachable"
@@ -93,8 +126,18 @@ func forwardToController(root *cobra.Command, args []string) error {
 		return fmt.Errorf("unknown command %q: no builtin and no plugin registered", strings.Join(args, " "))
 	}
 
+	// `vd <single-token>` (e.g. `vd apps` after the apps command was
+	// retired) reaches here with len(args)==1 and trips the server's
+	// "need at least <plugin> <command>" guard. From the operator's
+	// perspective they typed an unknown verb; surfacing the plugin-
+	// system internal is misleading. Reword to match the no-plugin
+	// path above so the two unknown-command outcomes read alike.
+	if resp.StatusCode == http.StatusBadRequest && len(args) < 2 {
+		return fmt.Errorf("unknown command %q: no builtin and no plugin registered", strings.Join(args, " "))
+	}
+
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, string(raw))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	return renderForwardResponse(root, raw)

@@ -245,7 +245,7 @@ func runExec(cmd *cobra.Command, ref string, command []string, containerOverride
 			return fmt.Errorf("%s", env.Error)
 		}
 
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	// At this point, conn is the raw bidirectional channel. The

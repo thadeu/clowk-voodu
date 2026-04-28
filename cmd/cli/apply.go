@@ -208,7 +208,7 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	// Route per-resource verdicts through progress.Reporter so NDJSON
@@ -364,7 +364,7 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	var plan diffResponse

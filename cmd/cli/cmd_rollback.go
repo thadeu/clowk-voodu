@@ -101,15 +101,7 @@ func runRollback(cmd *cobra.Command, ref, releaseID string) error {
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		var env struct {
-			Error string `json:"error"`
-		}
-
-		if json.Unmarshal(raw, &env) == nil && env.Error != "" {
-			return fmt.Errorf("%s", env.Error)
-		}
-
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	var env struct {

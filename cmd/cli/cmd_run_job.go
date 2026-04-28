@@ -95,7 +95,7 @@ func runRunJob(cmd *cobra.Command, ref string) error {
 			return fmt.Errorf("%s", env.Error)
 		}
 
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	return nil

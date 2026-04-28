@@ -179,7 +179,7 @@ func runDescribe(cmd *cobra.Command, kindStr, ref string, opts describeOptions) 
 			return fmt.Errorf("%s", env.Error)
 		}
 
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	mode := describeOutputMode(root)
@@ -746,7 +746,7 @@ func fetchPodDetail(cmd *cobra.Command, name string) (*controller.PodDetail, err
 			return nil, fmt.Errorf("%s", env.Error)
 		}
 
-		return nil, fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, formatControllerError(resp.StatusCode, raw)
 	}
 
 	if env.Data.Pod == nil {
@@ -810,7 +810,7 @@ func runDescribePodByFilter(cmd *cobra.Command, ref, scope, name string, opts de
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	var env podsListResponse

@@ -459,5 +459,5 @@ func surfaceConfigError(code int, raw []byte) error {
 		return fmt.Errorf("%s", env.Error)
 	}
 
-	return fmt.Errorf("controller returned %d: %s", code, strings.TrimSpace(string(raw)))
+	return formatControllerError(code, raw)
 }

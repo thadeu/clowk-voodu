@@ -169,7 +169,7 @@ func releaseRunStreaming(cmd *cobra.Command, ref string) error {
 	if resp.StatusCode != http.StatusOK {
 		rdr.stop()
 		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	// Stream the body line-by-line into the renderer. Buffer is
@@ -643,7 +643,7 @@ func releaseHistory(cmd *cobra.Command, ref string) error {
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("controller returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return formatControllerError(resp.StatusCode, raw)
 	}
 
 	var env struct {
