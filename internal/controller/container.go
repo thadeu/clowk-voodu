@@ -46,6 +46,25 @@ type ContainerManager interface {
 	// the spec-hash path without special-casing "unknown".
 	ImageIDsDiffer(container, tag string) (bool, error)
 
+	// ImageExists reports whether `ref` is a known local image.
+	// Used by rollback to decide between fast-path retag (image
+	// still present) and slow-path rebuild-from-source (image
+	// was GC'd).
+	ImageExists(ref string) bool
+
+	// TagImage points dst at src's image content via `docker tag`.
+	// Rollback uses this to re-point <app>:latest at an older
+	// <app>:<buildID> tag, instantly reverting the image
+	// content all replicas pull. Errors when src is missing —
+	// caller falls back to RetagImage's complement, the rebuild
+	// path.
+	TagImage(src, dst string) error
+
+	// RemoveImageTag drops a single tag (`docker rmi`). Used by
+	// the release-history GC to clean up <app>:<buildID> tags
+	// for records that fell off maxReleaseHistory. Idempotent.
+	RemoveImageTag(ref string) error
+
 	// Recreate stops-and-removes the existing container (if any) and
 	// starts a fresh one from spec. Distinct from Ensure because we
 	// want a *different* image/runtime config, not a no-op.
@@ -306,6 +325,18 @@ func (DockerContainerManager) ImageIDsDiffer(container, tag string) (bool, error
 	}
 
 	return containerID != tagID, nil
+}
+
+func (DockerContainerManager) ImageExists(ref string) bool {
+	return docker.ImageExists(ref)
+}
+
+func (DockerContainerManager) TagImage(src, dst string) error {
+	return docker.TagImage(src, dst)
+}
+
+func (DockerContainerManager) RemoveImageTag(ref string) error {
+	return docker.RemoveImageTag(ref)
 }
 
 func (DockerContainerManager) Remove(name string) error {

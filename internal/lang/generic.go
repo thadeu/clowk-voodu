@@ -41,13 +41,19 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 		return fmt.Errorf("no Dockerfile found and no language-specific strategy available")
 	}
 
-	imageTag := fmt.Sprintf("%s:latest", appName)
+	// Two tags: floating :latest for the manifest's pull target,
+	// and immutable :<buildID> so rollback can re-point :latest at
+	// older content without rebuilding. See common.go's
+	// runDockerBuild for the full rationale.
+	latestTag := fmt.Sprintf("%s:latest", appName)
+	buildID := filepath.Base(releaseDir)
+	immutableTag := fmt.Sprintf("%s:%s", appName, buildID)
 
 	var cmd *exec.Cmd
 	if spec.Dockerfile != "" {
-		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 	} else {
-		cmd = exec.Command("docker", "build", "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "-t", latestTag, "-t", immutableTag, releaseDir)
 	}
 
 	for _, label := range docker.GetVooduLabels() {

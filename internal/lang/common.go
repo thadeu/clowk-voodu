@@ -95,11 +95,32 @@ func deployContainer(appName string, spec *BuildSpec, releaseDir string) error {
 }
 
 // runDockerBuild invokes `docker build` honouring spec.Dockerfile /
-// spec.Workdir, tagged as <appName>:latest. buildArgs is merged into
-// --build-arg flags. Shared by Python/Ruby/Rails/Nodejs handlers which
-// all have the same shape.
+// spec.Workdir, tagged as <appName>:latest AND
+// <appName>:<buildID>. buildArgs is merged into --build-arg flags.
+// Shared by Python/Ruby/Rails/Nodejs handlers which all have the
+// same shape.
+//
+// Two tags by design:
+//
+//   - <appName>:latest is the floating "current build" tag the
+//     deployment manifest references. Apply-time replicas pick it
+//     up so re-deploys don't need a manifest edit.
+//   - <appName>:<buildID> is the immutable per-content tag.
+//     <buildID> is the sha256 of the source tarball, captured by
+//     receive-pack as the release dir name. This tag is what
+//     `vd rollback` re-points :latest at when restoring an older
+//     image — without it, rollback would scale and replace
+//     containers but every replica would still pull the latest
+//     buggy image.
+//
+// Old per-build tags accumulate locally; the controller's
+// gcReleaseImageTags trims them when records fall off
+// maxReleaseHistory. A failed rollback for a missing tag falls
+// back to rebuilding from the preserved release source dir.
 func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArgs map[string]string) error {
-	imageTag := fmt.Sprintf("%s:latest", appName)
+	latestTag := fmt.Sprintf("%s:latest", appName)
+	buildID := filepath.Base(releaseDir)
+	immutableTag := fmt.Sprintf("%s:%s", appName, buildID)
 
 	var cmd *exec.Cmd
 
@@ -115,9 +136,9 @@ func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArg
 		}
 
 		fmt.Printf("-----> Using custom Dockerfile: %s\n", dockerfilePath)
-		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 	} else {
-		cmd = exec.Command("docker", "build", "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "-t", latestTag, "-t", immutableTag, releaseDir)
 	}
 
 	for key, value := range buildArgs {

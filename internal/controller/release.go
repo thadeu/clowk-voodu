@@ -7,12 +7,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
 	"go.voodu.clowk.in/internal/containers"
+	"go.voodu.clowk.in/internal/paths"
 )
+
+// currentBuildID returns the content-addressable buildID
+// receive-pack last shipped for this app, by reading the basename
+// of the `current` symlink target. Returns "" when:
+//
+//   - The symlink doesn't exist (image-mode deployment, no
+//     receive-pack ever ran).
+//   - The symlink is broken (filesystem race, manual operator
+//     cleanup) — better to record an empty BuildID than crash the
+//     release flow over a side-channel detail.
+//
+// An empty BuildID disables rollback's image-retag fast path; the
+// rollback still works for spec/replicas changes, just doesn't
+// restore image content. That's the right degraded behaviour for
+// image-mode deployments where the runtime tag is fully owned by
+// the registry.
+func currentBuildID(app string) string {
+	link := paths.AppCurrentLink(app)
+
+	target, err := os.Readlink(link)
+	if err != nil {
+		return ""
+	}
+
+	return filepath.Base(target)
+}
 
 // newReleaseID returns a short sortable identifier for a release
 // run. Format: base36(unix_seconds) + 2 hex random chars, ~9 chars
@@ -122,6 +151,7 @@ func (h *DeploymentHandler) runReleaseIfNeeded(ctx context.Context, scope, name,
 		ID:           releaseID,
 		SpecHash:     hash,
 		Image:        spec.Image,
+		BuildID:      currentBuildID(app),
 		Status:       ReleaseStatusRunning,
 		StartedAt:    time.Now().UTC(),
 		SpecSnapshot: specSnapshot,
@@ -352,7 +382,15 @@ func (h *DeploymentHandler) appendReleaseRecord(ctx context.Context, app string,
 
 	prev.Releases = append([]ReleaseRecord{r}, prev.Releases...)
 
+	// Capture records that are about to fall off the cap so the
+	// image-tag GC below knows which <app>:<BuildID> tags to drop.
+	// Without this, every rebuild leaves an orphan tag pointing at
+	// an image content that's no longer referenced by any release
+	// record — fills the docker image cache over time.
+	var dropped []ReleaseRecord
+
 	if len(prev.Releases) > maxReleaseHistory {
+		dropped = append(dropped, prev.Releases[maxReleaseHistory:]...)
 		prev.Releases = prev.Releases[:maxReleaseHistory]
 	}
 
@@ -384,6 +422,13 @@ func (h *DeploymentHandler) appendReleaseRecord(ctx context.Context, app string,
 		if err := gcRunContainers(h.Containers, string(KindJob), scope, deployName+"-release", keep); err != nil {
 			h.logf("deployment/%s release container GC failed: %v", app, err)
 		}
+
+		// Drop <app>:<BuildID> tags for records that fell off the
+		// cap, so the docker image cache doesn't accumulate stale
+		// tags pointing at content nothing references anymore. A
+		// BuildID still referenced by a surviving record is kept —
+		// rollback to that record needs the tag intact.
+		h.gcReleaseImageTags(app, dropped, prev.Releases)
 	}
 
 	return nil
@@ -497,6 +542,7 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 		ID:           releaseID,
 		SpecHash:     hash,
 		Image:        spec.Image,
+		BuildID:      currentBuildID(app),
 		Status:       ReleaseStatusRunning,
 		StartedAt:    time.Now().UTC(),
 		SpecSnapshot: manifest.Spec,
@@ -652,11 +698,18 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 
 	newID := newReleaseID()
 
+	// Rollback inherits the target's BuildID — pods spawned by
+	// this rollback record run the target's image content, even
+	// though the new release_id is freshly minted. Without this,
+	// the rollback record's BuildID would be empty and a chained
+	// rollback (rolling back a rollback) couldn't find the
+	// content to restore.
 	rollbackRecord := ReleaseRecord{
 		ID:             newID,
 		RolledBackFrom: target.ID,
 		SpecHash:       target.SpecHash,
 		Image:          target.Image,
+		BuildID:        target.BuildID,
 		Status:         ReleaseStatusSucceeded,
 		StartedAt:      time.Now().UTC(),
 		EndedAt:        time.Now().UTC(),
@@ -698,7 +751,7 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 }
 
 // rolloutRollback brings the running fleet to whatever the snapshot
-// declared — image, env, command, AND replica count. Three phases:
+// declared — image, env, command, AND replica count. Four phases:
 //
 //  1. Scale down: if the snapshot wants fewer replicas than are
 //     currently live, prune the extras first. (`replicas=1` rolled
@@ -714,6 +767,17 @@ func (h *DeploymentHandler) Rollback(ctx context.Context, scope, name, targetID 
 //  3. Scale up: if the snapshot wants MORE replicas than are
 //     currently live (rolling back a scale-down), ensure the
 //     missing ones get spawned with the rolled-back spec.
+//
+//  4. Re-stamp release_id: sweep the final live set and recreate
+//     any replica whose voodu.release_id label doesn't match the
+//     rollback's newReleaseID. Necessary because the reconciler's
+//     apply() races with this rollout (the Store.Put fires the
+//     etcd watch, the reconciler picks it up, and mints its OWN
+//     applyReleaseID for the same drift). Without the sweep,
+//     `vd describe` shows pods stamped with the reconciler's id —
+//     a release that may not even exist in history because
+//     appendReleaseRecord can be clobbered by the rollback's
+//     own append. End-state authority belongs to the rollback.
 //
 // Status is baselined at the end so the reconciler's next pass
 // sees the rolled-back hash and skips its own drift detection —
@@ -738,6 +802,18 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 
 	if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
 		return fmt.Errorf("apply defaults: %w", err)
+	}
+
+	// Phase 0: image retag. Build-mode deployments rebuild
+	// <app>:latest on every apply, so the running tag points at
+	// the LATEST (potentially buggy) image — even if we replace
+	// every replica from the rolled-back spec, the new replicas
+	// would just pull the buggy content. Re-pointing :latest at
+	// the target's <app>:<BuildID> immutable tag is the actual
+	// content rollback. Skipped for image-mode deployments
+	// (target.BuildID is empty) where the registry owns the tag.
+	if err := h.retagToTargetBuild(scope, name, app, target); err != nil {
+		return fmt.Errorf("retag image for rollback: %w", err)
 	}
 
 	want := effectiveReplicas(spec)
@@ -788,9 +864,147 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 		}
 	}
 
-	if err := h.writeDeploymentStatus(ctx, app, spec.Image, target.SpecHash); err != nil {
+	// Phase 4: re-stamp any replicas whose voodu.release_id label
+	// doesn't match the rollback's newReleaseID. The race window
+	// is narrow but real: while rolloutRollback is running, the
+	// reconciler's apply() — woken by this same rollback's
+	// Store.Put — observes spec drift against the pre-rollback
+	// status hash, mints its own applyReleaseID, and may both
+	// (a) spawn replicas under that id, and (b) write a release
+	// record that the rollback's own append later clobbers via
+	// load-modify-write on the same status blob. Either way, the
+	// operator ends up with pods whose label points at a release
+	// that's invisible in `vd describe`.
+	//
+	// The sweep below is the end-state authority: list whatever
+	// the runtime actually has now, find replicas whose
+	// release_id ≠ newReleaseID, and rolling-replace them so they
+	// carry the correct label. Replicas already on newReleaseID
+	// are left alone — no churn for the ones we already stamped
+	// in Phase 2/3.
+	final, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+	if err != nil {
+		return fmt.Errorf("list replicas (post scale): %w", err)
+	}
+
+	stale := filterSlots(final, func(s ContainerSlot) bool {
+		return s.Identity.ReleaseID != newReleaseID
+	})
+
+	if len(stale) > 0 {
+		h.logf("deployment/%s rollback re-stamping %d replica(s) to release_id=%s",
+			app, len(stale), newReleaseID)
+
+		if err := h.rollingReplaceReplicas(ctx, scope, name, app, stale, spec, target.SpecHash, newReleaseID); err != nil {
+			return fmt.Errorf("re-stamp replicas: %w", err)
+		}
+	}
+
+	if err := h.writeDeploymentStatus(ctx, app, spec.Image, target.SpecHash, want); err != nil {
 		h.logf("deployment/%s rollback status persist failed: %v", app, err)
 	}
+
+	return nil
+}
+
+// gcReleaseImageTags drops <app>:<BuildID> tags for release
+// records that fell off the cap, but only when no surviving
+// record references the same BuildID. The "still referenced"
+// guard matters because two records can share a BuildID — a
+// rollback inherits the target's BuildID, so dropping the tag
+// just because the original record fell off would orphan the
+// rollback record's image.
+//
+// Best-effort: failures are logged but don't fail the release
+// flow. The worst case is a tag accumulating until the next
+// successful GC pass.
+func (h *DeploymentHandler) gcReleaseImageTags(app string, dropped, kept []ReleaseRecord) {
+	if h.Containers == nil || len(dropped) == 0 {
+		return
+	}
+
+	keptBuilds := make(map[string]bool, len(kept))
+	for _, r := range kept {
+		if r.BuildID != "" {
+			keptBuilds[r.BuildID] = true
+		}
+	}
+
+	for _, r := range dropped {
+		if r.BuildID == "" {
+			continue
+		}
+
+		if keptBuilds[r.BuildID] {
+			continue
+		}
+
+		tag := fmt.Sprintf("%s:%s", app, r.BuildID)
+
+		if err := h.Containers.RemoveImageTag(tag); err != nil {
+			h.logf("deployment/%s gc image tag %s failed: %v", app, tag, err)
+		}
+	}
+}
+
+// retagToTargetBuild re-points <app>:latest at the target
+// release's <app>:<BuildID> immutable tag, so the rolling-
+// replace below spawns containers running the rolled-back
+// image content (not whatever :latest happens to alias right
+// now from the latest apply).
+//
+// Three cases the helper has to absorb:
+//
+//   - target.BuildID is empty (image-mode deployment, or release
+//     captured before BuildID plumbing landed). Skip silently;
+//     the caller's rolling-replace still does the right thing
+//     for spec/replicas changes, and image-mode deployments
+//     rely on the registry tag the operator wrote in HCL.
+//
+//   - <app>:<BuildID> exists locally. `docker tag <src> <dst>`
+//     instantly retargets :latest. Fast path, no rebuild.
+//
+//   - <app>:<BuildID> is GONE (image was GC'd; release dir may
+//     also be gone). Surface a clear error so the operator
+//     knows rollback can't restore content. Future improvement:
+//     rebuild from `paths.AppReleasesDir/<BuildID>` when the
+//     source dir survives but the image was pruned.
+func (h *DeploymentHandler) retagToTargetBuild(scope, name, app string, target *ReleaseRecord) error {
+	if target.BuildID == "" {
+		// Image-mode deployment, or pre-BuildID release record.
+		// Spec.Image is whatever the manifest said (registry tag,
+		// or <app>:latest for older build-mode); rolling-replace
+		// uses it as-is.
+		return nil
+	}
+
+	if h.Containers == nil {
+		return nil
+	}
+
+	// Image base name: strip any tag from spec.Image to derive the
+	// repository (e.g. "clowk-lp-web:latest" → "clowk-lp-web").
+	// effectiveReplicas-style defaults already applied — spec.Image
+	// is non-empty here for build-mode.
+	imageBase := app
+
+	immutableTag := fmt.Sprintf("%s:%s", imageBase, target.BuildID)
+	latestTag := fmt.Sprintf("%s:latest", imageBase)
+
+	if !h.Containers.ImageExists(immutableTag) {
+		// Future: rebuild from paths.AppReleasesDir(app)/<BuildID>
+		// here. For now surface the loss explicitly — operator can
+		// re-build manually with `docker build` against the
+		// preserved source dir if it still exists.
+		return fmt.Errorf("rollback: image %s not present locally — cannot restore content (rebuild from /opt/voodu/apps/%s/releases/%s if available)",
+			immutableTag, app, target.BuildID)
+	}
+
+	if err := h.Containers.TagImage(immutableTag, latestTag); err != nil {
+		return fmt.Errorf("retag %s -> %s: %w", immutableTag, latestTag, err)
+	}
+
+	h.logf("deployment/%s rollback retagged %s -> %s", app, immutableTag, latestTag)
 
 	return nil
 }

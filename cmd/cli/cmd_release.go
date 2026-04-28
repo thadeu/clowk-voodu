@@ -55,8 +55,9 @@ import (
 //     specific wrapper would just shadow the existing path.
 func newReleaseCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "release <ref> [verb]",
-		Short: "Inspect and re-trigger the deployment release phase",
+		Use:     "release <ref> [verb]",
+		Aliases: []string{"re", "releases"},
+		Short:   "Inspect and re-trigger the deployment release phase",
 		Long: `Voodu's release phase runs a manifest-declared command
 (typically rails db:migrate, php artisan migrate, etc.) BEFORE the
 rolling restart of replicas. Each release is identified by a short
@@ -698,6 +699,43 @@ func podCountByRelease(pods []controller.Pod) map[string]int {
 	return out
 }
 
+// expectedReplicas returns the replica count declared in the
+// release's spec snapshot. Callers compare this against the live
+// pod count for the release to surface "expected/actual" — e.g.
+// `3/3` (healthy current) or `3/0` (superseded or scaled-out-of).
+//
+// Empty/missing snapshot or unparseable JSON falls back to 1
+// (the default for omitted `replicas` in HCL, matching what
+// effectiveReplicas does server-side). Older releases captured
+// before the spec_snapshot field was added land here too.
+func expectedReplicas(r controller.ReleaseRecord) int {
+	if len(r.SpecSnapshot) == 0 {
+		return 1
+	}
+
+	var probe struct {
+		Replicas int `json:"replicas,omitempty"`
+	}
+
+	if err := json.Unmarshal(r.SpecSnapshot, &probe); err != nil {
+		return 1
+	}
+
+	if probe.Replicas < 1 {
+		return 1
+	}
+
+	return probe.Replicas
+}
+
+// formatReplicaRatio renders the expected/actual ratio that
+// shows up in PODS columns and `replicas=X/Y` strings. Order is
+// `<expected>/<actual>` — same direction the operator typed in
+// HCL: "I asked for 3, X are live".
+func formatReplicaRatio(expected, actual int) string {
+	return fmt.Sprintf("%d/%d", expected, actual)
+}
+
 // renderReleaseHistory tabulates the deployment's release log,
 // newest first. PODS counts live containers that carry each
 // release's id in the voodu.release_id label — so the operator
@@ -732,8 +770,10 @@ func renderReleaseHistory(w io.Writer, records []controller.ReleaseRecord, pods 
 			image = "-"
 		}
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
-			r.ID, r.Status, shortHashCLI(r.SpecHash), image, counts[r.ID], rolledBackFrom, started, duration)
+		ratio := formatReplicaRatio(expectedReplicas(r), counts[r.ID])
+
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			r.ID, r.Status, shortHashCLI(r.SpecHash), image, ratio, rolledBackFrom, started, duration)
 	}
 
 	_ = tw.Flush()

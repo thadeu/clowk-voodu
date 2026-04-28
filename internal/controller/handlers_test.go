@@ -290,6 +290,12 @@ type fakeContainers struct {
 	containerImageIDs map[string]string
 	tagImageIDs       map[string]string
 
+	// imageTagOps records `tag` and `rmi` ops in the order the
+	// rollback / GC paths invoke them. Tests assert on this when
+	// they care about HOW the image was retagged (fast retag vs.
+	// fallback rebuild) rather than just the final state.
+	imageTagOps []string
+
 	// waitExits maps container name → the exit code Wait should report
 	// when the job runner blocks on it. waitErrs lets a test inject a
 	// docker-side failure (already-removed, daemon error). Both default
@@ -356,6 +362,42 @@ func (f *fakeContainers) ImageIDsDiffer(container, tag string) (bool, error) {
 	}
 
 	return cid != tid, nil
+}
+
+func (f *fakeContainers) ImageExists(ref string) bool {
+	_, ok := f.tagImageIDs[ref]
+	return ok
+}
+
+func (f *fakeContainers) TagImage(src, dst string) error {
+	if f.tagImageIDs == nil {
+		f.tagImageIDs = map[string]string{}
+	}
+
+	id, ok := f.tagImageIDs[src]
+	if !ok {
+		return fmt.Errorf("docker tag %s %s: source not found", src, dst)
+	}
+
+	f.tagImageIDs[dst] = id
+	f.imageTagOps = append(f.imageTagOps, fmt.Sprintf("tag %s -> %s", src, dst))
+
+	return nil
+}
+
+func (f *fakeContainers) RemoveImageTag(ref string) error {
+	if f.tagImageIDs == nil {
+		return nil
+	}
+
+	if _, ok := f.tagImageIDs[ref]; !ok {
+		return nil
+	}
+
+	delete(f.tagImageIDs, ref)
+	f.imageTagOps = append(f.imageTagOps, "rmi "+ref)
+
+	return nil
 }
 
 func (f *fakeContainers) Recreate(spec ContainerSpec) error {

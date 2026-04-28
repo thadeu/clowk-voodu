@@ -596,12 +596,71 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 	hash := deploymentSpecHash(spec)
 
-	// Apply-time creation has no release context — release-block
-	// deployments get their release_id stamp from the orchestrator
-	// (Release / Rollback) which replaces these initial replicas
-	// shortly after. Non-release-block deployments simply have no
-	// release identity; an empty label is the right thing.
-	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash, "")
+	// Detect first-apply vs spec-drift vs scale-only vs no-op
+	// replay. A release record gets minted exactly when this
+	// apply represents a meaningful new state of the deployment:
+	//
+	//   - First apply (no prior status, replicas about to spawn) →
+	//     the initial release. Record captures the launch spec for
+	//     future rollback.
+	//   - Spec drift (status hash != current hash) → a new release.
+	//     Record captures what changed.
+	//   - Scale-only change (hash same, replica count differs) →
+	//     a new release. Replicas isn't in the hash (so we don't
+	//     churn already-running pods on scale-up) but the operator's
+	//     intent ("now I want 3 instead of 1") is still a release-
+	//     worthy state change worth recording for rollback.
+	//   - No-op replay (hash same, replicas same) → no record.
+	//     Reconciler watch fires for env changes / config set / etc.
+	//     and we don't want every config-set burst to mint a release.
+	//
+	// Release-block deployments don't go through this path —
+	// they're orchestrated by `vd release run` (CLI), which mints
+	// its own release ID and creates its own record. Skipping here
+	// avoids double-counting.
+	prevStatus, _ := h.loadDeploymentStatus(ctx, app)
+	specDrifted := prevStatus.SpecHash != "" && prevStatus.SpecHash != hash
+	firstApply := prevStatus.SpecHash == ""
+
+	// Replicas-tracking landed after SpecHash; deployments
+	// persisted by an older controller have prev.Replicas == 0
+	// (zero value of an unset field). Treat that as "unknown" so
+	// the first reconcile post-upgrade silently back-fills the
+	// count via writeDeploymentStatus instead of minting a
+	// phantom release for every existing deployment.
+	replicaCountChanged := prevStatus.SpecHash != "" &&
+		prevStatus.Replicas != 0 &&
+		prevStatus.Replicas != replicas
+
+	// Image-id drift: build-mode rebuilds <app>:latest under the
+	// same tag string on every receive-pack push, so the spec
+	// hash stays stable (image string didn't change) but the
+	// underlying image ID differs. The most common shape — user
+	// edits source, runs `vd apply`, no HCL change — lands here.
+	// Without this check applyReleaseID stays empty and the
+	// rebuild rolls out without a release record, breaking the
+	// "every meaningful apply mints a release" contract.
+	//
+	// Only checked when there's a running replica to inspect; on
+	// first apply (no live containers) firstApply already covers
+	// the mint. recreateReplicasIfSpecChanged repeats the same
+	// check later — this earlier read is the price of stamping
+	// the mint with the correct releaseID.
+	imageIDDrift := false
+
+	if !firstApply && !specDrifted && spec.Image != "" && len(live) > 0 {
+		if differ, err := h.Containers.ImageIDsDiffer(live[0].Name, spec.Image); err == nil && differ {
+			imageIDDrift = true
+		}
+	}
+
+	var applyReleaseID string
+
+	if spec.Release == nil && (firstApply || specDrifted || replicaCountChanged || imageIDDrift) {
+		applyReleaseID = newReleaseID()
+	}
+
+	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash, applyReleaseID)
 	if err != nil {
 		return err
 	}
@@ -614,10 +673,19 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	}
 
 	if createdAny {
-		// Baseline the spec hash so the next reconcile has something
-		// to compare against. Without this, the very next apply would
-		// see no persisted status and treat a real drift as first-seen.
-		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+		// Baseline the spec hash + replica count so the next
+		// reconcile has something to compare against. Without
+		// this, the very next apply would see no persisted
+		// status and treat a real drift as first-seen.
+		//
+		// Critical: this writeStatus must NOT happen on the
+		// spec-drift path (createdAny=false there). The drift
+		// detector inside recreateReplicasIfSpecChanged compares
+		// the new hash against the PERSISTED hash; if we write
+		// the new hash here, the recreate loop short-circuits
+		// because "no drift". Scale-only and post-recreate
+		// status writes happen later in this function.
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash, replicas); err != nil {
 			h.logf("deployment/%s status persist failed: %v", ev.Name, err)
 		}
 	}
@@ -648,7 +716,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 			return !justCreated
 		})
 
-		r, err := h.recreateReplicasIfSpecChanged(ctx, ev.Scope, ev.Name, app, toCheck, spec, hash)
+		r, err := h.recreateReplicasIfSpecChanged(ctx, ev.Scope, ev.Name, app, toCheck, spec, hash, applyReleaseID)
 		if err != nil {
 			return err
 		}
@@ -687,6 +755,53 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 					h.logf("deployment/%s env-change rolling restart failed: %v", ev.Name, err)
 				}
 			}
+		}
+	}
+
+	// Scale-only writeStatus: pure replica count changes mint
+	// applyReleaseID but neither create nor recreate pods (the
+	// scale-down path only prunes; scale-up would have set
+	// createdAny earlier). Without this, prevStatus.Replicas
+	// stays stale and the NEXT scale-only change wouldn't be
+	// detected as a count drift.
+	if applyReleaseID != "" && !createdAny && !recreatedAny {
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash, replicas); err != nil {
+			h.logf("deployment/%s scale-only status persist failed: %v", ev.Name, err)
+		}
+	}
+
+	// Universal release record — every meaningful apply (first-
+	// apply, spec drift, or scale-only change on a non-release-
+	// block deployment) gets a record in the release history.
+	// Without this, rollback could only target deployments that
+	// explicitly declared `release {}` — but every deployment
+	// deserves rollback. The record captures the spec snapshot
+	// so `vd rollback web <id>` can re-apply it.
+	//
+	// `applyReleaseID` was minted earlier in this function; if
+	// it's still empty here we skipped record creation
+	// deliberately (release-block deployment delegated to
+	// /releases/run, or no-op replay where nothing actually
+	// changed). The mint itself is the gate — no need to also
+	// check createdAny/recreatedAny: a scale-down mints
+	// applyReleaseID but does neither, and we still want the
+	// record so rollback can target the pre-scale state.
+	if applyReleaseID != "" {
+		now := time.Now().UTC()
+
+		record := ReleaseRecord{
+			ID:           applyReleaseID,
+			SpecHash:     hash,
+			Image:        spec.Image,
+			BuildID:      currentBuildID(app),
+			Status:       ReleaseStatusSucceeded,
+			StartedAt:    now,
+			EndedAt:      now,
+			SpecSnapshot: ev.Manifest.Spec,
+		}
+
+		if err := h.appendReleaseRecord(ctx, app, record); err != nil {
+			h.logf("deployment/%s release record persist failed: %v", ev.Name, err)
 		}
 	}
 
@@ -894,7 +1009,14 @@ func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []Containe
 // On recreate we generate a fresh replica id for the new container —
 // the old one is gone, so there's no name to reuse, and the opaque
 // id keeps emphasising that replicas are interchangeable.
-func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash string) (bool, error) {
+//
+// `releaseID` is the apply-minted release identifier for non-release-
+// block deployments. Stamped onto the new replicas so `vd describe`
+// can correlate them to the release record this apply created.
+// Empty for release-block deployments (the reconciler explicitly
+// skips those — `vd release run` orchestrates them with its own
+// releaseID).
+func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash, releaseID string) (bool, error) {
 	raw, err := h.Store.GetStatus(ctx, KindDeployment, app)
 	if err != nil {
 		return false, fmt.Errorf("read deployment status: %w", err)
@@ -903,7 +1025,7 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 	if raw == nil {
 		// Baseline — no recreate, just record what's running so the
 		// next apply has a reference point.
-		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash, effectiveReplicas(spec)); err != nil {
 			h.logf("deployment/%s status persist failed: %v", app, err)
 		}
 
@@ -917,7 +1039,7 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 		// to hand-edit etcd to unblock a reconcile.
 		h.logf("deployment/%s status decode failed, re-baselining: %v", app, err)
 
-		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+		if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash, effectiveReplicas(spec)); err != nil {
 			h.logf("deployment/%s status persist failed: %v", app, err)
 		}
 
@@ -974,13 +1096,15 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 
 	h.logf("deployment/%s %s, recreating %d replica(s)", app, reason, len(live))
 
-	// Reconciler-driven recreate (non-release-block deployment) —
-	// no release record exists, so no release_id to stamp.
-	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, ""); err != nil {
+	// Reconciler-driven recreate (non-release-block deployment).
+	// If apply() minted a releaseID for this drift, stamp it on
+	// the replacement containers so they correlate with the
+	// release record this same apply will write.
+	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, releaseID); err != nil {
 		return false, err
 	}
 
-	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash, effectiveReplicas(spec)); err != nil {
 		h.logf("deployment/%s status persist failed: %v", app, err)
 	}
 
@@ -1308,6 +1432,19 @@ type DeploymentStatus struct {
 	Image    string `json:"image,omitempty"`
 	SpecHash string `json:"spec_hash,omitempty"`
 
+	// Replicas is the desired replica count from the most recent
+	// apply. Tracked separately from SpecHash because it's
+	// deliberately NOT in the hash — a scale-up shouldn't
+	// rebuild every existing pod, only spawn the missing ones.
+	// But the operator's intent ("now I want 3 replicas instead
+	// of 1") is still a release-worthy state change, so apply()
+	// compares prev.Replicas against the new declaration to
+	// decide whether to mint a release record. Without this
+	// field, scale-only changes would silently skip the release
+	// log and rollback could not target a specific replica
+	// configuration.
+	Replicas int `json:"replicas,omitempty"`
+
 	// Releases is the deployment's release-phase history, newest
 	// first, capped at maxReleaseHistory entries. Each record carries
 	// the spec snapshot used at release time, which is what
@@ -1352,6 +1489,20 @@ type ReleaseRecord struct {
 	// the history table so the operator can correlate "release X
 	// took 30s" with "image vd-web:1.2.3".
 	Image string `json:"image,omitempty"`
+
+	// BuildID is the content-addressable hash of the source
+	// tarball that produced this release's image (build-mode
+	// deployments only). Captured by reading paths.AppCurrentLink
+	// at release-record-creation time — the symlink target's
+	// basename is the buildID receive-pack used.
+	//
+	// Rollback re-points <app>:latest at <app>:<BuildID> via
+	// `docker tag` so the runtime serves the rolled-back image
+	// content, not the latest (potentially buggy) build that
+	// :latest currently aliases. Empty for image-mode (registry)
+	// deployments — those use spec.Image directly without rebuild
+	// machinery.
+	BuildID string `json:"build_id,omitempty"`
 
 	Status    ReleaseStatus `json:"status"`
 	StartedAt time.Time     `json:"started_at,omitempty"`
@@ -1451,21 +1602,28 @@ func shortHash(h string) string {
 }
 
 func (h *DeploymentHandler) putDeploymentStatus(ctx context.Context, app string, spec deploymentSpec) error {
-	return h.writeDeploymentStatus(ctx, app, spec.Image, deploymentSpecHash(spec))
+	return h.writeDeploymentStatus(ctx, app, spec.Image, deploymentSpecHash(spec), effectiveReplicas(spec))
 }
 
-// writeDeploymentStatus persists Image+SpecHash while preserving
-// the Releases history that lives on the same blob. A naive marshal
-// of `{Image, SpecHash}` would erase the release-phase records every
-// time the reconciler baselined the spec — a release run + an
-// immediate reconcile pass would leave the operator with an empty
-// `vd release <ref>` history. Load-modify-write keeps the two
-// concerns from clobbering each other.
-func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, image, hash string) error {
+// writeDeploymentStatus persists Image+SpecHash+Replicas while
+// preserving the Releases history that lives on the same blob. A
+// naive marshal of `{Image, SpecHash, Replicas}` would erase the
+// release-phase records every time the reconciler baselined the
+// spec — a release run + an immediate reconcile pass would leave
+// the operator with an empty `vd release <ref>` history.
+// Load-modify-write keeps the two concerns from clobbering each
+// other.
+//
+// `replicas` is the operator's just-declared desired count. Used
+// by the next apply() to detect scale-only intent changes — those
+// don't move SpecHash (replicas isn't in the hash) but should
+// still mint a release record.
+func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, image, hash string, replicas int) error {
 	prev, _ := h.loadDeploymentStatus(ctx, app)
 
 	prev.Image = image
 	prev.SpecHash = hash
+	prev.Replicas = replicas
 
 	blob, err := json.Marshal(prev)
 	if err != nil {

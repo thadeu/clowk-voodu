@@ -232,7 +232,7 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 	// motivated this refactor.
 	switch manifest.Kind {
 	case controller.KindDeployment:
-		renderDeploymentSummary(w, statusBlob)
+		renderDeploymentSummary(w, statusBlob, pods)
 
 	case controller.KindDatabase:
 		renderDatabaseSummary(w, statusBlob)
@@ -320,7 +320,7 @@ func renderDescribePodsTable(w io.Writer, pods []controller.Pod) error {
 
 // --- Per-kind summary renderers -------------------------------------
 
-func renderDeploymentSummary(w io.Writer, blob json.RawMessage) {
+func renderDeploymentSummary(w io.Writer, blob json.RawMessage, pods []controller.Pod) {
 	var st controller.DeploymentStatus
 	if !decodeStatus(w, blob, &st) {
 		return
@@ -330,7 +330,7 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage) {
 	fmt.Fprintf(w, "  spec_hash: %s\n", dashIfEmpty(st.SpecHash))
 
 	if len(st.Releases) > 0 {
-		renderReleaseSummaryInline(w, st.Releases)
+		renderReleaseSummaryInline(w, st.Releases, pods)
 	}
 }
 
@@ -350,32 +350,37 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage) {
 // `previous` is omitted when there's only one release record.
 // `rollback` hint is omitted when there's no useful target (single
 // release in history, or all records are rollbacks of each other).
-func renderReleaseSummaryInline(w io.Writer, records []controller.ReleaseRecord) {
+func renderReleaseSummaryInline(w io.Writer, records []controller.ReleaseRecord, pods []controller.Pod) {
+	counts := podCountByRelease(pods)
+
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  release:")
-	fmt.Fprintf(w, "    current:    %s\n", formatReleaseLine(records[0]))
+	fmt.Fprintf(w, "    current:    %s\n", formatReleaseLine(records[0], counts))
 
 	if len(records) >= 2 {
-		fmt.Fprintf(w, "    previous:   %s\n", formatReleaseLine(records[1]))
-	}
-
-	if hint := rollbackHint(records); hint != "" {
-		fmt.Fprintln(w)
-		fmt.Fprintf(w, "    rollback:   %s\n", hint)
+		fmt.Fprintf(w, "    previous:   %s\n", formatReleaseLine(records[1], counts))
 	}
 }
 
 // formatReleaseLine renders one release row inline-style for the
 // describe block. Compact on purpose — operator scans these fast,
 // long URLs and timestamps don't help here.
-func formatReleaseLine(r controller.ReleaseRecord) string {
+//
+// `replicas=X/Y` shows the snapshot's declared replica count vs.
+// live pods carrying this release_id. `3/3` is healthy current,
+// `3/0` means the release is superseded (newer release owns the
+// pods now), `3/1` mid-rollout. The mismatch is the operator's
+// at-a-glance health signal.
+func formatReleaseLine(r controller.ReleaseRecord, podCounts map[string]int) string {
 	age := "-"
 	if !r.StartedAt.IsZero() {
 		age = humanizeAge(time.Since(r.StartedAt))
 	}
 
-	out := fmt.Sprintf("%s   %s   %s   image=%s",
-		r.ID, r.Status, age, dashIfEmpty(r.Image))
+	ratio := formatReplicaRatio(expectedReplicas(r), podCounts[r.ID])
+
+	out := fmt.Sprintf("%s   %s   %s   image=%s   replicas=%s",
+		r.ID, r.Status, age, dashIfEmpty(r.Image), ratio)
 
 	if r.RolledBackFrom != "" {
 		out += "   rolled-back-from=" + r.RolledBackFrom
@@ -759,19 +764,19 @@ type describePodResponse struct {
 // pod` and its `get pod` alias. Three ref shapes are accepted:
 //
 //   - "<scope>"            — every container in this scope, across
-//                            kinds (deployments, jobs, cronjobs, …).
-//                            Useful for the "what's running for app X?"
-//                            sweep, e.g. `vd get pd clowk-lp`.
+//     kinds (deployments, jobs, cronjobs, …).
+//     Useful for the "what's running for app X?"
+//     sweep, e.g. `vd get pd clowk-lp`.
 //   - "<scope>/<name>"     — every container matching the (scope, name)
-//                            identity. All replicas of one resource,
-//                            e.g. `vd get pd clowk-lp/web`.
+//     identity. All replicas of one resource,
+//     e.g. `vd get pd clowk-lp/web`.
 //   - "<container_name>"   — single rich detail by docker name, e.g.
-//                            `vd get pd clowk-lp-web.a3f9`.
+//     `vd get pd clowk-lp-web.a3f9`.
 //
 // Discriminators:
 //   - has `/` → scope/name (split on first slash)
 //   - has `.` → container name (replica id suffix is the giveaway —
-//               every voodu container ends in ".<replicaID>")
+//     every voodu container ends in ".<replicaID>")
 //   - else    → bare scope filter
 //
 // The dot heuristic is safe because voodu enforces dot-less scope

@@ -681,6 +681,71 @@ func GetContainerImageID(name string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// TagImage points dst at the same image ID currently aliased by
+// src. Wraps `docker tag <src> <dst>`. Idempotent — re-tagging
+// an existing tag at the same image is a no-op as far as docker
+// is concerned (just updates the tag→id map in place).
+//
+// Used by `vd rollback` to re-point <app>:latest at an older
+// <app>:<buildID> tag without rebuilding. Errors when src isn't
+// known to the local daemon (image was GC'd; caller falls back
+// to a from-source rebuild).
+func TagImage(src, dst string) error {
+	cmd := exec.Command("docker", "tag", src, dst)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker tag %s %s: %s", src, dst, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+// ImageExists reports whether a local image matches `ref`. Same
+// shape as GetImageID's "missing" path (empty string == not
+// present), but expressed as a bool so callers don't have to write
+// the cmp themselves. Used by rollback to decide between fast-path
+// retag and slow-path rebuild.
+func ImageExists(ref string) bool {
+	id, err := GetImageID(ref)
+	if err != nil {
+		return false
+	}
+
+	return id != ""
+}
+
+// RemoveImageTag deletes a single tag without touching other tags
+// pointing at the same image content. `docker rmi` removes the
+// tag→id entry; the underlying image stays as long as another tag
+// (or running container) references it.
+//
+// Used by the release-history GC to drop <app>:<buildID> tags
+// for records that fell off maxReleaseHistory. Idempotent — a
+// missing tag returns nil (no-op) rather than an error so the GC
+// doesn't trip on a double-cleanup.
+func RemoveImageTag(ref string) error {
+	if !ImageExists(ref) {
+		return nil
+	}
+
+	cmd := exec.Command("docker", "rmi", "--no-prune", ref)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// "No such image" between the existence check and the rmi
+		// call is a benign race; surface anything else.
+		raw := strings.TrimSpace(string(out))
+		if strings.Contains(raw, "No such image") {
+			return nil
+		}
+
+		return fmt.Errorf("docker rmi %s: %s", ref, raw)
+	}
+
+	return nil
+}
+
 // GetImageID resolves a tag (or any image reference) to its current
 // sha256 ID. Pair with GetContainerImageID to detect build-mode drift:
 // after `docker build -t vd-web:latest`, the tag points at a new ID

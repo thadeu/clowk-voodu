@@ -48,7 +48,13 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return fmt.Errorf("failed to ensure Dockerfile: %v", err)
 	}
 
-	imageTag := fmt.Sprintf("%s:latest", appName)
+	// Two tags: floating :latest for the manifest's pull target,
+	// and immutable :<buildID> so rollback can re-point :latest at
+	// older content without rebuilding. See common.go's
+	// runDockerBuild for the full rationale.
+	latestTag := fmt.Sprintf("%s:latest", appName)
+	buildID := filepath.Base(releaseDir)
+	immutableTag := fmt.Sprintf("%s:%s", appName, buildID)
 	buildArgs := l.buildArgs(spec)
 
 	var cmd *exec.Cmd
@@ -63,11 +69,11 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 			}
 		}
 
-		cmd = exec.Command("docker", "build", "--progress=plain", "-f", dockerfilePath, "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "--progress=plain", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 
 		fmt.Printf("-----> Using custom Dockerfile: %s\n", dockerfilePath)
 	} else {
-		cmd = exec.Command("docker", "build", "--progress=plain", "-t", imageTag, releaseDir)
+		cmd = exec.Command("docker", "build", "--progress=plain", "-t", latestTag, "-t", immutableTag, releaseDir)
 	}
 
 	for key, value := range buildArgs {
