@@ -8,19 +8,23 @@
 #
 # Server mode (default on Linux): installs base deps + Docker, drops the
 # `voodu` and `voodu-controller` binaries, seeds /opt/voodu, enables the
-# voodu-controller.service systemd unit, and adds the deploy user to the
-# docker group. Truly turnkey — a fresh Ubuntu/Debian/RHEL/Alpine box
-# ends ready to deploy.
+# voodu-controller.service systemd unit, adds the deploy user to the
+# docker group, AND installs the default plugins (voodu-caddy for
+# ingress) so a fresh box can serve `app` blocks immediately. Truly
+# turnkey — a fresh Ubuntu/Debian/RHEL/Alpine box ends ready to deploy.
 #
 # Client mode (default on macOS, forced on Linux with --client): just
 # the CLI — meant for laptops that deploy to remote servers.
 #
 # Env knobs:
-#   VERSION               pin a release (default: latest from GitHub)
-#   VOODU_INSTALL_REPO    source repo (default: thadeu/clowk-voodu)
-#   VOODU_ROOT            server state dir (default: /opt/voodu)
-#   VOODU_HTTP_ADDR       controller HTTP bind (default: 127.0.0.1:8686)
-#   SKIP_DOCKER=1         skip Docker install (server mode only)
+#   VERSION                 pin a release (default: latest from GitHub)
+#   VOODU_INSTALL_REPO      source repo (default: thadeu/clowk-voodu)
+#   VOODU_ROOT              server state dir (default: /opt/voodu)
+#   VOODU_HTTP_ADDR         controller HTTP bind (default: 127.0.0.1:8686)
+#   VOODU_DEFAULT_PLUGINS   space-separated plugins to install on first
+#                           boot (default: thadeu/voodu-caddy)
+#   SKIP_DOCKER=1           skip Docker install (server mode only)
+#   SKIP_PLUGINS=1          skip default plugin install (offline boxes)
 
 set -euo pipefail
 
@@ -361,6 +365,7 @@ server_setup() {
   write_voodurc_server_mode
   write_systemd_unit
   enable_controller
+  install_default_plugins
 }
 
 # write_voodurc_server_mode marks $TARGET_USER's ~/.voodurc with
@@ -438,6 +443,68 @@ enable_controller() {
   else
     warn "voodu-controller failed to start — inspect: sudo journalctl -u voodu-controller -n 50"
   fi
+}
+
+# wait_for_controller_http blocks until the controller's /health
+# endpoint responds 2xx, capped at 30s. systemctl is-active returns
+# true the moment the process spawns, but the HTTP listener takes
+# another beat to bind — without this gate, install_default_plugins
+# below would fire `voodu plugins install` against a port that
+# isn't ready and the plugin would silently fail to land.
+wait_for_controller_http() {
+  local i=0
+
+  while [ $i -lt 30 ]; do
+    if curl -fsS -m 2 "http://${VOODU_HTTP_ADDR}/health" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    i=$((i + 1))
+    sleep 1
+  done
+
+  warn "controller HTTP did not respond within 30s — skipping default plugin install"
+  return 1
+}
+
+# install_default_plugins materialises the out-of-the-box plugin
+# set so a fresh server can serve `app` blocks (deployment +
+# ingress) without a follow-up install step. Default is just
+# voodu-caddy — the reference ingress impl, required by every
+# `ingress { ... }` HCL block.
+#
+# Env knobs:
+#   SKIP_PLUGINS=1            skip entirely (offline installs)
+#   VOODU_DEFAULT_PLUGINS=... space-separated source list overriding
+#                             the default. Sources are anything
+#                             `voodu plugins install` accepts (github
+#                             shorthand, full URL, local path).
+#
+# Best-effort: a failed plugin install warns but doesn't abort the
+# bootstrap — the operator can `voodu plugins install` manually
+# later. The most common failure (no internet on the VM) shouldn't
+# leave them with a half-broken install.
+install_default_plugins() {
+  if [ "${SKIP_PLUGINS:-0}" = "1" ]; then
+    log "SKIP_PLUGINS=1 — skipping default plugin install"
+    return
+  fi
+
+  if ! wait_for_controller_http; then
+    return
+  fi
+
+  local plugins="${VOODU_DEFAULT_PLUGINS:-thadeu/voodu-caddy}"
+
+  for p in $plugins; do
+    log "installing plugin: $p"
+
+    if "$BIN_DIR/voodu" plugins install "$p" >/dev/null 2>&1; then
+      success "installed plugin: $p"
+    else
+      warn "failed to install plugin $p — finish manually with: voodu plugins install $p"
+    fi
+  done
 }
 
 print_next_steps() {
