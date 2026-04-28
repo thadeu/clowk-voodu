@@ -168,7 +168,7 @@ func ensureRemoteReady(info *remote.Info, identity string, autoApprove bool) err
 	// using a fork or pinned version need to confirm which script
 	// is being fetched. The ssh target is already obvious from
 	// the --remote flag the operator just typed.
-	preflightLog("First-time setup will run the voodu installer over SSH:")
+	preflightLog("Setup will run the voodu installer over SSH:")
 	preflightLog(fmt.Sprintf("curl -fsSL %s | bash -s -- --server", currentInstallURL()))
 	fmt.Fprintln(os.Stderr)
 
