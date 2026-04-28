@@ -148,6 +148,14 @@ func releaseRunStreaming(cmd *cobra.Command, ref string) error {
 		displayRef = name
 	}
 
+	// Blank separator so the release section reads as a distinct
+	// phase below the apply's `✓ ... applied` block. Without this,
+	// the first spinner row sits flush against the last applied
+	// line and the operator's eye doesn't catch the context shift
+	// (apply done → release starting). One newline is enough — the
+	// blank row visually anchors the section header that follows.
+	fmt.Fprintln(os.Stdout)
+
 	rdr := newReleaseRenderer(os.Stdout, displayRef)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -250,6 +258,15 @@ type releaseRenderer struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 	hasDrawn bool // true once the spinner has painted at least once
+
+	// hadOutput tracks whether any remote: lines were printed since
+	// the last ✓ commit. When true, the next commit prepends a
+	// blank line so the section break "logs ended → result" reads
+	// clean. Reset to false on every commit, so back-to-back commits
+	// with no intervening output (e.g. command → rolling restart
+	// when the restart phase produces no container logs) don't get
+	// a stray blank between them.
+	hadOutput bool
 }
 
 // newReleaseRenderer builds a renderer wired to out. When out is a
@@ -333,11 +350,35 @@ func (r *releaseRenderer) spin() {
 // paintSpinner writes the in-place spinner line. Caller holds r.mu.
 // `\r` returns to column 0 and `\033[K` clears to end-of-line so the
 // previous frame is wiped cleanly even if the new label is shorter.
+//
+// Two label modes:
+//
+//   - A sub-phase is open (stepLabel != "") → spinner shows that
+//     phase's label and per-phase elapsed. Operator sees ⠋ Release
+//     te6mfi5f: command (3s) ticking up while the migration runs.
+//
+//   - No sub-phase (between banners or before the first one) →
+//     spinner shows the outer "Releasing deployment/X" with the
+//     overall release elapsed. Mostly visible during the brief
+//     window between the apply finishing and the first server
+//     marker arriving.
+//
+// The label switch is the visual cue that "we're now on phase X" —
+// no separate "▸ start" line needed because the spinner IS the
+// start line until commitStep freezes it as ✓.
 func (r *releaseRenderer) paintSpinner(frame rune) {
-	elapsed := time.Since(r.started).Round(time.Second)
+	var label string
+	var elapsed time.Duration
 
-	fmt.Fprintf(r.out, "\r\033[K%c Releasing deployment/%s... (%s)",
-		frame, r.displayRef, elapsed)
+	if r.stepLabel != "" {
+		label = r.stepLabel
+		elapsed = time.Since(r.stepStart).Round(time.Second)
+	} else {
+		label = "Releasing deployment/" + r.displayRef
+		elapsed = time.Since(r.started).Round(time.Second)
+	}
+
+	fmt.Fprintf(r.out, "\r\033[K%c %s (%s)", frame, label, elapsed)
 
 	r.hasDrawn = true
 }
@@ -361,20 +402,58 @@ func (r *releaseRenderer) clearSpinner() {
 // gets corrupted by interleaved writes.
 func (r *releaseRenderer) line(s string) {
 	if strings.HasPrefix(s, "-----> ") {
-		label := strings.TrimPrefix(s, "-----> ")
-
-		r.commitStep()
-
-		r.mu.Lock()
-		r.stepLabel = label
-		r.stepStart = time.Now()
-		r.last = label
-		r.mu.Unlock()
-
+		r.transitionToStep(strings.TrimPrefix(s, "-----> "))
 		return
 	}
 
-	r.printAboveSpinner(fmt.Sprintf("  remote:    %s\n", s))
+	r.printAboveSpinner(fmt.Sprintf("  remote:  %s\n", s))
+
+	r.mu.Lock()
+	r.hadOutput = true
+	r.mu.Unlock()
+}
+
+// transitionToStep is the atomic "previous phase done, new phase
+// starting" operation. Held under a single critical section so the
+// spinner ticker can't fire between the ✓ print and the new label
+// taking effect — without atomicity the operator would see the
+// spinner briefly flash the outer "Releasing deployment/X" label
+// or the new label before the previous ✓ landed, which reads as
+// flicker.
+//
+// Visual sequence: clear spinner row, print ✓ for the previous
+// phase (if any), set the new label + reset the per-phase timer,
+// repaint the spinner with the new label and 0s elapsed.
+func (r *releaseRenderer) transitionToStep(newLabel string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	prevLabel, prevStart := r.stepLabel, r.stepStart
+
+	r.clearSpinner()
+
+	if prevLabel != "" {
+		// Blank separator between the phase's container output and
+		// the ✓ that closes it. Only when there WAS output —
+		// back-to-back commits with no logs in between would
+		// otherwise pick up a stray blank line per transition.
+		if r.hadOutput {
+			fmt.Fprintln(r.out)
+			r.hadOutput = false
+		}
+
+		elapsed := time.Since(prevStart).Round(time.Second)
+		fmt.Fprint(r.out, formatStepLine(prevLabel, elapsed, r.color))
+	}
+
+	r.stepLabel = newLabel
+	r.stepStart = time.Now()
+	r.last = newLabel
+
+	if r.tty {
+		frames := []rune(spinnerFrames)
+		r.paintSpinner(frames[r.frame])
+	}
 }
 
 // printAboveSpinner writes text in the row currently occupied by
@@ -399,6 +478,13 @@ func (r *releaseRenderer) printAboveSpinner(text string) {
 // Failure phases (label contains "failed") get a red ✗ instead so
 // the transcript visually distinguishes the broken step.
 //
+// Atomic with the spinner ticker: takes the lock for the full
+// "clear → print → repaint" sequence so the ticker can't paint a
+// half-stale frame mid-commit. Used by the success/failure paths
+// at end-of-stream where there's no NEW step to transition into;
+// transitionToStep is the equivalent for mid-stream banner-to-banner
+// hand-offs.
+//
 // Colors mirror progressFilter (stream_filter.go) byte-for-byte so
 // release output blends visually with the build steps:
 //
@@ -411,9 +497,10 @@ func (r *releaseRenderer) printAboveSpinner(text string) {
 // tty gate the spinner uses, so captured output stays plain.
 func (r *releaseRenderer) commitStep() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	label, start := r.stepLabel, r.stepStart
 	r.stepLabel = ""
-	r.mu.Unlock()
 
 	if label == "" {
 		return
@@ -421,7 +508,20 @@ func (r *releaseRenderer) commitStep() {
 
 	elapsed := time.Since(start).Round(time.Second)
 
-	r.printAboveSpinner(formatStepLine(label, elapsed, r.color))
+	r.clearSpinner()
+
+	// Blank separator after container output (see transitionToStep).
+	if r.hadOutput {
+		fmt.Fprintln(r.out)
+		r.hadOutput = false
+	}
+
+	fmt.Fprint(r.out, formatStepLine(label, elapsed, r.color))
+
+	if r.tty {
+		frames := []rune(spinnerFrames)
+		r.paintSpinner(frames[r.frame])
+	}
 }
 
 // formatStepLine renders the closed-step line. Pulled out of

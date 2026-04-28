@@ -112,7 +112,14 @@ func (r *eventRenderer) Write(p []byte) (int, error) {
 // silently swallowing. Caller must hold r.mu.
 func (r *eventRenderer) processLineLocked(line []byte) {
 	trimmed := bytes.TrimSpace(line)
+
+	// Blank line — used by the apply→release transition (and other
+	// downstream callers) as an intentional visual separator. Pass
+	// it through clean so the section break survives the SSH-
+	// forwarded path. Skip the spinner clear because there's
+	// nothing to overdraw, just emit a newline.
 	if len(trimmed) == 0 {
+		fmt.Fprintln(r.out)
 		return
 	}
 
