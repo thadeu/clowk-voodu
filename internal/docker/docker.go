@@ -1,6 +1,8 @@
-// Package docker wraps the `docker` CLI invocations Voodu uses for build,
-// deploy and container lifecycle management. Ported from the Gokku codebase
-// with path/label rebranding.
+// Package docker wraps the `docker` CLI invocations voodu uses for
+// build, deploy and container lifecycle management. Single-binary
+// wrappers over `docker run / ps / inspect / logs / exec` so the
+// rest of the codebase stays out of shell quoting and exit-code
+// translation.
 package docker
 
 import (
@@ -28,8 +30,9 @@ func GetVooduLabels() []string {
 	return []string{fmt.Sprintf("%s=%s", VooduLabelKey, VooduLabelValue)}
 }
 
-// ContainerInfo represents information about a running container. Inherited
-// from the Gokku codebase — combines docker ps output and the registry shape.
+// ContainerInfo represents information about a running container.
+// Mirrors the columns `docker ps --format json` emits so callers
+// can decode the daemon's output directly.
 type ContainerInfo struct {
 	ID      string `json:"ID"`
 	Names   string `json:"Names"`

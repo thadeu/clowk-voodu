@@ -131,7 +131,8 @@ func buildEnv(p *LoadedPlugin, per map[string]string) []string {
 // matching the plugin protocol. The detection is strict: the first
 // non-whitespace byte must be '{' AND the blob must unmarshal into an
 // Envelope with a non-empty Status. Anything else falls back to raw
-// text, preserving Gokku-compatible passthrough behavior.
+// text passthrough so shell-only plugins that print bare strings
+// still work.
 func parseEnvelope(raw []byte) *plugin.Envelope {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {

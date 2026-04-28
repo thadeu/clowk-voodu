@@ -1,5 +1,7 @@
-// Package containers persists per-app container metadata under the Voodu
-// state tree (<root>/apps/<app>/containers). Ported from the Gokku codebase.
+// Package containers persists per-app container metadata under the
+// voodu state tree (<root>/apps/<app>/containers) and provides the
+// label vocabulary used to identify voodu-managed containers in
+// docker (voodu.kind, voodu.scope, voodu.name, voodu.replica_id).
 package containers
 
 import (

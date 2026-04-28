@@ -217,10 +217,10 @@ func normaliseGitURL(s string) string {
 	return s
 }
 
-// runLifecycle runs `install` or `uninstall` in the plugin dir if that
-// script exists. Failures are logged to the caller's stderr but do not
-// abort the operation — matching Gokku behaviour, where lifecycle
-// scripts are advisory.
+// runLifecycle runs `install` or `uninstall` in the plugin dir if
+// that script exists. Failures are logged to the caller's stderr
+// but do not abort the operation — lifecycle scripts are advisory,
+// the plugin's commands/* are the contract.
 func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name string) {
 	path := filepath.Join(p.Dir, name)
 
@@ -239,8 +239,10 @@ func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name stri
 }
 
 // makeExecutable sets 0755 on every file under commands/ and bin/.
-// Mirrors the Gokku install step where shell scripts lose the +x bit
-// after `git clone` on some platforms.
+// Defensive: shell scripts in plugin repos can lose the +x bit
+// after `git clone` (Windows checkouts, archive extraction with
+// strict umask, etc.) and the plugin would silently fail with
+// "permission denied" on first invocation.
 func makeExecutable(root string) error {
 	for _, sub := range []string{"commands", "bin"} {
 		dir := filepath.Join(root, sub)

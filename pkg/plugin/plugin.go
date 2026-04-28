@@ -1,17 +1,16 @@
-// Package plugin is the public contract for Voodu plugins.
+// Package plugin is the public contract for voodu plugins.
 //
 // # Plugin layout on disk
 //
-// A plugin is a directory under /opt/voodu/plugins/<name>/. It mirrors
-// the Gokku layout so existing Gokku plugins port without changes:
+// A plugin is a directory under /opt/voodu/plugins/<name>/:
 //
 //	<plugin>/
 //	  plugin.yml             (optional metadata; falls back to convention)
 //	  install                (optional lifecycle hook, run at plugins:install)
 //	  uninstall              (optional lifecycle hook, run at plugins:remove)
 //	  commands/
-//	    name                 (required: echoes the plugin's CLI namespace)
-//	    help                 (required: multi-line help text)
+//	    name                 (required when plugin.yml is absent: echoes the plugin's CLI namespace)
+//	    help                 (recommended: multi-line help text)
 //	    info                 (recommended)
 //	    logs                 (recommended)
 //	    <custom...>          (any subcommand — `voodu <plugin> <custom>`)
@@ -20,9 +19,9 @@
 //	  hooks/
 //	    <event>              (optional — fired by controller on matching event)
 //
-// bin/ is checked before commands/ so plugin authors can ship compiled
-// Go binaries without changing the layout a Gokku user already knows.
-// Shell scripts and Go binaries are both valid — Voodu does not care.
+// bin/ is checked before commands/ so plugin authors can ship
+// compiled Go binaries alongside or instead of shell scripts —
+// voodu treats both the same.
 //
 // # plugin.yml (optional)
 //
@@ -61,12 +60,13 @@
 //
 // Plugins may output either:
 //
-//   - Plain text (backward-compatible with Gokku plugins). The controller
-//     proxies stdout verbatim to the CLI, which renders it unmodified.
+//   - Plain text. The controller proxies stdout verbatim to the
+//     CLI, which renders it unmodified. Useful for shell-only
+//     plugins that just echo lines.
 //
-//   - A JSON envelope matching the Envelope type below. When the first
-//     non-whitespace byte is '{', the controller parses the envelope and
-//     the CLI can render with -o text|json|yaml.
+//   - A JSON envelope matching the Envelope type below. When the
+//     first non-whitespace byte is '{', the controller parses the
+//     envelope and the CLI can render with -o text|json|yaml.
 //
 // Exit code 0 means success regardless of which protocol the plugin used.
 // Non-zero is reported to the CLI as an error.

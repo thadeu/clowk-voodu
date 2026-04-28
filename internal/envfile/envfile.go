@@ -40,9 +40,13 @@ func Load(path string) (map[string]string, error) {
 	return vars, nil
 }
 
-// Save writes the map to the file atomically-ish (write then rename would be safer,
-// but we match Gokku's prior behavior here for simplicity).
-// File mode is 0600 (env files frequently contain secrets).
+// Save writes the map to the file in place. File mode is 0600
+// (env files frequently contain secrets). A write-then-rename
+// would be safer against partial writes, but the file is small,
+// the writes are infrequent (per config-set), and a corrupted
+// .env is the kind of thing the operator notices on the next
+// container restart anyway — keeping it simple here is worth more
+// than crash-safety this rare case would buy.
 func Save(path string, vars map[string]string) error {
 	keys := make([]string, 0, len(vars))
 	for k := range vars {

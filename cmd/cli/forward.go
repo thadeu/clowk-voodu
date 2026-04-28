@@ -154,8 +154,9 @@ func renderForwardResponse(root *cobra.Command, raw []byte) error {
 	}
 
 	if trimmed[0] != '{' {
-		// Pre-envelope plugin output (legacy Gokku shell plugins that
-		// print raw text directly). Surface it untouched.
+		// Pre-envelope plugin output (shell plugins that print raw
+		// text directly instead of emitting the JSON envelope).
+		// Surface it untouched.
 		fmt.Print(string(raw))
 
 		if !bytes.HasSuffix(raw, []byte("\n")) {

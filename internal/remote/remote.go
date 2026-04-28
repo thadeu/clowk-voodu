@@ -7,22 +7,23 @@ import (
 )
 
 // Info is where a command is going: the SSH destination for this
-// invocation. BaseDir is the server's Voodu root — currently constant,
-// kept as a field because the Gokku layout had it configurable and we
-// may want that back.
+// invocation. BaseDir is the server's voodu root — currently
+// constant at /opt/voodu, kept as a field so future per-host
+// overrides don't require a struct change.
 //
-// Historical note: early versions carried an App field because remote
-// URLs had the form `user@host:app` (Gokku's shape). Identity now lives
-// in the HCL manifest itself (scope + name), so the remote reduces to
-// "which server do I ssh to" and App is gone.
+// Identity (which app to act on) lives entirely in the HCL
+// manifest (scope + name), not in the remote URL. The remote
+// reduces to "which server do I ssh to".
 type Info struct {
 	RemoteName string // git remote label that resolved to this info
 	Host       string // user@hostname (passed verbatim to ssh)
 	BaseDir    string // /opt/voodu by default
 }
 
-// DefaultRemote is the name of the git remote voodu looks up first when
-// no --remote / -a is given. Gokku used "gokku"; we keep the parallel.
+// DefaultRemote is the name of the git remote voodu looks up first
+// when no --remote / -r is given. Operators typically have one
+// production target per repo, so "the voodu remote" is unambiguous
+// and the explicit flag stays optional for the common case.
 const DefaultRemote = "voodu"
 
 // DefaultBaseDir mirrors paths.DefaultRoot on the server side. We don't
@@ -91,15 +92,10 @@ func Lookup(name string) (Info, error) {
 //  1. --remote NAME flag wins
 //  2. default remote "voodu"
 //
-// Returns (nil, nil) when no remote can be located — the caller treats
-// that as "not forwarding", not as an error, because many commands are
-// perfectly fine running locally (e.g. `voodu version`).
-//
-// Historical note: -a APP used to double as a remote-name lookup
-// fallback (Gokku shape, when a git remote per app was the norm). That
-// overload is gone. -a stays as a server-side arg (see ExtractFlags)
-// for commands like `config set FOO=bar -a api`, but no longer feeds
-// remote selection.
+// Returns (nil, nil) when no remote can be located — the caller
+// treats that as "not forwarding", not as an error, because many
+// commands are perfectly fine running locally (e.g. `voodu
+// version`).
 func Resolve(remoteFlag string) (*Info, error) {
 	if remoteFlag != "" {
 		info, err := Lookup(remoteFlag)

@@ -66,6 +66,13 @@ type Store interface {
 	// DeleteConfigKey removes a single key from a bucket. Returns
 	// (true, nil) when the key existed, (false, nil) when it didn't.
 	DeleteConfigKey(ctx context.Context, scope, name, key string) (bool, error)
+
+	// DeleteConfig wipes the entire (scope, name) bucket — every
+	// key under the prefix. Used by `vd delete --prune` to nuke a
+	// resource's config alongside its manifest, and by the scope-
+	// wipe path to clear scope-level + every per-app bucket. No-op
+	// when the bucket is empty.
+	DeleteConfig(ctx context.Context, scope, name string) error
 }
 
 // WatchEvent is a single change observed on /desired/*.
@@ -321,6 +328,17 @@ func (s *EtcdStore) DeleteConfigKey(ctx context.Context, scope, name, key string
 	}
 
 	return resp.Deleted > 0, nil
+}
+
+// DeleteConfig wipes every key under the (scope, name) bucket
+// prefix. Used by --prune flows. Idempotent — empty bucket is a
+// no-op success.
+func (s *EtcdStore) DeleteConfig(ctx context.Context, scope, name string) error {
+	if _, err := s.client.Delete(ctx, ConfigPrefix(scope, name), clientv3.WithPrefix()); err != nil {
+		return fmt.Errorf("etcd delete config bucket: %w", err)
+	}
+
+	return nil
 }
 
 // Watch returns a channel of events on /desired/*. The channel is closed

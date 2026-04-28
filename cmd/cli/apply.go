@@ -31,6 +31,7 @@ type applyFlags struct {
 	force            bool   // apply only: force rebuild even when the tarball hash already has a release
 	verbose          bool   // apply only: passthrough raw build output instead of collapsing to a spinner
 	dryRun           bool   // delete only: print the plan and exit without removing anything
+	prune            bool   // delete only: also wipe config + on-disk app/volume dirs
 }
 
 func newApplyCmd() *cobra.Command {
@@ -134,11 +135,21 @@ func newDeleteCmd() *cobra.Command {
 	var f applyFlags
 
 	cmd := &cobra.Command{
-		Use:   "delete",
-		Short: "Delete resources declared in the given manifests",
-		Long: `delete removes the named resources from the controller's store.
-Containers, plugin-side state (databases, ingress entries) and any
-status records are torn down by the reconciler that owns each kind.
+		Use:   "delete [-f file.hcl | <scope>]",
+		Short: "Delete resources declared in the given manifests, or wipe an entire scope",
+		Long: `delete removes resources from the controller's store. Two shapes:
+
+  vd delete -f file.hcl            soft-delete every manifest in the file
+                                   (containers + manifest + status; env vars
+                                   and on-disk state are kept)
+  vd delete -f file.hcl --prune    hard-delete: above + config bucket +
+                                   /opt/voodu/apps/<app> + volumes
+
+  vd delete <scope> --prune        nuke the entire scope: every manifest of
+                                   every kind, scope-level config, all per-app
+                                   filesystem state. --prune is required because
+                                   "soft scope wipe" doesn't have a useful
+                                   meaning.
 
 By default delete prints a plan listing every resource that will be
 removed and asks y/N before issuing any DELETE. Pass --auto-approve
@@ -148,7 +159,21 @@ Non-interactive invocations without either will refuse to proceed.
 Pass --dry-run to render the plan and exit without contacting the
 controller — useful for confirming "is this the right manifest set?"
 before committing to the destructive operation.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Two dispatch shapes:
+			//  - bare positional `<scope>` → scope-wipe
+			//  - -f file(s) → manifest-list delete
+			// Mixing both would be ambiguous (which wins?), so we
+			// reject up front.
+			if len(args) == 1 {
+				if len(f.files) > 0 {
+					return fmt.Errorf("delete: pass either -f or a positional <scope>, not both")
+				}
+
+				return runScopeWipe(cmd, args[0], f)
+			}
+
 			return runDelete(cmd, f)
 		},
 	}
@@ -157,6 +182,7 @@ before committing to the destructive operation.`,
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "render the plan and exit without deleting anything")
+	cmd.Flags().BoolVar(&f.prune, "prune", false, "also wipe app config + on-disk state (env file, releases dir, volumes); REQUIRED for scope-wipe shape")
 
 	return cmd
 }
@@ -587,6 +613,10 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 			q.Set("scope", m.Scope)
 		}
 
+		if f.prune {
+			q.Set("prune", "true")
+		}
+
 		resp, err := controllerDo(root, http.MethodDelete, "/apply", q.Encode(), nil)
 		if err != nil {
 			return err
@@ -599,10 +629,95 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 		case resp.StatusCode == http.StatusNotFound:
 			fmt.Printf("? %s/%s (not found)\n", m.Kind, m.Name)
 		case resp.StatusCode >= 400:
-			return fmt.Errorf("delete %s/%s: %d: %s", m.Kind, m.Name, resp.StatusCode, strings.TrimSpace(string(raw)))
+			return fmt.Errorf("delete %s/%s: %s", m.Kind, m.Name, formatControllerError(resp.StatusCode, raw))
 		default:
-			fmt.Printf("- %s/%s deleted\n", m.Kind, m.Name)
+			if f.prune {
+				fmt.Printf("- %s/%s deleted (pruned)\n", m.Kind, m.Name)
+			} else {
+				fmt.Printf("- %s/%s deleted\n", m.Kind, m.Name)
+			}
 		}
+	}
+
+	return nil
+}
+
+// runScopeWipe is the `vd delete <scope> --prune` path: wipe every
+// manifest in a scope across every kind, plus scope-level config,
+// plus per-app filesystem state. Hits DELETE /scope on the
+// controller; the server gates the destructive op on prune=true so
+// even a buggy CLI invocation can't accidentally trigger it.
+func runScopeWipe(cmd *cobra.Command, scope string, f applyFlags) error {
+	if !f.prune {
+		return fmt.Errorf("delete <scope> requires --prune (this destroys every manifest, config, and on-disk state in the scope)")
+	}
+
+	if f.dryRun {
+		fmt.Fprintf(os.Stdout, "Would wipe scope %q (every manifest, scope config, per-app dirs).\nDry-run: no DELETE issued.\n", scope)
+		return nil
+	}
+
+	root := cmd.Root()
+
+	q := url.Values{}
+	q.Set("scope", scope)
+	q.Set("prune", "true")
+
+	resp, err := controllerDo(root, http.MethodDelete, "/scope", q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return formatControllerError(resp.StatusCode, raw)
+	}
+
+	// Server returns the destructive summary so the operator sees
+	// exactly what got nuked vs. what failed (filesystem permissions,
+	// stale containers, etc.). Keep the rendering compact — the
+	// transcript matters most when something went wrong.
+	var env struct {
+		Data struct {
+			Scope            string `json:"scope"`
+			ResourcesWiped   []struct {
+				Kind   string `json:"kind"`
+				Name   string `json:"name"`
+				Pruned struct {
+					ConfigWiped   bool     `json:"config_wiped"`
+					AppDirRemoved string   `json:"app_dir_removed"`
+					VolumeRemoved string   `json:"volume_removed"`
+					Errors        []string `json:"errors"`
+				} `json:"pruned"`
+			} `json:"resources_wiped"`
+			ScopeConfigWiped bool     `json:"scope_config_wiped"`
+			Errors           []string `json:"errors"`
+		} `json:"data"`
+	}
+
+	_ = json.Unmarshal(raw, &env)
+
+	for _, w := range env.Data.ResourcesWiped {
+		fmt.Printf("- %s/%s/%s wiped\n", w.Kind, scope, w.Name)
+
+		for _, e := range w.Pruned.Errors {
+			fmt.Printf("  ! %s\n", e)
+		}
+	}
+
+	if env.Data.ScopeConfigWiped {
+		fmt.Printf("- scope/%s config wiped\n", scope)
+	}
+
+	for _, e := range env.Data.Errors {
+		fmt.Printf("! %s\n", e)
+	}
+
+	if len(env.Data.ResourcesWiped) == 0 && env.Data.ScopeConfigWiped {
+		fmt.Println("(no manifests in scope; only scope-level config existed and was wiped)")
 	}
 
 	return nil

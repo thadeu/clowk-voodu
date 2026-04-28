@@ -8,13 +8,12 @@ import (
 )
 
 const (
-	EnvRoot      = "VOODU_ROOT"
-	DefaultRoot  = "/opt/voodu"
-	UserRCFile   = ".voodurc"
-	UserCfgDir   = ".voodu"
-	ConfigFile   = "config.yml"
-	RemoteName   = "voodu"
-	RemoteLegacy = "gokku"
+	EnvRoot     = "VOODU_ROOT"
+	DefaultRoot = "/opt/voodu"
+	UserRCFile  = ".voodurc"
+	UserCfgDir  = ".voodu"
+	ConfigFile  = "config.yml"
+	RemoteName  = "voodu"
 )
 
 // Root returns the Voodu server root directory. Honors VOODU_ROOT.

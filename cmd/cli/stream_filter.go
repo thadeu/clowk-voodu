@@ -12,11 +12,12 @@ import (
 	"golang.org/x/term"
 )
 
-// phasePrefix identifies any server-emitted progress line. The plugin
-// runtime prefixes every phase banner with "-----> " (five dashes +
-// angle + space) and has done so since the Gokku days. The filter
-// treats every such line as a fresh phase: spinner tag updates, the
-// line passes through, and animation keeps running.
+// phasePrefix identifies any server-emitted progress line. Every
+// phase banner ships with "-----> " (five dashes + angle + space)
+// — the receive-pack, controller release-phase, and shell plugins
+// all share this convention. The filter treats every such line as
+// a fresh phase: spinner tag updates, the line passes through,
+// and the animation keeps running.
 const phasePrefix = "-----> "
 
 // endMarkers stop the spinner and print the final ✓ summary. The

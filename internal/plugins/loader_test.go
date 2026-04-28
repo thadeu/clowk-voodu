@@ -42,7 +42,7 @@ env:
 	}
 }
 
-func TestLoadFromDirGokkuStyleNoYAML(t *testing.T) {
+func TestLoadFromDirBareCommandsNoYAML(t *testing.T) {
 	dir := t.TempDir()
 
 	mkdir(t, filepath.Join(dir, "commands"))
@@ -56,7 +56,7 @@ func TestLoadFromDirGokkuStyleNoYAML(t *testing.T) {
 	}
 
 	if p.Manifest.Name != "redis" {
-		t.Errorf("gokku name fallback failed: got %q", p.Manifest.Name)
+		t.Errorf("bare commands/name fallback failed: got %q", p.Manifest.Name)
 	}
 
 	for _, want := range []string{"name", "info", "help"} {

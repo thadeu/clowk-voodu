@@ -12,15 +12,16 @@ import (
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "voodu",
-		Short: "voodu — PaaS git-push style, stateful services first-class",
-		Long: `voodu is a git-push deployer and orchestrator.
+		Short: "voodu — PaaS, declarative HCL, stateful services first-class",
+		Long: `voodu is a declarative-HCL deployer and orchestrator.
 
-It keeps what Gokku did well (git-push deploy, blue/green, config:set)
-and adds stateful services (Postgres, Mongo) as first-class citizens.
+Apply manifests with 'voodu apply -f file.hcl'; the controller
+reconciles deployments, ingresses, jobs, cronjobs and stateful
+services (Postgres, Mongo) into running containers.
 
 Use ":" syntax as shorthand for subcommands:
-  voodu config:set FOO=bar -a api    == voodu config set FOO=bar -a api
-  voodu postgres:create main          == voodu postgres create main`,
+  voodu config:set clowk-lp/web FOO=bar    == voodu config clowk-lp/web set FOO=bar
+  voodu postgres:create main                == voodu postgres create main`,
 		Version:       fmt.Sprintf("%s (commit: %s, built: %s)", version, commit, date),
 		SilenceUsage:  true,
 		SilenceErrors: true,

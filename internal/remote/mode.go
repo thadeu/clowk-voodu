@@ -4,16 +4,16 @@
 // Three pieces fit together:
 //
 //   - mode.go — is this host acting as a client (forward) or a server
-//     (run local)? Read from ~/.voodurc, Gokku-compatible format.
-//   - remote.go — given --remote / -a / a default convention, find the
-//     user@host:app triple to forward to (via git remotes).
+//     (run local)? Read from ~/.voodurc.
+//   - remote.go — given --remote / -r / a default convention, find the
+//     user@host pair to forward to (via git remotes).
 //   - ssh.go — shell out to ssh(1) and proxy stdin/stdout/stderr plus
 //     the exit code back to the caller.
 //
 // Everything here is intentionally process-level (shell out, parse rc
 // file). Plugging golang.org/x/crypto/ssh buys correctness in exchange
 // for reimplementing the OpenSSH config resolution users already have
-// working. Not worth it for M5.5.
+// working — not worth it.
 package remote
 
 import (
@@ -32,8 +32,10 @@ const (
 	ModeServer Mode = "server"
 )
 
-// RCFileName is the config file we read/write, matching the Gokku
-// convention so operators migrating muscle-memory is preserved.
+// RCFileName is the per-user mode file (`~/.voodurc`). Carries
+// `mode=client` (default) or `mode=server` so the CLI knows
+// whether to forward over SSH or run locally against the
+// controller on this host.
 const RCFileName = ".voodurc"
 
 // CurrentMode returns the effective mode. Missing file → client, which

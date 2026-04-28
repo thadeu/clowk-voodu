@@ -134,8 +134,9 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 
 // buildRemoteCommand shell-escapes each argv entry and joins them so
 // the remote shell reconstructs the argv exactly. Without escaping,
-// `config:set FOO="bar baz" -a api` would land on the server as three
-// tokens plus garbage — classic Gokku bug.
+// `config:set clowk-lp/web FOO="bar baz"` would land on the server
+// as three tokens plus garbage from the spaces inside the quoted
+// value.
 //
 // When env is non-empty, `KEY=VAL` pairs are prepended before the
 // binary. The remote shell interprets them as per-command env, same

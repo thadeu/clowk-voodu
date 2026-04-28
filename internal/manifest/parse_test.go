@@ -64,7 +64,7 @@ deployment "test" "api" {
   dockerfile   = "Dockerfile.api"
   path         = "cmd/api"
   ports        = ["127.0.0.1:9092:9092"]
-  volumes      = ["/opt/gokku/volumes/rtp:/app/recordings"]
+  volumes      = ["/opt/voodu/volumes/rtp:/app/recordings"]
   network      = "bridge"
   restart      = "unless-stopped"
   env          = { RAILS_ENV = "production" }

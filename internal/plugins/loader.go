@@ -1,12 +1,13 @@
-// Package plugins implements installation, resolution, and execution of
-// Voodu plugins. The on-disk layout and execution contract match Gokku —
-// existing Gokku plugins run unchanged — with two additive extras:
+// Package plugins implements installation, resolution, and
+// execution of voodu plugins. Two on-disk layouts are accepted:
 //
-//   - Optional plugin.yml for structured metadata (Gokku had none)
-//   - Optional JSON envelope for stdout (Gokku plugins printed plain text)
+//   - Modern: plugin.yml with structured metadata (name, version,
+//     commands, env), executables under ./commands/.
+//   - Bare: a `commands/` directory of executable scripts, no
+//     plugin.yml. Name falls back to the directory's basename.
 //
-// Both extras are detected opportunistically so plain Gokku plugins
-// work without modification.
+// Both shapes are detected opportunistically so simple shell-only
+// plugins (a directory of scripts) work without ceremony.
 package plugins
 
 import (
@@ -34,8 +35,9 @@ type LoadedPlugin struct {
 }
 
 // LoadFromDir reads one plugin from its installation directory. It
-// tolerates missing plugin.yml by filling in defaults from directory
-// conventions — which is how Gokku plugins are loaded.
+// tolerates missing plugin.yml by filling in defaults from
+// directory conventions — name from basename, commands from the
+// `commands/` subdir.
 func LoadFromDir(dir string) (*LoadedPlugin, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -59,7 +61,7 @@ func LoadFromDir(dir string) (*LoadedPlugin, error) {
 	// Convention backfills: plugin.yml can be absent entirely, in which
 	// case we derive name from the directory and commands from disk.
 	if manifest.Name == "" {
-		manifest.Name = gokkuCommandsName(dir, filepath.Base(dir))
+		manifest.Name = bareCommandsName(dir, filepath.Base(dir))
 	}
 
 	if len(manifest.Commands) == 0 {
@@ -134,10 +136,11 @@ func discoverCommands(dir string) (map[string]string, error) {
 	return out, nil
 }
 
-// gokkuCommandsName implements the Gokku fallback where the plugin's
-// display name is the first line of commands/name. If that script is
-// missing or errors, fall back to the directory basename.
-func gokkuCommandsName(dir, fallback string) string {
+// bareCommandsName resolves the plugin display name when plugin.yml
+// is absent: the first non-empty line of `commands/name` (the
+// optional name-emitting script), falling back to the directory
+// basename when that script is missing or empty.
+func bareCommandsName(dir, fallback string) string {
 	path := filepath.Join(dir, "commands", "name")
 
 	raw, err := os.ReadFile(path)

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
+	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -176,6 +178,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /restart", a.handleRestart)
 	mux.HandleFunc("POST /releases/run", a.handleReleaseRun)
 	mux.HandleFunc("POST /rollback", a.handleRollback)
+	mux.HandleFunc("DELETE /scope", a.handleScopeWipe)
 
 	return logRequests(mux)
 }
@@ -588,7 +591,160 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+	prune := r.URL.Query().Get("prune") == "true"
+
+	pruned := pruneSummary{}
+
+	if prune {
+		// Prune happens AFTER the manifest delete fires its watch
+		// event so the reconciler's handler.remove() has already
+		// torn down containers + cleared status. Then we go after
+		// the long-lived state the soft-delete deliberately keeps:
+		// app-level config in etcd, on-disk env file / releases /
+		// volumes. Best-effort — failures are logged into the
+		// response so the operator can finish manually but don't
+		// fail the whole DELETE.
+		pruned = pruneResource(r.Context(), a.Store, kind, scope, name)
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"pruned": pruned,
+		},
+	})
+}
+
+// pruneSummary captures the destructive cleanup outcome so the
+// CLI can surface "config wiped, /opt/voodu/apps/X removed, 1
+// volume left intact" to the operator. Fields stay populated even
+// on partial failure so the human knows which steps need a manual
+// follow-up.
+type pruneSummary struct {
+	ConfigWiped     bool     `json:"config_wiped,omitempty"`
+	AppDirRemoved   string   `json:"app_dir_removed,omitempty"`
+	VolumeRemoved   string   `json:"volume_removed,omitempty"`
+	Errors          []string `json:"errors,omitempty"`
+}
+
+// handleScopeWipe is the nuclear option: wipe every manifest in
+// `scope` across every scoped kind, plus the scope-level config
+// bucket, plus per-app filesystem state for each app inside.
+//
+//	DELETE /scope?scope=clowk-lp&prune=true
+//
+// `prune=true` is required — there's no useful "soft scope wipe"
+// (you'd just be removing the scope label which doesn't exist as
+// its own resource). The query gate enforces "operator typed
+// --prune explicitly", same belt the CLI applies.
+//
+// Per-resource teardown reuses pruneResource so the per-app
+// behaviour matches a `vd delete -f one.hcl --prune` of every
+// resource in the file. Scope-level config is wiped after the
+// per-resource passes so a half-failed wipe leaves consistent
+// state (apps gone, scope-level config still there) instead of
+// orphan apps with no scope-level config.
+func (a *API) handleScopeWipe(w http.ResponseWriter, r *http.Request) {
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	if scope == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope is required"))
+		return
+	}
+
+	if r.URL.Query().Get("prune") != "true" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope wipe requires ?prune=true (this destroys every manifest, config and on-disk state in the scope)"))
+		return
+	}
+
+	ctx := r.Context()
+
+	type wipedResource struct {
+		Kind   Kind         `json:"kind"`
+		Name   string       `json:"name"`
+		Pruned pruneSummary `json:"pruned"`
+	}
+
+	var wiped []wipedResource
+
+	scopedErrors := []string{}
+
+	for kind := range ScopedKinds {
+		mans, err := a.Store.ListByScope(ctx, kind, scope)
+		if err != nil {
+			scopedErrors = append(scopedErrors, fmt.Sprintf("list %s: %v", kind, err))
+			continue
+		}
+
+		for _, m := range mans {
+			if _, err := a.Store.Delete(ctx, kind, scope, m.Name); err != nil {
+				scopedErrors = append(scopedErrors, fmt.Sprintf("delete %s/%s/%s: %v", kind, scope, m.Name, err))
+				continue
+			}
+
+			sum := pruneResource(ctx, a.Store, kind, scope, m.Name)
+			wiped = append(wiped, wipedResource{Kind: kind, Name: m.Name, Pruned: sum})
+		}
+	}
+
+	// Scope-level config bucket (the shared `vd config <scope> set`
+	// values). Wiped last so per-app removals are done first; an
+	// early failure here would orphan apps without scope env.
+	scopeConfigErr := a.Store.DeleteConfig(ctx, scope, "")
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"scope":              scope,
+			"resources_wiped":    wiped,
+			"scope_config_wiped": scopeConfigErr == nil,
+			"errors":             scopedErrors,
+		},
+	})
+}
+
+// pruneResource is the per-resource destructive cleanup. Wipes the
+// app-level config bucket and (for kinds that own filesystem state)
+// removes the app dir + volume dir from /opt/voodu. Scope-level
+// config is NOT touched here — that's the scope-wipe path's job.
+//
+// All operations are best-effort: we want a partial wipe to still
+// progress as far as possible (filesystem remove can fail mid-way,
+// config delete can fail on etcd hiccup, etc.) and report what
+// landed in the summary.
+func pruneResource(ctx context.Context, store Store, kind Kind, scope, name string) pruneSummary {
+	var sum pruneSummary
+
+	if err := store.DeleteConfig(ctx, scope, name); err != nil {
+		sum.Errors = append(sum.Errors, fmt.Sprintf("delete config: %v", err))
+	} else {
+		sum.ConfigWiped = true
+	}
+
+	// Filesystem cleanup only makes sense for kinds that have a
+	// per-app on-disk footprint. Today: deployments (env file,
+	// release dirs, volumes); jobs/cronjobs share the same layout
+	// because they shell out through the same paths helpers. Other
+	// kinds (database, ingress) don't own any filesystem of their
+	// own — their state lives in plugins / etcd.
+	if kind == KindDeployment || kind == KindJob || kind == KindCronJob {
+		app := AppID(scope, name)
+
+		appDir := paths.AppDir(app)
+		if err := os.RemoveAll(appDir); err != nil {
+			sum.Errors = append(sum.Errors, fmt.Sprintf("remove %s: %v", appDir, err))
+		} else {
+			sum.AppDirRemoved = appDir
+		}
+
+		volDir := paths.AppVolumeDir(app)
+		if err := os.RemoveAll(volDir); err != nil {
+			sum.Errors = append(sum.Errors, fmt.Sprintf("remove %s: %v", volDir, err))
+		} else {
+			sum.VolumeRemoved = volDir
+		}
+	}
+
+	return sum
 }
 
 // resolveScope finds the single scope that owns (kind, name) when the

@@ -162,7 +162,7 @@ func TestParseLabelsRejectsNonVoodu(t *testing.T) {
 		nil,
 		{},
 		{"voodu.kind": "deployment"},                      // no createdby
-		{"createdby": "gokku", "voodu.kind": "deployment"}, // wrong value
+		{"createdby": "other", "voodu.kind": "deployment"}, // wrong umbrella value
 	}
 
 	for _, m := range cases {

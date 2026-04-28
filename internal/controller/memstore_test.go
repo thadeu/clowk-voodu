@@ -128,6 +128,15 @@ func (m *memStore) DeleteConfigKey(_ context.Context, scope, name, key string) (
 	return true, nil
 }
 
+func (m *memStore) DeleteConfig(_ context.Context, scope, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.config, configBucketKey(scope, name))
+
+	return nil
+}
+
 func (m *memStore) PutStatus(ctx context.Context, kind Kind, name string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

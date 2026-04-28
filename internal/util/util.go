@@ -1,6 +1,7 @@
-// Package util provides cross-cutting helpers inherited from the Gokku
-// codebase. Kept mostly mechanical during the Voodu port so behaviour is
-// preserved while paths and env vars move to the Voodu scheme.
+// Package util provides cross-cutting helpers used across the
+// voodu CLI and controller — process detection, env loading, file
+// utilities. Kept dependency-light so any subsystem can pull a
+// helper without dragging in larger packages.
 package util
 
 import (
