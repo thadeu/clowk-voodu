@@ -113,20 +113,27 @@ func newRemoteRemoveCmd() *cobra.Command {
 }
 
 // newRemoteSetupCmd bootstraps a Voodu server end-to-end: it verifies
-// SSH, optionally scps a prebuilt binary, runs `voodu setup` on the far
-// side, and registers the matching git remote locally.
+// SSH, optionally scps a prebuilt binary, seeds the server-side
+// directory layout + ~/.voodurc, and registers the matching git
+// remote locally.
 //
 // Not covered here (by design): binary compilation, SSH key
 // provisioning, default-plugin install, per-app setup. Compilation
 // belongs in the release pipeline; keys are the user's responsibility;
 // plugins land piecemeal via `voodu plugins install`; app directories
 // are created on-demand by `voodu apply` (see ensureAppLayout).
+//
+// Production bootstrap (no `--binary`) is better served by piping
+// `./install` over SSH directly — that script also installs Docker,
+// systemd, etc. This command targets the dev-loop case: ship a
+// freshly-built local binary to a host that already has the rest of
+// the stack (Docker, systemd unit, voodu-controller running).
 func newRemoteSetupCmd() *cobra.Command {
 	var (
 		identity    string
 		binary      string
 		installPath string
-		skipSetup   bool
+		skipSeed    bool
 	)
 
 	cmd := &cobra.Command{
@@ -135,12 +142,21 @@ func newRemoteSetupCmd() *cobra.Command {
 		Long: `Runs, in order:
   1. ssh preflight (BatchMode + ConnectTimeout)
   2. optional: scp --binary PATH to the server and install it
-  3. 'voodu setup' on the remote (idempotent)
+  3. seed the server-side dir layout + ~/.voodurc mode=server
   4. 'git remote add NAME user@host' locally (stores the target)
 
 After this runs you can 'voodu apply -f voodu.hcl --remote NAME' from
 any repo and it will ship over SSH to that host. The HCL owns which
-apps get deployed; the remote just owns the destination.`,
+apps get deployed; the remote just owns the destination.
+
+For a clean-room install (Docker, systemd unit, voodu-controller
+service), use the bundled installer instead:
+
+  ssh user@host 'curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash'
+
+This 'remote setup' command is for the dev loop — ship a freshly-
+built local binary with --binary to a host that already has the
+controller running.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, host := args[0], args[1]
@@ -163,12 +179,12 @@ apps get deployed; the remote just owns the destination.`,
 				fmt.Printf("✓ installed %s → %s:%s\n", binary, host, installPath)
 			}
 
-			if !skipSetup {
-				if err := remoteRun(host, identity, "voodu", "setup"); err != nil {
-					return fmt.Errorf("remote voodu setup: %w", err)
+			if !skipSeed {
+				if err := seedServerLayout(host, identity); err != nil {
+					return fmt.Errorf("seed server layout: %w", err)
 				}
 
-				fmt.Printf("✓ voodu setup ran on %s\n", host)
+				fmt.Printf("✓ seeded /opt/voodu layout + ~/.voodurc on %s\n", host)
 			}
 
 			if _, err := remote.Lookup(name); err == nil {
@@ -190,11 +206,48 @@ apps get deployed; the remote just owns the destination.`,
 	}
 
 	cmd.Flags().StringVar(&identity, "identity", "", "SSH private key (-i)")
-	cmd.Flags().StringVar(&binary, "binary", "", "upload this voodu binary to the server before running setup")
+	cmd.Flags().StringVar(&binary, "binary", "", "upload this voodu binary to the server before seeding the layout")
 	cmd.Flags().StringVar(&installPath, "install-path", "/usr/local/bin/voodu", "where to place --binary on the server")
-	cmd.Flags().BoolVar(&skipSetup, "skip-setup", false, "do not run 'voodu setup' on the remote")
+	cmd.Flags().BoolVar(&skipSeed, "skip-seed", false, "do not seed /opt/voodu and ~/.voodurc on the remote")
 
 	return cmd
+}
+
+// seedServerLayout runs the inline equivalent of what the bundled
+// `install` script's server_setup() does, scoped to the dirs and
+// ~/.voodurc the CLI's IsServerMode() check expects to find:
+//
+//   - /opt/voodu and its subdirs (apps, services, plugins, scripts,
+//     state, volumes), owned by the SSH user
+//   - ~/.voodurc with `mode=server`, so the CLI on the remote runs
+//     locally instead of trying to SSH-forward to itself
+//
+// Used by `vd remote setup` as a cheap alternative to running the
+// full installer over SSH — when the operator has already set up
+// Docker + systemd + voodu-controller on the box and just wants to
+// drop a freshly-built CLI binary in place.
+func seedServerLayout(host, identity string) error {
+	const script = `set -e
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+ROOT="${VOODU_ROOT:-/opt/voodu}"
+$SUDO install -m 0755 -d "$ROOT"
+for sub in apps services plugins scripts state volumes; do
+  $SUDO install -m 0755 -d "$ROOT/$sub"
+done
+USER_TO_OWN="$(whoami)"
+if [ "$USER_TO_OWN" != "root" ]; then
+  $SUDO chown -R "$USER_TO_OWN":"$USER_TO_OWN" "$ROOT"
+fi
+RC="$HOME/.voodurc"
+if [ -f "$RC" ] && grep -q '^mode=' "$RC" 2>/dev/null; then
+  sed -i 's/^mode=.*/mode=server/' "$RC"
+else
+  echo 'mode=server' >> "$RC"
+fi
+`
+
+	return remoteRunShell(host, identity, script)
 }
 
 // sshPing runs `true` over SSH with a short timeout. BatchMode prevents
@@ -245,26 +298,6 @@ func installBinaryOverSSH(host, identity, binary, installPath string) error {
 	}
 
 	return remoteRunShell(host, identity, moveCmd)
-}
-
-// remoteRun ssh-execs a voodu subcommand directly — uses the same shell
-// quoting the forward path uses.
-func remoteRun(host, identity string, parts ...string) error {
-	info := &remote.Info{Host: host}
-
-	code, err := remote.Forward(info, parts[1:], remote.ForwardOptions{
-		RemoteBinary: parts[0],
-		Identity:     identity,
-	})
-	if err != nil {
-		return err
-	}
-
-	if code != 0 {
-		return fmt.Errorf("%s exited %d", strings.Join(parts, " "), code)
-	}
-
-	return nil
 }
 
 // remoteRunShell ssh-execs an arbitrary shell line. Used for install

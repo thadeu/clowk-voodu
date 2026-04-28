@@ -56,19 +56,6 @@ sudo_() {
   fi
 }
 
-# run_as_target runs a command as $TARGET_USER. When the script itself
-# is already running as TARGET_USER (unprivileged install with sudo
-# password prompts), no privilege change is needed. When running as
-# root (cloud-init / sudo bash), drop to TARGET_USER with -H so $HOME
-# resolves to the user's home and `voodu setup` writes the right rc file.
-run_as_target() {
-  if [ "$(id -u)" -eq 0 ] && [ "$TARGET_USER" != "root" ]; then
-    sudo -u "$TARGET_USER" -H "$@"
-  else
-    "$@"
-  fi
-}
-
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -347,22 +334,57 @@ download_and_install_binary() {
 }
 
 server_setup() {
-  # Pre-create and chown the root so the target user can run `voodu
-  # setup` themselves. Doing the setup AS the user (not root) matters
-  # because `voodu setup` writes mode=server to ~/.voodurc — we want
-  # that file in the deploy user's home, not /root/.
   log "creating $VOODU_ROOT owned by $TARGET_USER"
   sudo_ install -m 0755 -d "$VOODU_ROOT"
 
+  # Subdirs the controller and per-app paths expect to exist. The CLI
+  # used to do this via `voodu setup`, but the bootstrap responsibility
+  # moved entirely to this installer — keeping the dir creation here
+  # means the CLI binary stays purely operational (no install commands).
+  for sub in apps services plugins scripts state volumes; do
+    sudo_ install -m 0755 -d "$VOODU_ROOT/$sub"
+  done
+
   if [ "$TARGET_USER" != "root" ]; then
-    sudo_ chown "$TARGET_USER":"$TARGET_USER" "$VOODU_ROOT"
+    sudo_ chown -R "$TARGET_USER":"$TARGET_USER" "$VOODU_ROOT"
   fi
 
-  log "running 'voodu setup' as $TARGET_USER (creates layout + marks ~/.voodurc mode=server)"
-  run_as_target env VOODU_ROOT="$VOODU_ROOT" "$BIN_DIR/voodu" setup
-
+  write_voodurc_server_mode
   write_systemd_unit
   enable_controller
+}
+
+# write_voodurc_server_mode marks $TARGET_USER's ~/.voodurc with
+# `mode=server`. The CLI's IsServerMode() reads this to decide
+# whether `voodu apply` runs locally (server mode) or SSH-forwards to
+# a remote (client mode, default). Without this, every `voodu`
+# invocation on the server would try to forward to itself.
+#
+# Idempotent: rewrites an existing `mode=` line in place; appends if
+# absent; preserves any other lines (operators sometimes drop config
+# unrelated to mode in the same file).
+write_voodurc_server_mode() {
+  local home
+  if [ "$TARGET_USER" = "root" ]; then
+    home="/root"
+  else
+    home="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    [ -n "$home" ] || home="/home/$TARGET_USER"
+  fi
+
+  local rc="$home/.voodurc"
+
+  log "marking $rc as mode=server"
+
+  if [ -f "$rc" ] && grep -q '^mode=' "$rc" 2>/dev/null; then
+    sudo_ sed -i 's/^mode=.*/mode=server/' "$rc"
+  else
+    echo "mode=server" | sudo_ tee -a "$rc" >/dev/null
+  fi
+
+  if [ "$TARGET_USER" != "root" ]; then
+    sudo_ chown "$TARGET_USER":"$TARGET_USER" "$rc"
+  fi
 }
 
 write_systemd_unit() {
@@ -425,9 +447,8 @@ ${GREEN}Voodu server ready.${NC}
 
 ${CYAN}Next steps:${NC}
   1. (if you weren't root) log out and back in so docker group membership applies
-  2. On this server:      voodu apps create api
-  3. On your laptop:      voodu remote add voodu ${TARGET_USER}@${host}:api
-  4. Write voodu.hcl, then: voodu apply -f voodu.hcl -a api
+  2. On your laptop:      voodu remote add voodu ${TARGET_USER}@${host}
+  3. Write voodu.hcl, then: voodu apply -f voodu.hcl --remote voodu
 
 EOF
   else
@@ -438,8 +459,8 @@ ${GREEN}Voodu CLI installed.${NC}
 
 ${CYAN}Next steps:${NC}
   1. Install voodu on a Linux server (same installer, --server is default there).
-  2. Register the target:      voodu remote add voodu user@server:<app>
-  3. Write voodu.hcl, then:    voodu apply -f voodu.hcl -a <app>
+  2. Register the target:      voodu remote add voodu user@server
+  3. Write api.voodu, then:    voodu apply -f api.voodu
 
 EOF
   fi

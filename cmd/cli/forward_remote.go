@@ -15,14 +15,13 @@ import (
 )
 
 // localOnlyCommands never forward over SSH — they manage client-side
-// state (git remotes, local setup) or are purely informational.
+// state (git remotes, --version) or are purely informational.
 var localOnlyCommands = map[string]bool{
 	"version":   true,
 	"help":      true,
 	"--help":    true,
 	"-h":        true,
 	"--version": true,
-	"setup":     true,
 	"remote":    true,
 }
 

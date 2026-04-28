@@ -39,7 +39,6 @@ Use ":" syntax as shorthand for subcommands:
 
 	root.AddCommand(
 		newVersionCmd(),
-		newSetupCmd(),
 		newReceivePackCmd(),
 		newConfigCmd(),
 		newApplyCmd(),
@@ -53,7 +52,6 @@ Use ":" syntax as shorthand for subcommands:
 		newDescribeCmd(),
 		newLogsCmd(),
 		newExecCmd(),
-		newServerCmd(),
 		newRemoteCmd(),
 		newPluginsCmd(),
 	)

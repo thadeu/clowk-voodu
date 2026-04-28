@@ -13,7 +13,6 @@ func TestIsLocalOnly(t *testing.T) {
 		{"empty", nil, true},
 		{"version", []string{"version"}, true},
 		{"help flag", []string{"--help"}, true},
-		{"setup", []string{"setup"}, true},
 		{"remote subtree", []string{"remote", "add", "api", "u@h:api"}, true},
 
 		{"apply forwards", []string{"apply", "-f", "stack.hcl"}, false},
