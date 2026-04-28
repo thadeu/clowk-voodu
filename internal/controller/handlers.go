@@ -656,12 +656,29 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// cycle the replicas that were neither freshly created this reconcile
 	// nor just recreated (recreate already absorbed the env), and only
 	// when env actually moved.
+	//
+	// rollingReplaceReplicas (rather than the legacy in-place
+	// docker-restart path) is the ONLY safe choice here: env is
+	// loaded by docker at `--env-file` parse time (i.e. `docker run`),
+	// not on `docker restart` — so an in-place restart would keep
+	// the old values. Recreate also rebuilds the M0 label set from
+	// containers.BuildLabels, which the legacy restart path lost,
+	// trapping the container in a "(legacy)" → pruned → recreated
+	// loop with exit code 0 each cycle. See the spec drift recreate
+	// branch above for the canonical builder.
 	if envChanged && !recreatedAny {
-		// Re-query because recreate may have left the live set
-		// untouched but env-only restart still needs a fresh view.
 		current, err := h.Containers.ListByIdentity(string(KindDeployment), ev.Scope, ev.Name)
 		if err == nil {
-			h.restartReplicas(ev.Name, current, createdSet)
+			toCycle := filterSlots(current, func(s ContainerSlot) bool {
+				_, justCreated := createdSet[s.Name]
+				return !justCreated
+			})
+
+			if len(toCycle) > 0 {
+				if err := h.rollingReplaceReplicas(ctx, ev.Scope, ev.Name, app, toCycle, spec, hash); err != nil {
+					h.logf("deployment/%s env-change rolling restart failed: %v", ev.Name, err)
+				}
+			}
 		}
 	}
 
@@ -846,30 +863,6 @@ func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []Containe
 	}
 
 	return nil
-}
-
-// restartReplicas cycles each replica in sequence with a short pause
-// between cycles so ingress load-balances onto the still-running
-// peers during the rollout. Skips just-created replicas in `skip`
-// since fresh containers already carry the current env.
-func (h *DeploymentHandler) restartReplicas(name string, live []ContainerSlot, skip map[string]struct{}) {
-	targets := filterSlots(live, func(s ContainerSlot) bool {
-		_, just := skip[s.Name]
-		return !just
-	})
-
-	for i, s := range targets {
-		if err := h.Containers.Restart(s.Name); err != nil {
-			h.logf("deployment/%s replica %s restart failed (env already written): %v", name, s.Name, err)
-			continue
-		}
-
-		h.logf("deployment/%s replica %s restarted (env changed)", name, s.Name)
-
-		if i < len(targets)-1 {
-			time.Sleep(slotRolloutPause)
-		}
-	}
 }
 
 // recreateReplicasIfSpecChanged detects drift against the persisted

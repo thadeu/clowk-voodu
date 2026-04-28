@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.voodu.clowk.in/internal/controller"
+	"go.voodu.clowk.in/internal/progress"
 )
 
 // newReleaseCmd is the deployment-release verb. Shape mirrors the
@@ -179,9 +180,14 @@ func releaseRunStreaming(cmd *cobra.Command, ref string) error {
 	}
 
 	// Failure signaled via the trailing banner's "failed" keyword.
-	// Stop the spinner before the error bubbles up so the next CLI
-	// line lands on a clean row, not over the spinner.
+	// commitStep first so the failed banner (which is the
+	// currently-open step) gets its red ✗ line — without it, the
+	// failure banner streams in but never anchors visually, and the
+	// operator only sees the bare error message printed by the
+	// caller. stop() then halts the spinner so the next CLI line
+	// lands on a clean row.
 	if rdr.failed() {
+		rdr.commitStep()
 		rdr.stop()
 		return fmt.Errorf("%s", rdr.lastBannerLabel())
 	}
@@ -239,6 +245,7 @@ type releaseRenderer struct {
 	// repaint never interleaves bytes with line() prints.
 	mu       sync.Mutex
 	tty      bool
+	color    bool // emit ANSI color codes — true on local TTY OR over SSH
 	frame    int
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -249,12 +256,36 @@ type releaseRenderer struct {
 // TTY, the spinner goroutine is started immediately so the operator
 // sees "⠋ Releasing deployment/X... (0s)" right away, even before
 // the first banner arrives over the wire.
+//
+// Two TTY-ish notions, deliberately separate:
+//
+//   - `tty` (writerIsTerminal): the spinner machinery (cursor
+//     hide/show, in-place line redraws) only makes sense against
+//     a real interactive terminal. Off when piping to a file or
+//     running server-side over SSH.
+//
+//   - `color` (tty || VOODU_PROTOCOL set): controls whether to
+//     emit ANSI color codes for the ✓ / ✗ glyphs. The codes are
+//     just bytes — when this CLI runs inside the SSH-forwarded
+//     apply pipeline (server side, where stdout isn't a TTY) the
+//     client at the other end IS a TTY and renders the codes
+//     correctly. The forwarder always sets VOODU_PROTOCOL on the
+//     remote env, so its presence is a reliable signal that "the
+//     ultimate consumer is a terminal-aware client".
+//
+// Without the second check, server-side release output would lose
+// its colors entirely on every `voodu apply` over SSH — the user
+// would see plain `✓ Release ...` instead of the green checkmarks
+// the build steps already get.
 func newReleaseRenderer(out io.Writer, displayRef string) *releaseRenderer {
+	tty := writerIsTerminal(out)
+
 	r := &releaseRenderer{
 		out:        out,
 		displayRef: displayRef,
 		started:    time.Now(),
-		tty:        writerIsTerminal(out),
+		tty:        tty,
+		color:      tty || os.Getenv(progress.EnvProtocol) != "",
 	}
 
 	if r.tty {
@@ -343,7 +374,7 @@ func (r *releaseRenderer) line(s string) {
 		return
 	}
 
-	r.printAboveSpinner(fmt.Sprintf("remote:    %s\n", s))
+	r.printAboveSpinner(fmt.Sprintf("  remote:    %s\n", s))
 }
 
 // printAboveSpinner writes text in the row currently occupied by
@@ -365,8 +396,19 @@ func (r *releaseRenderer) printAboveSpinner(text string) {
 
 // commitStep prints `✓ <label> (Xs)` for the in-progress phase, if
 // any. Idempotent — calling without an open phase does nothing.
-// Failure phases (label contains "failed") get ✗ instead so the
-// transcript visually distinguishes the broken step.
+// Failure phases (label contains "failed") get a red ✗ instead so
+// the transcript visually distinguishes the broken step.
+//
+// Colors mirror progressFilter (stream_filter.go) byte-for-byte so
+// release output blends visually with the build steps:
+//
+//	\x1b[32m  green FG     for the ✓ glyph
+//	\x1b[31m  red   FG     for the ✗ glyph
+//	\x1b[2m   dim          for the elapsed time
+//	\x1b[0m   reset
+//
+// Tests against a non-TTY writer skip the color codes via the same
+// tty gate the spinner uses, so captured output stays plain.
 func (r *releaseRenderer) commitStep() {
 	r.mu.Lock()
 	label, start := r.stepLabel, r.stepStart
@@ -379,12 +421,34 @@ func (r *releaseRenderer) commitStep() {
 
 	elapsed := time.Since(start).Round(time.Second)
 
+	r.printAboveSpinner(formatStepLine(label, elapsed, r.color))
+}
+
+// formatStepLine renders the closed-step line. Pulled out of
+// commitStep so finish() can reuse the same shape for the overall
+// `Released deployment/X in Xs` summary without duplicating the
+// color logic.
+//
+// `color` controls whether ANSI escapes are emitted. Decoupled
+// from the spinner's TTY check on purpose: when this CLI runs
+// server-side via the SSH-forwarded apply, stdout isn't a TTY but
+// the bytes still flow back to a terminal-aware client that
+// renders the colors correctly. See newReleaseRenderer for the
+// full rationale.
+func formatStepLine(label string, elapsed time.Duration, color bool) string {
 	glyph := "✓"
+	colorGlyph := "\x1b[32m✓\x1b[0m"
+
 	if strings.Contains(label, "failed") {
 		glyph = "✗"
+		colorGlyph = "\x1b[31m✗\x1b[0m"
 	}
 
-	r.printAboveSpinner(fmt.Sprintf("%s %s (%s)\n", glyph, label, elapsed))
+	if !color {
+		return fmt.Sprintf("%s %s (%s)\n", glyph, label, elapsed)
+	}
+
+	return fmt.Sprintf("%s %s \x1b[2m(%s)\x1b[0m\n", colorGlyph, label, elapsed)
 }
 
 // finish commits the trailing phase, stops the spinner, and prints
@@ -396,8 +460,13 @@ func (r *releaseRenderer) finish() {
 
 	r.stop()
 
-	fmt.Fprintf(r.out, "✓ Released deployment/%s in %s\n",
-		r.displayRef, time.Since(r.started).Round(time.Second))
+	footer := formatStepLine(
+		fmt.Sprintf("Released deployment/%s", r.displayRef),
+		time.Since(r.started).Round(time.Second),
+		r.color,
+	)
+
+	fmt.Fprint(r.out, footer)
 }
 
 // stop halts the spinner goroutine, erases the spinner line, and

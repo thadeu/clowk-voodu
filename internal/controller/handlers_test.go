@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -871,13 +872,13 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 	store := newMemStore()
 
 	// Pretend a replica already exists (e.g. a previous reconcile) so
-	// Ensure returns created=false and the restart branch fires for an
-	// env change. Use a fixed replica id so the assertion can name it.
+	// Ensure returns created=false and the env-change rolling-replace
+	// branch fires. Use a fixed replica id so the assertion can name it.
 	existing := deploymentSlot("test", "api", "img:1", "abcd")
 
 	// Baseline status so the spec-hash drift check is a no-op — we want
-	// the test to exercise the env-change → restart path, not the
-	// recreate path.
+	// the test to exercise the env-change rolling-replace path, not the
+	// spec-drift recreate path.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
 	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
@@ -900,8 +901,32 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 
 	h.Handle(context.Background(), ev)
 
-	if got, want := cm.restarts, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
-		t.Errorf("expected restart of %s, got %+v", existing.Name, got)
+	// Env change triggers rollingReplaceReplicas: Remove the old replica
+	// and Ensure a fresh one. The legacy in-place Restart path is gone
+	// because it lost the M0 identity labels (kind/scope/name/replica_id),
+	// trapping the container in a "(legacy)" → pruned → recreated loop
+	// after every config-set. The new replica must carry voodu.kind=
+	// deployment so the next reconcile recognizes it as M0.
+	if got, want := cm.removes, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected remove of %s, got %+v", existing.Name, got)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure for env-change replacement, got %d", len(cm.ensures))
+	}
+
+	got := cm.ensures[0]
+
+	if !slices.Contains(got.Labels, "voodu.kind=deployment") {
+		t.Errorf("env-change replacement missing voodu.kind label, would loop as legacy: %+v", got.Labels)
+	}
+
+	if !slices.Contains(got.Labels, "voodu.scope=test") {
+		t.Errorf("env-change replacement missing voodu.scope label: %+v", got.Labels)
+	}
+
+	if !slices.Contains(got.Labels, "voodu.name=api") {
+		t.Errorf("env-change replacement missing voodu.name label: %+v", got.Labels)
 	}
 }
 
@@ -1143,17 +1168,28 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 
 	h.Handle(context.Background(), ev)
 
-	if len(cm.removes) != 0 {
-		t.Errorf("no remove expected when image matches, got %+v", cm.removes)
+	// Env changed but spec hash didn't → env-change rolling-replace
+	// path: the existing replica is removed and a fresh one is ensured
+	// with the same identity but new env-file mounted at create time.
+	// (The legacy in-place Restart path was retired because it lost
+	// the M0 labels and trapped containers in a "(legacy)" loop after
+	// every config-set.)
+	if got, want := cm.removes, []string{existing.Name}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("expected remove of %s during env-change replace, got %+v", existing.Name, got)
 	}
 
-	if len(cm.ensures) != 0 {
-		t.Errorf("no ensure expected when image matches and replica exists, got %+v", cm.ensures)
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure for env-change replacement, got %d (%+v)", len(cm.ensures), cm.ensures)
 	}
 
-	// Env changed, container existed → plain restart picks up the env.
-	if len(cm.restarts) != 1 {
-		t.Errorf("expected 1 restart for env change, got %+v", cm.restarts)
+	if !slices.Contains(cm.ensures[0].Labels, "voodu.kind=deployment") {
+		t.Errorf("env-change replacement missing voodu.kind label, would loop as legacy: %+v", cm.ensures[0].Labels)
+	}
+
+	// No legacy in-place restarts: that path is gone. Asserts the
+	// regression guard doesn't accidentally come back.
+	if len(cm.restarts) != 0 {
+		t.Errorf("env change must NOT use the legacy in-place restart path (lost labels), got %+v", cm.restarts)
 	}
 }
 
