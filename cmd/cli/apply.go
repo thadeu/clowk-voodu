@@ -246,7 +246,73 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		}
 	}
 
+	// Release-phase auto-trigger: after the apply succeeds, fire
+	// `vd release run` for every deployment whose manifest carries
+	// a `release { ... }` block. The server's reconciler skips
+	// rolling restart for these deployments precisely so this CLI
+	// orchestration can take over with streaming logs — operator
+	// (and CI) sees the migration output flow live.
+	//
+	// Idempotency on the server side prevents double-execution if
+	// the apply also triggers the release via some other path:
+	// the second invocation finds a Succeeded record for the spec
+	// hash and skips the run.
+	for _, m := range mans {
+		if !manifestHasReleaseBlock(m) {
+			continue
+		}
+
+		ref := m.Name
+		if m.Scope != "" {
+			ref = m.Scope + "/" + m.Name
+		}
+
+		// releaseRunStreaming opens its own `-----> Releasing ...`
+		// banner so the section sits in the spinner-friendly visual
+		// vocabulary the build steps use. No header here would emit
+		// a duplicate; let the streaming function own it.
+		if err := releaseRunStreaming(cmd, ref); err != nil {
+			return fmt.Errorf("release for %s: %w", ref, err)
+		}
+	}
+
 	return nil
+}
+
+// manifestHasReleaseBlock returns true when the deployment's spec
+// JSON contains a non-empty release block. Cheap parse — only the
+// release.command field is inspected, which is enough to know that
+// auto-trigger should fire (other fields don't change the
+// trigger decision).
+func manifestHasReleaseBlock(m controller.Manifest) bool {
+	if m.Kind != controller.KindDeployment {
+		return false
+	}
+
+	if len(m.Spec) == 0 {
+		return false
+	}
+
+	var probe struct {
+		Release *struct {
+			Command     []string `json:"command,omitempty"`
+			PreCommand  []string `json:"pre_command,omitempty"`
+			PostCommand []string `json:"post_command,omitempty"`
+		} `json:"release,omitempty"`
+	}
+
+	if err := json.Unmarshal(m.Spec, &probe); err != nil {
+		return false
+	}
+
+	if probe.Release == nil {
+		return false
+	}
+
+	// Empty release block (operator declared but didn't fill any
+	// commands) is treated as "no release" — running an empty
+	// command would be a confusing no-op.
+	return len(probe.Release.Command) > 0 || len(probe.Release.PreCommand) > 0 || len(probe.Release.PostCommand) > 0
 }
 
 // splitManifestRef decomposes "kind/name" or "kind/scope/name" into

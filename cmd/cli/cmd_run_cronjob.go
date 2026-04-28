@@ -13,42 +13,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// newRunCronJobCmd builds `voodu run cronjob <scope>/<name>`. Forces
-// one immediate execution of a previously-applied cronjob, bypassing
-// the schedule. Useful when the operator just shipped a fix and wants
-// to verify it works without waiting for the next scheduled tick —
-// the scheduler's normal cadence is unaffected.
-//
-// Distinct from `vd exec` (M-3): `run cronjob` spawns a brand-new
-// container using the cronjob spec; `exec` enters an existing
-// container. Same axis as kubernetes "create a Job from a CronJob"
-// vs "kubectl exec into a Pod".
-func newRunCronJobCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "cronjob <scope>/<name> | <name>",
-		Short: "Force an immediate run of a previously-applied cronjob",
-		Long: `Trigger one execution of a declared cronjob manifest, bypassing
-the schedule. The cronjob spec is fetched from the controller (it
-must have been applied first via 'voodu apply'), a one-shot
-container is spawned with the spec's image / command / env, and the
-call blocks until the container exits.
-
-The scheduler's normal tick cadence is NOT affected — this is an
-extra ad-hoc run on top of any scheduled ones. Useful for "I just
-fixed the bug, run it now to confirm" flows without having to wait
-for the next */15 fire.
-
-Examples:
-  voodu run cronjob ops/purge        scope=ops, name=purge
-  voodu run cronjob crawler1         if 'crawler1' is unambiguous`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRunCronJob(cmd, args[0])
-		},
-	}
-
-	return cmd
-}
+// newRunCronJobCmd was the standalone subcommand `voodu run cronjob
+// <ref>`. Removed in favour of the unified `voodu run <ref>`
+// (cmd_run.go), which dispatches to runRunCronJob when the ref
+// resolves to a declared cronjob. The runRunCronJob implementation
+// stays — only the cobra wiring went away.
 
 func runRunCronJob(cmd *cobra.Command, ref string) error {
 	scope, name := splitJobRef(ref)

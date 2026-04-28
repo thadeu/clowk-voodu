@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.voodu.clowk.in/internal/containers"
@@ -79,6 +80,17 @@ type deploymentSpec struct {
 	NetworkMode string            `json:"network_mode,omitempty"`
 	Restart     string            `json:"restart,omitempty"`
 	HealthCheck string            `json:"health_check,omitempty"`
+	Release     *releaseSpec      `json:"release,omitempty"`
+}
+
+// releaseSpec mirrors manifest.ReleaseSpec but lives in the
+// controller package so the handler can decode it from the
+// deployment manifest's Spec blob without importing internal/manifest.
+type releaseSpec struct {
+	Command     []string `json:"command,omitempty"`
+	PreCommand  []string `json:"pre_command,omitempty"`
+	PostCommand []string `json:"post_command,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
 }
 
 // effectiveReplicas normalizes the replica count: manifest omits
@@ -428,6 +440,19 @@ type DeploymentHandler struct {
 	// Containers is the runtime surface for ensure/restart. Optional:
 	// when nil, the handler stays env-only and skips spawn/restart.
 	Containers ContainerManager
+
+	// releaseLocks serialises release execution per-deployment.
+	// Two concurrent `vd release run` (or apply-time auto-trigger
+	// racing with manual run) for the same deployment are forced
+	// to be sequential — preventing the classic "two migrations
+	// fighting for the same DB transaction" footgun. Other
+	// deployments run concurrently as today; the lock granularity
+	// is (scope, name).
+	//
+	// Map value is *sync.Mutex. Acquired via TryLock so an
+	// already-running release fails fast with a clear error
+	// instead of silently queueing.
+	releaseLocks sync.Map
 }
 
 func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
@@ -518,69 +543,12 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// fighting over the same docker name or filesystem path.
 	app := AppID(ev.Scope, ev.Name)
 
-	// Build-mode (no image, source streamed via voodu receive-pack)
-	// produces an image tagged <app>:latest. The controller never sees
-	// the build itself — receive-pack runs it — so we resolve the
-	// resulting image here by convention. Without this default,
-	// ensureContainer's `Image == ""` early return swallows every
-	// build-mode reconcile.
-	if spec.Image == "" {
-		spec.Image = app + ":latest"
-	}
-
-	// Network shaping. Two disjoint modes:
-	//
-	//   host/none mode: container shares the host's net stack (host) or
-	//     gets none at all. Mutually exclusive with any bridge — no
-	//     voodu0, no custom networks. Use for WebRTC/SIP/RTP/socket apps
-	//     that need the host ports directly and can't live behind docker's
-	//     userland NAT. Caveat: caddy ingress can't reach these by
-	//     container name — the operator wires the host port into
-	//     ingress.service manually.
-	//
-	//   bridge mode (default): voodu0 is the platform's plumbing bus —
-	//     voodu-caddy and managed plugins live there — so every bridge-
-	//     mode container MUST join it. `networks = [...]` opts INTO
-	//     additional bridges (db, cache, whatever) but never removes
-	//     voodu0. Append (not prepend) when auto-adding voodu0 so the
-	//     operator's chosen primary stays the docker DNS default.
-	switch spec.NetworkMode {
-	case "":
-		// Bridge path — fall through to networks normalization below.
-	case "host", "none":
-		if len(spec.Networks) > 0 || spec.Network != "" {
-			return fmt.Errorf("deployment/%s: network_mode=%q is mutually exclusive with network/networks", ev.Name, spec.NetworkMode)
-		}
-	default:
-		return fmt.Errorf("deployment/%s: network_mode=%q not supported (want \"host\" or \"none\"; omit for bridge mode)", ev.Name, spec.NetworkMode)
-	}
-
-	if spec.NetworkMode == "" {
-		if len(spec.Networks) == 0 && spec.Network != "" {
-			spec.Networks = []string{spec.Network}
-		}
-
-		if !slices.Contains(spec.Networks, "voodu0") {
-			spec.Networks = append(spec.Networks, "voodu0")
-		}
-	}
-
-	// Private-by-default port publishing. Bare container ports and
-	// host:container specs get localhost-bound so they're reachable
-	// from the VM (ssh tunnel, curl from inside) but invisible to the
-	// internet. Caddy still reaches the container via voodu0 bridge
-	// DNS — `-p` is only for host-to-container access, so this doesn't
-	// affect ingress. Operators who actually want world-exposure
-	// (postgres pinned to 0.0.0.0:5432, say) declare the IP explicitly.
-	spec.Ports = normalizePorts(spec.Ports)
-
-	// Default restart policy. Docker's native default is "no", which
-	// leaves containers dead after a host reboot — the wrong default for
-	// a PaaS where "apply once, stay up forever" is the whole pitch.
-	// Operators can still opt out explicitly (restart = "no") or pick
-	// "on-failure" etc.; only the empty case is overridden.
-	if spec.Restart == "" {
-		spec.Restart = "unless-stopped"
+	// Normalize image, networks, ports, restart policy in one place
+	// so Release()/Restart() (which decode the same spec from the
+	// store) get an identical shape. See applyDeploymentSpecDefaults
+	// for what the contract covers.
+	if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
+		return err
 	}
 
 	// Always link env, even when spec.Env is empty. Two reasons:
@@ -981,18 +949,51 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 		return false, nil
 	}
 
+	// Deployments with a release block are NOT auto-restarted by
+	// the reconciler — the operator's `vd apply` (CLI) calls
+	// /releases/run after persisting, which orchestrates release
+	// command + rolling restart with streaming logs back to the
+	// caller. Doing both in the reconciler AND the CLI would race
+	// on the per-deployment lock.
+	//
+	// For deployments without a release block, the reconciler is
+	// the trigger — same as before. Spec change → rolling restart.
+	if spec.Release != nil {
+		h.logf("deployment/%s %s, but release block present; awaiting `vd release run` for orchestrated restart", app, reason)
+
+		return false, nil
+	}
+
 	h.logf("deployment/%s %s, recreating %d replica(s)", app, reason, len(live))
 
+	if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash); err != nil {
+		return false, err
+	}
+
+	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
+		h.logf("deployment/%s status persist failed: %v", app, err)
+	}
+
+	return true, nil
+}
+
+// rollingReplaceReplicas is the shared rolling-replace loop used by
+// both the spec-drift recreate path and the imperative `vd restart`
+// path. Each replica is replaced one at a time with slotRolloutPause
+// between to keep zero-downtime under a load balancer.
+//
+// Replacements get a fresh replica id (the old name disappears, so
+// the new container avoids docker --name collisions). The rest of
+// the spec — image, command, networks, env file, labels — comes
+// from the same source the apply path uses, so a restart never
+// drifts from what apply would produce.
+func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash string) error {
 	envFile := ""
 	if h.EnvFilePath != nil {
 		envFile = h.EnvFilePath(app)
 	}
 
 	for i, s := range live {
-		// Replace the old container with a brand-new one bearing a
-		// fresh replica id — the old name disappears, so we don't
-		// have to deal with the docker `--name` collision that an
-		// in-place recreate would trip on.
 		newReplicaID := containers.NewReplicaID()
 		newName := containers.ContainerName(scope, name, newReplicaID)
 
@@ -1005,11 +1006,8 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		})
 
-		// Remove old, then create new. Recreate's atomic stop+remove+
-		// create wants the same name; here we want a different one,
-		// so we do the steps explicitly.
 		if err := h.Containers.Remove(s.Name); err != nil {
-			return false, fmt.Errorf("remove %s during recreate: %w", s.Name, err)
+			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
 		}
 
 		if _, err := h.Containers.Ensure(ContainerSpec{
@@ -1025,7 +1023,7 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 			EnvFile:        envFile,
 			Labels:         labels,
 		}); err != nil {
-			return false, fmt.Errorf("create replacement %s: %w", newName, err)
+			return fmt.Errorf("spawn replacement %s: %w", newName, err)
 		}
 
 		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
@@ -1035,11 +1033,63 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 		}
 	}
 
-	if err := h.writeDeploymentStatus(ctx, app, spec.Image, hash); err != nil {
-		h.logf("deployment/%s status persist failed: %v", app, err)
+	return nil
+}
+
+// Restart performs an imperative rolling restart of every live
+// replica of the named deployment, regardless of spec drift. Used
+// by `vd restart <scope>/<name>` to refresh long-running processes
+// after migrations / config changes / image rebuilds without
+// requiring a manifest edit.
+//
+// The flow mirrors a normal apply-time recreate (rolling, one
+// replica at a time, slotRolloutPause between) but bypasses the
+// hash check — the operator EXPLICITLY asked for restart, so
+// "spec unchanged" doesn't short-circuit. Status hash isn't
+// rewritten because the spec didn't actually drift; reapply
+// continues to be authoritative for that.
+func (h *DeploymentHandler) Restart(ctx context.Context, scope, name string) error {
+	app := AppID(scope, name)
+
+	manifest, err := h.Store.Get(ctx, KindDeployment, scope, name)
+	if err != nil {
+		return fmt.Errorf("read deployment manifest: %w", err)
 	}
 
-	return true, nil
+	if manifest == nil {
+		return fmt.Errorf("deployment/%s/%s not found", scope, name)
+	}
+
+	spec, err := decodeDeploymentSpec(manifest)
+	if err != nil {
+		return err
+	}
+
+	if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
+		return err
+	}
+
+	live, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+	if err != nil {
+		return fmt.Errorf("list replicas: %w", err)
+	}
+
+	if len(live) == 0 {
+		return fmt.Errorf("deployment/%s has no live replicas to restart", app)
+	}
+
+	// Refresh env before restart so any /config changes accumulated
+	// since the last apply land in the new replicas. Mirrors what
+	// the regular apply path does.
+	if _, err := h.linkEnv(ctx, scope, name, app, spec.Env); err != nil {
+		return fmt.Errorf("link env: %w", err)
+	}
+
+	hash := deploymentSpecHash(spec)
+
+	h.logf("deployment/%s rolling restart of %d replica(s) requested", app, len(live))
+
+	return h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash)
 }
 
 // linkEnv resolves refs and writes the result to the app's env file.
@@ -1169,6 +1219,65 @@ func decodeDeploymentSpec(m *Manifest) (deploymentSpec, error) {
 	return spec, nil
 }
 
+// applyDeploymentSpecDefaults fills in everything the reconciler's
+// apply() path expects to be normalized before it builds a
+// ContainerSpec — image fallback, voodu0 auto-join, port
+// localhost-binding, restart policy. The release/restart imperative
+// entry points decode the raw spec from the store and need the same
+// shape, so this lives once and the three call sites
+// (apply/Release/Restart) share the result.
+//
+// Returns an error only on validation failures (mutual exclusivity
+// of network_mode vs networks). Defaults themselves never fail.
+//
+// The fields covered:
+//
+//   - Image: empty → "<app>:latest" (build-mode convention)
+//   - NetworkMode/Networks: validate exclusivity; bridge mode adds
+//     voodu0 if missing
+//   - Ports: normalize to loopback-only unless operator pinned an IP
+//   - Restart: empty → "unless-stopped"
+//
+// Without this consolidation, build-mode + Release() would trip
+// "invalid reference format" (empty image) and bridge-mode +
+// Release()/Restart() would trip "network-scoped aliases are only
+// supported for user-defined networks" (no voodu0 in spec.Networks
+// → docker tries to apply --network-alias on the default bridge).
+func applyDeploymentSpecDefaults(spec *deploymentSpec, app string) error {
+	if spec.Image == "" {
+		spec.Image = app + ":latest"
+	}
+
+	switch spec.NetworkMode {
+	case "":
+		// Bridge mode — voodu0 auto-join below.
+	case "host", "none":
+		if len(spec.Networks) > 0 || spec.Network != "" {
+			return fmt.Errorf("deployment/%s: network_mode=%q is mutually exclusive with network/networks", app, spec.NetworkMode)
+		}
+	default:
+		return fmt.Errorf("deployment/%s: network_mode=%q not supported (want \"host\" or \"none\"; omit for bridge mode)", app, spec.NetworkMode)
+	}
+
+	if spec.NetworkMode == "" {
+		if len(spec.Networks) == 0 && spec.Network != "" {
+			spec.Networks = []string{spec.Network}
+		}
+
+		if !slices.Contains(spec.Networks, "voodu0") {
+			spec.Networks = append(spec.Networks, "voodu0")
+		}
+	}
+
+	spec.Ports = normalizePorts(spec.Ports)
+
+	if spec.Restart == "" {
+		spec.Restart = "unless-stopped"
+	}
+
+	return nil
+}
+
 // DeploymentStatus is persisted at /status/deployments/<name> after
 // every successful Ensure or Recreate. SpecHash is the sha256 of the
 // runtime-relevant fields of the spec (see deploymentSpecHash) and is
@@ -1180,7 +1289,100 @@ func decodeDeploymentSpec(m *Manifest) (deploymentSpec, error) {
 type DeploymentStatus struct {
 	Image    string `json:"image,omitempty"`
 	SpecHash string `json:"spec_hash,omitempty"`
+
+	// Releases is the deployment's release-phase history, newest
+	// first, capped at maxReleaseHistory entries. Each record carries
+	// the spec snapshot used at release time, which is what
+	// `vd release rollback` re-applies to revert.
+	Releases []ReleaseRecord `json:"releases,omitempty"`
 }
+
+// ReleaseRecord is one entry in the deployment's release history.
+// Mirrors JobRun's spirit but specialised for the release-phase
+// flow: tracks spec snapshot for rollback, separate exit codes for
+// pre/main/post, and a single Status that summarises the whole run.
+//
+// IDs are short sortable hashes generated independently per
+// release — no read-modify-write race like a monotonic counter
+// would have. Lexical sort matches creation order, so listing the
+// history in reverse (newest first) is a single sort.Sort.
+//
+// Heroku-style "v1, v2, v3" was tempting for UX but every read of
+// the current max would require either a global lock or risk of
+// collision under concurrent applies. The 9-char hash sidesteps
+// that entirely; operators copy IDs from `vd release <ref>` output
+// when they need to rollback.
+type ReleaseRecord struct {
+	// ID is the sortable 9-char hash unique to this release. The
+	// only operator-facing identifier; what `vd rollback web <id>`
+	// expects. Format: base36(unix_seconds) + 2 hex random chars,
+	// e.g. "1ksdtcj7e". Sortable lexicographically by creation time.
+	ID string `json:"id"`
+
+	// RolledBackFrom is the ID this record was created by rolling
+	// back TO. Empty for normal releases. Lets `vd release <ref>`
+	// render "this release was a rollback to <id>" so the timeline
+	// stays auditable.
+	RolledBackFrom string `json:"rolled_back_from,omitempty"`
+
+	// SpecHash is the deploymentSpecHash() of the spec at release
+	// time. The idempotency check before running uses this: a spec
+	// already-Succeeded skips the run on rollback / re-apply.
+	SpecHash string `json:"spec_hash"`
+
+	// Image is the image rolled out by this release. Surfaced in
+	// the history table so the operator can correlate "release X
+	// took 30s" with "image vd-web:1.2.3".
+	Image string `json:"image,omitempty"`
+
+	Status    ReleaseStatus `json:"status"`
+	StartedAt time.Time     `json:"started_at,omitempty"`
+	EndedAt   time.Time     `json:"ended_at,omitempty"`
+
+	// Per-step exit codes. Zero means "step succeeded or didn't run";
+	// PreExitCode for pre_command, ExitCode for the main command,
+	// PostExitCode for post_command. Step that aborted the run
+	// matches Status (e.g. Status=failed + ExitCode=42 means main
+	// command exited 42).
+	PreExitCode  int `json:"pre_exit_code,omitempty"`
+	ExitCode     int `json:"exit_code,omitempty"`
+	PostExitCode int `json:"post_exit_code,omitempty"`
+
+	// Error carries the first error that aborted the run — typically
+	// the docker-side message ("container exited 1: <stderr>") or a
+	// timeout signal. Empty for successful releases.
+	Error string `json:"error,omitempty"`
+
+	// SpecSnapshot is the full Manifest.Spec JSON at release time.
+	// `vd release rollback` re-applies this snapshot to revert. Kept
+	// alongside SpecHash because "the spec that ran X" needs to be
+	// reconstructible without consulting git history.
+	SpecSnapshot json.RawMessage `json:"spec_snapshot,omitempty"`
+}
+
+// ReleaseStatus is the lifecycle of a single ReleaseRecord. Same
+// shape as JobStatus but the values are release-specific (succeeded
+// includes both rolling restart + post hook completion; failed
+// covers any step before that).
+type ReleaseStatus string
+
+const (
+	ReleaseStatusRunning   ReleaseStatus = "running"
+	ReleaseStatusSucceeded ReleaseStatus = "succeeded"
+	ReleaseStatusFailed    ReleaseStatus = "failed"
+)
+
+// maxReleaseHistory caps the number of records we persist per
+// deployment. 10 is enough for "last few rollbacks" without
+// bloating the status blob — the file lives in etcd and we read it
+// every reconcile. New releases prepend; older ones drop off.
+const maxReleaseHistory = 10
+
+// defaultReleaseTimeout caps each release-phase command (pre, main,
+// post) at 10 minutes when the manifest doesn't say otherwise.
+// Generous enough for slow migrations on big tables, short enough
+// that a stuck command doesn't pin the rollout forever.
+const defaultReleaseTimeout = 10 * time.Minute
 
 // deploymentSpecHash canonicalises the runtime-shaping fields and
 // hashes them. The hash input is a struct (not the raw deploymentSpec)

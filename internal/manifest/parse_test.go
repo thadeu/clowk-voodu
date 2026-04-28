@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -328,6 +329,70 @@ app "clowk-lp" "web" {
 
 	if ingSpec.TLS == nil || !ingSpec.TLS.Enabled || ingSpec.TLS.Provider != "internal" {
 		t.Errorf("tls block lost: %+v", ingSpec.TLS)
+	}
+}
+
+// TestParseHCLAppCarriesReleaseBlock locks in that the authoring
+// sugar `app` exposes the release-phase block on parity with
+// `deployment`. Without this, web apps written in the `app` shape
+// silently lose their migration step on rollout — the parser would
+// either reject the block (HCL: unsupported) or, worse, accept and
+// drop it. Both outcomes broke once and the test exists so the
+// next refactor catches the regression.
+func TestParseHCLAppCarriesReleaseBlock(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  image = "clowk-lp:latest"
+  ports = ["3000"]
+  host  = "clowk.lp"
+
+  release {
+    command      = ["rails", "db:migrate"]
+    pre_command  = ["bin/preflight"]
+    post_command = ["bin/notify"]
+    timeout      = "5m"
+  }
+}
+`
+	tmp := writeTemp(t, "app_release.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 2 {
+		t.Fatalf("want 2 manifests (deployment+ingress), got %d", len(mans))
+	}
+
+	dep := mans[0]
+	if dep.Kind != controller.KindDeployment {
+		t.Fatalf("first manifest should be deployment, got %s", dep.Kind)
+	}
+
+	var depSpec DeploymentSpec
+	if err := json.Unmarshal(dep.Spec, &depSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	if depSpec.Release == nil {
+		t.Fatal("release block lost — app should propagate it to deployment")
+	}
+
+	if got, want := depSpec.Release.Command, []string{"rails", "db:migrate"}; !slices.Equal(got, want) {
+		t.Errorf("release.command: got %v, want %v", got, want)
+	}
+
+	if got, want := depSpec.Release.PreCommand, []string{"bin/preflight"}; !slices.Equal(got, want) {
+		t.Errorf("release.pre_command: got %v, want %v", got, want)
+	}
+
+	if got, want := depSpec.Release.PostCommand, []string{"bin/notify"}; !slices.Equal(got, want) {
+		t.Errorf("release.post_command: got %v, want %v", got, want)
+	}
+
+	if depSpec.Release.Timeout != "5m" {
+		t.Errorf("release.timeout: got %q, want %q", depSpec.Release.Timeout, "5m")
 	}
 }
 

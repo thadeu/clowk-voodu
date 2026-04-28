@@ -185,6 +185,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// apply / delete events.
 	s.api.Jobs = jobHandler
 
+	// Same instance for the imperative restart path.
+	s.api.Deployments = depHandler
+
 	cronJobHandler := &CronJobHandler{
 		Store:       store,
 		Log:         s.cfg.Logger,

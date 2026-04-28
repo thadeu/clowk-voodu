@@ -453,9 +453,20 @@ func rememberShippedTag(tag string) {
 // startSpinnerLocked kicks off the animation goroutine. Called with
 // f.mu held. The goroutine calls tick(), which takes its own lock —
 // safe because we release mu between channel reads.
+//
+// `\x1b[?25l` hides the terminal cursor for the lifetime of the
+// spinner — without this, the cursor's blinking block sits on top
+// of the spinner glyph and reads as a "white flash" behind every
+// frame. Restored in stopSpinnerLocked. Only emitted when out is a
+// TTY: piping to a file or pager would leave a stray escape that
+// some viewers render literally.
 func (f *progressFilter) startSpinnerLocked() {
 	f.stopCh = make(chan struct{})
 	f.doneCh = make(chan struct{})
+
+	if f.tty {
+		fmt.Fprint(f.out, "\x1b[?25l")
+	}
 
 	go f.spinLoop(f.stopCh, f.doneCh)
 }
@@ -501,6 +512,11 @@ func (f *progressFilter) advanceAndRenderLocked() {
 // stopSpinnerLocked signals the goroutine to exit and waits. Lock is
 // held on entry; we release it across the channel wait so the
 // goroutine's last tick() can acquire it, then reacquire.
+//
+// Restores the terminal cursor (`\x1b[?25h`) hidden by
+// startSpinnerLocked. Skipping this leaves the user's cursor
+// invisible after the apply finishes — confusing and easy to
+// forget. Only emitted when out is a TTY (matches start).
 func (f *progressFilter) stopSpinnerLocked() {
 	if f.stopCh == nil {
 		return
@@ -518,6 +534,10 @@ func (f *progressFilter) stopSpinnerLocked() {
 
 	f.stopCh = nil
 	f.doneCh = nil
+
+	if f.tty {
+		fmt.Fprint(f.out, "\x1b[?25h")
+	}
 }
 
 // CommitStep finalizes the currently-open step as a green ✓ without

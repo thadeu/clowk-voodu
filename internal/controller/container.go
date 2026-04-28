@@ -193,6 +193,16 @@ type ContainerSpec struct {
 	// completed runs disappear from `docker ps -a` automatically;
 	// long-running deployments leave it false (default).
 	AutoRemove bool
+
+	// TTY allocates a pseudo-terminal for the container (`docker run
+	// -t`). Off by default — long-running deployments don't need it
+	// and a TTY costs a tiny bit of kernel state per replica. The
+	// release runner sets it true so user-language stdout (Ruby,
+	// Node, Bun, Python) gets line-buffered: piped stdout would full-
+	// buffer until the process exits, defeating realtime log
+	// streaming. Operators see migration output flow live instead of
+	// in one final dump.
+	TTY bool
 }
 
 // DockerContainerManager is the production ContainerManager backed by
@@ -259,6 +269,7 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		EnvFile:        spec.EnvFile,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,
+		TTY:            spec.TTY,
 	}
 
 	if err := docker.CreateContainer(cfg); err != nil {
@@ -504,6 +515,7 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		EnvFile:        spec.EnvFile,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,
+		TTY:            spec.TTY,
 	}
 
 	return docker.CreateContainer(cfg)

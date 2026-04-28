@@ -69,6 +69,13 @@ type API struct {
 	// a real docker daemon.
 	Execer Execer
 
+	// Deployments powers `POST /restart?kind=deployment&...` — the
+	// imperative rolling-restart entry point. Nil → 503. Production
+	// wires *DeploymentHandler (its Restart method matches the
+	// signature). Tests substitute a fake to avoid spinning up
+	// reconciler machinery.
+	Deployments DeploymentRestarter
+
 	// Logs powers /logs streaming. Nil means the endpoint returns 503
 	// ("log streaming not configured"); production wires the
 	// ContainerManager (which satisfies LogStreamer through its Logs
@@ -111,6 +118,21 @@ type Execer interface {
 	Exec(name string, command []string, opts ExecOptions) (int, error)
 }
 
+// DeploymentRestarter is the seam `POST /restart?kind=deployment&...`
+// dispatches through. *DeploymentHandler.Restart implements this in
+// production; tests stub it to avoid touching docker.
+//
+// Release / Rollback live on the same surface so a single field on
+// API covers all three M-5/M-6 verbs against deployments. Release
+// takes an output writer so the HTTP handler can stream container
+// logs live to the response body — operators (and CI) see migration
+// output flow in real-time.
+type DeploymentRestarter interface {
+	Restart(ctx context.Context, scope, name string) error
+	Release(ctx context.Context, scope, name string, output io.Writer) error
+	Rollback(ctx context.Context, scope, name, targetID string) (newID string, err error)
+}
+
 // ExecOptions mirrors docker.ExecOptions field-for-field but lives
 // in the controller package so callers (handlers, CLI when running
 // in-process) don't need to import internal/docker just to pass
@@ -151,6 +173,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /jobs/run", a.handleJobRun)
 	mux.HandleFunc("POST /cronjobs/run", a.handleCronJobRun)
 	mux.HandleFunc("/config", a.handleConfig)
+	mux.HandleFunc("POST /restart", a.handleRestart)
+	mux.HandleFunc("POST /releases/run", a.handleReleaseRun)
+	mux.HandleFunc("POST /rollback", a.handleRollback)
 
 	return logRequests(mux)
 }
@@ -1530,6 +1555,235 @@ func parseUint16Query(s string) uint16 {
 	}
 
 	return uint16(n)
+}
+
+// handleRestart triggers a rolling restart of a deployment's
+// replicas without requiring a manifest edit. Common after running
+// migrations / config rotation / image rebuild — the spec didn't
+// drift, but the operator wants the running processes refreshed.
+//
+//	POST /restart?kind=deployment&scope=<scope>&name=<name>
+//
+// Only `kind=deployment` is supported today: jobs and cronjobs are
+// transient by design (you re-trigger them via /jobs/run /
+// /cronjobs/run), and databases / ingress are plugin-managed in a
+// way that doesn't fit the rolling-replace model.
+//
+// Synchronous: the call blocks until every replica has been
+// replaced (slotRolloutPause between, ~2s default). Returns the
+// per-replica progress in the response data so a future CLI render
+// can show "1/3 replaced, 2/3...". For now the body is just a
+// status envelope.
+func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if a.Deployments == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("restart not configured"))
+		return
+	}
+
+	kindStr := strings.TrimSpace(r.URL.Query().Get("kind"))
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+
+	// Default kind to deployment for ergonomics — `vd restart X`
+	// almost always means "restart the deployment". When other kinds
+	// gain rolling semantics (futureproofing) we'll accept them here.
+	if kindStr == "" {
+		kindStr = string(KindDeployment)
+	}
+
+	kind, err := ParseKind(kindStr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if kind != KindDeployment {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("restart only supports deployments today (got %q)", kind))
+		return
+	}
+
+	if scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
+		if err != nil {
+			if errors.Is(err, errScopeNotFound) {
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+
+		scope = resolved
+	}
+
+	if err := a.Deployments.Restart(r.Context(), scope, name); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]string{
+			"scope": scope,
+			"name":  name,
+		},
+	})
+}
+
+// handleReleaseRun manually triggers the release-phase command(s)
+// for a deployment. Same flow as the apply-time auto-trigger but
+// invoked imperatively so the operator can re-run a fix without
+// editing the manifest.
+//
+//	POST /releases/run?scope=&name=
+//
+// Response: text/plain streamed in real-time. The release
+// container's stdout+stderr flows through the response body as
+// the migration runs, with marker lines (-----> Release X: command,
+// -----> Release X failed in command, etc.) bracketing each phase.
+// CI runners see the migration logs flow live; operator running
+// interactively sees them too. Markers share the `----->` prefix the
+// rest of the apply pipeline uses so the CLI's stream filter can
+// render them as spinner steps.
+//
+// Always 200 — failure is communicated via the trailing marker
+// line ("-----> Release X failed in command (exit 42)") so the CLI
+// can read the body verbatim and decide on exit code at the end.
+func (a *API) handleReleaseRun(w http.ResponseWriter, r *http.Request) {
+	scope, name, err := a.releaseTarget(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if a.Deployments == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("release runner not configured"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Voodu-Scope", scope)
+	w.Header().Set("X-Voodu-Name", name)
+	w.WriteHeader(http.StatusOK)
+
+	// Wrap the response writer in a flusher so each line reaches
+	// the client immediately rather than sitting in the chunked-
+	// transfer buffer. Without this, CI would see the entire
+	// migration output in one burst at the end.
+	flushed := newFlushingWriter(w)
+
+	if err := a.Deployments.Release(r.Context(), scope, name, flushed); err != nil {
+		// Trailing line so the CLI can detect failure even though
+		// status is already 200 by now. The Release method's
+		// internal output already wrote a "-----> Release X failed"
+		// marker; this is a fallback for errors that happen
+		// outside the release runner (manifest read failure, etc.).
+		// The "failed" keyword is what the CLI greps for to set
+		// its exit code.
+		fmt.Fprintf(flushed, "-----> Release failed: %v\n", err)
+	}
+}
+
+// flushingWriter wraps an http.ResponseWriter so every Write
+// triggers an immediate Flush — needed for real-time log streaming
+// over chunked transfer encoding. Without this, Go's net/http
+// buffers writes until the response handler returns, defeating the
+// streaming UX entirely.
+type flushingWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func newFlushingWriter(w http.ResponseWriter) *flushingWriter {
+	flusher, _ := w.(http.Flusher)
+
+	return &flushingWriter{w: w, f: flusher}
+}
+
+func (fw *flushingWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+
+	return n, err
+}
+
+// handleRollback re-applies a specific past release's spec to the
+// deployment. Heroku-style: operator picks the release ID
+// (`vd rollback web 1ksdtcj7e`) and voodu re-Puts that snapshot
+// into etcd, triggering a normal recreate flow. Migration doesn't
+// re-run because the target's hash already has a Succeeded record.
+//
+//	POST /rollback?scope=&name=&release_id=
+//
+// release_id="" (or omitted): rollback to the release immediately
+// before the current. Otherwise: exact target. Errors when the
+// target doesn't exist or isn't a Succeeded release.
+//
+// Top-level /rollback (not /releases/rollback) because rollback
+// is its own verb conceptually — the release is the snapshot;
+// rollback is "go back to that snapshot". Different concerns.
+func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
+	scope, name, err := a.releaseTarget(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if a.Deployments == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("rollback not configured"))
+		return
+	}
+
+	targetID := strings.TrimSpace(r.URL.Query().Get("release_id"))
+
+	newID, err := a.Deployments.Rollback(r.Context(), scope, name, targetID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"scope":          scope,
+			"name":           name,
+			"rolled_back_to": targetID,
+			"new_release":    newID,
+		},
+	})
+}
+
+// releaseTarget pulls and validates scope/name from query params,
+// resolving an unambiguous bare name when scope is omitted. Shared
+// helper because /releases/run and /releases/rollback both need
+// the same shape.
+func (a *API) releaseTarget(r *http.Request) (string, string, error) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+
+	if name == "" {
+		return "", "", fmt.Errorf("name is required")
+	}
+
+	if scope == "" {
+		resolved, err := resolveScope(r.Context(), a.Store, KindDeployment, name)
+		if err != nil {
+			return "", "", err
+		}
+
+		scope = resolved
+	}
+
+	return scope, name, nil
 }
 
 // handleCronJobRun forces an immediate execution of a previously-

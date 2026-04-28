@@ -15,37 +15,11 @@ import (
 	"go.voodu.clowk.in/internal/controller"
 )
 
-// newRunJobCmd builds `voodu run job <scope>/<name>`. The argument is
-// always a slash-joined ref so the CLI can disambiguate scoped kinds
-// without a separate `--scope` flag — kubernetes-style `<ns>/<name>`,
-// adapted to voodu's vocabulary. A bare `<name>` is accepted too: the
-// controller resolves the scope server-side when it's unambiguous.
-func newRunJobCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "job <scope>/<name> | <name>",
-		Short: "Run a previously-applied job once",
-		Long: `Trigger one execution of a declared job manifest.
-
-The job spec is fetched from the controller (it must have been applied
-first via 'voodu apply'), a one-shot container is spawned with the
-spec's image / command / env, and the call blocks until the container
-exits. The exit code, run id, and duration are returned.
-
-The container is removed automatically on success. On failure (non-zero
-exit, docker error) the run record is preserved in the job's status
-history; inspect with 'voodu describe job <name>' once that's wired.
-
-Examples:
-  voodu run job api/migrate          scope=api, name=migrate
-  voodu run job migrate              if 'migrate' is unambiguous`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRunJob(cmd, args[0])
-		},
-	}
-
-	return cmd
-}
+// newRunJobCmd was the standalone subcommand `voodu run job <ref>`.
+// Removed in favour of the unified `voodu run <ref>` (cmd_run.go),
+// which dispatches to runRunJob automatically when the ref resolves
+// to a declared job. The implementation lives below — only the
+// cobra wiring went away.
 
 // runJobResponse mirrors the /jobs/run envelope. The data field
 // carries a JobRun whether the call succeeded or failed (the runner

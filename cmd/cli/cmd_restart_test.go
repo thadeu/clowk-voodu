@@ -7,18 +7,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"go.voodu.clowk.in/internal/controller"
 )
 
-// TestRunCronJobRoutesToEndpoint locks the wire shape: `vd run
-// cronjob api/migrate` POSTs to /cronjobs/run with scope+name
-// query params, and the JobRun envelope from the controller drives
-// the rendered output. Without this the CLI could silently land on
-// the wrong endpoint (e.g. /jobs/run) and an operator would only
-// notice when the cronjob runs as a regular job and skips the
-// CronJobHandler-only side effects.
-func TestRunCronJobRoutesToEndpoint(t *testing.T) {
+// TestRestartPostsCorrectQuery locks in the wire shape: `vd restart
+// clowk-lp/web` POSTs to /restart with kind=deployment + scope +
+// name. Without this assert, a regression in splitJobRef or the
+// query builder could quietly send the wrong kind and miss the
+// rolling-restart path entirely.
+func TestRestartPostsCorrectQuery(t *testing.T) {
 	var (
 		gotMethod string
 		gotPath   string
@@ -32,11 +28,7 @@ func TestRunCronJobRoutesToEndpoint(t *testing.T) {
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data": controller.JobRun{
-				RunID:    "abcd",
-				Status:   controller.JobStatusSucceeded,
-				ExitCode: 0,
-			},
+			"data":   map[string]string{"scope": "clowk-lp", "name": "web"},
 		})
 	}))
 	defer ts.Close()
@@ -47,7 +39,7 @@ func TestRunCronJobRoutesToEndpoint(t *testing.T) {
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"run", "cronjob", "ops/purge"})
+	root.SetArgs([]string{"restart", "clowk-lp/web"})
 
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -57,21 +49,22 @@ func TestRunCronJobRoutesToEndpoint(t *testing.T) {
 		t.Errorf("method=%q want POST", gotMethod)
 	}
 
-	if gotPath != "/cronjobs/run" {
-		t.Errorf("path=%q want /cronjobs/run", gotPath)
+	if gotPath != "/restart" {
+		t.Errorf("path=%q want /restart", gotPath)
 	}
 
-	for _, want := range []string{"scope=ops", "name=purge"} {
+	for _, want := range []string{"kind=deployment", "scope=clowk-lp", "name=web"} {
 		if !strings.Contains(gotQuery, want) {
 			t.Errorf("query missing %q: %q", want, gotQuery)
 		}
 	}
 }
 
-// TestRunCronJobBareNameOmitsScope mirrors run job: a bare ref must
-// NOT carry an empty scope query param, otherwise the controller's
-// scope-omitted resolver path never fires.
-func TestRunCronJobBareNameOmitsScope(t *testing.T) {
+// TestRestartBareNameOmitsScope confirms `vd restart web` (no
+// slash) sends only ?name= and lets the server's resolveScope find
+// the unique match. Without this, a stray empty `scope=` would
+// break the disambiguator.
+func TestRestartBareNameOmitsScope(t *testing.T) {
 	var gotQuery string
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +72,7 @@ func TestRunCronJobBareNameOmitsScope(t *testing.T) {
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data":   controller.JobRun{RunID: "x", Status: controller.JobStatusSucceeded},
+			"data":   map[string]string{"scope": "clowk-lp", "name": "web"},
 		})
 	}))
 	defer ts.Close()
@@ -90,7 +83,7 @@ func TestRunCronJobBareNameOmitsScope(t *testing.T) {
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"run", "cronjob", "purge"})
+	root.SetArgs([]string{"restart", "web"})
 
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -99,17 +92,22 @@ func TestRunCronJobBareNameOmitsScope(t *testing.T) {
 	if strings.Contains(gotQuery, "scope=") {
 		t.Errorf("bare name must omit scope query, got %q", gotQuery)
 	}
+
+	if !strings.Contains(gotQuery, "name=web") {
+		t.Errorf("query missing name=web: %q", gotQuery)
+	}
 }
 
-// TestRunCronJobSurfacesEnvelopeError confirms a JSON-envelope error
-// (cronjob not found, runner not configured) becomes the CLI's
-// error message verbatim — not wrapped behind an opaque 500.
-func TestRunCronJobSurfacesEnvelopeError(t *testing.T) {
+// TestRestartSurfacesEnvelopeError keeps the operator-friendly
+// error path: a 4xx/5xx from the server with a JSON envelope
+// reaches the CLI as the server's verbatim message, not a generic
+// "controller returned N".
+func TestRestartSurfacesEnvelopeError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status": "error",
-			"error":  "cronjob/ops/purge not found",
+			"error":  "deployment/clowk-lp/missing not found",
 		})
 	}))
 	defer ts.Close()
@@ -120,14 +118,14 @@ func TestRunCronJobSurfacesEnvelopeError(t *testing.T) {
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"run", "cronjob", "ops/purge"})
+	root.SetArgs([]string{"restart", "clowk-lp/missing"})
 
 	err := root.Execute()
 	if err == nil {
 		t.Fatal("expected error for 404")
 	}
 
-	if !strings.Contains(err.Error(), "ops/purge") {
+	if !strings.Contains(err.Error(), "missing not found") {
 		t.Errorf("error should surface server message, got %q", err.Error())
 	}
 }

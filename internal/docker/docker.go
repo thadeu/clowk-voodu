@@ -97,6 +97,15 @@ type ContainerConfig struct {
 	// stopped artifacts behind. Defaults to false (long-running
 	// deployments must persist across restarts).
 	AutoRemove bool
+
+	// TTY allocates a pseudo-terminal for the container (`docker run
+	// -t`). Without a TTY most language runtimes (Ruby, Node, Bun,
+	// Python) full-buffer stdout when it's a pipe — the operator
+	// only sees logs in one big dump after the process exits, which
+	// kills realtime streaming for release-phase migrations. Setting
+	// TTY=true on those one-shot runs forces line-buffering so
+	// `docker logs -f` flows naturally.
+	TTY bool
 }
 
 // DeploymentConfig represents deployment configuration.
@@ -191,6 +200,14 @@ func CreateContainer(cfg ContainerConfig) error {
 
 	args = append(args, "--ulimit", "nofile=65536:65536")
 	args = append(args, "--ulimit", "nproc=4096:4096")
+
+	// TTY allocation forces line-buffered stdout in the container's
+	// process. Plumbed in for release-phase one-shots; long-running
+	// deployments leave it off (default) since they don't need a
+	// terminal and a pty per replica is wasted kernel state.
+	if cfg.TTY {
+		args = append(args, "-t")
+	}
 
 	args = append(args, cfg.Image)
 

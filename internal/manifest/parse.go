@@ -201,7 +201,8 @@ type hclDeployment struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang *hclLangBlock `hcl:"lang,block"`
+	Lang    *hclLangBlock    `hcl:"lang,block"`
+	Release *hclReleaseBlock `hcl:"release,block"`
 }
 
 type hclLangBlock struct {
@@ -209,6 +210,17 @@ type hclLangBlock struct {
 	Version    string            `hcl:"version,optional"`
 	Entrypoint string            `hcl:"entrypoint,optional"`
 	BuildArgs  map[string]string `hcl:"build_args,optional"`
+}
+
+// hclReleaseBlock is the HCL surface for the release phase. Each
+// command field is a list so the operator can write the natural
+// `command = ["rails", "db:migrate"]` shape; voodu hands the slice
+// to docker exec verbatim (no shell interpretation unless explicit).
+type hclReleaseBlock struct {
+	Command     []string `hcl:"command,optional"`
+	PreCommand  []string `hcl:"pre_command,optional"`
+	PostCommand []string `hcl:"post_command,optional"`
+	Timeout     string   `hcl:"timeout,optional"`
 }
 
 func (b hclDeployment) spec() DeploymentSpec {
@@ -237,6 +249,15 @@ func (b hclDeployment) spec() DeploymentSpec {
 			Version:    b.Lang.Version,
 			Entrypoint: b.Lang.Entrypoint,
 			BuildArgs:  b.Lang.BuildArgs,
+		}
+	}
+
+	if b.Release != nil {
+		s.Release = &ReleaseSpec{
+			Command:     b.Release.Command,
+			PreCommand:  b.Release.PreCommand,
+			PostCommand: b.Release.PostCommand,
+			Timeout:     b.Release.Timeout,
 		}
 	}
 
@@ -304,7 +325,8 @@ type hclApp struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang *hclLangBlock `hcl:"lang,block"`
+	Lang    *hclLangBlock    `hcl:"lang,block"`
+	Release *hclReleaseBlock `hcl:"release,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -344,6 +366,15 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 			Version:    b.Lang.Version,
 			Entrypoint: b.Lang.Entrypoint,
 			BuildArgs:  b.Lang.BuildArgs,
+		}
+	}
+
+	if b.Release != nil {
+		s.Release = &ReleaseSpec{
+			Command:     b.Release.Command,
+			PreCommand:  b.Release.PreCommand,
+			PostCommand: b.Release.PostCommand,
+			Timeout:     b.Release.Timeout,
 		}
 	}
 

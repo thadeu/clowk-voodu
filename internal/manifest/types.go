@@ -73,6 +73,52 @@ type DeploymentSpec struct {
 	// Lang is the single, runtime-agnostic build-input block. A nil
 	// pointer means "not declared" — handlers fall back to auto-detect.
 	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
+
+	// Release is the optional release-phase block. When present, voodu
+	// runs Command in a one-shot container BEFORE rolling restart of
+	// the replicas — kubectl-/Heroku-style "migrate, then restart".
+	// Failure of the release aborts the rollout: replicas stay on the
+	// previous version, and the failure is recorded in the deployment
+	// status's release history. See ReleaseSpec for details.
+	Release *ReleaseSpec `yaml:"release,omitempty" json:"release,omitempty"`
+}
+
+// ReleaseSpec describes the one-shot command voodu runs between
+// "manifest applied" and "rolling replicas" — the gap that
+// migrations / cache warmup / smoke tests live in.
+//
+//	release {
+//	  command = ["rails", "db:migrate"]
+//	  timeout = "5m"
+//
+//	  pre_command  = ["bin/preflight"]   # optional
+//	  post_command = ["bin/notify"]      # optional
+//	}
+//
+// All commands run inside a fresh container spawned from the
+// deployment's NEW image, so they see the new code (with whatever
+// migrations / fixtures it ships) before any replica boots with
+// it. Env is the merged scope+app config + manifest spec.env (same
+// as the deployment containers see at boot).
+//
+// Lifecycle:
+//
+//	pre_command  →  command  →  rolling restart  →  post_command
+//
+// Any non-zero exit in pre_command or command aborts the rollout —
+// post_command runs only after the rolling restart completes
+// successfully. post_command failure is recorded but does NOT roll
+// the deploy back; the new replicas are already live.
+type ReleaseSpec struct {
+	Command     []string `yaml:"command,omitempty"      json:"command,omitempty"`
+	PreCommand  []string `yaml:"pre_command,omitempty"  json:"pre_command,omitempty"`
+	PostCommand []string `yaml:"post_command,omitempty" json:"post_command,omitempty"`
+
+	// Timeout caps each command's wall-clock duration. Format is
+	// time.ParseDuration ("30s", "5m", "1h"). Defaults to "10m" when
+	// omitted — enough for slow migrations on big tables, short
+	// enough that a stuck command doesn't pin the rollout forever.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // LangSpec carries build-time inputs for the chosen runtime. The
