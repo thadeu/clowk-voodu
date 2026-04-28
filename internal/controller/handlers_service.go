@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -372,30 +371,37 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 	}, nil
 }
 
-// deploymentUpstreams produces the list of `<container>:<port>`
-// targets caddy will load-balance across. Pre-M0 we synthesised them
-// from the replica count using deterministic slot names; with opaque
-// replica ids the runtime is the only source of truth, so we ask
-// docker via labels.
+// deploymentUpstreams produces the upstream caddy will dial for
+// this ingress. Returns a single `<alias>:<port>` entry — the
+// network alias (e.g. "web.clowk-lp") that BuildNetworkAliases
+// registered on every replica's docker --network-alias flag.
+//
+// Why the alias and not per-container names: container names are
+// replica-id qualified ("clowk-lp-web.afd2") and the embedded dot
+// trips docker's built-in DNS — the resolver treats `.afd2` as a
+// search-domain segment and reports `no such host` even though
+// the container is on the same network. The alias has no replica
+// suffix and resolves to every live replica IP automatically,
+// giving caddy DNS-level round-robin for free.
 //
 // Three retry-friendly cases the caller has to absorb:
 //
-//   - Containers nil — handler wired without a manager. Falls back to
-//     the bare AppID, which works for replicas=1 and degrades
-//     predictably for replicas>1 (caddy hits the wrong name once).
-//
-//   - List error — wrap as Transient so the reconciler retries. A
-//     transient docker hiccup mid-apply is more common than the
-//     handler being misconfigured.
-//
+//   - Containers nil — handler wired without a manager (tests).
+//     Returns the bare alias anyway; tests that care about the
+//     plugin contract still get a sensible value.
+//   - List error — wrap as Transient so the reconciler retries.
 //   - List returns zero containers — the deployment exists in
-//     /desired but the reconciler hasn't created replicas yet (the
-//     ingress event landed first). Same Transient retry.
+//     /desired but the reconciler hasn't created replicas yet
+//     (the ingress event landed first). Same Transient retry,
+//     because dialing the alias before any replica registers it
+//     would produce the same DNS failure caddy is reporting.
 func (h *IngressHandler) deploymentUpstreams(scope, name string, port int, dep deploymentSpec) ([]string, error) {
 	app := AppID(scope, name)
 
+	upstream := upstreamForAlias(scope, name, app, port)
+
 	if h.Containers == nil {
-		return []string{fmt.Sprintf("%s:%d", app, port)}, nil
+		return []string{upstream}, nil
 	}
 
 	slots, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
@@ -407,17 +413,22 @@ func (h *IngressHandler) deploymentUpstreams(scope, name string, port int, dep d
 		return nil, Transient(fmt.Errorf("ingress: deployment %s has no live replicas yet — will retry", app))
 	}
 
-	out := make([]string, 0, len(slots))
-	for _, s := range slots {
-		out = append(out, fmt.Sprintf("%s:%d", s.Name, port))
+	return []string{upstream}, nil
+}
+
+// upstreamForAlias picks the canonical network alias (e.g.
+// "web.clowk-lp") for a deployment so caddy dials a name docker's
+// embedded DNS can resolve. Falls back to the bare AppID for
+// unscoped resources or empty inputs (theoretical paths not used
+// by any current handler — defensive only).
+func upstreamForAlias(scope, name, app string, port int) string {
+	aliases := BuildNetworkAliases(scope, name)
+
+	if len(aliases) == 0 {
+		return fmt.Sprintf("%s:%d", app, port)
 	}
 
-	// Sort for determinism so caddy plugin diff is stable across
-	// reconciles even when docker returns the list in a different
-	// order. The set is what matters; the order doesn't.
-	sort.Strings(out)
-
-	return out, nil
+	return fmt.Sprintf("%s:%d", aliases[0], port)
 }
 
 func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, scope, name string) (*deploymentSpec, error) {
