@@ -47,19 +47,34 @@ func AppID(scope, name string) string {
 	return scope + "-" + name
 }
 
-// ScopedKinds is the set of kinds whose manifests must carry a non-empty
-// Scope. Anything else is single-label HCL with no scope concept yet.
+// ScopedKinds is the set of kinds whose manifests MUST carry a
+// non-empty Scope. Asset is intentionally absent — it's the only
+// kind that's optionally scoped (1-label = unscoped global,
+// 2-label = scoped). Other kinds are strictly 2-label.
 var ScopedKinds = map[Kind]bool{
 	KindDeployment:  true,
 	KindStatefulset: true,
 	KindIngress:     true,
 	KindJob:         true,
 	KindCronJob:     true,
-	KindAsset:       true,
+}
+
+// OptionallyScopedKinds is the set of kinds whose manifests
+// MAY carry a scope. Today only asset — operators declare
+// `asset "name" { … }` for global / shared bundles or
+// `asset "scope" "name" { … }` for scope-local ones. The
+// reference syntax distinguishes them: 3-segment refs resolve
+// unscoped, 4-segment refs resolve scoped.
+var OptionallyScopedKinds = map[Kind]bool{
+	KindAsset: true,
 }
 
 // IsScoped returns true when manifests of kind k must carry a scope.
 func IsScoped(k Kind) bool { return ScopedKinds[k] }
+
+// IsOptionallyScoped reports whether kind k accepts both
+// scoped and unscoped manifests. Today only asset.
+func IsOptionallyScoped(k Kind) bool { return OptionallyScopedKinds[k] }
 
 // IsCoreKind reports whether k is one of the controller's built-in
 // kinds (the ones with hand-written reconcile handlers). Anything
@@ -96,7 +111,10 @@ func (m *Manifest) Validate() error {
 		return fmt.Errorf("%s/%s: scope is required (use `%s \"scope\" \"%s\" { ... }`)", kind, m.Name, kind, m.Name)
 	}
 
-	if !IsScoped(kind) && m.Scope != "" {
+	// Optionally-scoped kinds (asset) accept both empty
+	// and non-empty scope — both are valid manifests with
+	// distinct semantics (unscoped global vs scope-local).
+	if !IsScoped(kind) && !IsOptionallyScoped(kind) && m.Scope != "" {
 		return fmt.Errorf("%s/%s: scope is not supported for this kind", kind, m.Name)
 	}
 

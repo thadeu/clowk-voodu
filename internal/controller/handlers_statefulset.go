@@ -73,6 +73,14 @@ type statefulsetSpec struct {
 	// the JSON shape stable so plugins authored against the early
 	// schema don't need a re-spec.
 	VolumeClaims []volumeClaim `json:"volume_claims,omitempty"`
+
+	// AssetDigests is the apply-time-stamped sha256 map for asset
+	// refs the consumer touches. Server-managed (StampAssetDigests
+	// writes it post plugin-expand); operators don't author this
+	// field. When non-empty, the hash function uses it directly;
+	// otherwise it falls back to LookupAssetDigests (/status path)
+	// for legacy manifests applied before stamping was wired up.
+	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
 }
 
 type volumeClaim struct {
@@ -205,14 +213,19 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// Hash MUST be computed BEFORE asset interpolation —
 	// see deploymentSpecHash for the rationale on why
 	// literals + content digests both fold into the hash.
-	assetRefs := collectStatefulsetAssetRefs(spec)
-	assetDigests := LookupAssetDigests(ctx, h.Store, ev.Scope, assetRefs)
+	//
+	// Digest source is the apply-time stamp (spec.AssetDigests)
+	// when present; falls back to a /status lookup for legacy
+	// manifests that pre-date the stamping pipeline.
+	assetDigests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectStatefulsetAssetRefs(spec))
+	})
 	hash := statefulsetSpecHash(spec, assetDigests)
 
 	// Now safe to resolve `${asset.X.Y}` literals into host
 	// paths so the ContainerSpec can wire docker bind mounts
 	// to real files.
-	if err := resolveStatefulsetSpecAssets(ctx, h.Store, ev.Scope, &spec); err != nil {
+	if err := resolveStatefulsetSpecAssets(ctx, h.Store, &spec); err != nil {
 		return err
 	}
 
@@ -651,8 +664,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 // posture: VolumeClaim mount_paths and Networks are left
 // untouched (container-side / docker-bridge identifiers, not
 // host paths).
-func resolveStatefulsetSpecAssets(ctx context.Context, store Store, scope string, spec *statefulsetSpec) error {
-	lookup := makeAssetPathLookup(ctx, store, scope)
+func resolveStatefulsetSpecAssets(ctx context.Context, store Store, spec *statefulsetSpec) error {
+	lookup := makeAssetPathLookup(ctx, store)
 
 	var err error
 
@@ -900,11 +913,12 @@ func (h *StatefulsetHandler) Restart(ctx context.Context, scope, name string) er
 		return err
 	}
 
-	assetRefs := collectStatefulsetAssetRefs(spec)
-	assetDigests := LookupAssetDigests(ctx, h.Store, scope, assetRefs)
+	assetDigests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectStatefulsetAssetRefs(spec))
+	})
 	hash := statefulsetSpecHash(spec, assetDigests)
 
-	if err := resolveStatefulsetSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+	if err := resolveStatefulsetSpecAssets(ctx, h.Store, &spec); err != nil {
 		return err
 	}
 
@@ -1059,7 +1073,7 @@ func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, a
 		return fmt.Errorf("apply defaults: %w", err)
 	}
 
-	if err := resolveStatefulsetSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+	if err := resolveStatefulsetSpecAssets(ctx, h.Store, &spec); err != nil {
 		return fmt.Errorf("resolve asset refs: %w", err)
 	}
 

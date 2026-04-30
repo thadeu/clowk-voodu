@@ -340,6 +340,33 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 
 	manifests = expandedManifests
 
+	// Asset-digest stamping. Walks the post-expand batch, hashes
+	// every asset's bytes, and embeds the resulting digests under
+	// `_asset_digests` on each consumer's spec (deployment,
+	// statefulset, job, cronjob). The hash function later reads
+	// from there instead of doing a /status side-channel lookup,
+	// so:
+	//
+	//   - The diff is honest: when an asset's bytes change, the
+	//     consumer's stamped digest changes, and the consumer's
+	//     /desired blob therefore textually differs.
+	//   - Restart triggers via the normal watch path: /desired
+	//     changed → handler runs → spec hash drift → rolling
+	//     restart. No fan-out from asset → consumer needed.
+	//   - Cross-batch refs work: a consumer in this apply can
+	//     reference an asset already in /status from a previous
+	//     apply, and stamping pulls the prior digest.
+	//
+	// Estrita on unresolved refs: if a consumer references an
+	// asset that's neither in the batch nor in /status, the apply
+	// rejects with the formatted ref in the error. Catches typos
+	// and missing-asset cases at apply time instead of at
+	// container-start-time.
+	if err := StampAssetDigests(r.Context(), a.Store, nil, nil, manifests); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("asset stamping: %w", err))
+		return
+	}
+
 	var (
 		applied = make([]*Manifest, 0, len(manifests))
 		current = make([]*Manifest, 0, len(manifests))

@@ -254,15 +254,22 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 	// the manifest as it sits in etcd ask for it explicitly; the default
 	// text view stays focused on derived/runtime fields that a JSON
 	// dump can't pretty-print well (next_run, history, pods).
+	//
+	// Top-level keys prefixed with "_" are controller-internal
+	// (e.g. `_asset_digests` stamped by the apply pipeline) and
+	// filtered out before rendering — the operator sees the spec
+	// they authored, not the controller's bookkeeping.
 	if showSpec && len(manifest.Spec) > 0 {
 		fmt.Fprintln(w, "\nspec:")
 
+		display := filterInternalSpecFields(manifest.Spec)
+
 		var pretty bytes.Buffer
 
-		if err := json.Indent(&pretty, manifest.Spec, "  ", "  "); err == nil {
+		if err := json.Indent(&pretty, display, "  ", "  "); err == nil {
 			fmt.Fprintf(w, "  %s\n", pretty.String())
 		} else {
-			fmt.Fprintf(w, "  %s\n", string(manifest.Spec))
+			fmt.Fprintf(w, "  %s\n", string(display))
 		}
 	}
 
@@ -301,6 +308,47 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 	}
 
 	return nil
+}
+
+// filterInternalSpecFields strips top-level keys prefixed with "_"
+// from a spec JSON blob before pretty-printing. Those keys are
+// controller-managed (today: `_asset_digests` stamped by the
+// apply pipeline) — they participate in the spec hash but
+// shouldn't appear in `vd describe -o spec` output, which is
+// meant to be a faithful view of what the operator authored.
+//
+// Filtering is shallow on purpose: nested objects keep their `_`
+// keys (asset specs use `_source` as a discriminator inside the
+// `files` map, and that's information the operator wants to see).
+// If the spec doesn't unmarshal as a JSON object, the original
+// bytes pass through unchanged so non-object specs (today none,
+// but defensive) don't get mangled.
+func filterInternalSpecFields(spec []byte) []byte {
+	var obj map[string]json.RawMessage
+
+	if err := json.Unmarshal(spec, &obj); err != nil {
+		return spec
+	}
+
+	changed := false
+
+	for k := range obj {
+		if strings.HasPrefix(k, "_") {
+			delete(obj, k)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return spec
+	}
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return spec
+	}
+
+	return out
 }
 
 // renderDescribePodsTable prints the same columns as `voodu get pods`,

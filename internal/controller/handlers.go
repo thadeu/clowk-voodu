@@ -78,6 +78,11 @@ type deploymentSpec struct {
 	Restart     string            `json:"restart,omitempty"`
 	HealthCheck string            `json:"health_check,omitempty"`
 	Release     *releaseSpec      `json:"release,omitempty"`
+
+	// AssetDigests is the apply-time-stamped sha256 map for asset
+	// refs the consumer touches. See statefulsetSpec.AssetDigests
+	// for the rationale and fallback behaviour.
+	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
 }
 
 // releaseSpec mirrors manifest.ReleaseSpec but lives in the
@@ -339,13 +344,18 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// rewritten to host paths and the hash would no longer
 	// reflect "this resource depends on assets X.Y, current
 	// digest Z".
-	assetRefs := collectDeploymentAssetRefs(spec)
-	assetDigests := LookupAssetDigests(ctx, h.Store, ev.Scope, assetRefs)
+	//
+	// Digest source is the apply-time stamp (spec.AssetDigests)
+	// when present; falls back to a /status lookup for legacy
+	// manifests that pre-date the stamping pipeline.
+	assetDigests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectDeploymentAssetRefs(spec))
+	})
 	hash := deploymentSpecHash(spec, assetDigests)
 
 	// Now safe to interpolate — the ContainerSpec needs
 	// real host paths in its volumes / command / image / etc.
-	if err := resolveDeploymentSpecAssets(ctx, h.Store, ev.Scope, &spec); err != nil {
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, &spec); err != nil {
 		return err
 	}
 
@@ -962,7 +972,7 @@ func (h *DeploymentHandler) Restart(ctx context.Context, scope, name string) err
 		return err
 	}
 
-	if err := resolveDeploymentSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, &spec); err != nil {
 		return err
 	}
 
@@ -982,8 +992,9 @@ func (h *DeploymentHandler) Restart(ctx context.Context, scope, name string) err
 		return fmt.Errorf("link env: %w", err)
 	}
 
-	assetRefs := collectDeploymentAssetRefs(spec)
-	assetDigests := LookupAssetDigests(ctx, h.Store, scope, assetRefs)
+	assetDigests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectDeploymentAssetRefs(spec))
+	})
 	hash := deploymentSpecHash(spec, assetDigests)
 
 	h.logf("deployment/%s rolling restart of %d replica(s) requested", app, len(live))
@@ -1061,7 +1072,7 @@ func resolveAppEnv(
 	// reference. Order doesn't matter (regexes don't
 	// overlap) but two passes keeps each interpolation
 	// engine focused on its own pattern.
-	resolved, err = resolveAssetRefsInMap(resolved, makeAssetPathLookup(ctx, store, scope))
+	resolved, err = resolveAssetRefsInMap(resolved, makeAssetPathLookup(ctx, store))
 	if err != nil {
 		return false, Transient(err)
 	}
@@ -1162,8 +1173,8 @@ func decodeDeploymentSpec(m *Manifest) (deploymentSpec, error) {
 // claim mount_path is a CONTAINER path, not a host path; and
 // network names are docker bridge identifiers that have no
 // host-fs counterpart.
-func resolveDeploymentSpecAssets(ctx context.Context, store Store, scope string, spec *deploymentSpec) error {
-	lookup := makeAssetPathLookup(ctx, store, scope)
+func resolveDeploymentSpecAssets(ctx context.Context, store Store, spec *deploymentSpec) error {
+	lookup := makeAssetPathLookup(ctx, store)
 
 	var err error
 
@@ -1471,11 +1482,11 @@ func shortHash(h string) string {
 
 func (h *DeploymentHandler) putDeploymentStatus(ctx context.Context, app string, spec deploymentSpec) error {
 	// putDeploymentStatus is a convenience wrapper used only
-	// by tests / synthetic baselining. The asset digests it
-	// captures are the ones currently visible in /status —
-	// matches the semantics of the real apply() path.
-	scope, _ := splitAppID(app)
-	digests := LookupAssetDigests(ctx, h.Store, scope, collectDeploymentAssetRefs(spec))
+	// by tests / synthetic baselining. Digest source matches
+	// the real apply() path: stamped first, /status fallback.
+	digests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectDeploymentAssetRefs(spec))
+	})
 
 	return h.writeDeploymentStatus(ctx, app, spec.Image, deploymentSpecHash(spec, digests), effectiveReplicas(spec))
 }

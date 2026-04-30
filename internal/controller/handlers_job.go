@@ -29,6 +29,12 @@ type jobSpec struct {
 
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
+
+	// AssetDigests is the apply-time-stamped sha256 map for asset
+	// refs the job touches. Job hashing folds it in the same way
+	// deployments / statefulsets do — see statefulsetSpec.AssetDigests
+	// for the rationale.
+	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
 }
 
 // JobHandler reconciles job manifests. Unlike DeploymentHandler, the

@@ -531,11 +531,13 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 
 	// Hash MUST capture asset literals + content digests
 	// before interpolation rewrites them to host paths.
-	assetRefs := collectDeploymentAssetRefs(spec)
-	assetDigests := LookupAssetDigests(ctx, h.Store, scope, assetRefs)
+	// Stamped digests preferred; /status fallback for legacy.
+	assetDigests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+		return LookupAssetDigests(ctx, h.Store, collectDeploymentAssetRefs(spec))
+	})
 	hash := deploymentSpecHash(spec, assetDigests)
 
-	if err := resolveDeploymentSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, &spec); err != nil {
 		return err
 	}
 
@@ -812,7 +814,7 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 		return fmt.Errorf("apply defaults: %w", err)
 	}
 
-	if err := resolveDeploymentSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, &spec); err != nil {
 		return fmt.Errorf("resolve asset refs: %w", err)
 	}
 

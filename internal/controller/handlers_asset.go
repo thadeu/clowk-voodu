@@ -61,15 +61,33 @@ type AssetHandler struct {
 // restart" without re-reading the filesystem on every
 // reconcile — they read /status once and trust the digest.
 type AssetStatus struct {
-	// Files maps `key → sha256(content)`. Ordered keys would
+	// Files maps `key → sha256(content)` for every key that
+	// SUCCEEDED on the most recent apply. Ordered keys would
 	// be marshal-deterministic anyway (Go maps marshal
 	// alphabetically since 1.12), so this stays a plain map.
 	Files map[string]string `json:"files,omitempty"`
 
+	// Errors maps `key → error message` for every key that
+	// FAILED on the most recent apply (URL fetch failed,
+	// inline source decode failed, write failed, etc.). The
+	// asset reconcile is best-effort per-key — a single bad
+	// URL doesn't abort the rest of the bundle. Operators
+	// inspect this map via `vd describe asset/<scope>/<name>`
+	// (when implemented) or by reading /status directly.
+	//
+	// A key present in Errors may also be present on disk
+	// (from a previous successful apply); the reconciler
+	// preserves stale files for declared-but-failing keys
+	// so consumers don't break suddenly when an upstream
+	// blips. Errors is the authoritative "this key is
+	// broken right now" signal regardless of disk state.
+	Errors map[string]string `json:"errors,omitempty"`
+
 	// MaterialisedAt is the wall-clock time of the most
-	// recent successful materialisation. Useful for
-	// debugging "did the server pick up my new R2 URL
-	// content?" without diff-ing the file content.
+	// recent reconcile attempt (whether or not every key
+	// succeeded). Useful for debugging "did the server pick
+	// up my new R2 URL content?" without diff-ing the file
+	// content.
 	MaterialisedAt time.Time `json:"materialised_at,omitempty"`
 }
 
@@ -99,83 +117,220 @@ func (h *AssetHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("put event without manifest")
 	}
 
+	digests, errs, err := materializeAssetSpec(ctx, h.Store, h.HTTP, h.logf, ev.Manifest)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case len(errs) == 0:
+		h.logf("asset/%s/%s materialised %d file(s) at %s", ev.Scope, ev.Name, len(digests), paths.AssetDir(ev.Scope, ev.Name))
+	case len(digests) == 0:
+		// All keys failed AND no stale-good content on disk
+		// to fall back to. Surface as transient so the watch
+		// retries. No partial state to keep alive; operators
+		// will see this as the asset never reaching ready,
+		// and consumers will fail to mount.
+		return Transient(fmt.Errorf("asset/%s/%s: all %d key(s) failed with no prior content (see /status)", ev.Scope, ev.Name, len(errs)))
+	default:
+		// Mixed result OR all-failed-but-stale-good-on-disk.
+		// Either way the bundle is at least partially
+		// available; log loudly so operators notice in
+		// `journalctl -u voodu-controller` and return
+		// success — retrying immediately would be churn,
+		// and consumers can keep using stale content.
+		h.logf("asset/%s/%s: %d ok, %d failed (%d stale-preserved); check /status for details",
+			ev.Scope, ev.Name,
+			len(digests)-len(errs), len(errs),
+			countStaleRecovered(digests, errs))
+	}
+
+	return nil
+}
+
+// materializeAssetSpec writes every key in an asset manifest's
+// spec to disk under <root>/assets/<scope>/<name>/<key>, computes
+// per-key sha256 digests, sweeps undeclared files, recovers
+// stale-good content on a failed key, and persists the digest
+// map + per-key errors to /status.
+//
+// Free-function shape so two callers share the same implementation:
+//
+//   - AssetHandler.apply (the async reconcile path, fired by a
+//     watch event on the asset's /desired key)
+//   - StampAssetDigests (the SYNCHRONOUS path inside the apply
+//     pipeline, fired before /desired is persisted — ensures
+//     bytes are on disk by the time consumer reconciles fire,
+//     so docker bind mounts pick up real files instead of
+//     creating empty directories at the source path)
+//
+// Both paths must produce identical on-disk + /status state for
+// the same input, so the implementation lives once.
+//
+// Race-recovery (the dir-as-file footgun): docker bind mounts
+// create the SOURCE path as a directory if it doesn't exist
+// when the container starts. If the consumer reconcile won
+// the race against the asset reconcile (pre-stamping era),
+// /opt/voodu/assets/<scope>/<name>/<key> is a dir instead of a
+// file, and `os.Rename` from atomicWrite errors with EISDIR
+// on every subsequent apply. The cleanup step here removes any
+// dir-shaped destination before the rename, so a re-apply
+// auto-recovers without the operator running `rm -rf`.
+//
+// Per-key best-effort: invalid key, source resolve failure,
+// dir-cleanup failure, and write failure all land in the
+// errors map and the loop continues. Returning early would
+// mean a single flaky URL takes down every sibling key on
+// every apply — usually catastrophic when one of the others
+// is a working file/inline source the consumer depends on.
+func materializeAssetSpec(
+	ctx context.Context,
+	store Store,
+	httpClient *http.Client,
+	logf func(string, ...any),
+	m *Manifest,
+) (digests map[string]string, errs map[string]string, err error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+
+	if m == nil {
+		return nil, nil, fmt.Errorf("nil manifest")
+	}
+
+	if len(m.Spec) == 0 {
+		return nil, nil, fmt.Errorf("asset/%s/%s: empty spec", m.Scope, m.Name)
+	}
+
 	var spec assetSpec
 
-	if len(ev.Manifest.Spec) == 0 {
-		return fmt.Errorf("asset/%s/%s: empty spec", ev.Scope, ev.Name)
+	if jerr := json.Unmarshal(m.Spec, &spec); jerr != nil {
+		return nil, nil, fmt.Errorf("decode asset spec: %w", jerr)
 	}
 
-	if err := json.Unmarshal(ev.Manifest.Spec, &spec); err != nil {
-		return fmt.Errorf("decode asset spec: %w", err)
+	dir := paths.AssetDir(m.Scope, m.Name)
+
+	if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+		return nil, nil, fmt.Errorf("create asset dir: %w", mkErr)
 	}
 
-	dir := paths.AssetDir(ev.Scope, ev.Name)
-
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create asset dir: %w", err)
-	}
-
-	digests := make(map[string]string, len(spec.Files))
-
-	// Track the keys we wrote on this reconcile so we can
-	// drop any leftover files from a previous version of the
-	// asset (operator removed a key — file shouldn't linger).
-	written := make(map[string]bool, len(spec.Files))
+	digests = make(map[string]string, len(spec.Files))
+	errs = make(map[string]string)
 
 	for key, raw := range spec.Files {
 		if !validAssetKey(key) {
-			return fmt.Errorf("asset/%s/%s: key %q must be alphanumeric + underscore + hyphen (no dots, no whitespace)", ev.Scope, ev.Name, key)
+			errs[key] = "invalid key: must be alphanumeric + underscore + hyphen (no dots, no whitespace)"
+			logf("asset/%s/%s/%s: invalid key", m.Scope, m.Name, key)
+			continue
 		}
 
-		bytes, err := h.resolveSource(ctx, raw)
-		if err != nil {
-			return fmt.Errorf("asset/%s/%s/%s: %w", ev.Scope, ev.Name, key, err)
+		bytes, srcErr := resolveAssetSourceForStamping(ctx, httpClient, raw)
+		if srcErr != nil {
+			errs[key] = srcErr.Error()
+			logf("asset/%s/%s/%s: resolve failed: %v", m.Scope, m.Name, key, srcErr)
+			continue
 		}
 
-		dst := paths.AssetFile(ev.Scope, ev.Name, key)
+		dst := paths.AssetFile(m.Scope, m.Name, key)
 
-		if err := atomicWrite(dst, bytes); err != nil {
-			return fmt.Errorf("write %s: %w", dst, err)
+		// Race-recovery: if dst exists as a directory (artifact
+		// of a docker bind mount that fired before the asset
+		// reconcile got here on a previous apply), remove it so
+		// the rename below lands. Without this the rename errors
+		// EISDIR on every subsequent apply and the bytes never
+		// make it to disk — operator stuck with an empty dir
+		// inside the container forever until manual `rm -rf`.
+		if info, statErr := os.Stat(dst); statErr == nil && info.IsDir() {
+			logf("asset/%s/%s/%s: clearing directory at %s (bind-mount race artifact)", m.Scope, m.Name, key, dst)
+
+			if rmErr := os.RemoveAll(dst); rmErr != nil {
+				errs[key] = fmt.Sprintf("clear stale directory: %v", rmErr)
+				logf("asset/%s/%s/%s: clear dir failed: %v", m.Scope, m.Name, key, rmErr)
+				continue
+			}
+		}
+
+		if writeErr := atomicWrite(dst, bytes); writeErr != nil {
+			errs[key] = fmt.Sprintf("write: %v", writeErr)
+			logf("asset/%s/%s/%s: write failed: %v", m.Scope, m.Name, key, writeErr)
+			continue
 		}
 
 		sum := sha256.Sum256(bytes)
 		digests[key] = hex.EncodeToString(sum[:])
-		written[key] = true
 	}
 
-	// Sweep stale files: anything in the asset dir that the
-	// new spec didn't ask for gets removed. Without this, a
-	// renamed key would leave the old file mounted on the
-	// container indefinitely.
-	if entries, err := os.ReadDir(dir); err == nil {
+	// Sweep files that aren't declared in the current spec
+	// (renamed key, removed key). Files declared but failed
+	// on this apply are PRESERVED on disk — consumers keep
+	// their bind mounts pointing at the last-good content
+	// (graceful degradation). The Errors map in /status
+	// is the authoritative "this key is broken right now"
+	// signal regardless of disk state.
+	if entries, listErr := os.ReadDir(dir); listErr == nil {
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
 
-			if !written[e.Name()] {
+			if _, declared := spec.Files[e.Name()]; !declared {
 				_ = os.Remove(filepath.Join(dir, e.Name()))
 			}
 		}
 	}
 
+	// Stale-success recovery: a key that failed THIS apply
+	// but has bytes on disk from a previous successful
+	// apply is graceful-degradation, not "broken". Compute
+	// its digest from disk and add to Files — consumer spec
+	// hashes stay stable, container keeps its mount pointing
+	// at the (stale-but-consistent) content. The Errors map
+	// still flags the key so operators see the issue.
+	for key := range errs {
+		p := paths.AssetFile(m.Scope, m.Name, key)
+
+		content, readErr := os.ReadFile(p)
+		if readErr != nil {
+			continue
+		}
+
+		sum := sha256.Sum256(content)
+		digests[key] = hex.EncodeToString(sum[:])
+	}
+
 	status := AssetStatus{
 		Files:          digests,
+		Errors:         errs,
 		MaterialisedAt: time.Now().UTC(),
 	}
 
-	blob, err := json.Marshal(status)
-	if err != nil {
-		return err
+	blob, marshErr := json.Marshal(status)
+	if marshErr != nil {
+		return digests, errs, marshErr
 	}
 
-	if err := h.Store.PutStatus(ctx, KindAsset, AppID(ev.Scope, ev.Name), blob); err != nil {
-		return err
+	if putErr := store.PutStatus(ctx, KindAsset, AppID(m.Scope, m.Name), blob); putErr != nil {
+		return digests, errs, fmt.Errorf("put status: %w", putErr)
 	}
 
-	h.logf("asset/%s/%s materialised %d file(s) at %s", ev.Scope, ev.Name, len(digests), dir)
+	return digests, errs, nil
+}
 
-	return nil
+// countStaleRecovered reports how many failed keys were
+// recovered from stale disk content (digest in Files, error
+// in Errors). Used in the mixed-result log line so operators
+// can tell "everything fresh except X" from "X is stale-good
+// from a previous apply".
+func countStaleRecovered(digests, errors map[string]string) int {
+	n := 0
+
+	for k := range errors {
+		if _, ok := digests[k]; ok {
+			n++
+		}
+	}
+
+	return n
 }
 
 // remove tears down the asset directory and clears status.
@@ -260,14 +415,27 @@ func (h *AssetHandler) resolveSource(ctx context.Context, raw json.RawMessage) (
 	}
 }
 
-// fetchURL retrieves the URL with a small ETag-based cache so
-// re-applies that don't change content skip the network. The
-// cache lives under <root>/cache/<sha256-of-url> with two
-// sibling files: `.bytes` (the response body) and `.meta`
-// (JSON with the ETag and Last-Modified the server sent
-// last). Any cache miss / stale entry triggers a fresh GET.
+// fetchURL is the AssetHandler-bound entry point — delegates to
+// the free-function fetchAssetURLShared so both the reconcile
+// path (this handler) and the apply-time stamping path
+// (StampAssetDigests) share the same on-disk ETag cache.
 func (h *AssetHandler) fetchURL(ctx context.Context, u string) ([]byte, error) {
-	client := h.HTTP
+	return fetchAssetURLShared(ctx, h.HTTP, h.logf, u)
+}
+
+// fetchAssetURLShared retrieves the URL with a small ETag-based
+// cache so re-applies that don't change content skip the network.
+// The cache lives under <root>/cache/<sha256-of-url> with two
+// sibling files: `.bytes` (the response body) and `.meta`
+// (JSON with the ETag and Last-Modified the server sent last).
+// Any cache miss / stale entry triggers a fresh GET.
+//
+// Free-function shape so AssetHandler and the stamping pipeline
+// can share both the network round-trip AND the cache state — a
+// successful fetch during stamping primes the cache for the
+// later reconcile, and vice versa. `logf` is optional (can be
+// nil); used only for non-fatal cache-write warnings.
+func fetchAssetURLShared(ctx context.Context, client *http.Client, logf func(string, ...any), u string) ([]byte, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
@@ -335,7 +503,9 @@ func (h *AssetHandler) fetchURL(ctx context.Context, u string) ([]byte, error) {
 	if err := os.WriteFile(bytesPath, body, 0644); err != nil {
 		// Cache write failure is non-fatal — operator gets
 		// the bytes anyway, just no cache for next time.
-		h.logf("asset cache: write %s failed: %v", bytesPath, err)
+		if logf != nil {
+			logf("asset cache: write %s failed: %v", bytesPath, err)
+		}
 	}
 
 	_ = writeCacheMeta(metaPath, cacheMeta{

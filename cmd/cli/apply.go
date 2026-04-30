@@ -560,17 +560,46 @@ func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modi
 
 		first = false
 
+		// Asset specs carry file bytes (`content` field as base64
+		// for file() sources, raw string for inline). Two reasons
+		// to redact them in the diff:
+		//
+		//   1. Security — assets can include ACL files with
+		//      hashed passwords, TLS certs with fingerprints,
+		//      configs with embedded tokens. Diff output
+		//      lands in terminal scrollback, CI logs, screen
+		//      shares — surfaces operators may not control.
+		//   2. UX — base64-encoded files can be megabytes;
+		//      diffing them inline buries the rest of the
+		//      output. A `<sha256 N bytes>` summary tells
+		//      the operator that a file changed without
+		//      flooding the terminal.
+		//
+		// URLs and filenames pass through verbatim — those are
+		// metadata operators want to see in the diff (URL
+		// rotated? filename renamed?). Only `content` is
+		// redacted.
+		desiredSpec, currentSpec := desired.Spec, json.RawMessage(nil)
+		if current != nil {
+			currentSpec = current.Spec
+		}
+
+		if desired.Kind == controller.KindAsset {
+			desiredSpec = redactAssetContent(desiredSpec)
+			currentSpec = redactAssetContent(currentSpec)
+		}
+
 		if current == nil {
 			fmt.Fprintf(w, "%s %s (new)\n", p.Add("+"), label)
 
-			renderResourceDiff(w, diffSpec(desired.Spec, nil), p)
+			renderResourceDiff(w, diffSpec(desiredSpec, nil), p)
 
 			added++
 
 			continue
 		}
 
-		changes := diffSpec(desired.Spec, current.Spec)
+		changes := diffSpec(desiredSpec, currentSpec)
 
 		if len(changes) == 0 {
 			fmt.Fprintf(w, "= %s (unchanged)\n", label)

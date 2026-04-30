@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.voodu.clowk.in/internal/paths"
@@ -246,6 +247,230 @@ func TestAssetHandler_RejectsInvalidKey(t *testing.T) {
 		if err := h.Handle(context.Background(), ev); err == nil {
 			t.Errorf("accepted invalid key %q", key)
 		}
+	}
+}
+
+// TestAssetHandler_PartialFailureKeepsSuccesses pins the
+// best-effort contract: a single failing source (unreachable
+// URL, decode error) doesn't abort the rest of the bundle.
+// Successful keys land on disk; failing keys land in
+// /status as Errors. Critical for prod where dozens of
+// assets share a controller — one flaky URL must not
+// derail every other apply.
+func TestAssetHandler_PartialFailureKeepsSuccesses(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+
+	// Server that ALWAYS returns 500 — exercises the URL
+	// failure path without depending on a specific port
+	// being closed on the test runner.
+	failingURL := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer failingURL.Close()
+
+	store := newMemStore()
+	h := &AssetHandler{Store: store, Log: quietLogger()}
+
+	spec, _ := json.Marshal(map[string]any{
+		"files": map[string]any{
+			"good": "the good one (inline source, always succeeds)",
+			"bad": map[string]any{
+				"_source": "url",
+				"url":     failingURL.URL,
+			},
+		},
+	})
+
+	ev := WatchEvent{
+		Type: WatchPut, Kind: KindAsset,
+		Scope: "data", Name: "mixed",
+		Manifest: &Manifest{Kind: KindAsset, Scope: "data", Name: "mixed", Spec: spec},
+	}
+
+	// Best-effort: 1 succeeded, 1 failed → reconcile returns
+	// success (not Transient — partial state is durable).
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("partial failure should not return error: %v", err)
+	}
+
+	// Successful key landed on disk.
+	good, err := os.ReadFile(paths.AssetFile("data", "mixed", "good"))
+	if err != nil {
+		t.Errorf("good key not materialised: %v", err)
+	}
+
+	if !strings.Contains(string(good), "the good one") {
+		t.Errorf("good key content wrong: %q", good)
+	}
+
+	// Failed key NOT on disk (no previous apply succeeded
+	// for it; nothing to preserve).
+	if _, err := os.Stat(paths.AssetFile("data", "mixed", "bad")); !os.IsNotExist(err) {
+		t.Errorf("bad key should not be on disk on first failure: %v", err)
+	}
+
+	// Status reflects both: Files has good, Errors has bad.
+	statusBlob, _ := store.GetStatus(context.Background(), KindAsset, "data-mixed")
+
+	var st AssetStatus
+	if err := json.Unmarshal(statusBlob, &st); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := st.Files["good"]; !ok {
+		t.Errorf("Files map missing 'good': %+v", st.Files)
+	}
+
+	if _, ok := st.Files["bad"]; ok {
+		t.Errorf("Files map should NOT carry failed keys: %+v", st.Files)
+	}
+
+	if msg := st.Errors["bad"]; msg == "" {
+		t.Errorf("Errors map missing 'bad' key error message")
+	}
+
+	if _, ok := st.Errors["good"]; ok {
+		t.Errorf("Errors map should not include successful keys: %+v", st.Errors)
+	}
+}
+
+// TestAssetHandler_PartialFailurePreservesStaleSuccess: when
+// a key SUCCEEDED on a previous apply and FAILS on a later
+// one (URL flaky), the file from the last successful apply
+// stays on disk. Consumers don't break suddenly — they keep
+// the previous content until the source recovers.
+//
+// The Errors map flags the key as "broken right now"
+// regardless of disk state, so operators see the issue
+// without having to diff content themselves.
+func TestAssetHandler_PartialFailurePreservesStaleSuccess(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+
+	// First-pass server returns content; subsequent calls 500.
+	calls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			_, _ = w.Write([]byte("first-good-content"))
+			return
+		}
+
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	store := newMemStore()
+	h := &AssetHandler{Store: store, Log: quietLogger()}
+
+	specJSON, _ := json.Marshal(map[string]any{
+		"files": map[string]any{
+			"acl": map[string]any{
+				"_source": "url",
+				"url":     srv.URL,
+			},
+		},
+	})
+
+	ev := WatchEvent{
+		Type: WatchPut, Kind: KindAsset,
+		Scope: "data", Name: "stale",
+		Manifest: &Manifest{Kind: KindAsset, Scope: "data", Name: "stale", Spec: specJSON},
+	}
+
+	// Apply 1 — success.
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+
+	got, _ := os.ReadFile(paths.AssetFile("data", "stale", "acl"))
+	if string(got) != "first-good-content" {
+		t.Fatalf("apply 1 content: %q", got)
+	}
+
+	// Wipe URL cache so apply 2 actually hits the server
+	// (and gets the 500). Otherwise If-None-Match would
+	// short-circuit to cached bytes.
+	if err := os.RemoveAll(paths.CacheDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Apply 2 — fails. File on disk MUST stay.
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("apply 2 should succeed (best-effort): %v", err)
+	}
+
+	got, err := os.ReadFile(paths.AssetFile("data", "stale", "acl"))
+	if err != nil {
+		t.Fatalf("stale file should still be on disk after failure: %v", err)
+	}
+
+	if string(got) != "first-good-content" {
+		t.Errorf("stale content corrupted: %q", got)
+	}
+
+	// Status reflects the dual reality:
+	//   - Files HAS the key with the stale-good digest, so
+	//     consumer spec hashes (statefulset/deployment) stay
+	//     stable instead of churning on every failed refresh
+	//   - Errors flags the failure regardless, so operators
+	//     see the issue even though disk has content
+	statusBlob, _ := store.GetStatus(context.Background(), KindAsset, "data-stale")
+
+	var st AssetStatus
+	_ = json.Unmarshal(statusBlob, &st)
+
+	if msg := st.Errors["acl"]; msg == "" {
+		t.Error("Errors should reflect the recent failure even though disk has stale content")
+	}
+
+	if _, ok := st.Files["acl"]; !ok {
+		t.Error("Files should include stale-recovered digest so consumers keep stable hashes")
+	}
+}
+
+// TestAssetHandler_AllKeysFailReturnsTransient: when EVERY
+// key fails (no successful materialisation, nothing to
+// graceful-degrade to), the reconciler returns Transient so
+// the watch retries. Without this, a totally-broken asset
+// would silently sit in /status with all errors and consumers
+// would mount empty paths forever.
+func TestAssetHandler_AllKeysFailReturnsTransient(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	store := newMemStore()
+	h := &AssetHandler{Store: store, Log: quietLogger()}
+
+	spec, _ := json.Marshal(map[string]any{
+		"files": map[string]any{
+			"only_one": map[string]any{
+				"_source": "url",
+				"url":     srv.URL,
+			},
+		},
+	})
+
+	ev := WatchEvent{
+		Type: WatchPut, Kind: KindAsset,
+		Scope: "data", Name: "broken",
+		Manifest: &Manifest{Kind: KindAsset, Scope: "data", Name: "broken", Spec: spec},
+	}
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil {
+		t.Fatal("expected error when all keys fail")
+	}
+
+	if !isTransient(err) {
+		t.Errorf("all-keys-failed error should be transient (so reconciler retries): %T %v", err, err)
 	}
 }
 

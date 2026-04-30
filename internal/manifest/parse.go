@@ -204,8 +204,18 @@ type hclDeployment struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang    *hclLangBlock    `hcl:"lang,block"`
-	Release *hclReleaseBlock `hcl:"release,block"`
+	Lang      *hclLangBlock    `hcl:"lang,block"`
+	Release   *hclReleaseBlock `hcl:"release,block"`
+	DependsOn *hclDependsOn    `hcl:"depends_on,block"`
+}
+
+// hclDependsOn is the HCL surface for explicit dependencies. The
+// only sub-attribute today is `assets` — a list of ref strings the
+// consumer depends on. See manifest.DependsOn for the wire-shape
+// counterpart and the rationale for declaring deps that aren't
+// visible as textual `${asset.…}` refs.
+type hclDependsOn struct {
+	Assets []string `hcl:"assets,optional"`
 }
 
 type hclLangBlock struct {
@@ -325,8 +335,9 @@ type hclApp struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang    *hclLangBlock    `hcl:"lang,block"`
-	Release *hclReleaseBlock `hcl:"release,block"`
+	Lang      *hclLangBlock    `hcl:"lang,block"`
+	Release   *hclReleaseBlock `hcl:"release,block"`
+	DependsOn *hclDependsOn    `hcl:"depends_on,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -376,6 +387,10 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 			PostCommand: b.Release.PostCommand,
 			Timeout:     b.Release.Timeout,
 		}
+	}
+
+	if b.DependsOn != nil {
+		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
 
 	s.applyDefaults()
@@ -442,6 +457,7 @@ type hclStatefulset struct {
 	HealthCheck string            `hcl:"health_check,optional"`
 
 	VolumeClaims []hclVolumeClaim `hcl:"volume_claim,block"`
+	DependsOn    *hclDependsOn    `hcl:"depends_on,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -478,6 +494,10 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 				Size:      c.Size,
 			})
 		}
+	}
+
+	if b.DependsOn != nil {
+		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
 
 	return s
@@ -562,7 +582,8 @@ type hclJob struct {
 	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
 	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
 
-	Lang *hclLangBlock `hcl:"lang,block"`
+	Lang      *hclLangBlock `hcl:"lang,block"`
+	DependsOn *hclDependsOn `hcl:"depends_on,block"`
 }
 
 func (b hclJob) spec() JobSpec {
@@ -589,6 +610,10 @@ func (b hclJob) spec() JobSpec {
 			Entrypoint: b.Lang.Entrypoint,
 			BuildArgs:  b.Lang.BuildArgs,
 		}
+	}
+
+	if b.DependsOn != nil {
+		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
 
 	return s
@@ -627,7 +652,8 @@ type hclCronJob struct {
 	NetworkMode string            `hcl:"network_mode,optional"`
 	Timeout     string            `hcl:"timeout,optional"`
 
-	Lang *hclLangBlock `hcl:"lang,block"`
+	Lang      *hclLangBlock `hcl:"lang,block"`
+	DependsOn *hclDependsOn `hcl:"depends_on,block"`
 }
 
 func (b hclCronJob) spec() CronJobSpec {
@@ -652,6 +678,10 @@ func (b hclCronJob) spec() CronJobSpec {
 			Entrypoint: b.Lang.Entrypoint,
 			BuildArgs:  b.Lang.BuildArgs,
 		}
+	}
+
+	if b.DependsOn != nil {
+		job.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
 
 	return CronJobSpec{
@@ -848,9 +878,32 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 // Nested blocks are not supported on assets — there's nothing
 // to nest. Operators who try get a clear error.
 func decodeAssetBlock(blk *hclsyntax.Block, source string) ([]controller.Manifest, error) {
-	scope, name, err := requireScopedLabels(blk)
-	if err != nil {
-		return nil, err
+	// Asset is OPTIONALLY scoped:
+	//
+	//   asset "name" { … }              → unscoped (global). Any
+	//                                     resource on the host can
+	//                                     reference via 3-segment
+	//                                     `${asset.<name>.<key>}`.
+	//
+	//   asset "scope" "name" { … }      → scoped. Referenced via
+	//                                     4-segment `${asset.<scope>.
+	//                                     <name>.<key>}` from any
+	//                                     scope (cross-scope OK).
+	//
+	// Any other label count is a clear authoring error.
+	var scope, name string
+
+	switch len(blk.Labels) {
+	case 1:
+		name = blk.Labels[0]
+	case 2:
+		scope, name = blk.Labels[0], blk.Labels[1]
+	default:
+		return nil, fmt.Errorf("asset block: takes 1 label (unscoped) or 2 labels (scoped), got %d", len(blk.Labels))
+	}
+
+	if name == "" {
+		return nil, fmt.Errorf("asset block: name must be non-empty")
 	}
 
 	if len(blk.Body.Blocks) > 0 {

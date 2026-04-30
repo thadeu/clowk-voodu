@@ -105,24 +105,37 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 
 	hasSpecChanges := planChangeCount(plan) > 0
 	needsSourcePush := len(stream.buildModeDeploys) > 0
+	hasAssetSensitive := planContainsAssetSensitive(plan)
 
-	// Three cases worth distinguishing:
+	// Four cases worth distinguishing:
 	//
-	//  1. No spec changes AND no build-mode deploys → nothing to do,
+	//  1. No spec changes AND no build-mode deploys AND no
+	//     asset-sensitive manifests → nothing to do,
 	//     short-circuit with the terraform-ish "No changes." line.
 	//
 	//  2. Spec changes (regardless of build-mode) → render the diff,
 	//     prompt the user, then push source + apply on approval.
 	//
-	//  3. No spec changes BUT build-mode deploys present → this is the
+	//  3. No spec changes BUT build-mode deploys present → the
 	//     "commitless re-deploy" workflow that is voodu's whole point:
 	//     user iterates on source, re-applies with the same HCL, server
 	//     content-addresses the new tarball, rebuilds if the tree hash
 	//     differs, redeploys. Skipping this case would silently break
-	//     the core UX. We proceed without prompting — there's nothing
-	//     to show in a diff anyway — and print a short banner so the
-	//     user sees *why* we're still doing work.
-	if !hasSpecChanges && !needsSourcePush {
+	//     the core UX. We proceed without prompting and print a short
+	//     banner so the user sees *why* we're still doing work.
+	//
+	//  4. No spec changes BUT asset-sensitive manifests present
+	//     (asset block or plugin macro block in the apply set) →
+	//     proceed to apply anyway. asset content can drift WITHOUT
+	//     the manifest spec changing — most obviously a `url()`
+	//     source whose remote content rotated, but also a `file()`
+	//     whose bytes changed when CLI parsed (already in the diff)
+	//     OR a plugin's bin/get-conf that synthesises content
+	//     server-side per apply. The watch fires, the asset
+	//     handler re-fetches, and downstream consumers (statefulset
+	//     specs that fold the asset digest into their own hash)
+	//     get the rolling restart they need.
+	if !hasSpecChanges && !needsSourcePush && !hasAssetSensitive {
 		fmt.Fprintln(os.Stdout, "No changes. Nothing to apply.")
 		return 0, nil
 	}
@@ -152,23 +165,37 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 			}
 		}
 	} else {
-		// Source-only re-apply: no spec delta, but there's code to
-		// push. No prompt — nothing to confirm, and asking y/N over a
-		// blank diff is annoying. The server will content-address the
-		// tarball and skip the rebuild if the tree is unchanged.
-		word := "deployment"
-		if len(stream.buildModeDeploys) > 1 {
-			word = "deployments"
+		// No spec delta, but there's still work to do — explain
+		// why so the operator doesn't think the apply is a no-op.
+		// Two non-mutually-exclusive reasons trigger this branch:
+		//
+		//   - build-mode deploys: source has to be re-pushed even
+		//     when the manifest is byte-identical (commitless
+		//     deploy workflow).
+		//   - asset-sensitive manifests: asset content can drift
+		//     with the manifest unchanged (URL rotated, plugin's
+		//     synthesised conf changed, file bytes changed but
+		//     CLI's diff renderer collapsed them via redact).
+		//     We re-apply unconditionally so the watch fires and
+		//     the asset handler re-fetches; downstream consumers
+		//     pick up the new digest via spec-hash drift.
+		var reasons []string
+
+		if needsSourcePush {
+			word := "deployment"
+			if len(stream.buildModeDeploys) > 1 {
+				word = "deployments"
+			}
+
+			reasons = append(reasons, fmt.Sprintf("re-pushing source for %d build-mode %s", len(stream.buildModeDeploys), word))
 		}
 
-		// Prefix with a green ✓ so the line reads as a finished check in
-		// the same visual language as the ✓ build steps below — but
-		// keep the `----->` phase marker so it still signals "this is a
-		// server-style banner" in the scrollback. The check conveys "we
-		// looked, nothing to apply"; the banner body explains why we're
-		// still doing work (re-pushing source for build-mode deploys).
-		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m No spec changes. Re-pushing source for %d build-mode %s.\n",
-			len(stream.buildModeDeploys), word)
+		if hasAssetSensitive {
+			reasons = append(reasons, "checking asset content drift")
+		}
+
+		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m No spec changes. %s.\n",
+			strings.Join(reasons, "; "))
 	}
 
 	// Phase 2: push source tarballs for build-mode deployments *now*,
@@ -309,6 +336,44 @@ func planChangeCount(plan diffResponse) int {
 	}
 
 	return changes
+}
+
+// planContainsAssetSensitive reports whether any manifest in the
+// apply plan can produce side effects whose value isn't fully
+// captured by the dry-run diff:
+//
+//   - asset blocks: file() bytes are embedded by the CLI (so
+//     diff catches changes there), but url() sources are
+//     fetched server-side at reconcile and dry-run doesn't
+//     pre-fetch them. URL content drift would be invisible
+//     without this check.
+//
+//   - non-core kinds (plugin macro blocks like postgres /
+//     redis): the plugin's expand command runs on every apply
+//     and may synthesise new asset content (e.g. a
+//     bin/get-conf script that templates env / hostname /
+//     anything dynamic). Two applies of the same HCL can
+//     legitimately produce different bytes.
+//
+// Either case demands the apply call actually fire so the
+// watch fires, the asset handler re-fetches, and consumer
+// spec hashes pick up the new digest.
+func planContainsAssetSensitive(plan diffResponse) bool {
+	for _, m := range plan.Data.Applied {
+		if m == nil {
+			continue
+		}
+
+		if m.Kind == controller.KindAsset {
+			return true
+		}
+
+		if !controller.IsCoreKind(m.Kind) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // envAutoApprove is the CI escape hatch. Accept "1", "true", "yes"

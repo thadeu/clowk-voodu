@@ -106,8 +106,8 @@ postgres "data" "pg" {
   ]
 
   volumes = [
-    "${asset.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro",
-    "${asset.pg-config.pg_hba_conf}:/etc/postgresql/pg_hba.conf:ro",
+    "${asset.data.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro",
+    "${asset.data.pg-config.pg_hba_conf}:/etc/postgresql/pg_hba.conf:ro",
   ]
 }
 
@@ -122,8 +122,8 @@ redis "data" "cache" {
   command = ["redis-server", "/etc/redis/redis.conf"]
 
   volumes = [
-    "${asset.redis-config.configuration}:/etc/redis/redis.conf:ro",
-    "${asset.redis-config.users_acl}:/etc/redis/users.acl:ro",
+    "${asset.data.redis-config.configuration}:/etc/redis/redis.conf:ro",
+    "${asset.data.redis-config.users_acl}:/etc/redis/users.acl:ro",
   ]
 }
 

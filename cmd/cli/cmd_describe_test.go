@@ -13,6 +13,97 @@ import (
 	"go.voodu.clowk.in/internal/controller"
 )
 
+// TestFilterInternalSpecFields_StripsTopLevelUnderscoreKeys pins
+// the contract: top-level keys prefixed with "_" disappear from
+// `vd describe -o spec` output. Today that means `_asset_digests`
+// stamped by the apply pipeline; tomorrow it can absorb any other
+// controller-managed bookkeeping that lands in the spec.
+func TestFilterInternalSpecFields_StripsTopLevelUnderscoreKeys(t *testing.T) {
+	in, _ := json.Marshal(map[string]any{
+		"image":   "redis:7",
+		"volumes": []string{"/host:/container"},
+		"_asset_digests": map[string]any{
+			"data.redis.cfg": "abc123",
+		},
+		"_other_internal": "should-be-gone",
+	})
+
+	out := filterInternalSpecFields(in)
+
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+
+	if _, present := got["_asset_digests"]; present {
+		t.Error("_asset_digests should be stripped")
+	}
+
+	if _, present := got["_other_internal"]; present {
+		t.Error("_other_internal should be stripped")
+	}
+
+	if got["image"] != "redis:7" {
+		t.Errorf("operator-authored field 'image' lost: %v", got["image"])
+	}
+}
+
+// TestFilterInternalSpecFields_PreservesNestedUnderscore: nested
+// underscore-prefixed keys are NOT stripped — asset specs use
+// `_source` as a discriminator inside the `files` map and the
+// operator wants to see that on `vd describe -o spec`.
+func TestFilterInternalSpecFields_PreservesNestedUnderscore(t *testing.T) {
+	in, _ := json.Marshal(map[string]any{
+		"files": map[string]any{
+			"cfg": map[string]any{
+				"_source": "url",
+				"url":     "https://example.com/cfg",
+			},
+		},
+	})
+
+	out := filterInternalSpecFields(in)
+
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	files, _ := got["files"].(map[string]any)
+	cfg, _ := files["cfg"].(map[string]any)
+
+	if cfg["_source"] != "url" {
+		t.Errorf("nested _source preserved? got %v", cfg["_source"])
+	}
+}
+
+// TestFilterInternalSpecFields_NoChangeIfNoUnderscoreKeys: when
+// the spec has no top-level underscore keys, the original bytes
+// pass through unchanged. Avoids spurious re-marshal that would
+// reorder keys (which Go's map iteration randomises) and break
+// stable-output assertions in unrelated tests.
+func TestFilterInternalSpecFields_NoChangeIfNoUnderscoreKeys(t *testing.T) {
+	in := []byte(`{"image":"redis:7","replicas":1}`)
+	out := filterInternalSpecFields(in)
+
+	if string(out) != string(in) {
+		t.Errorf("spec without underscore keys should pass through unchanged\n  got:  %s\n  want: %s", out, in)
+	}
+}
+
+// TestFilterInternalSpecFields_NonObjectPassesThrough: if the spec
+// blob doesn't unmarshal as a JSON object (defensive — today there
+// are no such cases but the filter shouldn't mangle them), the
+// original bytes are returned.
+func TestFilterInternalSpecFields_NonObjectPassesThrough(t *testing.T) {
+	in := []byte(`["not", "an", "object"]`)
+	out := filterInternalSpecFields(in)
+
+	if string(out) != string(in) {
+		t.Errorf("non-object spec should pass through, got %s", out)
+	}
+}
+
 // describeMockServer stamps every incoming request and returns a
 // fixed envelope so tests can assert on the wire shape without
 // duplicating boilerplate. The captured query is the most important

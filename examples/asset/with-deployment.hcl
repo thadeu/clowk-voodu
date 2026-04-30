@@ -8,12 +8,17 @@
 //   2. `vd apply -f with-deployment.hcl` reads the file, embeds
 //      the bytes in the manifest, POSTs to the server
 //   3. server materialises /opt/voodu/assets/clowk-lp/web-config/runtime
-//   4. deployment handler interpolates ${asset.web-config.runtime}
-//      into the host path and mounts it as a bind volume
+//   4. deployment handler interpolates
+//      ${asset.clowk-lp.web-config.runtime} into the host path
+//      and mounts it as a bind volume
 //   5. container at /etc/web/config.json reads the file
 //   6. operator edits config.json, re-applies — content hash
 //      changes → spec hash changes → rolling restart picks up
 //      the new file automatically
+//
+// The 4-segment ref `${asset.<scope>.<name>.<key>}` addresses a
+// scoped asset explicitly. For an unscoped (global) asset, use
+// the 3-segment form `${asset.<name>.<key>}` instead.
 
 asset "clowk-lp" "web-config" {
   runtime = file("./web/config.json")
@@ -26,7 +31,7 @@ deployment "clowk-lp" "web" {
   ports = ["8080"]
 
   volumes = [
-    "${asset.web-config.runtime}:/etc/web/config.json:ro",
+    "${asset.clowk-lp.web-config.runtime}:/etc/web/config.json:ro",
   ]
 
   env = {

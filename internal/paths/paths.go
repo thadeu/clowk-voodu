@@ -35,11 +35,13 @@ func AssetsDir() string   { return filepath.Join(Root(), "assets") }
 func CacheDir() string    { return filepath.Join(Root(), "cache") }
 
 // AssetDir is the materialised on-disk root for one asset
-// manifest (`asset "<scope>" "<name>" { … }`). Each file key
-// in the spec lands as a sibling file under this directory:
-// `<assets_root>/<scope>/<name>/<file_key>`. Resources that
-// interpolate `${asset.<name>.<file_key>}` resolve to the full
-// path of one of those files.
+// manifest. Asset blocks take 1 label (unscoped, scope="") or
+// 2 labels (scoped). Each file key in the spec lands as a
+// sibling file under this directory:
+// `<assets_root>/[<scope>/]<name>/<file_key>`. Resources that
+// interpolate `${asset.<scope>.<name>.<file_key>}` (4-seg) or
+// `${asset.<name>.<file_key>}` (3-seg, unscoped) resolve to the
+// full path of one of those files.
 func AssetDir(scope, name string) string {
 	return filepath.Join(AssetsDir(), scope, name)
 }
@@ -48,8 +50,8 @@ func AssetDir(scope, name string) string {
 // (scope, name, key) tuple. Convention is one file per key —
 // the key itself is the filename, no extension auto-applied.
 // Operators control the in-container filename via the `volumes`
-// mount target: `${asset.X.Y}:/etc/svc/conf.yaml:ro` mounts the
-// host file (whatever name) at `conf.yaml` inside the
+// mount target: `${asset.<scope>.<name>.<key>}:/etc/svc/conf.yaml:ro`
+// mounts the host file (whatever name) at `conf.yaml` inside the
 // container.
 func AssetFile(scope, name, key string) string {
 	return filepath.Join(AssetDir(scope, name), key)

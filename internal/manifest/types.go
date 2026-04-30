@@ -81,6 +81,20 @@ type DeploymentSpec struct {
 	// previous version, and the failure is recorded in the deployment
 	// status's release history. See ReleaseSpec for details.
 	Release *ReleaseSpec `yaml:"release,omitempty" json:"release,omitempty"`
+
+	// DependsOn declares explicit dependencies — today only `assets`,
+	// listing asset refs the consumer relies on. Server-side stamping
+	// resolves these (plus textual ${asset.…} refs in other fields)
+	// into AssetDigests at apply time.
+	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+
+	// AssetDigests is server-stamped at apply time: a sha256 per
+	// asset ref the consumer uses. Folded into the spec hash so
+	// asset content drift triggers rolling restart without the
+	// operator needing to touch the manifest. Operators don't write
+	// this field — the apply pipeline stamps it post plugin-expand.
+	// Filtered out by `vd describe` (underscore prefix = internal).
+	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
 }
 
 // ReleaseSpec describes the one-shot command voodu runs between
@@ -214,6 +228,14 @@ type StatefulsetSpec struct {
 	// the field is reserved on M-S0 so plugins authored against
 	// the early shape don't need to migrate when the block lands.
 	VolumeClaims []VolumeClaim `yaml:"volume_claims,omitempty" json:"volume_claims,omitempty"`
+
+	// DependsOn declares explicit dependencies — see
+	// DeploymentSpec.DependsOn for semantics. Same shape, same
+	// stamping behaviour.
+	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+
+	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
+	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
 }
 
 // VolumeClaim is one per-pod storage template. Voodu provisions a
@@ -245,7 +267,8 @@ type VolumeClaim struct {
 // AssetSpec is a bag of (key → source) pairs the controller
 // materialises onto the host filesystem so deployments and
 // statefulsets can mount the resulting paths via
-// `${asset.<name>.<key>}` interpolation.
+// `${asset.<scope>.<name>.<key>}` (scoped) or
+// `${asset.<name>.<key>}` (unscoped) interpolation.
 //
 // The shape is deliberately a flat map — there is no top-level
 // metadata field. Convention: keys starting with `_` (like
@@ -381,6 +404,33 @@ type JobSpec struct {
 	// Defaults match cronjobs: 3 successes, 1 failure.
 	SuccessfulHistoryLimit int `yaml:"successful_history_limit,omitempty" json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `yaml:"failed_history_limit,omitempty"     json:"failed_history_limit,omitempty"`
+
+	// DependsOn declares explicit dependencies — see
+	// DeploymentSpec.DependsOn for semantics.
+	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+
+	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
+	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// DependsOn declares explicit, non-textual dependencies on other
+// manifests. Currently only `assets` is supported — listing asset
+// refs that the consumer depends on but doesn't necessarily have a
+// `${asset.…}` interpolation for in any field.
+//
+// The `assets` list accepts both ref shapes:
+//
+//   - "name.key"               — 3-segment, unscoped global asset
+//   - "scope.name.key"         — 4-segment, scoped asset
+//
+// Use this when the dependency is semantic-only (e.g. the app
+// reads the asset path via env var injected by the controller, or
+// "this redis must restart whenever <unrelated asset> changes")
+// and therefore not visible to the textual-ref scanner. The asset
+// stamping pipeline folds these refs into AssetDigests just like
+// it folds in textual refs from volumes / command / env.
+type DependsOn struct {
+	Assets []string `yaml:"assets,omitempty" json:"assets,omitempty"`
 }
 
 // CronJobSpec wraps a JobSpec with a schedule. Apply registers the

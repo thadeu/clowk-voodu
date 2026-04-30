@@ -6,7 +6,7 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 
 | dir | what it shows |
 |---|---|
-| [`asset/`](./asset) | Standalone `asset` blocks with `file()`, `url()`, and inline string sources; combination with a `deployment` mounting the materialised paths via `${asset.…}` |
+| [`asset/`](./asset) | Standalone `asset` blocks with `file()`, `url()`, and inline string sources; scoped (`asset "scope" "name"`) and unscoped (`asset "name"`) shapes; combination with a `deployment` mounting the materialised paths via `${asset.…}` |
 | [`statefulset/`](./statefulset) | Single-node and multi-replica statefulsets (postgres, redis) with per-pod ordinal identity and persistent volume claims |
 | [`stack/`](./stack) | Production-grade full stack: postgres + redis (macro plugins) + asset (postgresql.conf / pg_hba.conf / redis.conf / ACL) + app (deployment + ingress) with TLS |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
@@ -31,20 +31,30 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 
 - **`ingress`** — host routing, TLS, load balancing. See `ingress/`.
 
-### The `${asset.<name>.<key>}` interpolation
+### Asset interpolation — scoped vs unscoped
 
-Inside any string field of any kind (volumes, command, ports, env values, image), `${asset.<name>.<key>}` resolves at reconcile time to the materialised host path. Scope is implicit — taken from the resource doing the interpolation.
+Inside any string field of any kind (volumes, command, ports, env values, image), asset refs resolve at reconcile time to the materialised host path. Two shapes:
+
+- **`${asset.<scope>.<name>.<key>}`** (4 segments) — addresses a **scoped** asset. Asset is declared with two labels: `asset "<scope>" "<name>"`. This is the common case — keeps assets isolated per tenant / scope.
+- **`${asset.<name>.<key>}`** (3 segments) — addresses an **unscoped** (global) asset. Asset is declared with one label: `asset "<name>"`. Useful for shared bytes (CA bundles, shared ACLs, MOTDs) addressed from many scopes without duplication.
+
+Both forms can coexist in the same string. There is no implicit-scope fallback: a 3-segment ref ONLY matches an unscoped asset, and a 4-segment ref ONLY matches a scoped asset with the matching `(scope, name)`.
 
 ```hcl
 asset "data" "redis-config" {
   configuration = file("./redis/redis.conf")
 }
 
+asset "ca-bundle" {
+  pem = file("./tls/ca.pem")
+}
+
 statefulset "data" "cache" {
   command = ["redis-server", "/etc/redis/redis.conf"]
 
   volumes = [
-    "${asset.redis-config.configuration}:/etc/redis/redis.conf:ro",
+    "${asset.data.redis-config.configuration}:/etc/redis/redis.conf:ro",
+    "${asset.ca-bundle.pem}:/etc/ssl/ca.pem:ro",
   ]
 }
 ```
