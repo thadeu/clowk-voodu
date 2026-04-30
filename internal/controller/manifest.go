@@ -50,14 +50,26 @@ func AppID(scope, name string) string {
 // ScopedKinds is the set of kinds whose manifests must carry a non-empty
 // Scope. Anything else is single-label HCL with no scope concept yet.
 var ScopedKinds = map[Kind]bool{
-	KindDeployment: true,
-	KindIngress:    true,
-	KindJob:        true,
-	KindCronJob:    true,
+	KindDeployment:  true,
+	KindStatefulset: true,
+	KindIngress:     true,
+	KindJob:         true,
+	KindCronJob:     true,
+	KindAsset:       true,
 }
 
 // IsScoped returns true when manifests of kind k must carry a scope.
 func IsScoped(k Kind) bool { return ScopedKinds[k] }
+
+// IsCoreKind reports whether k is one of the controller's built-in
+// kinds (the ones with hand-written reconcile handlers). Anything
+// else is presumed to be a plugin-block kind whose lifecycle is
+// macro-expanded by an installed plugin into one or more core
+// kinds before persistence. Used by /apply to route between the
+// direct-store path and the plugin-expand path.
+func IsCoreKind(k Kind) bool {
+	return validKinds[k]
+}
 
 // Metadata is controller-managed bookkeeping written alongside the spec.
 // Callers may leave it nil on apply; the store fills it in.

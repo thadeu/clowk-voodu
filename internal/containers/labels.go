@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -75,15 +76,27 @@ const (
 	// Empty is fine — `vd describe` renders a "-" and `vd release`
 	// just shows zero pods for that record.
 	LabelReleaseID = "voodu.release_id"
+
+	// LabelReplicaOrdinal carries the stable integer index of a
+	// statefulset replica (0, 1, 2, ...). Distinct from
+	// LabelReplicaID — that label exists on every voodu container
+	// and is opaque hex for deployments. Statefulsets reuse the
+	// ordinal as the ReplicaID so ContainerName produces
+	// `<scope>-<name>.0` instead of `<scope>-<name>.a3f9`, and
+	// the dedicated ordinal label exists so `docker ps --filter
+	// label=voodu.replica_ordinal=0` works without parsing
+	// names. Empty for non-statefulset kinds.
+	LabelReplicaOrdinal = "voodu.replica_ordinal"
 )
 
 // Kind values used in LabelKind. Mirror controller.Kind constants —
 // kept here as plain strings to avoid a circular import (containers
 // is a leaf package; controller depends on it).
 const (
-	KindDeployment = "deployment"
-	KindJob        = "job"
-	KindCronJob    = "cronjob"
+	KindDeployment  = "deployment"
+	KindStatefulset = "statefulset"
+	KindJob         = "job"
+	KindCronJob     = "cronjob"
 )
 
 // Identity is the structured form of voodu container labels. Two
@@ -102,6 +115,15 @@ type Identity struct {
 	// run inside a release orchestrator (initial replica creation,
 	// non-release-block deployments).
 	ReleaseID string
+
+	// ReplicaOrdinal is the integer index of this pod inside a
+	// statefulset (0, 1, 2, …). Set only for Kind=statefulset
+	// containers; deployments leave it as -1 (the "not set"
+	// sentinel — distinct from a legitimate ordinal 0). Helpers
+	// `OrdinalReplicaID` and `Identity.Ordinal()` translate
+	// between the integer and the string form stored on
+	// LabelReplicaOrdinal / reused as the ReplicaID.
+	ReplicaOrdinal int
 }
 
 // NewReplicaID returns a 4-char hex string for use as a container
@@ -114,6 +136,42 @@ func NewReplicaID() string {
 	_, _ = rand.Read(b[:])
 
 	return hex.EncodeToString(b[:])
+}
+
+// OrdinalReplicaID returns the canonical string form of a
+// statefulset ordinal — just decimal digits ("0", "1", "12").
+// Stored under both LabelReplicaID (so ContainerName produces
+// `<app>.0` cleanly) and LabelReplicaOrdinal (for direct
+// queryability via docker ps filters).
+//
+// Negative ordinals are clamped to 0; statefulsets index from
+// zero by construction and a negative value would only land here
+// from a programmer bug, where panicking would hide the cause.
+func OrdinalReplicaID(n int) string {
+	if n < 0 {
+		n = 0
+	}
+
+	return strconv.Itoa(n)
+}
+
+// Ordinal recovers the integer ordinal from a statefulset
+// container's labels. Returns (n, true) when Kind=statefulset
+// and ReplicaID parses as a non-negative integer; (0, false)
+// otherwise. The bool lets callers distinguish "ordinal 0"
+// from "not a statefulset", which matters for the rolling
+// restart path that iterates ordinals top-down.
+func (id Identity) Ordinal() (int, bool) {
+	if id.Kind != KindStatefulset {
+		return 0, false
+	}
+
+	n, err := strconv.Atoi(id.ReplicaID)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+
+	return n, true
 }
 
 // ContainerName composes a Docker container name from the (scope,
@@ -177,6 +235,15 @@ func BuildLabels(id Identity) []string {
 		out = append(out, fmt.Sprintf("%s=%s", LabelReleaseID, id.ReleaseID))
 	}
 
+	// LabelReplicaOrdinal is emitted only for statefulset pods.
+	// Deployments leave Identity.ReplicaOrdinal at the zero value;
+	// emitting "0" on every deployment replica would be noise
+	// (and a docker filter on ordinal=0 would suddenly match
+	// every deployment pod ever spawned). Gate strictly on Kind.
+	if id.Kind == KindStatefulset {
+		out = append(out, fmt.Sprintf("%s=%d", LabelReplicaOrdinal, id.ReplicaOrdinal))
+	}
+
 	return out
 }
 
@@ -194,15 +261,31 @@ func ParseLabels(m map[string]string) (Identity, bool) {
 		return Identity{}, false
 	}
 
-	return Identity{
-		Kind:         m[LabelKind],
-		Scope:        m[LabelScope],
-		Name:         m[LabelName],
-		ReplicaID:    m[LabelReplicaID],
-		ManifestHash: m[LabelManifestHash],
-		CreatedAt:    m[LabelCreatedAt],
-		ReleaseID:    m[LabelReleaseID],
-	}, true
+	id := Identity{
+		Kind:           m[LabelKind],
+		Scope:          m[LabelScope],
+		Name:           m[LabelName],
+		ReplicaID:      m[LabelReplicaID],
+		ManifestHash:   m[LabelManifestHash],
+		CreatedAt:      m[LabelCreatedAt],
+		ReleaseID:      m[LabelReleaseID],
+		ReplicaOrdinal: -1,
+	}
+
+	// Recover the ordinal only for statefulset pods. The label
+	// shouldn't exist on deployment containers; if it does (e.g.
+	// a hand-edited container or a future label rename) we leave
+	// the sentinel -1 so downstream logic that branches on
+	// "is this stateful?" stays driven by Kind alone.
+	if id.Kind == KindStatefulset {
+		if v, ok := m[LabelReplicaOrdinal]; ok {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				id.ReplicaOrdinal = n
+			}
+		}
+	}
+
+	return id, true
 }
 
 // Matches reports whether id describes the (kind, scope, name) tuple.

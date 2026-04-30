@@ -78,6 +78,11 @@ type API struct {
 	// reconciler machinery.
 	Deployments DeploymentRestarter
 
+	// Statefulsets powers `POST /restart?kind=statefulset&...` and
+	// `POST /rollback?kind=statefulset&...`. Nil → 503 for those
+	// kinds. Production wires *StatefulsetHandler.
+	Statefulsets StatefulsetRestarter
+
 	// Logs powers /logs streaming. Nil means the endpoint returns 503
 	// ("log streaming not configured"); production wires the
 	// ContainerManager (which satisfies LogStreamer through its Logs
@@ -85,6 +90,23 @@ type API struct {
 	// to implement the whole ContainerManager just to assert the
 	// streamer is wired correctly.
 	Logs LogStreamer
+
+	// PluginBlocks resolves plugin-block kinds (`postgres { … }`,
+	// `redis { … }`) to the on-disk plugin that expands them into
+	// core kinds. Nil → no plugin support; non-core kinds 400 with
+	// a "no plugin registered" error. Production wires
+	// *DirPluginRegistry pointed at PluginsRoot.
+	PluginBlocks PluginBlockRegistry
+
+	// PluginInstaller is the JIT-install seam: when a manifest
+	// references a plugin block kind that has no matching plugin
+	// under PluginsRoot, the apply path attempts to install it
+	// from the convention repo `thadeu/voodu-<kind>` (or an
+	// override via VOODU_PLUGIN_REPO_<KIND> env / block
+	// `_repo` attribute) before failing the apply. Nil disables
+	// JIT install — operators must pre-install plugins in that
+	// case via `vd plugins:install <name>`.
+	PluginInstaller *plugins.Installer
 }
 
 // LogStreamer is the seam /logs dispatches through. The production
@@ -133,6 +155,23 @@ type DeploymentRestarter interface {
 	Restart(ctx context.Context, scope, name string) error
 	Release(ctx context.Context, scope, name string, output io.Writer) error
 	Rollback(ctx context.Context, scope, name, targetID string) (newID string, err error)
+}
+
+// StatefulsetRestarter is the statefulset twin — same Restart and
+// Rollback semantics, but NO Release method (statefulset workloads
+// are databases / queues / caches, not apps with migration steps).
+// The API dispatch picks this surface when `kind=statefulset` lands
+// on /restart or /rollback.
+//
+// Volumes is the read-side seam used by handleDescribe to surface
+// per-(claim, ordinal) docker volume names alongside the pod
+// listing. Returns the volume names matching this statefulset;
+// empty slice on lister failure or unconfigured Containers.
+type StatefulsetRestarter interface {
+	Restart(ctx context.Context, scope, name string) error
+	Rollback(ctx context.Context, scope, name, targetID string) (newID string, err error)
+	PruneVolumes(scope, name string) ([]string, error)
+	Volumes(scope, name string) ([]string, error)
 }
 
 // ExecOptions mirrors docker.ExecOptions field-for-field but lives
@@ -277,6 +316,30 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	// the intended usage pattern.
 	prune := r.URL.Query().Get("prune") != "false"
 
+	// Plugin-block expansion: any manifest whose Kind is not a
+	// core kind gets expanded by an installed plugin into one or
+	// more core-kind manifests. Operator wrote `postgres "data"
+	// "main" { … }` → expand to `statefulset "data" "main" { … }`.
+	// Failure modes:
+	//
+	//   - No plugin installed for that kind: JIT install attempts
+	//     `thadeu/voodu-<kind>` (or block-level _repo override),
+	//     fails 400 if even that doesn't resolve.
+	//   - Plugin's expand command failed: 400 with the plugin's
+	//     stderr / envelope error verbatim — operator sees the
+	//     real cause without spelunking.
+	//
+	// Done before the dry-run branch so `vd diff` shows the
+	// EXPANDED manifests (the operator wants to see the
+	// statefulset that will materialise, not the postgres macro).
+	expandedManifests, expansions, installs, err := a.expandPluginBlocks(r.Context(), manifests)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	manifests = expandedManifests
+
 	var (
 		applied = make([]*Manifest, 0, len(manifests))
 		current = make([]*Manifest, 0, len(manifests))
@@ -335,6 +398,20 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"applied": applied,
 		"pruned":  prunedRefs,
+	}
+
+	// Plugin-expansion bookkeeping — surfaced for the CLI to log
+	// `installed plugin X v0.2.0 from <repo>` and `expanded
+	// postgres/data/main → statefulset/data/main` so operators
+	// see exactly what the macro layer did. Empty arrays are
+	// omitted at JSON encoding time (omitempty on the slice
+	// types, falsy on nil).
+	if len(installs) > 0 {
+		data["plugin_installs"] = installs
+	}
+
+	if len(expansions) > 0 {
+		data["plugin_expansions"] = expansions
 	}
 
 	// `current` is only meaningful for dry-run — it's the "before"
@@ -605,6 +682,20 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 		// response so the operator can finish manually but don't
 		// fail the whole DELETE.
 		pruned = pruneResource(r.Context(), a.Store, kind, scope, name)
+
+		// Statefulset-only: remove the per-pod docker volumes the
+		// handler created. Soft-delete leaves them so an operator
+		// can re-apply and recover the data; --prune is the
+		// explicit opt-in to wipe. Best-effort: errors append to
+		// the summary but don't fail the delete.
+		if kind == KindStatefulset && a.Statefulsets != nil {
+			vols, err := a.Statefulsets.PruneVolumes(scope, name)
+			if err != nil {
+				pruned.Errors = append(pruned.Errors, fmt.Sprintf("prune volumes: %v", err))
+			} else {
+				pruned.VolumesRemoved = vols
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, envelope{
@@ -621,10 +712,17 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 // on partial failure so the human knows which steps need a manual
 // follow-up.
 type pruneSummary struct {
-	ConfigWiped     bool     `json:"config_wiped,omitempty"`
-	AppDirRemoved   string   `json:"app_dir_removed,omitempty"`
-	VolumeRemoved   string   `json:"volume_removed,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
+	ConfigWiped   bool   `json:"config_wiped,omitempty"`
+	AppDirRemoved string `json:"app_dir_removed,omitempty"`
+	VolumeRemoved string `json:"volume_removed,omitempty"`
+
+	// VolumesRemoved is the list of docker named volumes wiped
+	// by `vd delete statefulset/... --prune`. Populated only for
+	// the statefulset kind — other kinds don't own per-pod
+	// docker volumes. Empty slice is normal (no claims declared).
+	VolumesRemoved []string `json:"volumes_removed,omitempty"`
+
+	Errors []string `json:"errors,omitempty"`
 }
 
 // handleScopeWipe is the nuclear option: wipe every manifest in
@@ -723,10 +821,12 @@ func pruneResource(ctx context.Context, store Store, kind Kind, scope, name stri
 	// Filesystem cleanup only makes sense for kinds that have a
 	// per-app on-disk footprint. Today: deployments (env file,
 	// release dirs, volumes); jobs/cronjobs share the same layout
-	// because they shell out through the same paths helpers. Other
-	// kinds (database, ingress) don't own any filesystem of their
-	// own — their state lives in plugins / etcd.
-	if kind == KindDeployment || kind == KindJob || kind == KindCronJob {
+	// because they shell out through the same paths helpers;
+	// statefulset has the env file too (write_env writes to
+	// AppEnvFile under AppDir) so it joins the family. Other
+	// kinds (ingress) don't own any filesystem of their own —
+	// their state lives in plugins / etcd.
+	if kind == KindDeployment || kind == KindStatefulset || kind == KindJob || kind == KindCronJob {
 		app := AppID(scope, name)
 
 		appDir := paths.AppDir(app)
@@ -864,14 +964,42 @@ func (a *API) handleDescribe(w http.ResponseWriter, r *http.Request) {
 	// knows to look at `voodu get pods` for runtime issues.
 	pods := a.matchingPods(kind, scope, name)
 
+	data := map[string]any{
+		"manifest": manifest,
+		"status":   status,
+		"pods":     pods,
+	}
+
+	// Statefulset-only: surface per-pod volume names so the operator
+	// can see which docker volumes carry the persistent data. Failure
+	// listing volumes is best-effort (same posture as pod listing) —
+	// the manifest+pods rendering still works.
+	if kind == KindStatefulset {
+		data["volumes"] = a.matchingStatefulsetVolumes(scope, name)
+	}
+
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data: map[string]any{
-			"manifest": manifest,
-			"status":   status,
-			"pods":     pods,
-		},
+		Data:   data,
 	})
+}
+
+// matchingStatefulsetVolumes enumerates the docker named volumes a
+// statefulset owns — one per (claim, ordinal). Delegates to the
+// Statefulsets seam (which reaches the labelled-volume listing
+// inside its ContainerManager). Returns nil on missing seam or
+// lister failure so the describe payload stays well-formed.
+func (a *API) matchingStatefulsetVolumes(scope, name string) []string {
+	if a.Statefulsets == nil {
+		return nil
+	}
+
+	vols, err := a.Statefulsets.Volumes(scope, name)
+	if err != nil {
+		return nil
+	}
+
+	return vols
 }
 
 // matchingPods filters the host's voodu-labeled containers to the
@@ -1264,7 +1392,8 @@ func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Source string `json:"source"`
+		Source  string `json:"source"`
+		Version string `json:"version,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1279,7 +1408,7 @@ func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
 
 	inst := &plugins.Installer{Root: a.PluginsRoot}
 
-	loaded, err := inst.Install(r.Context(), req.Source)
+	loaded, err := inst.Install(r.Context(), req.Source, req.Version)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -1741,11 +1870,6 @@ func parseUint16Query(s string) uint16 {
 // can show "1/3 replaced, 2/3...". For now the body is just a
 // status envelope.
 func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
-	if a.Deployments == nil {
-		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("restart not configured"))
-		return
-	}
-
 	kindStr := strings.TrimSpace(r.URL.Query().Get("kind"))
 	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
@@ -1756,8 +1880,8 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Default kind to deployment for ergonomics — `vd restart X`
-	// almost always means "restart the deployment". When other kinds
-	// gain rolling semantics (futureproofing) we'll accept them here.
+	// almost always means "restart the deployment". Statefulsets
+	// must be addressed explicitly via kind=statefulset.
 	if kindStr == "" {
 		kindStr = string(KindDeployment)
 	}
@@ -1768,8 +1892,29 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if kind != KindDeployment {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("restart only supports deployments today (got %q)", kind))
+	type restartFn func(ctx context.Context, scope, name string) error
+
+	var fn restartFn
+
+	switch kind {
+	case KindDeployment:
+		if a.Deployments == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("deployment restart not configured"))
+			return
+		}
+
+		fn = a.Deployments.Restart
+
+	case KindStatefulset:
+		if a.Statefulsets == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("statefulset restart not configured"))
+			return
+		}
+
+		fn = a.Statefulsets.Restart
+
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("restart not supported for kind %q (deployment, statefulset)", kind))
 		return
 	}
 
@@ -1788,7 +1933,7 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		scope = resolved
 	}
 
-	if err := a.Deployments.Restart(r.Context(), scope, name); err != nil {
+	if err := fn(r.Context(), scope, name); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1798,6 +1943,7 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		Data: map[string]string{
 			"scope": scope,
 			"name":  name,
+			"kind":  string(kind),
 		},
 	})
 }
@@ -1822,7 +1968,10 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 // line ("-----> Release X failed in command (exit 42)") so the CLI
 // can read the body verbatim and decide on exit code at the end.
 func (a *API) handleReleaseRun(w http.ResponseWriter, r *http.Request) {
-	scope, name, err := a.releaseTarget(r)
+	// Release-phase commands are deployment-only — statefulsets
+	// don't carry a release block. resolveScope walks the
+	// deployments tree to find an unambiguous bare-name target.
+	scope, name, err := a.releaseTarget(r, KindDeployment)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -1898,20 +2047,52 @@ func (fw *flushingWriter) Write(p []byte) (int, error) {
 // is its own verb conceptually — the release is the snapshot;
 // rollback is "go back to that snapshot". Different concerns.
 func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
-	scope, name, err := a.releaseTarget(r)
+	kindStr := strings.TrimSpace(r.URL.Query().Get("kind"))
+	if kindStr == "" {
+		kindStr = string(KindDeployment)
+	}
+
+	kind, err := ParseKind(kindStr)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 
-	if a.Deployments == nil {
-		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("rollback not configured"))
+	scope, name, err := a.releaseTarget(r, kind)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	type rollbackFn func(ctx context.Context, scope, name, targetID string) (string, error)
+
+	var fn rollbackFn
+
+	switch kind {
+	case KindDeployment:
+		if a.Deployments == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("deployment rollback not configured"))
+			return
+		}
+
+		fn = a.Deployments.Rollback
+
+	case KindStatefulset:
+		if a.Statefulsets == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("statefulset rollback not configured"))
+			return
+		}
+
+		fn = a.Statefulsets.Rollback
+
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("rollback not supported for kind %q", kind))
 		return
 	}
 
 	targetID := strings.TrimSpace(r.URL.Query().Get("release_id"))
 
-	newID, err := a.Deployments.Rollback(r.Context(), scope, name, targetID)
+	newID, err := fn(r.Context(), scope, name, targetID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -1922,6 +2103,7 @@ func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
 		Data: map[string]any{
 			"scope":          scope,
 			"name":           name,
+			"kind":           string(kind),
 			"rolled_back_to": targetID,
 			"new_release":    newID,
 		},
@@ -1930,9 +2112,9 @@ func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 // releaseTarget pulls and validates scope/name from query params,
 // resolving an unambiguous bare name when scope is omitted. Shared
-// helper because /releases/run and /releases/rollback both need
-// the same shape.
-func (a *API) releaseTarget(r *http.Request) (string, string, error) {
+// helper because /releases/run and /rollback both need the same
+// shape — kind selects which manifest tree resolveScope walks.
+func (a *API) releaseTarget(r *http.Request, kind Kind) (string, string, error) {
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
 
@@ -1941,7 +2123,7 @@ func (a *API) releaseTarget(r *http.Request) (string, string, error) {
 	}
 
 	if scope == "" {
-		resolved, err := resolveScope(r.Context(), a.Store, KindDeployment, name)
+		resolved, err := resolveScope(r.Context(), a.Store, kind, name)
 		if err != nil {
 			return "", "", err
 		}

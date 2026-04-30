@@ -57,121 +57,43 @@ func copyMap(in map[string]string) map[string]string {
 	return out
 }
 
-// envelopeResult is a tiny helper to build a *plugins.Result carrying
-// the JSON envelope a database plugin would actually produce.
+// statusBlob marshals an arbitrary blob shape into the JSON the
+// /status store accepts, with the controller-conventional `data`
+// envelope. Used by ref-resolution tests that need a status target
+// for ${ref.<kind>.<name>.<field>} lookups.
+func statusBlob(t *testing.T, data map[string]any) []byte {
+	t.Helper()
+
+	raw, err := json.Marshal(map[string]any{"data": data})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return raw
+}
+
+// envelopeResult is a tiny helper to build a *plugins.Result
+// carrying the JSON envelope a plugin (today: ingress) would
+// actually produce. The wire shape matches plugin.Envelope so
+// the handler's unmarshal path is exercised end-to-end.
 func envelopeResult(data map[string]any) *plugins.Result {
 	env := &plugin.Envelope{Status: "ok", Data: data}
 	raw, _ := json.Marshal(env)
 	return &plugins.Result{Raw: raw, Envelope: env}
 }
 
-func TestDatabaseHandler_CreatePersistsEnvelope(t *testing.T) {
-	store := newMemStore()
-	inv := &fakeInvoker{
-		results: map[string]*plugins.Result{
-			"postgres.create": envelopeResult(map[string]any{
-				"url":  "postgres://u:p@h:5432/db",
-				"host": "h",
-			}),
-		},
-	}
-
-	h := &DatabaseHandler{Store: store, Invoker: inv, Log: quietLogger()}
-
-	spec := databaseSpec{Engine: "postgres", Version: "16"}
-	ev := putEvent(t, KindDatabase, "main", spec)
-
-	h.Handle(context.Background(), ev)
-
-	if len(inv.calls) != 1 {
-		t.Fatalf("expected 1 invoker call, got %d", len(inv.calls))
-	}
-
-	call := inv.calls[0]
-
-	if call.Plugin != "postgres" || call.Command != "create" {
-		t.Errorf("bad plugin/command: %s/%s", call.Plugin, call.Command)
-	}
-
-	if call.Env[plugin.EnvDBEngine] != "postgres" || call.Env[plugin.EnvDBVersion] != "16" {
-		t.Errorf("env missing spec fields: %+v", call.Env)
-	}
-
-	// Status should carry both engine and the envelope data.
-	raw, _ := store.GetStatus(context.Background(), KindDatabase, "main")
-	if raw == nil {
-		t.Fatal("no status persisted")
-	}
-
-	var status DatabaseStatus
-	if err := json.Unmarshal(raw, &status); err != nil {
-		t.Fatal(err)
-	}
-
-	if status.Engine != "postgres" {
-		t.Errorf("engine: %q", status.Engine)
-	}
-
-	if status.Data["url"] != "postgres://u:p@h:5432/db" {
-		t.Errorf("url field missing from status data: %+v", status.Data)
-	}
-}
-
-func TestDatabaseHandler_IdempotentOnReplay(t *testing.T) {
-	store := newMemStore()
-	inv := &fakeInvoker{
-		results: map[string]*plugins.Result{
-			"postgres.create": envelopeResult(map[string]any{"url": "x"}),
-		},
-	}
-
-	h := &DatabaseHandler{Store: store, Invoker: inv, Log: quietLogger()}
-
-	ev := putEvent(t, KindDatabase, "main", databaseSpec{Engine: "postgres"})
-
-	h.Handle(context.Background(), ev) // first call → invoke plugin
-	h.Handle(context.Background(), ev) // replay → must NOT re-invoke
-
-	if len(inv.calls) != 1 {
-		t.Errorf("expected 1 invoke on replay, got %d", len(inv.calls))
-	}
-}
-
-func TestDatabaseHandler_DestroyCallsPluginAndClearsStatus(t *testing.T) {
-	store := newMemStore()
-
-	// Seed status as if a previous create had succeeded.
-	pre, _ := json.Marshal(DatabaseStatus{Engine: "postgres", Data: map[string]any{"url": "x"}})
-	_ = store.PutStatus(context.Background(), KindDatabase, "main", pre)
-
-	inv := &fakeInvoker{}
-
-	h := &DatabaseHandler{Store: store, Invoker: inv, Log: quietLogger()}
-
-	h.Handle(context.Background(), WatchEvent{Type: WatchDelete, Kind: KindDatabase, Name: "main"})
-
-	if len(inv.calls) != 1 || inv.calls[0].Command != "destroy" {
-		t.Fatalf("destroy not called: %+v", inv.calls)
-	}
-
-	raw, _ := store.GetStatus(context.Background(), KindDatabase, "main")
-	if raw != nil {
-		t.Errorf("status not cleared after destroy")
-	}
-}
-
 func TestDeploymentHandler_ResolvesRefsIntoEnv(t *testing.T) {
 	store := newMemStore()
 
-	// Pretend a postgres DB was reconciled earlier.
-	ds, _ := json.Marshal(DatabaseStatus{
-		Engine: "postgres",
-		Data: map[string]any{
-			"url":  "postgres://u:p@h:5432/db",
-			"host": "h",
-		},
-	})
-	_ = store.PutStatus(context.Background(), KindDatabase, "main", ds)
+	// Pretend an ingress was reconciled earlier — its status carries
+	// a `data` map that ${ref.ingress.NAME.FIELD} resolves against.
+	// Same shape any kind would use; ingress is the simplest scoped
+	// kind with plugin-driven status fields.
+	_ = store.PutStatus(context.Background(), KindIngress, "test-edge",
+		statusBlob(t, map[string]any{
+			"url":  "https://api.example.com",
+			"host": "api.example.com",
+		}))
 
 	var writes []envWrite
 
@@ -186,9 +108,9 @@ func TestDeploymentHandler_ResolvesRefsIntoEnv(t *testing.T) {
 
 	spec := deploymentSpec{
 		Env: map[string]string{
-			"DATABASE_URL": "${ref.database.main.url}",
-			"DB_HOST":      "${ref.database.main.host}",
-			"STATIC":       "plain",
+			"PUBLIC_URL":  "${ref.ingress.edge.url}",
+			"PUBLIC_HOST": "${ref.ingress.edge.host}",
+			"STATIC":      "plain",
 		},
 	}
 
@@ -205,8 +127,8 @@ func TestDeploymentHandler_ResolvesRefsIntoEnv(t *testing.T) {
 	}
 
 	want := []string{
-		"DATABASE_URL=postgres://u:p@h:5432/db",
-		"DB_HOST=h",
+		"PUBLIC_HOST=api.example.com",
+		"PUBLIC_URL=https://api.example.com",
 		"STATIC=plain",
 	}
 
@@ -232,7 +154,7 @@ func TestDeploymentHandler_UnresolvedRefIsTransient(t *testing.T) {
 	}
 
 	spec := deploymentSpec{
-		Env: map[string]string{"URL": "${ref.database.ghost.url}"},
+		Env: map[string]string{"URL": "${ref.ingress.ghost.url}"},
 	}
 
 	ev := putEvent(t, KindDeployment, "api", spec)
@@ -246,7 +168,7 @@ func TestDeploymentHandler_UnresolvedRefIsTransient(t *testing.T) {
 		t.Errorf("unresolved ref should be transient, got %T: %v", err, err)
 	}
 
-	if !strings.Contains(err.Error(), "database.ghost.url") {
+	if !strings.Contains(err.Error(), "ingress.ghost.url") {
 		t.Errorf("error should name the missing ref, got: %v", err)
 	}
 
@@ -295,6 +217,18 @@ type fakeContainers struct {
 	// they care about HOW the image was retagged (fast retag vs.
 	// fallback rebuild) rather than just the final state.
 	imageTagOps []string
+
+	// volumes maps docker volume name → its label set (the same
+	// `key=value` strings the production caller passes to
+	// EnsureVolume). Statefulset tests pre-seed via direct map
+	// writes; the production flow goes through EnsureVolume.
+	volumes map[string][]string
+
+	// volumeOps records every EnsureVolume / RemoveVolume call
+	// in order. Tests assert on this when the per-pod claim
+	// materialisation order matters (e.g. volume created before
+	// the pod boots).
+	volumeOps []string
 
 	// waitExits maps container name → the exit code Wait should report
 	// when the job runner blocks on it. waitErrs lets a test inject a
@@ -398,6 +332,71 @@ func (f *fakeContainers) RemoveImageTag(ref string) error {
 	f.imageTagOps = append(f.imageTagOps, "rmi "+ref)
 
 	return nil
+}
+
+// EnsureVolume / RemoveVolume / ListVolumesByLabels track volume
+// state in-memory so statefulset tests can assert on materialised
+// claims without spawning a real docker daemon. The fake is
+// deliberately label-aware: ListVolumesByLabels filters by
+// substring match on the stamped label set, mirroring docker's
+// AND-combined --filter behaviour.
+func (f *fakeContainers) EnsureVolume(name string, labels []string) error {
+	if f.volumes == nil {
+		f.volumes = map[string][]string{}
+	}
+
+	if _, exists := f.volumes[name]; exists {
+		f.volumeOps = append(f.volumeOps, "noop "+name)
+		return nil
+	}
+
+	f.volumes[name] = append([]string(nil), labels...)
+	f.volumeOps = append(f.volumeOps, "create "+name)
+
+	return nil
+}
+
+func (f *fakeContainers) RemoveVolume(name string) error {
+	if _, exists := f.volumes[name]; !exists {
+		// Idempotent: matching production's "no such volume → no-op"
+		// posture so prune loops don't crash on a re-run.
+		return nil
+	}
+
+	delete(f.volumes, name)
+	f.volumeOps = append(f.volumeOps, "remove "+name)
+
+	return nil
+}
+
+func (f *fakeContainers) ListVolumesByLabels(filters []string) ([]string, error) {
+	out := make([]string, 0, len(f.volumes))
+
+	for name, labels := range f.volumes {
+		matched := true
+
+		for _, want := range filters {
+			found := false
+
+			for _, have := range labels {
+				if have == want {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				matched = false
+				break
+			}
+		}
+
+		if matched {
+			out = append(out, name)
+		}
+	}
+
+	return out, nil
 }
 
 func (f *fakeContainers) Recreate(spec ContainerSpec) error {
@@ -922,7 +921,7 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 	// the test to exercise the env-change rolling-replace path, not the
 	// spec-drift recreate path.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
-	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec, nil)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	cm := &fakeContainers{}
@@ -978,7 +977,7 @@ func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	// Pre-seed status as if a prior reconcile had run with v1.0.0.
 	// Without this, the no-status baseline path would mask the drift
 	// on first reconcile after upgrade — by design.
-	prevHash := deploymentSpecHash(deploymentSpec{Image: "ghcr.io/acme/api:1.0.0"})
+	prevHash := deploymentSpecHash(deploymentSpec{Image: "ghcr.io/acme/api:1.0.0"}, nil)
 	pre, _ := json.Marshal(DeploymentStatus{Image: "ghcr.io/acme/api:1.0.0", SpecHash: prevHash})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
@@ -1045,7 +1044,7 @@ func TestDeploymentHandler_RecreatesOnPortsDrift(t *testing.T) {
 
 	// Prior reconcile ran with no port bindings.
 	prevSpec := deploymentSpec{Image: "nginx:latest", Ports: []string{"80"}}
-	prevHash := deploymentSpecHash(prevSpec)
+	prevHash := deploymentSpecHash(prevSpec, nil)
 	pre, _ := json.Marshal(DeploymentStatus{Image: prevSpec.Image, SpecHash: prevHash})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-web", pre)
 
@@ -1095,7 +1094,7 @@ func TestDeploymentHandler_RecreatesOnImageIDDrift(t *testing.T) {
 	store := newMemStore()
 
 	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
-	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec, nil)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
 	existing := deploymentSlot("test", "vd-web", "vd-web:latest", "vw01")
@@ -1145,7 +1144,7 @@ func TestDeploymentHandler_NoRecreateWhenImageIDsMatch(t *testing.T) {
 	store := newMemStore()
 
 	spec := deploymentSpec{Image: "vd-web:latest", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
-	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec, nil)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-vd-web", pre)
 
 	existing := deploymentSlot("test", "vd-web", "vd-web:latest", "vw01")
@@ -1187,7 +1186,7 @@ func TestDeploymentHandler_NoRecreateWhenImagesMatch(t *testing.T) {
 	// of empty → [voodu0]) so the hash we pre-seed matches the hash the
 	// handler will recompute after apply() runs its normalization.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
-	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec, nil)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	existing := deploymentSlot("test", "api", "img:1", "rep1")
@@ -1278,38 +1277,6 @@ func TestDeploymentHandler_FirstReconcileBaselinesWithoutRecreate(t *testing.T) 
 
 	if st.SpecHash == "" {
 		t.Errorf("persisted status missing hash: %+v", st)
-	}
-}
-
-func TestDatabaseHandler_LogsVersionDriftOnReplay(t *testing.T) {
-	store := newMemStore()
-
-	// Pre-seed status from a prior `create` that persisted version=16.
-	pre, _ := json.Marshal(DatabaseStatus{
-		Engine:  "postgres",
-		Version: "16",
-		Data:    map[string]any{"url": "x"},
-	})
-	_ = store.PutStatus(context.Background(), KindDatabase, "main", pre)
-
-	inv := &fakeInvoker{}
-
-	var logs strings.Builder
-
-	h := &DatabaseHandler{Store: store, Invoker: inv, Log: log.New(&logs, "", 0)}
-
-	// New desired spec wants version 17 — that's drift.
-	ev := putEvent(t, KindDatabase, "main", databaseSpec{Engine: "postgres", Version: "17"})
-
-	_ = h.Handle(context.Background(), ev)
-
-	// Handler must stay idempotent: no plugin re-invoke.
-	if len(inv.calls) != 0 {
-		t.Errorf("drift detection must not re-invoke plugin, got %d calls", len(inv.calls))
-	}
-
-	if !strings.Contains(logs.String(), "version drift") {
-		t.Errorf("expected version-drift warning in logs:\n%s", logs.String())
 	}
 }
 
@@ -1440,7 +1407,7 @@ func TestDeploymentHandler_ScaleDownRemovesExtraReplicas(t *testing.T) {
 
 	// Baseline status so no spec-drift recreate triggers.
 	spec := deploymentSpec{Image: "img:1", Networks: []string{"voodu0"}, Restart: "unless-stopped"}
-	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec)})
+	pre, _ := json.Marshal(DeploymentStatus{Image: spec.Image, SpecHash: deploymentSpecHash(spec, nil)})
 	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
 
 	h := &DeploymentHandler{

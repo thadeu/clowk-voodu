@@ -31,6 +31,29 @@ func PluginsDir() string  { return filepath.Join(Root(), "plugins") }
 func ScriptsDir() string  { return filepath.Join(Root(), "scripts") }
 func StateDir() string    { return filepath.Join(Root(), "state") }
 func VolumesDir() string  { return filepath.Join(Root(), "volumes") }
+func AssetsDir() string   { return filepath.Join(Root(), "assets") }
+func CacheDir() string    { return filepath.Join(Root(), "cache") }
+
+// AssetDir is the materialised on-disk root for one asset
+// manifest (`asset "<scope>" "<name>" { … }`). Each file key
+// in the spec lands as a sibling file under this directory:
+// `<assets_root>/<scope>/<name>/<file_key>`. Resources that
+// interpolate `${asset.<name>.<file_key>}` resolve to the full
+// path of one of those files.
+func AssetDir(scope, name string) string {
+	return filepath.Join(AssetsDir(), scope, name)
+}
+
+// AssetFile returns the materialised path for a single
+// (scope, name, key) tuple. Convention is one file per key —
+// the key itself is the filename, no extension auto-applied.
+// Operators control the in-container filename via the `volumes`
+// mount target: `${asset.X.Y}:/etc/svc/conf.yaml:ro` mounts the
+// host file (whatever name) at `conf.yaml` inside the
+// container.
+func AssetFile(scope, name, key string) string {
+	return filepath.Join(AssetDir(scope, name), key)
+}
 
 func AppDir(app string) string         { return filepath.Join(AppsDir(), app) }
 func AppReleasesDir(app string) string { return filepath.Join(AppDir(app), "releases") }

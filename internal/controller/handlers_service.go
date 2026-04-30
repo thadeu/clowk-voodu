@@ -175,6 +175,24 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 	return nil
 }
 
+// envelopeDataAsMap normalises a plugin envelope's Data field to a
+// string-keyed map. Plugins emitting `{"url": "..."}` produce
+// map[string]any when json.Decode targets `any`; plain-string Data
+// gets wrapped under a `value` key so refLookup still has something
+// to surface. Used by the ingress handler — the only kind that
+// stores plugin-produced fields under /status for ${ref...} resolution.
+func envelopeDataAsMap(data any) map[string]any {
+	if data == nil {
+		return nil
+	}
+
+	if m, ok := data.(map[string]any); ok {
+		return m
+	}
+
+	return map[string]any{"value": data}
+}
+
 func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 	app := AppID(ev.Scope, ev.Name)
 

@@ -66,7 +66,12 @@ type Installer struct {
 // Install places the plugin in Root and returns the loaded plugin. If a
 // plugin with the same name already exists, it is replaced atomically
 // (scratch dir → rename).
-func (i *Installer) Install(ctx context.Context, source string) (*LoadedPlugin, error) {
+//
+// `version` pins a specific git tag for SourceGit sources (e.g.
+// `"0.2.0"` or `"v0.2.0"` — leading `v` auto-prefixed when missing).
+// Empty string clones the default branch (latest). Local sources
+// ignore the version argument; pin via the source path itself.
+func (i *Installer) Install(ctx context.Context, source, version string) (*LoadedPlugin, error) {
 	src, err := ParseSource(source)
 	if err != nil {
 		return nil, err
@@ -83,7 +88,7 @@ func (i *Installer) Install(ctx context.Context, source string) (*LoadedPlugin, 
 
 	cleanup := func() { _ = os.RemoveAll(tmp) }
 
-	if err := i.fetch(ctx, src, tmp); err != nil {
+	if err := i.fetch(ctx, src, tmp, version); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -163,7 +168,10 @@ func (i *Installer) Remove(ctx context.Context, name string) (bool, error) {
 
 // fetch materialises src into dst. For local sources it copies the tree
 // (so the original stays pristine); for git it shells out to `git clone`.
-func (i *Installer) fetch(ctx context.Context, src InstallSource, dst string) error {
+// When `version` is non-empty, the git path adds `--branch v<version>`
+// (auto-prefixing `v` when the operator omits it) so JIT installs pin
+// to specific tags. Local sources ignore version — pin via path.
+func (i *Installer) fetch(ctx context.Context, src InstallSource, dst, version string) error {
 	switch src.Kind {
 	case SourceLocal:
 		return copyTree(src.Raw, dst)
@@ -174,11 +182,28 @@ func (i *Installer) fetch(ctx context.Context, src InstallSource, dst string) er
 			git = "git"
 		}
 
-		cmd := exec.CommandContext(ctx, git, "clone", "--depth=1", normaliseGitURL(src.Raw), dst)
+		args := []string{"clone", "--depth=1"}
+
+		if version != "" {
+			tag := version
+			if !strings.HasPrefix(tag, "v") {
+				tag = "v" + tag
+			}
+
+			args = append(args, "--branch", tag)
+		}
+
+		args = append(args, normaliseGitURL(src.Raw), dst)
+
+		cmd := exec.CommandContext(ctx, git, args...)
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 
 		if err := cmd.Run(); err != nil {
+			if version != "" {
+				return fmt.Errorf("git clone %s @ v%s: %w (tag may not exist)", src.Raw, version, err)
+			}
+
 			return fmt.Errorf("git clone %s: %w", src.Raw, err)
 		}
 

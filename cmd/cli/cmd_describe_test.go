@@ -127,26 +127,6 @@ func TestDescribeWireContractBareName(t *testing.T) {
 	}
 }
 
-// TestDescribeUnscopedKind: database is unscoped — passing a scope
-// must be rejected client-side BEFORE any HTTP call so a typo can't
-// produce a confusing 404.
-func TestDescribeRejectsScopeOnUnscopedKind(t *testing.T) {
-	// Server should never be reached.
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("server should not be reached; got %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
-	}))
-	defer ts.Close()
-
-	err := runDescribeCmd(t, ts, "database", "scope/main")
-	if err == nil {
-		t.Fatal("expected error for scope-on-unscoped-kind")
-	}
-
-	if !strings.Contains(err.Error(), "unscoped") {
-		t.Errorf("error=%q expected mention of unscoped", err.Error())
-	}
-}
-
 // TestDescribeUnknownKindClientSide: the CLI parses kind eagerly so a
 // typo errors before we waste a round trip.
 func TestDescribeUnknownKindClientSide(t *testing.T) {
@@ -199,7 +179,7 @@ func TestRenderDescribeDeployment(t *testing.T) {
 	statusBlob, _ := json.Marshal(controller.DeploymentStatus{Image: "img:1", SpecHash: "abc123"})
 
 	var buf bytes.Buffer
-	if err := renderDescribe(&buf, manifest, statusBlob, nil, false); err != nil {
+	if err := renderDescribe(&buf, manifest, statusBlob, nil, nil, false); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -232,7 +212,7 @@ func TestRenderDescribeDeploymentWithSpecDump(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	_ = renderDescribe(&buf, manifest, nil, nil, true)
+	_ = renderDescribe(&buf, manifest, nil, nil, nil, true)
 
 	out := buf.String()
 
@@ -242,46 +222,6 @@ func TestRenderDescribeDeploymentWithSpecDump(t *testing.T) {
 
 	if !strings.Contains(out, `"image": "img:1"`) {
 		t.Errorf("spec dump missing manifest content: %q", out)
-	}
-}
-
-func TestRenderDescribeDatabase(t *testing.T) {
-	manifest := &controller.Manifest{
-		Kind: controller.KindDatabase, Name: "main",
-		Spec: json.RawMessage(`{"engine":"postgres","version":"16"}`),
-	}
-
-	statusBlob, _ := json.Marshal(controller.DatabaseStatus{
-		Engine: "postgres", Version: "16",
-		Params: map[string]string{"DATABASE_URL": "postgres://..."},
-		Data:   map[string]any{"backup_count": 3},
-	})
-
-	var buf bytes.Buffer
-	if err := renderDescribe(&buf, manifest, statusBlob, nil, false); err != nil {
-		t.Fatalf("render: %v", err)
-	}
-
-	out := buf.String()
-
-	if !strings.Contains(out, "database/main") {
-		t.Errorf("missing unscoped header: %q", out)
-	}
-
-	if strings.Contains(out, "database//main") {
-		t.Errorf("unscoped header has double slash: %q", out)
-	}
-
-	if !strings.Contains(out, "engine:  postgres") {
-		t.Errorf("missing engine line: %q", out)
-	}
-
-	if !strings.Contains(out, "DATABASE_URL") {
-		t.Errorf("missing params: %q", out)
-	}
-
-	if !strings.Contains(out, "backup_count") {
-		t.Errorf("missing data section: %q", out)
 	}
 }
 
@@ -302,7 +242,7 @@ func TestRenderDescribeJobWithHistory(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	if err := renderDescribe(&buf, manifest, statusBlob, nil, false); err != nil {
+	if err := renderDescribe(&buf, manifest, statusBlob, nil, nil, false); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -356,7 +296,7 @@ func TestRenderDescribeJobShowsImageDriftWhenStatusDiffers(t *testing.T) {
 	statusBlob, _ := json.Marshal(controller.JobStatus{Image: "img:1"})
 
 	var buf bytes.Buffer
-	_ = renderDescribe(&buf, manifest, statusBlob, nil, false)
+	_ = renderDescribe(&buf, manifest, statusBlob, nil, nil, false)
 
 	out := buf.String()
 
@@ -376,7 +316,7 @@ func TestRenderDescribeCronJobComputesNextRun(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := renderDescribe(&buf, manifest, nil, nil, false); err != nil {
+	if err := renderDescribe(&buf, manifest, nil, nil, nil, false); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -438,7 +378,7 @@ func TestRenderDescribeCronJobSuspendedHasNoNextRun(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	_ = renderDescribe(&buf, manifest, nil, nil, false)
+	_ = renderDescribe(&buf, manifest, nil, nil, nil, false)
 
 	out := buf.String()
 
@@ -463,7 +403,7 @@ func TestRenderDescribePodsTable(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := renderDescribe(&buf, manifest, nil, pods, false); err != nil {
+	if err := renderDescribe(&buf, manifest, nil, pods, nil, false); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -500,7 +440,7 @@ func TestRenderDescribeOmitsPodsSectionWhenEmpty(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	_ = renderDescribe(&buf, manifest, nil, nil, false)
+	_ = renderDescribe(&buf, manifest, nil, nil, nil, false)
 
 	if strings.Contains(buf.String(), "pods (") {
 		t.Errorf("empty pods slice should omit section: %q", buf.String())
@@ -509,7 +449,7 @@ func TestRenderDescribeOmitsPodsSectionWhenEmpty(t *testing.T) {
 
 func TestRenderDescribeEmptyManifestErrors(t *testing.T) {
 	var buf bytes.Buffer
-	err := renderDescribe(&buf, nil, nil, nil, false)
+	err := renderDescribe(&buf, nil, nil, nil, nil, false)
 
 	if err == nil {
 		t.Fatal("expected error when manifest is nil")

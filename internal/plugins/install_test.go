@@ -73,7 +73,7 @@ func TestInstallerInstallsLocalPlugin(t *testing.T) {
 	root := t.TempDir()
 	inst := &Installer{Root: root}
 
-	p, err := inst.Install(context.Background(), src)
+	p, err := inst.Install(context.Background(), src, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,12 +116,12 @@ func TestInstallerReplacesExisting(t *testing.T) {
 		return dir
 	}
 
-	_, err := inst.Install(context.Background(), makeSource(t, "1"))
+	_, err := inst.Install(context.Background(), makeSource(t, "1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p2, err := inst.Install(context.Background(), makeSource(t, "2"))
+	p2, err := inst.Install(context.Background(), makeSource(t, "2"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestInstallerRemoveExisting(t *testing.T) {
 	root := t.TempDir()
 	inst := &Installer{Root: root}
 
-	if _, err := inst.Install(context.Background(), src); err != nil {
+	if _, err := inst.Install(context.Background(), src, ""); err != nil {
 		t.Fatal(err)
 	}
 

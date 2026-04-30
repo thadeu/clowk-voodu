@@ -12,6 +12,7 @@ import (
 
 	"go.voodu.clowk.in/internal/envfile"
 	"go.voodu.clowk.in/internal/paths"
+	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/internal/secrets"
 )
 
@@ -119,12 +120,16 @@ func (s *Server) Start(ctx context.Context) error {
 
 		// Same instance — its Exec method satisfies the Execer seam.
 		Execer: DockerContainerManager{},
-	}
 
-	dbHandler := &DatabaseHandler{
-		Store:   store,
-		Invoker: invoker,
-		Log:     s.cfg.Logger,
+		// Plugin-block expansion: discovers plugins under
+		// PluginsRoot at apply time and routes non-core kinds
+		// through their `expand` command. M-D2+ kicks in.
+		PluginBlocks: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+
+		// JIT-install plugins missing at apply time. Convention
+		// repo is `thadeu/voodu-<kind>`; operators override per
+		// block via `_repo` attribute or per-server via env.
+		PluginInstaller: &plugins.Installer{Root: s.cfg.PluginsRoot},
 	}
 
 	depHandler := &DeploymentHandler{
@@ -135,6 +140,29 @@ func (s *Server) Start(ctx context.Context) error {
 			// Load pre-image first so we can diff against the merged
 			// result and decide whether to restart the container. A
 			// missing file is fine — treat as empty.
+			before, _ := envfile.Load(envFile)
+
+			after, err := secrets.Set(app, pairs)
+			if err != nil {
+				return false, err
+			}
+
+			return !stringMapsEqual(before, after), nil
+		},
+		EnvFilePath: paths.AppEnvFile,
+		Containers:  DockerContainerManager{},
+	}
+
+	assetHandler := &AssetHandler{
+		Store: store,
+		Log:   s.cfg.Logger,
+	}
+
+	stsHandler := &StatefulsetHandler{
+		Store: store,
+		Log:   s.cfg.Logger,
+		WriteEnv: func(app string, pairs []string) (bool, error) {
+			envFile := paths.AppEnvFile(app)
 			before, _ := envfile.Load(envFile)
 
 			after, err := secrets.Set(app, pairs)
@@ -188,6 +216,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// Same instance for the imperative restart path.
 	s.api.Deployments = depHandler
 
+	// Statefulset surface mirrors deployment for the
+	// imperative restart / rollback / prune-volumes paths.
+	s.api.Statefulsets = stsHandler
+
 	cronJobHandler := &CronJobHandler{
 		Store:       store,
 		Log:         s.cfg.Logger,
@@ -217,11 +249,12 @@ func (s *Server) Start(ctx context.Context) error {
 		Store:  store,
 		Logger: s.cfg.Logger,
 		Handlers: map[Kind]HandlerFunc{
-			KindDatabase:   dbHandler.Handle,
-			KindDeployment: depHandler.Handle,
-			KindIngress:    ingHandler.Handle,
-			KindJob:        jobHandler.Handle,
-			KindCronJob:    cronJobHandler.Handle,
+			KindDeployment:  depHandler.Handle,
+			KindStatefulset: stsHandler.Handle,
+			KindIngress:     ingHandler.Handle,
+			KindJob:         jobHandler.Handle,
+			KindCronJob:     cronJobHandler.Handle,
+			KindAsset:       assetHandler.Handle,
 		},
 	}
 

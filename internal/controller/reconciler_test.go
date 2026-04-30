@@ -8,13 +8,13 @@ import (
 	"time"
 )
 
-var errTestRefMissing = errors.New("ref.database.main.url not yet reconciled")
+var errTestRefMissing = errors.New("ref.ingress.main.url not yet reconciled")
 
 func TestReconcilerReplaysExistingManifests(t *testing.T) {
 	store := newMemStore()
 
 	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "main"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindIngress, Scope: "test", Name: "edge"})
 
 	var (
 		mu   sync.Mutex
@@ -36,7 +36,7 @@ func TestReconcilerReplaysExistingManifests(t *testing.T) {
 		Store: store,
 		Handlers: map[Kind]HandlerFunc{
 			KindDeployment: record(KindDeployment),
-			KindDatabase:   record(KindDatabase),
+			KindIngress:    record(KindIngress),
 		},
 	}
 
@@ -52,7 +52,7 @@ func TestReconcilerReplaysExistingManifests(t *testing.T) {
 	deadline := time.After(400 * time.Millisecond)
 	for {
 		mu.Lock()
-		ok := seen[KindDeployment] == 1 && seen[KindDatabase] == 1
+		ok := seen[KindDeployment] == 1 && seen[KindIngress] == 1
 		mu.Unlock()
 
 		if ok {
@@ -239,7 +239,7 @@ func TestReconcilerGivesUpAfterMaxAttempts(t *testing.T) {
 func TestReconcilerNilHandlerIsNoop(t *testing.T) {
 	store := newMemStore()
 
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "web"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindIngress, Scope: "test", Name: "web"})
 
 	rec := &Reconciler{Store: store}
 

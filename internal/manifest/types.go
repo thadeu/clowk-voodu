@@ -171,20 +171,107 @@ func (s *DeploymentSpec) applyDefaults() {
 	}
 }
 
-// DatabaseSpec is a managed data service. The Engine field selects which
-// plugin materialises the instance (M7 lands postgres, M9 lands mongo).
-type DatabaseSpec struct {
-	Engine  string            `yaml:"engine"            json:"engine"`
-	Version string            `yaml:"version,omitempty" json:"version,omitempty"`
-	Storage string            `yaml:"storage,omitempty" json:"storage,omitempty"`
-	Backup  *DatabaseBackup   `yaml:"backup,omitempty"  json:"backup,omitempty"`
-	Params  map[string]string `yaml:"params,omitempty"  json:"params,omitempty"`
+// StatefulsetSpec is a deployment shape with stable per-pod identity:
+// each replica gets an integer ordinal (0, 1, 2, …) reflected in its
+// container name (`<scope>-<name>.0`), its labels (voodu.replica_ordinal),
+// and its DNS aliases (`<name>-0.<scope>`). Compared to DeploymentSpec:
+//
+//   - Replicas are NOT interchangeable: pod-0 is durably pod-0 across
+//     restarts. Plugins like postgres lean on this — pod-0 is the
+//     primary by convention, pg-1+ are followers.
+//   - Storage attaches by ordinal (M-S2 introduces volume claim
+//     templates). Volumes survive scale-down — operator opts into
+//     destruction via `vd delete --prune`.
+//   - Rollouts are ordered: scale-up provisions 0→N-1 sequentially,
+//     scale-down removes N-1→0, rolling-replace iterates top-down.
+//
+// Image-mode only on M-S0/M-S1; build-mode (`lang {}`) and release-phase
+// commands (`release {}`) are deferred — statefulset workloads in
+// practice are databases / queues / caches with prebuilt registry
+// images. Adding either later is mechanical (mirror DeploymentSpec).
+//
+// Networking and env behave identically to DeploymentSpec: voodu0
+// auto-join, ports loopback by default, env from manifest+config
+// merge. The shared aliases (`<name>.<scope>`) round-robin between
+// replicas as before; per-pod aliases (`<name>-N.<scope>`) are the
+// new affordance.
+type StatefulsetSpec struct {
+	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
+	Replicas    int               `yaml:"replicas,omitempty"     json:"replicas,omitempty"`
+	Command     []string          `yaml:"command,omitempty"      json:"command,omitempty"`
+	Env         map[string]string `yaml:"env,omitempty"          json:"env,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"        json:"ports,omitempty"`
+	Volumes     []string          `yaml:"volumes,omitempty"      json:"volumes,omitempty"`
+	Network     string            `yaml:"network,omitempty"      json:"network,omitempty"`
+	Networks    []string          `yaml:"networks,omitempty"     json:"networks,omitempty"`
+	NetworkMode string            `yaml:"network_mode,omitempty" json:"network_mode,omitempty"`
+	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
+	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
+
+	// VolumeClaims is the set of per-pod volume templates. Each
+	// claim materialises into one docker volume per ordinal:
+	// `voodu-<scope>-<name>-<claim>-<ordinal>`. Filled in M-S2;
+	// the field is reserved on M-S0 so plugins authored against
+	// the early shape don't need to migrate when the block lands.
+	VolumeClaims []VolumeClaim `yaml:"volume_claims,omitempty" json:"volume_claims,omitempty"`
 }
 
-type DatabaseBackup struct {
-	Schedule  string `yaml:"schedule,omitempty"  json:"schedule,omitempty"`
-	Retention string `yaml:"retention,omitempty" json:"retention,omitempty"`
-	Target    string `yaml:"target,omitempty"    json:"target,omitempty"`
+// VolumeClaim is one per-pod storage template. Voodu provisions a
+// docker named volume per ordinal at apply time and mounts it at
+// MountPath inside every replica. The volume name is deterministic
+// (`voodu-<scope>-<name>-<Name>-<ordinal>`) so reconcile-after-restart
+// is idempotent.
+//
+// Size is currently informational — docker volumes don't enforce
+// quotas at the daemon level. Storing it in the spec lets a future
+// volume driver (loop-mount on a sized image, ZFS quota) honour it
+// without a manifest re-roll.
+type VolumeClaim struct {
+	// Name disambiguates multiple claims on one statefulset (e.g.
+	// "data" + "wal"). Must be lowercase alphanumeric — flows into
+	// docker volume names which have a stricter charset than
+	// arbitrary strings.
+	Name string `yaml:"name" json:"name"`
+
+	// MountPath is the path inside the container the volume binds
+	// to. Required.
+	MountPath string `yaml:"mount_path" json:"mount_path"`
+
+	// Size is informational on M-S2 (docker has no native quota).
+	// Format mirrors k8s ("10Gi", "500Mi").
+	Size string `yaml:"size,omitempty" json:"size,omitempty"`
+}
+
+// AssetSpec is a bag of (key → source) pairs the controller
+// materialises onto the host filesystem so deployments and
+// statefulsets can mount the resulting paths via
+// `${asset.<name>.<key>}` interpolation.
+//
+// The shape is deliberately a flat map — there is no top-level
+// metadata field. Convention: keys starting with `_` (like
+// `_repo` for plugin blocks, `_labels` for nested HCL block
+// labels) are reserved for future controller metadata; today
+// none are recognised, so any underscore-prefixed key is just
+// a regular file pair operators are free to declare.
+//
+// Each Source carries the materialisation hint:
+//
+//   - `{"_source":"file","content":"<base64>","filename":"x"}`
+//     — bytes embedded by the CLI at apply time via `file("…")`
+//   - `{"_source":"url","url":"https://…"}` — fetched server-side
+//     during reconcile (cached by ETag/Last-Modified)
+//   - plain string — inline literal, materialised verbatim
+//
+// HCL parses `key = file(…)` / `key = url(…)` / `key = "literal"`
+// directly into this shape; YAML callers spell out the object
+// form (see decodeYAMLSpec for how YAML rebuilds it).
+type AssetSpec struct {
+	// Files is keyed by the asset key (alphanumeric +
+	// underscore). Values are heterogeneous JSON — string for
+	// inline literals, object for file/url sources — so we
+	// keep the field as RawMessage and let the handler decide
+	// per-source how to materialise.
+	Files map[string]any `yaml:"files,omitempty" json:"files,omitempty"`
 }
 
 // IngressSpec describes an externally reachable hostname. M6's voodu-caddy

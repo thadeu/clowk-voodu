@@ -119,14 +119,19 @@ func TestBuildLabelsSkipsEmpty(t *testing.T) {
 // TestParseLabelsRoundTrip ensures BuildLabels → ParseLabels recovers
 // the original Identity. This is the canonical sanity check that the
 // label key constants are spelled the same on both sides.
+//
+// Non-statefulset kinds carry ReplicaOrdinal=-1 as the "not set"
+// sentinel — the label is never emitted for them, so ParseLabels
+// has nothing to recover from and leaves the field at -1.
 func TestParseLabelsRoundTrip(t *testing.T) {
 	want := Identity{
-		Kind:         KindJob,
-		Scope:        "softphone",
-		Name:         "migrate",
-		ReplicaID:    "1234",
-		ManifestHash: "feedface",
-		CreatedAt:    "2026-04-24T10:00:00Z",
+		Kind:           KindJob,
+		Scope:          "softphone",
+		Name:           "migrate",
+		ReplicaID:      "1234",
+		ManifestHash:   "feedface",
+		CreatedAt:      "2026-04-24T10:00:00Z",
+		ReplicaOrdinal: -1,
 	}
 
 	flags := BuildLabels(want)
@@ -151,6 +156,48 @@ func TestParseLabelsRoundTrip(t *testing.T) {
 
 	if got != want {
 		t.Errorf("round-trip lost data:\n got:  %+v\n want: %+v", got, want)
+	}
+}
+
+// TestParseLabelsRoundTripStatefulset locks down ordinal recovery
+// for statefulset pods specifically — the only kind that emits
+// LabelReplicaOrdinal. Without this test, a regression that
+// stopped emitting or recovering the label would only surface
+// when an actual postgres/redis cluster lost its ordering.
+func TestParseLabelsRoundTripStatefulset(t *testing.T) {
+	want := Identity{
+		Kind:           KindStatefulset,
+		Scope:          "data",
+		Name:           "pg",
+		ReplicaID:      "2",
+		ReplicaOrdinal: 2,
+		ManifestHash:   "deadbeef",
+		CreatedAt:     "2026-04-28T12:00:00Z",
+	}
+
+	flags := BuildLabels(want)
+
+	labelMap := make(map[string]string, len(flags))
+	for _, f := range flags {
+		eq := strings.IndexByte(f, '=')
+		if eq < 0 {
+			t.Fatalf("malformed label flag: %q", f)
+		}
+
+		labelMap[f[:eq]] = f[eq+1:]
+	}
+
+	got, ok := ParseLabels(labelMap)
+	if !ok {
+		t.Fatal("ParseLabels rejected statefulset output")
+	}
+
+	if got != want {
+		t.Errorf("statefulset round-trip lost data:\n got:  %+v\n want: %+v", got, want)
+	}
+
+	if n, ok := got.Ordinal(); !ok || n != 2 {
+		t.Errorf("Identity.Ordinal() = (%d,%v), want (2,true)", n, ok)
 	}
 }
 

@@ -247,47 +247,6 @@ func TestDescribeReturnsManifestStatusAndPods(t *testing.T) {
 	}
 }
 
-// TestDescribeUnscopedKind: database doesn't carry a scope and must not
-// be auto-resolved. The handler stores+retrieves with empty scope and
-// the manifest comes back with Scope == "".
-func TestDescribeUnscopedKind(t *testing.T) {
-	api, store := newTestAPI(t)
-
-	ts := httptest.NewServer(api.Handler())
-	defer ts.Close()
-
-	_, _ = store.Put(t.Context(), &Manifest{
-		Kind: KindDatabase, Name: "main",
-		Spec: json.RawMessage(`{"engine":"postgres"}`),
-	})
-
-	statusBlob, _ := json.Marshal(DatabaseStatus{Engine: "postgres", Version: "16"})
-	_ = store.PutStatus(t.Context(), KindDatabase, "main", statusBlob)
-
-	resp, env := describeGet(t, ts, "kind=database&name=main")
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d want 200", resp.StatusCode)
-	}
-
-	if env.Data.Manifest == nil {
-		t.Fatal("manifest missing")
-	}
-
-	if env.Data.Manifest.Scope != "" {
-		t.Errorf("unscoped kind has scope=%q", env.Data.Manifest.Scope)
-	}
-
-	var st DatabaseStatus
-	if err := json.Unmarshal(env.Data.Status, &st); err != nil {
-		t.Fatalf("decode status: %v", err)
-	}
-
-	if st.Engine != "postgres" || st.Version != "16" {
-		t.Errorf("status decoded wrong: %+v", st)
-	}
-}
-
 // TestDescribePodListerErrorTolerated: matchingPods returns nil on
 // lister failure. The describe response should still be 200 with an
 // empty pods slice — the manifest+status are the heart of describe's

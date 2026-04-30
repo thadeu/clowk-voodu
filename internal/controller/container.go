@@ -65,6 +65,27 @@ type ContainerManager interface {
 	// for records that fell off maxReleaseHistory. Idempotent.
 	RemoveImageTag(ref string) error
 
+	// EnsureVolume creates a docker named volume if missing. The
+	// labels slice is the `--label k=v` payload — voodu stamps
+	// (createdby, voodu.scope, voodu.name, voodu.claim,
+	// voodu.replica_ordinal) so describe / prune paths can find
+	// the volume later via `docker volume ls --filter label=...`.
+	// Idempotent: calling on an existing volume is a no-op (and
+	// does NOT update labels — docker create's documented
+	// behaviour).
+	EnsureVolume(name string, labels []string) error
+
+	// RemoveVolume drops a named volume. Used by `vd delete
+	// --prune` on statefulsets after the operator opts in.
+	// Idempotent against missing volumes (a successful no-op).
+	RemoveVolume(name string) error
+
+	// ListVolumesByLabels enumerates volume names matching every
+	// label in the filter slice (each `key=value`). Used by
+	// `vd describe statefulset/...` to surface per-pod claims
+	// and by the prune path to plan what to delete.
+	ListVolumesByLabels(filters []string) ([]string, error)
+
 	// Recreate stops-and-removes the existing container (if any) and
 	// starts a fresh one from spec. Distinct from Ensure because we
 	// want a *different* image/runtime config, not a no-op.
@@ -337,6 +358,18 @@ func (DockerContainerManager) TagImage(src, dst string) error {
 
 func (DockerContainerManager) RemoveImageTag(ref string) error {
 	return docker.RemoveImageTag(ref)
+}
+
+func (DockerContainerManager) EnsureVolume(name string, labels []string) error {
+	return docker.EnsureVolume(name, labels)
+}
+
+func (DockerContainerManager) RemoveVolume(name string) error {
+	return docker.RemoveVolume(name)
+}
+
+func (DockerContainerManager) ListVolumesByLabels(filters []string) ([]string, error) {
+	return docker.ListVolumesByLabels(filters)
 }
 
 func (DockerContainerManager) Remove(name string) error {

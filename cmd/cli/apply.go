@@ -22,6 +22,26 @@ import (
 
 const applyTimeout = 30 * time.Second
 
+// controllerInstallRef mirrors controller.PluginInstallation —
+// what the server reports back when a plugin was JIT-installed
+// during apply. Decoded inline in runApply so the CLI can
+// surface "installed plugin X v0.2.0 from <repo>" to the
+// operator.
+type controllerInstallRef struct {
+	Plugin  string `json:"plugin"`
+	Version string `json:"version,omitempty"`
+	Source  string `json:"source,omitempty"`
+}
+
+// controllerExpansionRef mirrors controller.PluginExpansion.
+// Surfaces "expanded postgres/data/main → statefulset/data/main"
+// in the apply output so the operator sees the macro layer's
+// work without spelunking into describe.
+type controllerExpansionRef struct {
+	From string   `json:"from"`
+	To   []string `json:"to"`
+}
+
 type applyFlags struct {
 	files            []string
 	format           string // stdin only: "hcl" | "yaml"
@@ -252,15 +272,42 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		reporter.Result(string(m.Kind), m.Scope, m.Name, "applied")
 	}
 
-	// The controller returns {"data": {"applied": [...], "pruned": [...]}}.
-	// Surface prune results so operators can see what a re-apply removed.
+	// The controller returns {"data": {"applied": [...], "pruned":
+	// [...], "plugin_installs": [...], "plugin_expansions": [...]}}.
+	// Surface prune + plugin lifecycle so operators see what
+	// happened beyond the per-manifest verdicts.
 	var env struct {
 		Data struct {
-			Pruned []string `json:"pruned"`
+			Pruned           []string                `json:"pruned"`
+			PluginInstalls   []controllerInstallRef  `json:"plugin_installs,omitempty"`
+			PluginExpansions []controllerExpansionRef `json:"plugin_expansions,omitempty"`
 		} `json:"data"`
 	}
 
 	if err := json.Unmarshal(raw, &env); err == nil {
+		// Plugin installs first — operators want to know "I got
+		// voodu-postgres v0.2.0" before the per-resource lines
+		// scroll past.
+		for _, ins := range env.Data.PluginInstalls {
+			suffix := ins.Plugin
+			if ins.Version != "" {
+				suffix += " " + ins.Version
+			}
+
+			if ins.Source != "" {
+				suffix += " from " + ins.Source
+			}
+
+			reporter.Result("plugin", "", ins.Plugin, "installed "+suffix)
+		}
+
+		// Macro expansions: `expanded postgres/data/main →
+		// statefulset/data/main`. Pretty-print so the operator
+		// sees the lineage at a glance.
+		for _, exp := range env.Data.PluginExpansions {
+			reporter.Result("expand", "", exp.From, "expanded → "+strings.Join(exp.To, ", "))
+		}
+
 		for _, p := range env.Data.Pruned {
 			// p is a pre-formatted "kind/scope/name" string from the
 			// controller. Split back into parts so the typed Result

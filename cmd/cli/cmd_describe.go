@@ -119,6 +119,12 @@ type describeResponse struct {
 		Manifest *controller.Manifest `json:"manifest"`
 		Status   json.RawMessage      `json:"status,omitempty"`
 		Pods     []controller.Pod     `json:"pods,omitempty"`
+
+		// Volumes is statefulset-only. Server omits the field for
+		// other kinds so the JSON view stays clean. Each entry is
+		// a docker named volume produced by a (claim, ordinal)
+		// pair — see handlers_statefulset.go::volumeName.
+		Volumes []string `json:"volumes,omitempty"`
 	} `json:"data"`
 	Error string `json:"error,omitempty"`
 }
@@ -197,7 +203,7 @@ func runDescribe(cmd *cobra.Command, kindStr, ref string, opts describeOptions) 
 
 	// text + spec both render through the same path; `spec` just flips
 	// on the raw spec dump section.
-	return renderDescribe(os.Stdout, env.Data.Manifest, env.Data.Status, env.Data.Pods, mode == "spec")
+	return renderDescribe(os.Stdout, env.Data.Manifest, env.Data.Status, env.Data.Pods, env.Data.Volumes, mode == "spec")
 }
 
 // renderDescribe is the text-mode formatter. Header + per-kind
@@ -210,7 +216,7 @@ func runDescribe(cmd *cobra.Command, kindStr, ref string, opts describeOptions) 
 // matters to a human operator — dumping the spec by default just
 // duplicates information, like the cronjob's `schedule` appearing in
 // both the summary line and the JSON below it.
-func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.RawMessage, pods []controller.Pod, showSpec bool) error {
+func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.RawMessage, pods []controller.Pod, volumes []string, showSpec bool) error {
 	if manifest == nil {
 		return fmt.Errorf("empty response: no manifest returned")
 	}
@@ -231,11 +237,8 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 	// duplicating them via a JSON dump below was the duplication that
 	// motivated this refactor.
 	switch manifest.Kind {
-	case controller.KindDeployment:
+	case controller.KindDeployment, controller.KindStatefulset:
 		renderDeploymentSummary(w, statusBlob, pods)
-
-	case controller.KindDatabase:
-		renderDatabaseSummary(w, statusBlob)
 
 	case controller.KindIngress:
 		renderIngressSummary(w, statusBlob)
@@ -264,14 +267,27 @@ func renderDescribe(w io.Writer, manifest *controller.Manifest, statusBlob json.
 	}
 
 	// Pods section — only render when there's something to show.
-	// Plugin-managed kinds (ingress = caddy on the host, database =
-	// plugin-owned containers without our labels) typically come back
-	// empty; skipping the heading keeps the output uncluttered.
+	// Plugin-managed kinds (ingress = caddy on the host) typically
+	// come back empty; skipping the heading keeps the output
+	// uncluttered.
 	if len(pods) > 0 {
 		fmt.Fprintf(w, "\npods (%d):\n", len(pods))
 
 		if err := renderDescribePodsTable(w, pods); err != nil {
 			return err
+		}
+	}
+
+	// Volumes section — statefulset only. Names follow the
+	// `voodu-<scope>-<name>-<claim>-<ordinal>` convention so the
+	// operator can match each entry to a (claim, ordinal) without
+	// inspecting docker. Renders nothing when the slice is empty
+	// (no claims declared, or kind doesn't carry persistent storage).
+	if len(volumes) > 0 {
+		fmt.Fprintf(w, "\nvolumes (%d):\n", len(volumes))
+
+		for _, v := range volumes {
+			fmt.Fprintf(w, "  %s\n", v)
 		}
 	}
 
@@ -442,32 +458,6 @@ func humanizeAge(d time.Duration) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	default:
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-	}
-}
-
-func renderDatabaseSummary(w io.Writer, blob json.RawMessage) {
-	var st controller.DatabaseStatus
-	if !decodeStatus(w, blob, &st) {
-		return
-	}
-
-	fmt.Fprintf(w, "  engine:  %s\n", dashIfEmpty(st.Engine))
-	fmt.Fprintf(w, "  version: %s\n", dashIfEmpty(st.Version))
-
-	if len(st.Data) > 0 {
-		fmt.Fprintln(w, "  data:")
-
-		for k, v := range st.Data {
-			fmt.Fprintf(w, "    %s: %v\n", k, v)
-		}
-	}
-
-	if len(st.Params) > 0 {
-		fmt.Fprintln(w, "  params:")
-
-		for k, v := range st.Params {
-			fmt.Fprintf(w, "    %s: %s\n", k, v)
-		}
 	}
 }
 

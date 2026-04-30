@@ -34,14 +34,20 @@ func newPluginsCmd() *cobra.Command {
 }
 
 func newPluginsInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var version string
+
+	cmd := &cobra.Command{
 		Use:   "install SOURCE",
 		Short: "Install a plugin from a git repo, URL or local path",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return pluginInstall(cmd.Root(), args[0])
+			return pluginInstall(cmd.Root(), args[0], version)
 		},
 	}
+
+	cmd.Flags().StringVar(&version, "version", "", "Pin to a specific git tag (e.g. 0.2.0). Without this, the default branch is cloned.")
+
+	return cmd
 }
 
 func newPluginsListCmd() *cobra.Command {
@@ -81,8 +87,13 @@ func newPluginsUpdateCmd() *cobra.Command {
 	}
 }
 
-func pluginInstall(root *cobra.Command, source string) error {
-	body, _ := json.Marshal(map[string]string{"source": source})
+func pluginInstall(root *cobra.Command, source, version string) error {
+	payload := map[string]string{"source": source}
+	if version != "" {
+		payload["version"] = version
+	}
+
+	body, _ := json.Marshal(payload)
 
 	resp, err := controllerDo(root, http.MethodPost, "/plugins/install", "", bytes.NewReader(body))
 	if err != nil {
@@ -239,7 +250,10 @@ func pluginUpdate(root *cobra.Command, name string) error {
 			continue
 		}
 
-		if err := pluginInstall(root, p.Source); err != nil {
+		// `vd plugins update` reinstalls from the recorded
+		// source at the latest tag (default branch). Pin via
+		// `vd plugins install <source> --version X` if needed.
+		if err := pluginInstall(root, p.Source, ""); err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", p.Name, err))
 		}
 	}

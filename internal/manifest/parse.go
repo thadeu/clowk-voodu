@@ -10,7 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hashicorp/hcl/v2/hclsimple"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 	"gopkg.in/yaml.v3"
 
 	"go.voodu.clowk.in/internal/controller"
@@ -119,7 +123,11 @@ func parseBytes(source string, raw []byte, format Format, vars map[string]string
 
 	switch format {
 	case FormatHCL:
-		return parseHCL(source, []byte(interp))
+		// Pre-escape server-side refs (`${ref.…}`, `${asset.…}`)
+		// so HCL doesn't choke on them as template variables.
+		// They land in the manifest as literal `${…}` and the
+		// controller resolves them at reconcile time.
+		return parseHCL(source, []byte(escapeServerSideRefsForHCL(interp)))
 	case FormatYAML:
 		return parseYAML([]byte(interp))
 	default:
@@ -161,29 +169,24 @@ func formatFromExt(path string) (Format, error) {
 	}
 }
 
-// hclRoot is the top-level shape of an HCL manifest file. Each kind has
-// its own slice so hclsimple can tell blocks apart by label. HCL block
-// structs list their fields explicitly — hcl/v2 doesn't walk anonymous
-// embedded specs, so we mirror (not embed) the typed Spec shape.
+// HCL block structs list their fields explicitly — hcl/v2 doesn't
+// walk anonymous embedded specs, so we mirror (not embed) the typed
+// Spec shape.
 //
-// `app` is authoring sugar — not a controller kind. Each app block in
-// the source expands into one deployment + one ingress with the same
-// (scope, name); the controller never sees an "app". This keeps the
-// runtime contract simple (every manifest is one of the canonical
-// kinds) while letting users declare the overwhelmingly common
-// "1 deployment ↔ 1 ingress" pair in a single block.
-type hclRoot struct {
-	Apps        []hclApp        `hcl:"app,block"`
-	Deployments []hclDeployment `hcl:"deployment,block"`
-	Databases   []hclDatabase   `hcl:"database,block"`
-	Ingresses   []hclIngress    `hcl:"ingress,block"`
-	Jobs        []hclJob        `hcl:"job,block"`
-	CronJobs    []hclCronJob    `hcl:"cronjob,block"`
-}
+// `app` is authoring sugar — not a controller kind. Each app block
+// in the source expands into one deployment + one ingress with the
+// same (scope, name); the controller never sees an "app". This
+// keeps the runtime contract simple (every manifest is one of the
+// canonical kinds) while letting users declare the overwhelmingly
+// common "1 deployment ↔ 1 ingress" pair in a single block.
+//
+// Block-name dispatch happens in parseHCL via the hclsyntax-level
+// iteration. Unknown block types (`postgres`, `redis`, …) are not
+// rejected — they're emitted as Manifests with Kind = block type
+// and Spec = JSON of the block's attributes. The server side
+// (M-D1+) decides whether a plugin is registered to expand them.
 
 type hclDeployment struct {
-	Scope        string            `hcl:"scope,label"`
-	Name         string            `hcl:"name,label"`
 	Image        string            `hcl:"image,optional"`
 	Workdir      string            `hcl:"workdir,optional"`
 	Dockerfile   string            `hcl:"dockerfile,optional"`
@@ -301,9 +304,6 @@ func (b hclDeployment) spec() DeploymentSpec {
 // `deployment` + `ingress` separately. The parser doesn't try to
 // cover every shape — it covers the 90% case in fewer lines.
 type hclApp struct {
-	Scope string `hcl:"scope,label"`
-	Name  string `hcl:"name,label"`
-
 	// Deployment-side fields — verbatim copy of hclDeployment minus
 	// the labels (which the app already carries). Kept in sync by
 	// hand: HCL doesn't walk embedded structs, and a code-gen step
@@ -417,36 +417,73 @@ func (b hclApp) ingressSpec() IngressSpec {
 	return out
 }
 
-type hclDatabase struct {
-	Name    string            `hcl:"name,label"`
-	Engine  string            `hcl:"engine"`
-	Version string            `hcl:"version,optional"`
-	Storage string            `hcl:"storage,optional"`
-	Backup  *hclBackup        `hcl:"backup,block"`
-	Params  map[string]string `hcl:"params,optional"`
+// hclStatefulset is the HCL surface for a statefulset workload —
+// pods with stable ordinal identity, per-pod storage (volume claim
+// templates from M-S2), and ordered rollout. Image-mode only on
+// M-S0/M-S1; build-mode and release blocks are deferred since
+// statefulsets in practice are databases / queues / caches with
+// prebuilt registry images.
+//
+// Field selection is a strict subset of hclDeployment. Lang and
+// Release are absent (not "optional" — adding them prematurely
+// would advertise capabilities the handler doesn't yet honour).
+// VolumeClaim becomes a block list in M-S2.
+type hclStatefulset struct {
+	Image       string            `hcl:"image,optional"`
+	Replicas    int               `hcl:"replicas,optional"`
+	Command     []string          `hcl:"command,optional"`
+	Env         map[string]string `hcl:"env,optional"`
+	Ports       []string          `hcl:"ports,optional"`
+	Volumes     []string          `hcl:"volumes,optional"`
+	Network     string            `hcl:"network,optional"`
+	Networks    []string          `hcl:"networks,optional"`
+	NetworkMode string            `hcl:"network_mode,optional"`
+	Restart     string            `hcl:"restart,optional"`
+	HealthCheck string            `hcl:"health_check,optional"`
+
+	VolumeClaims []hclVolumeClaim `hcl:"volume_claim,block"`
 }
 
-type hclBackup struct {
-	Schedule  string `hcl:"schedule,optional"`
-	Retention string `hcl:"retention,optional"`
-	Target    string `hcl:"target,optional"`
+// hclVolumeClaim is one per-pod volume template. The block label
+// (`volume_claim "data"`) becomes the claim name; remaining fields
+// are body attributes. Only MountPath is mandatory — Size is
+// informational on M-S2 (docker has no native quota enforcement).
+type hclVolumeClaim struct {
+	Name      string `hcl:"name,label"`
+	MountPath string `hcl:"mount_path"`
+	Size      string `hcl:"size,optional"`
 }
 
-func (b hclDatabase) spec() DatabaseSpec {
-	out := DatabaseSpec{Engine: b.Engine, Version: b.Version, Storage: b.Storage, Params: b.Params}
+func (b hclStatefulset) spec() StatefulsetSpec {
+	s := StatefulsetSpec{
+		Image:       b.Image,
+		Replicas:    b.Replicas,
+		Command:     b.Command,
+		Env:         b.Env,
+		Ports:       b.Ports,
+		Volumes:     b.Volumes,
+		Network:     b.Network,
+		Networks:    b.Networks,
+		NetworkMode: b.NetworkMode,
+		Restart:     b.Restart,
+		HealthCheck: b.HealthCheck,
+	}
 
-	if b.Backup != nil {
-		out.Backup = &DatabaseBackup{
-			Schedule: b.Backup.Schedule, Retention: b.Backup.Retention, Target: b.Backup.Target,
+	if len(b.VolumeClaims) > 0 {
+		s.VolumeClaims = make([]VolumeClaim, 0, len(b.VolumeClaims))
+		for _, c := range b.VolumeClaims {
+			s.VolumeClaims = append(s.VolumeClaims, VolumeClaim{
+				Name:      c.Name,
+				MountPath: c.MountPath,
+				Size:      c.Size,
+			})
 		}
 	}
 
-	return out
+	return s
 }
 
 type hclIngress struct {
-	Scope     string              `hcl:"scope,label"`
-	Name      string              `hcl:"name,label"`
 	Host      string              `hcl:"host"`
 	Service   string              `hcl:"service,optional"`
 	Port      int                 `hcl:"port,optional"`
@@ -510,8 +547,6 @@ func (b hclIngress) spec() IngressSpec {
 // build pipeline (rake task, alembic migration, …) without wanting a
 // separate registry image.
 type hclJob struct {
-	Scope       string            `hcl:"scope,label"`
-	Name        string            `hcl:"name,label"`
 	Image       string            `hcl:"image,optional"`
 	Workdir     string            `hcl:"workdir,optional"`
 	Dockerfile  string            `hcl:"dockerfile,optional"`
@@ -571,8 +606,6 @@ func (b hclJob) spec() JobSpec {
 // noisy. The handler reconstructs a JobSpec at apply time by copying
 // the matching fields.
 type hclCronJob struct {
-	Scope string `hcl:"scope,label"`
-	Name  string `hcl:"name,label"`
 
 	Schedule          string `hcl:"schedule"`
 	Timezone          string `hcl:"timezone,optional"`
@@ -632,89 +665,52 @@ func (b hclCronJob) spec() CronJobSpec {
 	}
 }
 
+// parseHCL is the dynamic-block-aware HCL parser. It iterates over
+// every top-level block in the file via hclsyntax (to keep
+// "unknown" block types around — that's what the plugin system
+// rides on) and dispatches per block type:
+//
+//   - Core block types (app, deployment, statefulset, ingress,
+//     job, cronjob): decoded with gohcl into the typed hcl* struct
+//     for the kind, then encoded into the wire-shape Manifest.
+//
+//   - Anything else: treated as a plugin block. Its labels are
+//     interpreted as (scope, name) — 0 labels means unscoped
+//     singleton (Name = block type), 1 label means name-only,
+//     2 labels means scope+name. Its body's attributes are walked
+//     and emitted as a JSON spec. Nested blocks become arrays
+//     keyed by block type. The server decides whether a plugin
+//     is registered for the kind; the parser stays agnostic.
+//
+// The synthetic .hcl extension dance survives — gohcl's diagnostic
+// formatting picks up the source name and underlines the offending
+// expressions exactly like hclsimple did.
 func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
-	// hclsimple.Decode hard-codes its dispatch on ".hcl" / ".hcl.json",
-	// so any other extension (our branded .voodu/.vdu/.vd, or a stdin
-	// source with no extension at all) gets rewritten to a synthetic
-	// .hcl path before the call. The original name is kept for error
-	// messages when it already ended in .hcl.
 	if strings.ToLower(filepath.Ext(source)) != ".hcl" {
 		source = source + ".hcl"
 	}
 
-	var root hclRoot
+	parser := hclparse.NewParser()
 
-	if err := hclsimple.Decode(source, raw, nil, &root); err != nil {
-		return nil, err
+	file, diags := parser.ParseHCL(raw, source)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	body, ok := file.Body.(*hclsyntax.Body)
+	if !ok {
+		return nil, fmt.Errorf("unexpected HCL backend %T (want *hclsyntax.Body)", file.Body)
 	}
 
 	var out []controller.Manifest
 
-	// Apps expand into a deployment + ingress pair with the same
-	// (scope, name). Emit the pair first so the canonical kinds are
-	// already in `out` when collision detection runs at the end — that
-	// way duplicate (kind, scope, name) errors point at the standalone
-	// block as the redeclaration regardless of where it sits in the
-	// source.
-	for _, b := range root.Apps {
-		dep, err := encode(controller.KindDeployment, b.Scope, b.Name, b.deploymentSpec())
+	for _, blk := range body.Blocks {
+		mans, err := dispatchHCLBlock(blk, source)
 		if err != nil {
 			return nil, err
 		}
 
-		out = append(out, dep)
-
-		ing, err := encode(controller.KindIngress, b.Scope, b.Name, b.ingressSpec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, ing)
-	}
-
-	for _, b := range root.Deployments {
-		m, err := encode(controller.KindDeployment, b.Scope, b.Name, b.spec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
-	}
-
-	for _, b := range root.Databases {
-		m, err := encode(controller.KindDatabase, "", b.Name, b.spec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
-	}
-
-	for _, b := range root.Ingresses {
-		m, err := encode(controller.KindIngress, b.Scope, b.Name, b.spec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
-	}
-
-	for _, b := range root.Jobs {
-		m, err := encode(controller.KindJob, b.Scope, b.Name, b.spec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
-	}
-
-	for _, b := range root.CronJobs {
-		m, err := encode(controller.KindCronJob, b.Scope, b.Name, b.spec())
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
+		out = append(out, mans...)
 	}
 
 	if err := assertNoDuplicateIdentities(out); err != nil {
@@ -723,6 +719,391 @@ func parseHCL(source string, raw []byte) ([]controller.Manifest, error) {
 
 	return out, nil
 }
+
+// dispatchHCLBlock routes one top-level block to the right
+// decoder. Apps fan out to (deployment, ingress) so the dedup
+// check downstream catches collisions cleanly; everything else is
+// 1:1 (one block → one manifest, except plugin blocks where the
+// wire kind is the block type itself).
+func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifest, error) {
+	switch blk.Type {
+	case "app":
+		return decodeAppBlock(blk)
+
+	case "deployment":
+		scope, name, err := requireScopedLabels(blk)
+		if err != nil {
+			return nil, err
+		}
+
+		var d hclDeployment
+		if d2 := gohcl.DecodeBody(blk.Body, nil, &d); d2.HasErrors() {
+			return nil, d2
+		}
+
+		m, err := encode(controller.KindDeployment, scope, name, d.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		return []controller.Manifest{m}, nil
+
+	case "statefulset":
+		scope, name, err := requireScopedLabels(blk)
+		if err != nil {
+			return nil, err
+		}
+
+		var s hclStatefulset
+		if d := gohcl.DecodeBody(blk.Body, nil, &s); d.HasErrors() {
+			return nil, d
+		}
+
+		m, err := encode(controller.KindStatefulset, scope, name, s.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		return []controller.Manifest{m}, nil
+
+	case "ingress":
+		scope, name, err := requireScopedLabels(blk)
+		if err != nil {
+			return nil, err
+		}
+
+		var i hclIngress
+		if d := gohcl.DecodeBody(blk.Body, nil, &i); d.HasErrors() {
+			return nil, d
+		}
+
+		m, err := encode(controller.KindIngress, scope, name, i.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		return []controller.Manifest{m}, nil
+
+	case "job":
+		scope, name, err := requireScopedLabels(blk)
+		if err != nil {
+			return nil, err
+		}
+
+		var j hclJob
+		if d := gohcl.DecodeBody(blk.Body, nil, &j); d.HasErrors() {
+			return nil, d
+		}
+
+		m, err := encode(controller.KindJob, scope, name, j.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		return []controller.Manifest{m}, nil
+
+	case "cronjob":
+		scope, name, err := requireScopedLabels(blk)
+		if err != nil {
+			return nil, err
+		}
+
+		var c hclCronJob
+		if d := gohcl.DecodeBody(blk.Body, nil, &c); d.HasErrors() {
+			return nil, d
+		}
+
+		m, err := encode(controller.KindCronJob, scope, name, c.spec())
+		if err != nil {
+			return nil, err
+		}
+
+		return []controller.Manifest{m}, nil
+
+	case "asset":
+		return decodeAssetBlock(blk, source)
+
+	default:
+		return decodePluginBlock(blk)
+	}
+}
+
+// decodeAssetBlock collects every body attribute as one entry in
+// the asset's `files` map. Unlike the other core kinds, asset
+// has NO typed schema — the body is a flat key-to-source mapping
+// where the operator chooses both the key name and the source
+// kind:
+//
+//	asset "clowk-lp" "redis" {
+//	  configuration = file("./redis/redis.conf")
+//	  acls          = url("https://r2.example.com/acl")
+//	  motd          = "Welcome to production"
+//	}
+//
+// The CLI's HCL eval context (M-C1) implements `file()` and
+// `url()` as functions returning typed objects with a `_source`
+// discriminator the server later inspects to choose the
+// materialisation strategy.
+//
+// Nested blocks are not supported on assets — there's nothing
+// to nest. Operators who try get a clear error.
+func decodeAssetBlock(blk *hclsyntax.Block, source string) ([]controller.Manifest, error) {
+	scope, name, err := requireScopedLabels(blk)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(blk.Body.Blocks) > 0 {
+		return nil, fmt.Errorf("asset/%s/%s: nested blocks are not supported (asset bodies are flat key/source pairs)", scope, name)
+	}
+
+	files := make(map[string]any, len(blk.Body.Attributes))
+
+	for k, attr := range blk.Body.Attributes {
+		val, diags := attr.Expr.Value(assetEvalContext(source))
+		if diags.HasErrors() {
+			return nil, diags
+		}
+
+		files[k] = ctyValueToGo(val)
+	}
+
+	specJSON, err := json.Marshal(map[string]any{"files": files})
+	if err != nil {
+		return nil, err
+	}
+
+	return []controller.Manifest{
+		{
+			Kind:  controller.KindAsset,
+			Scope: scope,
+			Name:  name,
+			Spec:  specJSON,
+		},
+	}, nil
+}
+
+// requireScopedLabels enforces the scoped-kind label contract: two
+// labels exactly, neither empty. Plain `deployment "scope" "name"
+// {}` lands here cleanly; missing labels (or an extra one) errors
+// at parse time so the operator sees the mistake before the wire.
+func requireScopedLabels(blk *hclsyntax.Block) (scope, name string, err error) {
+	if len(blk.Labels) != 2 {
+		return "", "", fmt.Errorf("%s block needs scope and name labels (got %d)", blk.Type, len(blk.Labels))
+	}
+
+	scope, name = blk.Labels[0], blk.Labels[1]
+
+	if scope == "" || name == "" {
+		return "", "", fmt.Errorf("%s block: scope and name must both be non-empty", blk.Type)
+	}
+
+	return scope, name, nil
+}
+
+// decodeAppBlock fans `app "scope" "name" { ... }` out into the
+// canonical (deployment, ingress) pair. The pair shares the
+// (scope, name); downstream dedup catches an `app` followed by a
+// standalone `deployment` of the same identity.
+func decodeAppBlock(blk *hclsyntax.Block) ([]controller.Manifest, error) {
+	scope, name, err := requireScopedLabels(blk)
+	if err != nil {
+		return nil, err
+	}
+
+	var a hclApp
+	if d := gohcl.DecodeBody(blk.Body, nil, &a); d.HasErrors() {
+		return nil, d
+	}
+
+	dep, err := encode(controller.KindDeployment, scope, name, a.deploymentSpec())
+	if err != nil {
+		return nil, err
+	}
+
+	ing, err := encode(controller.KindIngress, scope, name, a.ingressSpec())
+	if err != nil {
+		return nil, err
+	}
+
+	return []controller.Manifest{dep, ing}, nil
+}
+
+// decodePluginBlock turns an unknown block (`postgres`, `redis`,
+// `mysql`, …) into a Manifest with Kind = block type. Labels map
+// to (scope, name) per the convention:
+//
+//	postgres { … }                  Scope="", Name="postgres" (singleton)
+//	postgres "main" { … }           Scope="", Name="main"
+//	postgres "data" "main" { … }    Scope="data", Name="main"
+//
+// Spec is the JSON of the block's attributes, plus nested blocks
+// rolled up under their type as either an object (single
+// occurrence) or array (multiple). The server-side plugin
+// registry (M-D1+) decides whether a plugin handles this kind;
+// the parser stays agnostic — operators can pre-write HCL for
+// plugins they haven't installed yet.
+func decodePluginBlock(blk *hclsyntax.Block) ([]controller.Manifest, error) {
+	var scope, name string
+
+	switch len(blk.Labels) {
+	case 0:
+		// Singleton — block type IS the resource name. Useful
+		// for "global" plugins that only ever exist once on a
+		// host (a redis cache, a single mongo).
+		name = blk.Type
+	case 1:
+		name = blk.Labels[0]
+	case 2:
+		scope, name = blk.Labels[0], blk.Labels[1]
+	default:
+		return nil, fmt.Errorf("%s block: too many labels (max 2: scope and name)", blk.Type)
+	}
+
+	if name == "" {
+		return nil, fmt.Errorf("%s block: name must be non-empty", blk.Type)
+	}
+
+	specJSON, err := bodyToJSON(blk.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: %w", blk.Type, name, err)
+	}
+
+	return []controller.Manifest{
+		{
+			Kind:  controller.Kind(blk.Type),
+			Scope: scope,
+			Name:  name,
+			Spec:  specJSON,
+		},
+	}, nil
+}
+
+// bodyToJSON walks an hclsyntax.Body collecting attributes (cty
+// values converted to Go primitives + JSON-marshalled) and nested
+// blocks (recursed into the same shape). Single-occurrence nested
+// blocks become an object; multi-occurrence become an array of
+// objects under the block type key.
+//
+// EvalContext is nil — plugin blocks accept literal values only
+// in M-D0d. ${VAR} interpolation already happened at the
+// pre-parse stage (see Interpolate); HCL-side functions / refs
+// land in M-D2 alongside the expand pipeline.
+func bodyToJSON(body *hclsyntax.Body) (json.RawMessage, error) {
+	out := make(map[string]any, len(body.Attributes)+len(body.Blocks))
+
+	for k, attr := range body.Attributes {
+		val, diags := attr.Expr.Value(nil)
+		if diags.HasErrors() {
+			return nil, diags
+		}
+
+		out[k] = ctyValueToGo(val)
+	}
+
+	// Nested blocks: collapse to object when single occurrence,
+	// array of objects when multiple. This matches how operators
+	// expect to write `postgres "main" { backup { schedule = "..." } }`
+	// (one backup) vs `redis "cluster" { node {…} node {…} }`
+	// (multiple nodes).
+	nestedByType := make(map[string][]map[string]any, len(body.Blocks))
+
+	for _, nested := range body.Blocks {
+		nestedSpec, err := bodyToJSON(nested.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		var asMap map[string]any
+
+		if err := json.Unmarshal(nestedSpec, &asMap); err != nil {
+			return nil, fmt.Errorf("nested block %s: %w", nested.Type, err)
+		}
+
+		// Labels on nested blocks (e.g. `volume_claim "data" {…}`)
+		// land under a synthetic "_labels" key so the plugin can
+		// recover them. Skipped when the nested block has no
+		// labels.
+		if len(nested.Labels) > 0 {
+			labels := make([]any, 0, len(nested.Labels))
+			for _, lbl := range nested.Labels {
+				labels = append(labels, lbl)
+			}
+
+			asMap["_labels"] = labels
+		}
+
+		nestedByType[nested.Type] = append(nestedByType[nested.Type], asMap)
+	}
+
+	for typ, list := range nestedByType {
+		if len(list) == 1 {
+			out[typ] = list[0]
+		} else {
+			out[typ] = list
+		}
+	}
+
+	return json.Marshal(out)
+}
+
+// ctyValueToGo collapses a cty.Value into the Go-side any types
+// that json.Marshal handles natively. cty's type system is richer
+// than JSON (numbers stay arbitrary-precision until rendered;
+// tuples/objects vs lists/maps), so we collapse to the simpler
+// shape — float64 for numbers, []any for sequences, map[string]any
+// for keyed collections. Null becomes nil.
+//
+// This is enough for declarative plugin configs (image strings,
+// numeric replicas, env maps, lists of ports). Plugins that need
+// HCL-side functions (fileexists(), etc.) will get a richer eval
+// context in M-D2.
+func ctyValueToGo(val cty.Value) any {
+	if val.IsNull() {
+		return nil
+	}
+
+	ty := val.Type()
+
+	switch {
+	case ty.Equals(cty.String):
+		return val.AsString()
+
+	case ty.Equals(cty.Bool):
+		return val.True()
+
+	case ty.Equals(cty.Number):
+		f, _ := val.AsBigFloat().Float64()
+		return f
+
+	case ty.IsListType(), ty.IsTupleType(), ty.IsSetType():
+		out := make([]any, 0, val.LengthInt())
+
+		for it := val.ElementIterator(); it.Next(); {
+			_, v := it.Element()
+			out = append(out, ctyValueToGo(v))
+		}
+
+		return out
+
+	case ty.IsMapType(), ty.IsObjectType():
+		out := make(map[string]any, val.LengthInt())
+
+		for it := val.ElementIterator(); it.Next(); {
+			k, v := it.Element()
+			out[k.AsString()] = ctyValueToGo(v)
+		}
+
+		return out
+	}
+
+	return nil
+}
+
+// _ keeps hcl.Diagnostics referenced from the gohcl path imported
+// (gohcl.DecodeBody returns diagnostics directly) — needed because
+// the import only otherwise appears in gohcl call sites.
+var _ = hcl.DiagError
 
 // assertNoDuplicateIdentities rejects files that declare the same
 // (kind, scope, name) tuple more than once. Catches two authoring
@@ -831,8 +1212,8 @@ func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, err
 
 		return s, nil
 
-	case controller.KindDatabase:
-		var s DatabaseSpec
+	case controller.KindStatefulset:
+		var s StatefulsetSpec
 		return s, node.Decode(&s)
 
 	case controller.KindIngress:
@@ -845,6 +1226,10 @@ func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, err
 
 	case controller.KindCronJob:
 		var s CronJobSpec
+		return s, node.Decode(&s)
+
+	case controller.KindAsset:
+		var s AssetSpec
 		return s, node.Decode(&s)
 
 	default:

@@ -214,8 +214,8 @@ func TestParseHCLMultiKind(t *testing.T) {
 deployment "test" "api" {
   image = "a:1"
 }
-database "main" {
-  engine = "postgres"
+statefulset "data" "pg" {
+  image = "postgres:15"
 }
 ingress "test" "api" {
   host    = "api.example.com"
@@ -514,10 +514,11 @@ spec:
   image: nginx:1
   replicas: 2
 ---
-kind: database
-name: main
+kind: statefulset
+scope: data
+name: pg
 spec:
-  engine: postgres
+  image: postgres:15
 `
 	tmp := writeTemp(t, "stack.yaml", src)
 
@@ -530,7 +531,7 @@ spec:
 		t.Fatalf("want 2 manifests, got %d", len(mans))
 	}
 
-	if mans[0].Kind != controller.KindDeployment || mans[1].Kind != controller.KindDatabase {
+	if mans[0].Kind != controller.KindDeployment || mans[1].Kind != controller.KindStatefulset {
 		t.Errorf("unexpected kinds: %+v %+v", mans[0], mans[1])
 	}
 }
@@ -539,7 +540,7 @@ func TestParseDirMixedFormats(t *testing.T) {
 	dir := t.TempDir()
 
 	writeAt(t, filepath.Join(dir, "a.hcl"), `deployment "test" "api" { image = "x:1" }`)
-	writeAt(t, filepath.Join(dir, "b.yaml"), "kind: database\nname: main\nspec:\n  engine: postgres\n")
+	writeAt(t, filepath.Join(dir, "b.yaml"), "kind: statefulset\nscope: data\nname: pg\nspec:\n  image: postgres:15\n")
 	writeAt(t, filepath.Join(dir, "README.md"), "ignored")
 
 	sub := filepath.Join(dir, "sub")
@@ -996,6 +997,166 @@ spec:
 
 	if spec.SuccessfulHistoryLimit != 5 || spec.FailedHistoryLimit != 2 {
 		t.Errorf("history limits: succ=%d fail=%d", spec.SuccessfulHistoryLimit, spec.FailedHistoryLimit)
+	}
+}
+
+// TestParseHCLPluginBlockEmitsDynamicKind locks down the M-D0d
+// contract: any block type the parser doesn't have a typed
+// decoder for becomes a Manifest with Kind = block type and Spec
+// = JSON of the body's attributes. The server side decides
+// whether a plugin is registered for that kind — the parser
+// stays agnostic.
+//
+// Three label shapes covered: 0 (singleton), 1 (name-only), 2
+// (scope+name). Each maps to the (Scope, Name) pair the
+// downstream handler expects; without explicit testing the rule
+// could silently drift to "always 2 labels" or similar.
+func TestParseHCLPluginBlockEmitsDynamicKind(t *testing.T) {
+	src := `
+postgres "data" "main" {
+  image    = "postgres:15-alpine"
+  replicas = 2
+
+  env = {
+    POSTGRES_DB = "myapp"
+  }
+}
+
+redis "cache" {
+  image   = "redis:7-alpine"
+  cluster = false
+}
+
+mongo {
+  image = "mongo:7"
+}
+`
+	tmp := writeTemp(t, "plugins.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if len(mans) != 3 {
+		t.Fatalf("expected 3 manifests, got %d", len(mans))
+	}
+
+	byKind := make(map[string]controller.Manifest, len(mans))
+	for _, m := range mans {
+		byKind[string(m.Kind)] = m
+	}
+
+	// 2 labels → scope + name.
+	pg := byKind["postgres"]
+	if pg.Scope != "data" || pg.Name != "main" {
+		t.Errorf("postgres scope/name: %q/%q", pg.Scope, pg.Name)
+	}
+
+	var pgSpec map[string]any
+	if err := json.Unmarshal(pg.Spec, &pgSpec); err != nil {
+		t.Fatalf("decode postgres spec: %v", err)
+	}
+
+	if pgSpec["image"] != "postgres:15-alpine" {
+		t.Errorf("postgres image: %v", pgSpec["image"])
+	}
+
+	if pgSpec["replicas"].(float64) != 2 {
+		t.Errorf("postgres replicas: %v", pgSpec["replicas"])
+	}
+
+	envMap, _ := pgSpec["env"].(map[string]any)
+	if envMap["POSTGRES_DB"] != "myapp" {
+		t.Errorf("postgres env: %v", envMap)
+	}
+
+	// 1 label → name only, scope empty.
+	rd := byKind["redis"]
+	if rd.Scope != "" || rd.Name != "cache" {
+		t.Errorf("redis scope/name: %q/%q", rd.Scope, rd.Name)
+	}
+
+	var rdSpec map[string]any
+	_ = json.Unmarshal(rd.Spec, &rdSpec)
+
+	if rdSpec["cluster"] != false {
+		t.Errorf("redis cluster: %v", rdSpec["cluster"])
+	}
+
+	// 0 labels → name = block type (singleton).
+	mg := byKind["mongo"]
+	if mg.Scope != "" || mg.Name != "mongo" {
+		t.Errorf("mongo (singleton) scope/name: %q/%q", mg.Scope, mg.Name)
+	}
+}
+
+// TestParseHCLPluginBlockNestedBlocks covers nested-block
+// rollup: `postgres "main" { backup { schedule = "..." } }`
+// surfaces backup as an object inside the spec; multiple
+// occurrences would surface as an array. Plugins that need
+// labels on nested blocks (e.g. `volume_claim "data" {…}`)
+// recover them via the synthetic "_labels" key.
+func TestParseHCLPluginBlockNestedBlocks(t *testing.T) {
+	src := `
+postgres "main" {
+  image = "postgres:15-alpine"
+
+  backup {
+    schedule  = "@daily"
+    retention = "7d"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+
+  volume_claim "wal" {
+    mount_path = "/var/lib/postgresql/wal"
+  }
+}
+`
+	tmp := writeTemp(t, "nested.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("expected 1 manifest, got %d", len(mans))
+	}
+
+	var spec map[string]any
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	// Single occurrence — flat object.
+	backup, ok := spec["backup"].(map[string]any)
+	if !ok {
+		t.Fatalf("backup not an object: %T %v", spec["backup"], spec["backup"])
+	}
+
+	if backup["schedule"] != "@daily" {
+		t.Errorf("backup.schedule: %v", backup["schedule"])
+	}
+
+	// Multiple occurrence — array of objects.
+	claims, ok := spec["volume_claim"].([]any)
+	if !ok {
+		t.Fatalf("volume_claim not a list: %T %v", spec["volume_claim"], spec["volume_claim"])
+	}
+
+	if len(claims) != 2 {
+		t.Fatalf("expected 2 volume_claims, got %d", len(claims))
+	}
+
+	first, _ := claims[0].(map[string]any)
+
+	labels, _ := first["_labels"].([]any)
+	if len(labels) != 1 {
+		t.Errorf("first claim labels: %v", labels)
 	}
 }
 

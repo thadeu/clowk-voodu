@@ -28,9 +28,9 @@ deployment "test" "api" {
 }
 `)
 
-	mustWrite(t, filepath.Join(dir, "database.hcl"), `
-database "main" {
-  engine = "postgres"
+	mustWrite(t, filepath.Join(dir, "statefulset.hcl"), `
+statefulset "data" "pg" {
+  image = "postgres:15"
 }
 `)
 
@@ -95,7 +95,7 @@ ingress "test" "api" {
 		kinds[m.Kind] = true
 	}
 
-	for _, want := range []controller.Kind{controller.KindDeployment, controller.KindDatabase, controller.KindIngress} {
+	for _, want := range []controller.Kind{controller.KindDeployment, controller.KindStatefulset, controller.KindIngress} {
 		if !kinds[want] {
 			t.Errorf("missing kind %s", want)
 		}

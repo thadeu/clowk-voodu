@@ -1,6 +1,9 @@
 package controller
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // networkAliasTLD is the synthetic top-level voodu reserves for the
 // fully-qualified DNS form of every container alias. Branded so it
@@ -51,6 +54,56 @@ func BuildNetworkAliases(scope, name string) []string {
 	}
 
 	short := name + "." + scope
+
+	return []string{
+		short,
+		short + "." + networkAliasTLD,
+	}
+}
+
+// BuildPodNetworkAliases returns the per-pod DNS names for a
+// statefulset replica. Distinct from BuildNetworkAliases (which
+// returns names round-robined across all replicas) — these names
+// resolve to ONE specific ordinal, so plugin postgres can dial
+// `pg-0.scope` and reach the primary even when multiple replicas
+// of the same statefulset share the bridge.
+//
+// Shape:
+//
+//	scoped:   ["<name>-<ord>.<scope>", "<name>-<ord>.<scope>.voodu"]
+//	unscoped: ["<name>-<ord>", "<name>-<ord>.voodu"]
+//
+// Statefulset replicas register BOTH the per-pod alias set AND
+// the shared one — so clients that don't care about identity
+// (`pg.scope`) get round-robin'd as before, while clients that
+// need a specific replica (`pg-0.scope`) hit it deterministically.
+// The handler concatenates both lists when building the
+// ContainerSpec; this helper just emits the per-pod half.
+//
+// Negative ordinals are clamped to 0 — same posture as
+// containers.OrdinalReplicaID. Returns nil when name is empty.
+func BuildPodNetworkAliases(scope, name string, ordinal int) []string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return nil
+	}
+
+	if ordinal < 0 {
+		ordinal = 0
+	}
+
+	scope = strings.ToLower(strings.TrimSpace(scope))
+
+	podName := name + "-" + strconv.Itoa(ordinal)
+
+	if scope == "" {
+		return []string{
+			podName,
+			podName + "." + networkAliasTLD,
+		}
+	}
+
+	short := podName + "." + scope
 
 	return []string{
 		short,

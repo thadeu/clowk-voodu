@@ -30,19 +30,21 @@ const (
 type Kind string
 
 const (
-	KindDeployment Kind = "deployment"
-	KindDatabase   Kind = "database"
-	KindIngress    Kind = "ingress"
-	KindJob        Kind = "job"
-	KindCronJob    Kind = "cronjob"
+	KindDeployment  Kind = "deployment"
+	KindStatefulset Kind = "statefulset"
+	KindIngress     Kind = "ingress"
+	KindJob         Kind = "job"
+	KindCronJob     Kind = "cronjob"
+	KindAsset       Kind = "asset"
 )
 
 var validKinds = map[Kind]bool{
-	KindDeployment: true,
-	KindDatabase:   true,
-	KindIngress:    true,
-	KindJob:        true,
-	KindCronJob:    true,
+	KindDeployment:  true,
+	KindStatefulset: true,
+	KindIngress:     true,
+	KindJob:         true,
+	KindCronJob:     true,
+	KindAsset:       true,
 }
 
 // ParseKind returns the canonical Kind for either the singular or plural
@@ -61,7 +63,7 @@ func ParseKind(s string) (Kind, error) {
 		return trimmed, nil
 	}
 
-	return "", fmt.Errorf("unknown kind %q (valid: deployment, database, ingress, job, cronjob)", s)
+	return "", fmt.Errorf("unknown kind %q (valid: deployment, statefulset, ingress, job, cronjob, asset)", s)
 }
 
 // DesiredPrefix returns "/desired/<kind>s/" — the prefix covering every

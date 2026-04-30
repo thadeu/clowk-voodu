@@ -113,16 +113,6 @@ const (
 	EnvPluginDir  = "VOODU_PLUGIN_DIR"
 	EnvApp        = "VOODU_APP"
 
-	// Database-kind env — set by the reconciler when calling
-	// <engine>:create and <engine>:destroy for a declared database.
-	// Plugins that only implement user-facing subcommands can ignore
-	// these; database-flavored plugins use them instead of parsing args.
-	EnvDBName    = "VOODU_DB_NAME"
-	EnvDBEngine  = "VOODU_DB_ENGINE"
-	EnvDBVersion = "VOODU_DB_VERSION"
-	EnvDBStorage = "VOODU_DB_STORAGE"
-	EnvDBParams  = "VOODU_DB_PARAMS" // JSON-encoded map[string]string
-
 	// Ingress-kind env — set by the reconciler when calling
 	// <ingress-plugin>:apply and :remove for a declared ingress.
 	EnvIngressHost        = "VOODU_INGRESS_HOST"
@@ -178,31 +168,6 @@ const (
 	// healthcheck and the ingress-level probe. Unset falls back to "/".
 	EnvIngressHealthCheckPath = "VOODU_INGRESS_HC_PATH"
 )
-
-// Database-kind plugin contract.
-//
-// A plugin that wants to materialise `database "<name>" { engine =
-// "<engine>" ... }` manifests must expose two commands:
-//
-//	create    Provision a new instance named $VOODU_DB_NAME.
-//	          Must be idempotent if called twice before status is
-//	          persisted (rare, but happens on crash-during-reconcile).
-//	          Returns a JSON envelope:
-//	              {"status":"ok","data":{
-//	                "url":"...", "host":"...", "port":"5432",
-//	                "username":"...", "password":"...", "database":"..."
-//	              }}
-//	          Fields listed above are conventional, not mandatory —
-//	          ${ref.database.NAME.FIELD} resolves against whatever keys
-//	          the plugin emits.
-//
-//	destroy   Tear down the instance named $VOODU_DB_NAME. Safe to call
-//	          on a non-existent instance (the reconciler invokes it
-//	          unconditionally when a manifest is deleted).
-//
-// Plugins that only offer CLI subcommands (postgres:backup, etc.) don't
-// need create/destroy. The reconciler only invokes them when a database
-// manifest references the plugin's engine.
 
 // Ingress-kind plugin contract.
 //

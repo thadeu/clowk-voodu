@@ -50,7 +50,7 @@ func TestApplyPostArrayOfManifests(t *testing.T) {
 
 	body := `[
 		{"kind":"deployment","scope":"test","name":"api","spec":{}},
-		{"kind":"database","name":"main","spec":{"engine":"postgres"}}
+		{"kind":"statefulset","scope":"data","name":"pg","spec":{"image":"postgres:15"}}
 	]`
 
 	resp, err := http.Post(ts.URL+"/apply", "application/json", strings.NewReader(body))
@@ -91,7 +91,7 @@ func TestApplyGetListsAll(t *testing.T) {
 	defer ts.Close()
 
 	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDeployment, Scope: "test", Name: "api"})
-	_, _ = store.Put(t.Context(), &Manifest{Kind: KindDatabase, Name: "main"})
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindStatefulset, Scope: "data", Name: "pg", Spec: json.RawMessage(`{"image":"postgres:15"}`)})
 
 	resp, err := http.Get(ts.URL + "/apply")
 	if err != nil {

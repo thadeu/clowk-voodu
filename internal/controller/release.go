@@ -529,7 +529,15 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 		return fmt.Errorf("deployment/%s has no release block", app)
 	}
 
-	hash := deploymentSpecHash(spec)
+	// Hash MUST capture asset literals + content digests
+	// before interpolation rewrites them to host paths.
+	assetRefs := collectDeploymentAssetRefs(spec)
+	assetDigests := LookupAssetDigests(ctx, h.Store, scope, assetRefs)
+	hash := deploymentSpecHash(spec, assetDigests)
+
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+		return err
+	}
 
 	// Reserved for symmetry with runReleaseIfNeeded — no-op here
 	// since we don't gate on prior status.
@@ -802,6 +810,10 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 
 	if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
 		return fmt.Errorf("apply defaults: %w", err)
+	}
+
+	if err := resolveDeploymentSpecAssets(ctx, h.Store, scope, &spec); err != nil {
+		return fmt.Errorf("resolve asset refs: %w", err)
 	}
 
 	// Phase 0: image retag. Build-mode deployments rebuild

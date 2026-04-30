@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# voodu — universal uninstaller. Sibling to ./install.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/uninstall | bash
+#   curl -fsSL ...uninstall | bash -s -- --prune
+#   curl -fsSL ...uninstall | bash -s -- --prune -y
+#
+# Default mode (no flags):
+#   - stops + disables the voodu-controller systemd unit
+#   - removes /etc/systemd/system/voodu-controller.service
+#   - removes /usr/local/bin/voodu, voodu-controller, vd
+#   - PRESERVES /opt/voodu (state, plugins, configs, assets, volumes)
+#
+# --prune mode:
+#   - everything above, PLUS
+#   - stop + remove every docker container labelled createdby=voodu
+#   - remove every docker volume labelled createdby=voodu
+#   - remove the voodu0 docker network
+#   - delete /opt/voodu wholesale (state, plugins, configs, assets,
+#     release dirs — everything)
+#
+# Idempotent: missing systemd unit / binary / dir is fine. Each step
+# is best-effort with a warn on failure so a partial install still
+# cleans up cleanly.
+#
+# `-y` / `--yes` skips the confirmation prompt that --prune normally
+# fires before nuking state. Useful in CI.
+#
+# Env knobs:
+#   VOODU_ROOT          state dir (default: /opt/voodu)
+
+set -euo pipefail
+
+VOODU_ROOT="${VOODU_ROOT:-/opt/voodu}"
+BIN_DIR="/usr/local/bin"
+UNIT_PATH="/etc/systemd/system/voodu-controller.service"
+PRUNE=0
+ASSUME_YES=0
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+
+log()     { printf '%s[voodu/uninstall]%s %s\n' "$CYAN" "$NC" "$*"; }
+success() { printf '%s[voodu/uninstall]%s %s\n' "$GREEN" "$NC" "$*"; }
+warn()    { printf '%s[voodu/uninstall]%s %s\n' "$YELLOW" "$NC" "$*"; }
+fail()    { printf '%s[voodu/uninstall]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+sudo_() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prune) PRUNE=1; shift ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      --help|-h)
+        cat <<EOF
+voodu uninstaller
+
+Usage: uninstall [--prune] [-y]
+
+Default (no flags):
+  Removes binaries (voodu, voodu-controller, vd) and the
+  voodu-controller systemd unit. Preserves /opt/voodu state.
+
+--prune:
+  Above + wipes /opt/voodu, voodu-managed docker
+  containers/volumes, and the voodu0 docker network.
+
+-y, --yes:
+  Skip the --prune confirmation prompt.
+
+Environment:
+  VOODU_ROOT          state dir (default: /opt/voodu)
+EOF
+        exit 0
+        ;;
+      *) fail "unknown option: $1 (try --help)" ;;
+    esac
+  done
+}
+
+confirm_prune() {
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    return 0
+  fi
+
+  warn "--prune will:"
+  warn "  - delete $VOODU_ROOT (apps, plugins, configs, assets, volumes)"
+  warn "  - stop + remove every container labelled createdby=voodu"
+  warn "  - remove every docker volume labelled createdby=voodu"
+  warn "  - remove the voodu0 docker network"
+  warn ""
+  warn "this CANNOT be undone. live workloads on this host will go down."
+
+  printf '%s[voodu/uninstall]%s continue? [y/N] ' "$YELLOW" "$NC"
+
+  local response
+  read -r response
+
+  case "$response" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) log "aborted"; exit 0 ;;
+  esac
+}
+
+stop_controller() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if systemctl is-active --quiet voodu-controller.service 2>/dev/null; then
+    log "stopping voodu-controller.service"
+    sudo_ systemctl stop voodu-controller.service || warn "stop failed (continuing)"
+  fi
+}
+
+disable_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if systemctl is-enabled --quiet voodu-controller.service 2>/dev/null; then
+    log "disabling voodu-controller.service"
+    sudo_ systemctl disable voodu-controller.service >/dev/null 2>&1 || warn "disable failed (continuing)"
+  fi
+}
+
+remove_systemd_unit() {
+  if [ -f "$UNIT_PATH" ]; then
+    log "removing $UNIT_PATH"
+    sudo_ rm -f "$UNIT_PATH"
+
+    if command -v systemctl >/dev/null 2>&1; then
+      sudo_ systemctl daemon-reload || true
+    fi
+  fi
+}
+
+remove_binaries() {
+  local removed=0
+
+  for bin in voodu voodu-controller vd; do
+    if [ -e "$BIN_DIR/$bin" ] || [ -L "$BIN_DIR/$bin" ]; then
+      log "removing $BIN_DIR/$bin"
+      sudo_ rm -f "$BIN_DIR/$bin"
+      removed=1
+    fi
+  done
+
+  if [ "$removed" -eq 0 ]; then
+    log "no voodu binaries found in $BIN_DIR"
+  fi
+}
+
+# remove_voodu_containers stops and removes every docker container
+# tagged createdby=voodu — pods, release runners, ingress sidecars.
+# Best-effort: we already announced the wipe; a docker hiccup
+# shouldn't abort the rest of the cleanup.
+remove_voodu_containers() {
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "docker not on PATH — skipping container cleanup"
+    return 0
+  fi
+
+  local ids
+  ids="$(docker ps -aq --filter 'label=createdby=voodu' 2>/dev/null || true)"
+
+  if [ -z "$ids" ]; then
+    log "no voodu-managed containers to remove"
+    return 0
+  fi
+
+  log "stopping + removing voodu-managed containers"
+
+  # `xargs -r` would skip the call when ids is empty, but we
+  # already early-returned above. Splat is fine here.
+  # shellcheck disable=SC2086
+  docker stop $ids >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  docker rm -f $ids >/dev/null 2>&1 || warn "some containers refused to remove"
+}
+
+remove_voodu_volumes() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local vols
+  vols="$(docker volume ls -q --filter 'label=createdby=voodu' 2>/dev/null || true)"
+
+  if [ -z "$vols" ]; then
+    log "no voodu-managed volumes to remove"
+    return 0
+  fi
+
+  log "removing voodu-managed docker volumes"
+
+  # shellcheck disable=SC2086
+  docker volume rm $vols >/dev/null 2>&1 || warn "some volumes refused to remove (in use?)"
+}
+
+remove_voodu_network() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if docker network inspect voodu0 >/dev/null 2>&1; then
+    log "removing docker network voodu0"
+    docker network rm voodu0 >/dev/null 2>&1 || warn "voodu0 removal failed (containers still attached?)"
+  fi
+}
+
+remove_voodu_root() {
+  if [ ! -d "$VOODU_ROOT" ]; then
+    log "$VOODU_ROOT already absent"
+    return 0
+  fi
+
+  log "removing $VOODU_ROOT"
+  sudo_ rm -rf "$VOODU_ROOT"
+}
+
+main() {
+  parse_args "$@"
+
+  if [ "$PRUNE" -eq 1 ]; then
+    confirm_prune
+  fi
+
+  log "starting uninstall"
+
+  stop_controller
+  disable_systemd
+  remove_systemd_unit
+  remove_binaries
+
+  if [ "$PRUNE" -eq 1 ]; then
+    remove_voodu_containers
+    remove_voodu_volumes
+    remove_voodu_network
+    remove_voodu_root
+  fi
+
+  echo
+
+  if [ "$PRUNE" -eq 1 ]; then
+    success "voodu uninstalled and pruned"
+  else
+    success "voodu uninstalled"
+    log "state preserved at $VOODU_ROOT — re-run with --prune to wipe"
+  fi
+}
+
+main "$@"

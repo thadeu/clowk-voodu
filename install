@@ -366,6 +366,48 @@ server_setup() {
   write_systemd_unit
   enable_controller
   install_default_plugins
+  install_uninstaller
+}
+
+# install_uninstaller stamps the matching `uninstall` script under
+# $VOODU_ROOT/scripts/ so operators can wipe the host without
+# having to remember the GitHub raw URL. Pinned to the same VERSION
+# as the install so the cleanup logic always matches the layout
+# this installer just laid down (paths, labels, systemd unit name).
+#
+# Silent on both success and failure — operators see the stamped
+# path in print_next_steps below, and the curl-based fallback is
+# documented there too. Failure modes (network blip, tag without
+# uninstall yet) are recoverable post-install via a manual curl.
+#
+# Idempotent: re-running the installer overwrites with the
+# matching version.
+install_uninstaller() {
+  local dst="$VOODU_ROOT/scripts/uninstall"
+
+  # Use the same git ref the binaries came from. `main` falls back
+  # only when VERSION wasn't resolved for some reason.
+  local ref="${VERSION:-main}"
+  local url="https://raw.githubusercontent.com/${REPO}/${ref}/uninstall"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return
+  fi
+
+  if ! sudo_ install -m 0755 "$tmp" "$dst" 2>/dev/null; then
+    rm -f "$tmp"
+    return
+  fi
+
+  rm -f "$tmp"
+
+  if [ "$TARGET_USER" != "root" ]; then
+    sudo_ chown "$TARGET_USER":"$TARGET_USER" "$dst" 2>/dev/null || true
+  fi
 }
 
 # write_voodurc_server_mode marks $TARGET_USER's ~/.voodurc with
@@ -516,10 +558,21 @@ print_next_steps() {
   Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller (alias: $BIN_DIR/vd)
   Docker:       $(docker --version 2>/dev/null || echo "not installed")
 
+  To uninstall (local — stamped at install time):
+    sudo $VOODU_ROOT/scripts/uninstall
+    sudo $VOODU_ROOT/scripts/uninstall --prune       # wipe state + docker resources
+
+  Or pull the latest cleanup logic from GitHub:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/uninstall | bash
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/uninstall | bash -s -- --prune
+
 EOF
   else
     cat <<EOF
   Binary:  $BIN_DIR/voodu (alias: $BIN_DIR/vd)
+
+  To uninstall:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/uninstall | bash
 
 EOF
   fi
