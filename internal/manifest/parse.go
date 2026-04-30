@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -1051,7 +1052,23 @@ func bodyToJSON(body *hclsyntax.Body) (json.RawMessage, error) {
 			return nil, diags
 		}
 
-		out[k] = ctyValueToGo(val)
+		goVal := ctyValueToGo(val)
+
+		// Env is the one attribute we coerce per-value: in the
+		// real world env vars are always strings, but operators
+		// reflexively write `MAX_CONNS = 100` or `DEBUG = true`
+		// without quotes. Without coercion, the JSON serialises
+		// as a number/bool, the consumer kind's `Env map[string]
+		// string` decode silently fails on the type mismatch,
+		// and the env never reaches the container — invisible
+		// failure mode (no error surfaced; container just runs
+		// with empty env). Stringify here so HCL ergonomics
+		// match the wire contract.
+		if k == "env" {
+			goVal = stringifyEnvMap(goVal)
+		}
+
+		out[k] = goVal
 	}
 
 	// Nested blocks: collapse to object when single occurrence,
@@ -1098,6 +1115,63 @@ func bodyToJSON(body *hclsyntax.Body) (json.RawMessage, error) {
 	}
 
 	return json.Marshal(out)
+}
+
+// stringifyEnvMap walks a parsed env attribute (after
+// ctyValueToGo) and coerces every leaf value to a string.
+// Number → strconv-formatted, bool → "true"/"false", string
+// passes through. Non-string-coercible values (nested objects,
+// lists) are left as-is — the wire contract for env is
+// map[string]string, so a downstream decoder will surface them
+// as errors loudly rather than silently dropping the whole map.
+//
+// Why coerce here instead of in ctyValueToGo: the broader
+// converter is kind-agnostic. Env is the one place where the
+// JSON wire shape must be string-valued no matter what the
+// operator typed. Doing the coercion at the bodyToJSON entry
+// point keeps the converter pure and the special case localised.
+func stringifyEnvMap(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+
+	out := make(map[string]any, len(m))
+
+	for k, raw := range m {
+		switch x := raw.(type) {
+		case string:
+			out[k] = x
+
+		case bool:
+			out[k] = strconv.FormatBool(x)
+
+		case float64:
+			// Render whole numbers without the `.0` suffix that
+			// strconv would apply for FormatFloat — operators
+			// expect `1` to render as `"1"`, not `"1.0"`.
+			if x == float64(int64(x)) {
+				out[k] = strconv.FormatInt(int64(x), 10)
+			} else {
+				out[k] = strconv.FormatFloat(x, 'g', -1, 64)
+			}
+
+		case nil:
+			// HCL `K = null` → empty string. Matches shell
+			// convention where `export K=` sets K to "".
+			out[k] = ""
+
+		default:
+			// Nested objects / lists — leave verbatim so the
+			// downstream JSON decoder fails loudly with a type
+			// mismatch operator can act on. Pretending to
+			// coerce a list to a string by JSON-encoding it
+			// would mask an authoring mistake.
+			out[k] = raw
+		}
+	}
+
+	return out
 }
 
 // ctyValueToGo collapses a cty.Value into the Go-side any types

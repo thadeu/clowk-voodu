@@ -1160,6 +1160,131 @@ postgres "main" {
 	}
 }
 
+// TestParseHCLPluginBlockEnvCoercion pins the env-stringify
+// contract: HCL number / bool literals inside a plugin block's
+// `env` attribute serialise as JSON strings, not JSON numbers/
+// bools. Without this, the consumer kind's `Env map[string]string`
+// decode silently drops the env (or whole spec) on type
+// mismatch, and the operator never knows the var didn't reach
+// the container.
+func TestParseHCLPluginBlockEnvCoercion(t *testing.T) {
+	src := `
+redis "data" "cache" {
+  image = "redis:8"
+
+  env = {
+    SKIP_FIX_PERMS = 1
+    DEBUG          = true
+    MAX_CONNS      = 100
+    LOG_LEVEL      = "info"
+    SAMPLE_RATE    = 0.25
+  }
+}
+`
+	tmp := writeTemp(t, "env-coerce.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("expected 1 manifest, got %d", len(mans))
+	}
+
+	var spec map[string]any
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	env, ok := spec["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("env not an object: %T", spec["env"])
+	}
+
+	cases := map[string]string{
+		"SKIP_FIX_PERMS": "1",
+		"DEBUG":          "true",
+		"MAX_CONNS":      "100",
+		"LOG_LEVEL":      "info",
+		"SAMPLE_RATE":    "0.25",
+	}
+
+	for k, want := range cases {
+		got, ok := env[k].(string)
+		if !ok {
+			t.Errorf("env[%q] = %v (%T), want string %q", k, env[k], env[k], want)
+			continue
+		}
+
+		if got != want {
+			t.Errorf("env[%q] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestStringifyEnvMap is the unit-level pin for the helper —
+// covers the type variants that ctyValueToGo emits for an HCL
+// object literal (string, bool, float64-from-int, float64
+// genuine, null, empty string).
+func TestStringifyEnvMap(t *testing.T) {
+	in := map[string]any{
+		"S":     "hello",
+		"EMPTY": "",
+		"B":     true,
+		"BF":    false,
+		"I":     float64(42),
+		"F":     3.14,
+		"Z":     float64(0),
+		"NULL":  nil,
+	}
+
+	out, ok := stringifyEnvMap(in).(map[string]any)
+	if !ok {
+		t.Fatalf("not a map: %T", out)
+	}
+
+	cases := map[string]string{
+		"S":     "hello",
+		"EMPTY": "",
+		"B":     "true",
+		"BF":    "false",
+		"I":     "42",
+		"F":     "3.14",
+		"Z":     "0",
+		"NULL":  "",
+	}
+
+	for k, want := range cases {
+		got, ok := out[k].(string)
+		if !ok {
+			t.Errorf("[%s] = %v (%T), want string %q", k, out[k], out[k], want)
+			continue
+		}
+
+		if got != want {
+			t.Errorf("[%s] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestStringifyEnvMap_PreservesNonMap covers the defensive
+// passthrough: if env isn't a map (somehow — author error), the
+// helper hands back the original value rather than panicking.
+// The downstream JSON decoder will surface the type mismatch
+// loudly.
+func TestStringifyEnvMap_PreservesNonMap(t *testing.T) {
+	got := stringifyEnvMap("not a map")
+	if got != "not a map" {
+		t.Errorf("got %v, want passthrough", got)
+	}
+
+	got = stringifyEnvMap(nil)
+	if got != nil {
+		t.Errorf("got %v, want nil passthrough", got)
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 

@@ -98,6 +98,53 @@ func TestRestartBareNameOmitsScope(t *testing.T) {
 	}
 }
 
+// TestRestartKindFlag pins the -k/--kind plumbing so a future
+// refactor doesn't quietly drop the flag and silently route every
+// restart to deployments.
+func TestRestartKindFlag(t *testing.T) {
+	cases := []struct {
+		args     []string
+		wantKind string
+	}{
+		{[]string{"restart", "clowk-lp/redis"}, "deployment"},
+		{[]string{"restart", "-k", "statefulset", "clowk-lp/redis"}, "statefulset"},
+		{[]string{"restart", "--kind=statefulset", "clowk-lp/redis"}, "statefulset"},
+	}
+
+	for _, tc := range cases {
+		var gotQuery string
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.RawQuery
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data":   map[string]string{"scope": "clowk-lp", "name": "redis"},
+			})
+		}))
+
+		root := newRootCmd()
+		_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+		var buf bytes.Buffer
+		root.SetOut(&buf)
+		root.SetErr(&buf)
+		root.SetArgs(tc.args)
+
+		if err := root.Execute(); err != nil {
+			ts.Close()
+			t.Fatalf("execute %v: %v", tc.args, err)
+		}
+
+		ts.Close()
+
+		want := "kind=" + tc.wantKind
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("args=%v: query=%q, want contains %q", tc.args, gotQuery, want)
+		}
+	}
+}
+
 // TestRestartSurfacesEnvelopeError keeps the operator-friendly
 // error path: a 4xx/5xx from the server with a JSON envelope
 // reaches the CLI as the server's verbatim message, not a generic

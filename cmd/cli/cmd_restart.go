@@ -26,13 +26,18 @@ import (
 // `vd run X cmd` (one-off exec, no restart). `vd restart` is the
 // only way to refresh a running deploy without changing its spec.
 func newRestartCmd() *cobra.Command {
+	var kindFlag string
+
 	cmd := &cobra.Command{
 		Use:   "restart <ref>",
-		Short: "Rolling restart a deployment without changing its manifest",
+		Short: "Rolling restart a deployment or statefulset without changing its manifest",
 		Long: `Triggers a rolling restart of every replica of the named
-deployment. Each replica is replaced one at a time with a fresh
+resource. Each replica is replaced one at a time with a fresh
 container, with a short pause between to keep the load balancer
 healthy.
+
+By default targets a deployment; pass -k/--kind=statefulset for a
+statefulset (per-ordinal rolling replace, preserves pod-N identity).
 
 Use this after:
 
@@ -41,32 +46,42 @@ Use this after:
                                              use this for a manual sweep
   - docker pull image                      # picking up rebuilt image tags
                                              without a config bump
+  - any HCL change that didn't auto-restart # belt-and-braces refresh
 
 The manifest is NOT modified; the next 'vd apply' is still
 authoritative for desired state. Restart only affects the running
 processes.
 
 Examples:
-  vd restart clowk-lp/web                  # rolling restart, scope/name
-  vd restart web                           # auto-resolve scope`,
+  vd restart clowk-lp/web                            # deployment (default)
+  vd restart web                                     # auto-resolve scope
+  vd restart -k statefulset clowk-lp/redis           # statefulset
+  vd restart --kind=statefulset data/postgres        # long form`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRestart(cmd, args[0])
+			return runRestart(cmd, args[0], kindFlag)
 		},
 	}
+
+	cmd.Flags().StringVarP(&kindFlag, "kind", "k", "deployment",
+		"resource kind to restart: deployment | statefulset")
 
 	return cmd
 }
 
-func runRestart(cmd *cobra.Command, ref string) error {
+func runRestart(cmd *cobra.Command, ref, kind string) error {
 	scope, name := splitJobRef(ref)
 
 	if name == "" {
 		return fmt.Errorf("restart ref %q is empty or invalid", ref)
 	}
 
+	if kind == "" {
+		kind = "deployment"
+	}
+
 	q := url.Values{}
-	q.Set("kind", "deployment")
+	q.Set("kind", kind)
 	q.Set("name", name)
 
 	if scope != "" {
@@ -94,7 +109,7 @@ func runRestart(cmd *cobra.Command, ref string) error {
 		return formatControllerError(resp.StatusCode, raw)
 	}
 
-	fmt.Printf("deployment/%s rolling restart complete\n", ref)
+	fmt.Printf("%s/%s rolling restart complete\n", kind, ref)
 
 	return nil
 }

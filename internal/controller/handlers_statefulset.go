@@ -757,20 +757,22 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 	sort.Slice(claims, func(i, j int) bool { return claims[i].Name < claims[j].Name })
 
 	input := struct {
-		Image        string        `json:"image"`
-		Command      []string      `json:"command"`
-		Ports        []string      `json:"ports"`
-		Volumes      []string      `json:"volumes"`
-		Networks     []string      `json:"networks"`
-		NetworkMode  string        `json:"network_mode"`
-		Restart      string        `json:"restart"`
-		VolumeClaims []volumeClaim `json:"volume_claims"`
-		Assets       []string      `json:"assets,omitempty"`
+		Image        string            `json:"image"`
+		Command      []string          `json:"command"`
+		Ports        []string          `json:"ports"`
+		Volumes      []string          `json:"volumes"`
+		Env          map[string]string `json:"env"`
+		Networks     []string          `json:"networks"`
+		NetworkMode  string            `json:"network_mode"`
+		Restart      string            `json:"restart"`
+		VolumeClaims []volumeClaim     `json:"volume_claims"`
+		Assets       []string          `json:"assets,omitempty"`
 	}{
 		Image:        spec.Image,
 		Command:      spec.Command,
 		Ports:        spec.Ports,
 		Volumes:      spec.Volumes,
+		Env:          spec.Env,
 		Networks:     nets,
 		NetworkMode:  spec.NetworkMode,
 		Restart:      spec.Restart,

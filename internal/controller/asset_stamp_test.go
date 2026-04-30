@@ -699,6 +699,43 @@ func TestMaterializeAssetSpec_HandlerAndStampingProduceSameState(t *testing.T) {
 	}
 }
 
+// TestSpecHash_EnvChangeFlipsHash pins the contract: changing
+// spec.env (manifest-level env) changes the spec hash, which
+// triggers rolling restart on next reconcile. Without env in
+// the hash, an operator could `vd apply` with a new env var
+// declared in HCL and the running container would never see it
+// — the env file on disk would update, but the process wouldn't
+// be respawned to pick it up.
+func TestSpecHash_EnvChangeFlipsHash(t *testing.T) {
+	base := statefulsetSpec{
+		Image:   "redis:8",
+		Command: []string{"redis-server", "/etc/redis/redis.conf"},
+		Ports:   []string{"6379"},
+	}
+
+	without := statefulsetSpecHash(base, nil)
+
+	withEnv := base
+	withEnv.Env = map[string]string{"SKIP_FIX_PERMS": "1"}
+
+	withHash := statefulsetSpecHash(withEnv, nil)
+
+	if without == withHash {
+		t.Errorf("env change should flip statefulset hash; both produced %s", without)
+	}
+
+	// Same shape for deployment — env participates symmetrically.
+	depBase := deploymentSpec{Image: "myapp:1"}
+	depWithout := deploymentSpecHash(depBase, nil)
+
+	depWith := depBase
+	depWith.Env = map[string]string{"FOO": "bar"}
+
+	if deploymentSpecHash(depWith, nil) == depWithout {
+		t.Error("env change should flip deployment hash too")
+	}
+}
+
 func mapsEqual(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false
