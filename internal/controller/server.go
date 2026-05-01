@@ -142,7 +142,11 @@ func (s *Server) Start(ctx context.Context) error {
 			// missing file is fine — treat as empty.
 			before, _ := envfile.Load(envFile)
 
-			after, err := secrets.Set(app, pairs)
+			// Replace, not Set — the reconciler's pairs are the
+			// COMPLETE merged state (config bucket + spec.env).
+			// Set's overlay semantics would leave keys removed
+			// from the bucket lingering in the .env file forever.
+			after, err := secrets.Replace(app, pairs)
 			if err != nil {
 				return false, err
 			}
@@ -165,7 +169,8 @@ func (s *Server) Start(ctx context.Context) error {
 			envFile := paths.AppEnvFile(app)
 			before, _ := envfile.Load(envFile)
 
-			after, err := secrets.Set(app, pairs)
+			// Replace semantics — see deployment WriteEnv for why.
+			after, err := secrets.Replace(app, pairs)
 			if err != nil {
 				return false, err
 			}
@@ -199,7 +204,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 			before, _ := envfile.Load(envFile)
 
-			after, err := secrets.Set(app, pairs)
+			// Replace semantics — see deployment WriteEnv for why.
+			after, err := secrets.Replace(app, pairs)
 			if err != nil {
 				return false, err
 			}
@@ -230,7 +236,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 			before, _ := envfile.Load(envFile)
 
-			after, err := secrets.Set(app, pairs)
+			// Replace semantics — see deployment WriteEnv for why.
+			after, err := secrets.Replace(app, pairs)
 			if err != nil {
 				return false, err
 			}

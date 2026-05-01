@@ -179,7 +179,7 @@ func TestPluginDispatch_UnknownCommand(t *testing.T) {
 
 	raw, _ := io.ReadAll(resp.Body)
 
-	if !strings.Contains(string(raw), "does not declare command") {
+	if !strings.Contains(string(raw), "does not have an executable") {
 		t.Errorf("error mismatch: %s", raw)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -273,6 +274,110 @@ func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 
 	if err := dispatch(root, args[1:]); err != nil {
 		t.Fatalf("dispatch: %v", err)
+	}
+}
+
+// TestLooksLikePluginHelp_RecognizedShapes pins the help-flag
+// detector. -h or --help on a dispatch verb routes to the
+// CLI-side printer; same flag on an unknown verb falls through
+// to the generic forwarder so the plugin's own --help can fire.
+func TestLooksLikePluginHelp_RecognizedShapes(t *testing.T) {
+	cases := []struct {
+		name                string
+		args                []string
+		wantOK              bool
+		wantPlugin, wantCmd string
+	}{
+		{
+			name:       "verb help short flag",
+			args:       []string{"redis", "link", "-h"},
+			wantOK:     true,
+			wantPlugin: "redis", wantCmd: "link",
+		},
+		{
+			name:       "verb help long flag",
+			args:       []string{"redis", "unlink", "--help"},
+			wantOK:     true,
+			wantPlugin: "redis", wantCmd: "unlink",
+		},
+		{
+			name:       "plugin overview short flag",
+			args:       []string{"redis", "-h"},
+			wantOK:     true,
+			wantPlugin: "redis", wantCmd: "",
+		},
+		{
+			name:       "plugin overview long flag",
+			args:       []string{"postgres", "--help"},
+			wantOK:     true,
+			wantPlugin: "postgres", wantCmd: "",
+		},
+		{
+			name:   "unknown verb with help falls through",
+			args:   []string{"redis", "weird-command", "-h"},
+			wantOK: false,
+		},
+		{
+			name:   "no help flag",
+			args:   []string{"redis", "link", "from", "to"},
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin, cmd, ok := looksLikePluginHelp(tc.args)
+
+			if ok != tc.wantOK {
+				t.Errorf("ok=%v want %v", ok, tc.wantOK)
+				return
+			}
+
+			if !tc.wantOK {
+				return
+			}
+
+			if plugin != tc.wantPlugin || cmd != tc.wantCmd {
+				t.Errorf("plugin=%q cmd=%q want plugin=%q cmd=%q",
+					plugin, cmd, tc.wantPlugin, tc.wantCmd)
+			}
+		})
+	}
+}
+
+// TestPrintPluginHelp_KnownVerbs covers the rendered output for
+// each dispatch verb. Pin the placeholder substitution so a
+// plugin name shows up consistently in the Example line and the
+// Usage line.
+func TestPrintPluginHelp_KnownVerbs(t *testing.T) {
+	for verb := range pluginDispatchCommands {
+		t.Run(verb, func(t *testing.T) {
+			// Capture stdout — printPluginHelp writes via fmt.
+			old := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			err := printPluginHelp("postgres", verb)
+
+			w.Close()
+			os.Stdout = old
+
+			out, _ := io.ReadAll(r)
+
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+
+			s := string(out)
+
+			if !strings.Contains(s, "vd postgres:"+verb) {
+				t.Errorf("plugin name not substituted: %s", s)
+			}
+
+			if strings.Contains(s, "<plugin>") {
+				t.Errorf("placeholder leaked into output: %s", s)
+			}
+		})
 	}
 }
 

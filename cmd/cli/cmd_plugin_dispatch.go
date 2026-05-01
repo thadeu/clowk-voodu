@@ -6,10 +6,50 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
+
+// pluginDispatchHelp carries the operator-facing help text for
+// each structured dispatch verb. Help is hardcoded in the CLI
+// because the verbs themselves are standardised across plugins
+// (every redis-like plugin gets the same `link <from> <to>`
+// shape). Plugin-specific commands route through the generic
+// forwarder, which has its own help-discovery path via the
+// plugin's `--help` invocation.
+//
+// `vd <plugin>:<verb> -h` and `vd <plugin>:<verb> --help` print
+// the verb's entry from this map.
+var pluginDispatchHelp = map[string]string{
+	"link": `Usage: vd <plugin>:link <provider-scope/name> <consumer-scope/name>
+
+Inject the provider's connection URL into the consumer's config
+bucket. The consumer auto-restarts to pick up the new env.
+
+Example:
+  vd <plugin>:link clowk-lp/<plugin> clowk-lp/web`,
+
+	"unlink": `Usage: vd <plugin>:unlink <provider-scope/name> <consumer-scope/name>
+
+Remove the previously-injected connection URL from the consumer's
+config bucket. Symmetrical to link. Consumer auto-restarts.
+
+Example:
+  vd <plugin>:unlink clowk-lp/<plugin> clowk-lp/web`,
+
+	"new-password": `Usage: vd <plugin>:new-password <scope/name>
+
+Rotate the provider's password. Generates a fresh random password
+and stores it in the provider's config bucket. Operator runs
+'vd apply' next to propagate to the runtime config, then
+'vd <plugin>:link' per consumer to refresh URLs with the new
+password.
+
+Example:
+  vd <plugin>:new-password clowk-lp/<plugin>`,
+}
 
 // pluginDispatchCommands names the plugin commands that route
 // through the structured dispatch endpoint (POST
@@ -42,6 +82,107 @@ func IsPluginDispatchCommand(command string) bool {
 	_, ok := pluginDispatchCommands[command]
 
 	return ok
+}
+
+// looksLikePluginHelp matches a help-request shape on a
+// dispatch verb:
+//
+//	vd <plugin>:link -h
+//	vd <plugin>:link --help
+//	vd <plugin> -h            (plugin overview — list known verbs)
+//	vd <plugin> --help
+//
+// Returns (plugin, command, true) when the help text is
+// printable here. `command` is empty for plugin-level overview.
+//
+// Help paths handled by THIS function are limited to the
+// structured dispatch verbs (link / unlink / new-password) —
+// commands outside the dispatch set fall through to the
+// generic forwarder, which has its own --help routing.
+func looksLikePluginHelp(argv []string) (plugin, command string, ok bool) {
+	if len(argv) < 1 {
+		return "", "", false
+	}
+
+	hasHelp := false
+
+	for _, tok := range argv {
+		if tok == "-h" || tok == "--help" {
+			hasHelp = true
+			break
+		}
+	}
+
+	if !hasHelp {
+		return "", "", false
+	}
+
+	plugin = argv[0]
+
+	if len(argv) >= 2 && !strings.HasPrefix(argv[1], "-") {
+		command = argv[1]
+	}
+
+	if command == "" {
+		// `vd <plugin> -h` — plugin overview is always
+		// printable.
+		return plugin, "", true
+	}
+
+	if _, isDispatch := pluginDispatchCommands[command]; isDispatch {
+		return plugin, command, true
+	}
+
+	// Help requested for an unknown / non-dispatch command —
+	// fall through to the generic forwarder so the plugin
+	// itself can supply --help via /plugins/exec.
+	return "", "", false
+}
+
+// printPluginHelp renders help text for a dispatch verb.
+// Empty command prints the plugin-level overview (list of
+// known dispatch verbs + how to invoke each); a non-empty
+// command prints that verb's specific usage from
+// pluginDispatchHelp.
+func printPluginHelp(plugin, command string) error {
+	if command == "" {
+		fmt.Printf("Plugin: %s\n\n", plugin)
+		fmt.Println("Structured dispatch verbs (auto-discovered by the CLI):")
+
+		// Sort for deterministic output — operators expect
+		// the same ordering across runs.
+		verbs := make([]string, 0, len(pluginDispatchCommands))
+		for v := range pluginDispatchCommands {
+			verbs = append(verbs, v)
+		}
+
+		sort.Strings(verbs)
+
+		for _, v := range verbs {
+			fmt.Printf("  vd %s:%s\n", plugin, v)
+		}
+
+		fmt.Println()
+		fmt.Printf("Run `vd %s:<verb> -h` for verb-specific usage.\n", plugin)
+		fmt.Println()
+		fmt.Println("Plugin-specific commands beyond the dispatch set forward to the")
+		fmt.Println("plugin binary directly — `vd " + plugin + ":<command> --help` if the plugin supports it.")
+
+		return nil
+	}
+
+	help, ok := pluginDispatchHelp[command]
+	if !ok {
+		return fmt.Errorf("no built-in help for %s:%s", plugin, command)
+	}
+
+	// Replace the placeholder `<plugin>` in the help text
+	// with the actual plugin name so the operator sees their
+	// invocation, not a generic template.
+	rendered := strings.ReplaceAll(help, "<plugin>", plugin)
+	fmt.Println(rendered)
+
+	return nil
 }
 
 // looksLikePluginDispatch matches `vd <plugin>:<command>

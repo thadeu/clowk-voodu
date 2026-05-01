@@ -87,6 +87,55 @@ func List(app string) ([]string, map[string]string, error) {
 	return keys, vars, nil
 }
 
+// Replace overwrites the app's .env file with the given pairs.
+// Unlike Set (which OVERLAYS — preserves existing keys not in
+// the pairs slice), Replace treats the pairs argument as the
+// COMPLETE desired state: keys present in the file but absent
+// from pairs get removed.
+//
+// Used by reconciler paths (DeploymentHandler.linkEnv and the
+// statefulset/job/cronjob equivalents) where the pairs come
+// from a fresh merge of (config bucket + spec.env). The merge
+// IS the source of truth — the file should mirror it exactly,
+// not accumulate forever.
+//
+// Set vs Replace cheat sheet:
+//
+//   - `vd config set FOO=bar` → Set semantics: keep existing
+//     keys, add/update FOO. Operator's mental model is "I'm
+//     adding one var".
+//
+//   - reconciler watch event after `vd config unset` →
+//     Replace semantics: rewrite .env from the (now-shorter)
+//     merged state. Without this, removed keys persist forever
+//     in the .env file even though the config bucket says
+//     they're gone.
+func Replace(app string, pairs []string) (map[string]string, error) {
+	if err := paths.EnsureAppLayout(app); err != nil {
+		return nil, fmt.Errorf("ensure app layout: %w", err)
+	}
+
+	envFile := paths.AppEnvFile(app)
+
+	vars := make(map[string]string, len(pairs))
+
+	for _, pair := range pairs {
+		parts := strings.SplitN(pair, "=", 2)
+
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid format %q, expected KEY=VALUE", pair)
+		}
+
+		vars[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+
+	if err := envfile.Save(envFile, vars); err != nil {
+		return nil, err
+	}
+
+	return vars, nil
+}
+
 // Unset removes the given keys from the app's .env file. Missing keys
 // are silently ignored.
 func Unset(app string, keys []string) error {

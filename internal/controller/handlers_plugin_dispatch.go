@@ -136,7 +136,14 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, declared := plug.Commands[command]; !declared {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("plugin %q does not declare command %q (check `commands:` in plugin.yml)", pluginName, command))
+		// Plugin commands are discovered by FILE in `bin/` (or the
+		// legacy `commands/` dir), not by the plugin.yml `commands:`
+		// list. Common mistake: declaring the command in plugin.yml
+		// without dropping a matching shim script in bin/ that
+		// re-execs the actual binary.
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(
+			"plugin %q does not have an executable named %q under bin/ (each subcommand needs a shim file in bin/<name> that re-execs the plugin binary)",
+			pluginName, command))
 		return
 	}
 

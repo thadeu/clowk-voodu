@@ -247,6 +247,16 @@ func dispatch(root *cobra.Command, args []string) error {
 		return root.Execute()
 	}
 
+	// Help intercept before normal dispatch: `-h` / `--help`
+	// on a structured-dispatch verb (or on the plugin itself
+	// without a verb) prints CLI-side help text and exits.
+	// Without this, `-h` would either get treated as a missing
+	// positional ref by the dispatcher or silently forwarded
+	// to /plugins/exec which doesn't understand it.
+	if plugin, command, ok := looksLikePluginHelp(args); ok {
+		return printPluginHelp(plugin, command)
+	}
+
 	if plugin, command, refs, ok := looksLikePluginDispatch(args); ok {
 		return runPluginDispatch(root, plugin, command, refs)
 	}
