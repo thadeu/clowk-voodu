@@ -428,6 +428,19 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 		mountedVolumes := append([]string(nil), spec.Volumes...)
 		mountedVolumes = append(mountedVolumes, claimMounts...)
 
+		// Per-pod identity env: VOODU_REPLICA_ORDINAL,
+		// VOODU_REPLICA_ID, VOODU_SCOPE, VOODU_NAME. Plugin-
+		// authored entrypoints (redis, postgres) read these
+		// to pick a role at boot. Operator-supplied env from
+		// the HCL `env { ... }` block (already in spec.Env at
+		// this point) layers underneath — platform names win
+		// on collision so a typo'd `env.VOODU_SCOPE = "x"`
+		// doesn't poison the pod's identity.
+		podEnv := MergePodEnv(
+			BuildStatefulsetPodEnv(scope, name, n),
+			spec.Env,
+		)
+
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:           cname,
 			Image:          spec.Image,
@@ -439,6 +452,7 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			NetworkAliases: aliases,
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			Env:            podEnv,
 			Labels:         labels,
 		})
 		if err != nil {
@@ -631,6 +645,15 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 		mountedVolumes := append([]string(nil), spec.Volumes...)
 		mountedVolumes = append(mountedVolumes, claimMounts...)
 
+		// Same identity env as the spawn path — ordinal is
+		// preserved across rolling-restart (volumes do too),
+		// so the role decision (master vs replica) doesn't
+		// flip just because the pod was recreated.
+		podEnv := MergePodEnv(
+			BuildStatefulsetPodEnv(scope, name, ord),
+			spec.Env,
+		)
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:           newName,
 			Image:          spec.Image,
@@ -642,6 +665,7 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			NetworkAliases: aliases,
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			Env:            podEnv,
 			Labels:         labels,
 		}); err != nil {
 			return fmt.Errorf("respawn ordinal %d: %w", ord, err)

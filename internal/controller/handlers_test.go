@@ -612,6 +612,54 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 // The handler must rewrite an empty Restart to "unless-stopped" before
 // handing the spec to the container manager, while leaving an explicit
 // value ("no", "on-failure", etc.) untouched.
+// TestDeploymentHandler_InjectsAppIdentityEnv mirrors the
+// statefulset test on the deployment side. Apps sometimes want
+// to self-identify in logs/metrics — the platform stamps
+// VOODU_SCOPE/VOODU_NAME on every pod so the operator doesn't
+// have to thread these through their own env file. NO ordinal
+// here: deployment replicas are interchangeable (the whole point
+// of the kind), so plugins/apps that want stable identity must
+// reach for the statefulset kind instead.
+func TestDeploymentHandler_InjectsAppIdentityEnv(t *testing.T) {
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
+		Image: "img:1",
+	})
+
+	h.Handle(context.Background(), ev)
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+	}
+
+	got := cm.ensures[0].Env
+	if got == nil {
+		t.Fatal("Env nil — apps depending on VOODU_SCOPE/NAME for self-identification will boot blind")
+	}
+
+	if got["VOODU_SCOPE"] != "test" {
+		t.Errorf("VOODU_SCOPE = %q, want %q", got["VOODU_SCOPE"], "test")
+	}
+
+	if got["VOODU_NAME"] != "api" {
+		t.Errorf("VOODU_NAME = %q, want %q", got["VOODU_NAME"], "api")
+	}
+
+	if _, ok := got["VOODU_REPLICA_ORDINAL"]; ok {
+		t.Errorf("deployment must not carry VOODU_REPLICA_ORDINAL — replicas are interchangeable: %+v", got)
+	}
+}
+
 func TestDeploymentHandler_DefaultsRestartPolicy(t *testing.T) {
 	cases := []struct {
 		name    string

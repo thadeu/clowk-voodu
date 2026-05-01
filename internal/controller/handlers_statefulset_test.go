@@ -497,3 +497,121 @@ func TestStatefulsetHandler_RestartsTopDownOnSpecDrift(t *testing.T) {
 	}
 }
 
+// TestStatefulsetHandler_InjectsPodIdentityEnv pins the per-pod
+// platform identity contract: every spawned pod carries a unique
+// VOODU_REPLICA_ORDINAL/VOODU_REPLICA_ID plus the shared
+// VOODU_SCOPE/VOODU_NAME. Plugin-authored entrypoint scripts
+// (voodu-redis picks master vs replica from VOODU_REPLICA_ORDINAL
+// at boot) depend on these landing on every replica, every time.
+//
+// Without this test, a regression that drops Env from the
+// ContainerSpec would silently boot every redis pod as a master,
+// breaking replication without any visible error in the
+// handler log.
+func TestStatefulsetHandler_InjectsPodIdentityEnv(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 3,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.ensures) != 3 {
+		t.Fatalf("expected 3 ensures, got %d", len(cm.ensures))
+	}
+
+	for n, e := range cm.ensures {
+		if e.Env == nil {
+			t.Fatalf("ordinal %d: Env is nil — plugin entrypoints will boot blind", n)
+		}
+
+		if got := e.Env["VOODU_SCOPE"]; got != "test" {
+			t.Errorf("ordinal %d: VOODU_SCOPE = %q, want %q", n, got, "test")
+		}
+
+		if got := e.Env["VOODU_NAME"]; got != "redis" {
+			t.Errorf("ordinal %d: VOODU_NAME = %q, want %q", n, got, "redis")
+		}
+
+		wantOrd := containers.OrdinalReplicaID(n)
+
+		if got := e.Env["VOODU_REPLICA_ORDINAL"]; got != wantOrd {
+			t.Errorf("ordinal %d: VOODU_REPLICA_ORDINAL = %q, want %q", n, got, wantOrd)
+		}
+
+		if got := e.Env["VOODU_REPLICA_ID"]; got != wantOrd {
+			t.Errorf("ordinal %d: VOODU_REPLICA_ID = %q, want %q", n, got, wantOrd)
+		}
+	}
+}
+
+// TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv guards
+// the security-relevant invariant: an operator can NOT override
+// the platform identity by stuffing VOODU_SCOPE into their HCL
+// `env { ... }` block. The handler stamps the real values last,
+// so plugin entrypoints always see ground-truth scope/name/ordinal.
+func TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 1,
+		"env": map[string]any{
+			"VOODU_SCOPE":           "spoofed",
+			"VOODU_REPLICA_ORDINAL": "99",
+			"APP_LOG_LEVEL":         "debug",
+		},
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+	}
+
+	got := cm.ensures[0].Env
+
+	if got["VOODU_SCOPE"] != "test" {
+		t.Errorf("VOODU_SCOPE = %q, want %q (operator-supplied value leaked through)", got["VOODU_SCOPE"], "test")
+	}
+
+	if got["VOODU_REPLICA_ORDINAL"] != "0" {
+		t.Errorf("VOODU_REPLICA_ORDINAL = %q, want %q (operator-supplied ordinal leaked through)", got["VOODU_REPLICA_ORDINAL"], "0")
+	}
+
+	// Non-reserved operator env still flows through. The handler
+	// only protects the VOODU_* namespace; everything else is the
+	// operator's domain.
+	if got["APP_LOG_LEVEL"] != "debug" {
+		t.Errorf("APP_LOG_LEVEL = %q, want %q (operator env got dropped)", got["APP_LOG_LEVEL"], "debug")
+	}
+}
+

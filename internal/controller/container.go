@@ -213,6 +213,17 @@ type ContainerSpec struct {
 	// only require restart, not recreate.
 	EnvFile string
 
+	// Env carries platform-injected per-container identity vars
+	// (VOODU_REPLICA_ORDINAL, VOODU_REPLICA_ID, VOODU_SCOPE,
+	// VOODU_NAME, ...). These are emitted as `-e KEY=VAL` AFTER
+	// `--env-file`, so they override anything an operator put in
+	// their env file with the same key. The platform owns these
+	// names; operators should not set them. Plugin-authored
+	// containers (redis, postgres) read them in their wrapper
+	// scripts to pick a role at boot (master vs replica) without
+	// the controller having to template the command.
+	Env map[string]string
+
 	// Labels are the structured voodu.* identity flags appended to
 	// docker run. Handler builds these from containers.Identity so
 	// the next ListByIdentity call can find the container without
@@ -307,6 +318,7 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		NetworkAliases: spec.NetworkAliases,
 		RestartPolicy:  spec.Restart,
 		EnvFile:        spec.EnvFile,
+		Env:            spec.Env,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,
 		TTY:            spec.TTY,
@@ -577,6 +589,7 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		NetworkAliases: spec.NetworkAliases,
 		RestartPolicy:  spec.Restart,
 		EnvFile:        spec.EnvFile,
+		Env:            spec.Env,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,
 		TTY:            spec.TTY,

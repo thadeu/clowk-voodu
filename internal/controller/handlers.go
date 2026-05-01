@@ -645,6 +645,15 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			ReleaseID:    releaseID,
 		})
 
+		// Platform identity env: VOODU_SCOPE/VOODU_NAME so the
+		// app can self-identify without the operator threading
+		// these in through their env file. No ordinal — deployment
+		// replicas are interchangeable by design.
+		podEnv := MergePodEnv(
+			BuildDeploymentPodEnv(scope, name),
+			spec.Env,
+		)
+
 		_, err := h.Containers.Ensure(ContainerSpec{
 			Name:           cname,
 			Image:          spec.Image,
@@ -656,6 +665,7 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			NetworkAliases: BuildNetworkAliases(scope, name),
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			Env:            podEnv,
 			Labels:         labels,
 		})
 		if err != nil {
@@ -913,6 +923,11 @@ func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, nam
 			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
 		}
 
+		podEnv := MergePodEnv(
+			BuildDeploymentPodEnv(scope, name),
+			spec.Env,
+		)
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:           newName,
 			Image:          spec.Image,
@@ -924,6 +939,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, nam
 			NetworkAliases: BuildNetworkAliases(scope, name),
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			Env:            podEnv,
 			Labels:         labels,
 		}); err != nil {
 			return fmt.Errorf("spawn replacement %s: %w", newName, err)

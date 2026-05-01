@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,16 @@ type ContainerConfig struct {
 	Image   string
 	Ports   []string
 	EnvFile string
+
+	// Env carries per-container environment variables emitted as
+	// `-e KEY=VAL` on `docker run`. Distinct from EnvFile: the file
+	// holds operator secrets and changes between restarts, while Env
+	// is reserved for platform-injected identity that is fixed for
+	// the lifetime of THIS specific container — VOODU_REPLICA_ORDINAL,
+	// VOODU_SCOPE, VOODU_NAME, etc. Per-container `-e` is emitted
+	// AFTER `--env-file`, so platform identity wins over a malicious
+	// or accidental override in the operator's env file.
+	Env map[string]string
 
 	// NetworkMode is the legacy single-network knob — kept for the
 	// build-driven deploy path (DeploymentConfig) which only ever joins
@@ -191,6 +202,27 @@ func CreateContainer(cfg ContainerConfig) error {
 
 	if cfg.EnvFile != "" {
 		args = append(args, "--env-file", cfg.EnvFile)
+	}
+
+	// Per-container env vars come AFTER --env-file so docker resolves
+	// the file first and these `-e` flags override any colliding key.
+	// Platform identity (VOODU_REPLICA_ORDINAL/SCOPE/NAME) MUST win
+	// over the operator's env file even if the operator accidentally
+	// declared a key with the same name. Iterate in sorted key order
+	// so the rendered `docker run` line is deterministic — easier to
+	// diff in tests and in logs.
+	if len(cfg.Env) > 0 {
+		keys := make([]string, 0, len(cfg.Env))
+
+		for k := range cfg.Env {
+			keys = append(keys, k)
+		}
+
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			args = append(args, "-e", k+"="+cfg.Env[k])
+		}
 	}
 
 	for _, volume := range cfg.Volumes {
