@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -224,10 +225,19 @@ func materializeAssetSpec(
 			continue
 		}
 
-		bytes, srcErr := resolveAssetSourceForStamping(ctx, httpClient, raw)
+		bytes, opts, srcErr := resolveAssetSourceForStamping(ctx, httpClient, raw)
 		if srcErr != nil {
+			// on_failure = "error" → propagate immediately as
+			// a fatal apply error. Operator opted into strict
+			// mode for this asset; honour it without the silent
+			// stale-good fallback below.
+			if opts.OnFailure == OnFailureError {
+				return digests, errs, fmt.Errorf("asset/%s/%s/%s: %w", m.Scope, m.Name, key, srcErr)
+			}
+
 			errs[key] = srcErr.Error()
 			logf("asset/%s/%s/%s: resolve failed: %v", m.Scope, m.Name, key, srcErr)
+
 			continue
 		}
 
@@ -419,9 +429,48 @@ func (h *AssetHandler) resolveSource(ctx context.Context, raw json.RawMessage) (
 // the free-function fetchAssetURLShared so both the reconcile
 // path (this handler) and the apply-time stamping path
 // (StampAssetDigests) share the same on-disk ETag cache.
+//
+// Per-URL timeout overrides aren't plumbed here — the async
+// reconcile path is best-effort by design and uses the default
+// timeout. Only the apply pipeline cares about timeouts that
+// fit inside applyTimeout, and that path calls
+// fetchAssetURLShared directly with the operator's per-url()
+// option.
 func (h *AssetHandler) fetchURL(ctx context.Context, u string) ([]byte, error) {
-	return fetchAssetURLShared(ctx, h.HTTP, h.logf, u)
+	return fetchAssetURLShared(ctx, h.HTTP, h.logf, u, 0)
 }
+
+// AssetURLTimeoutError is the typed error fetchAssetURLShared
+// returns when the GET hits its deadline. Lets callers (the
+// apply-time stamping pipeline notably) format an operator-
+// friendly message that includes the URL and the actual
+// duration the timeout fired at, plus a hint about the
+// per-url() override.
+//
+// Outside the timeout case the function returns the raw network
+// error as before — only the deadline path is typed because
+// it's the one operators care about distinguishing.
+type AssetURLTimeoutError struct {
+	URL     string
+	Timeout time.Duration
+	Cause   error
+}
+
+func (e *AssetURLTimeoutError) Error() string {
+	return fmt.Sprintf("GET %s timed out after %s — set url(\"…\", { timeout = \"<longer>\" }) or on_failure = \"stale\" to use last-known-good content",
+		e.URL, e.Timeout)
+}
+
+func (e *AssetURLTimeoutError) Unwrap() error { return e.Cause }
+
+// defaultAssetURLTimeout is the per-fetch budget when the
+// operator didn't override via `url("…", { timeout = "…" })`.
+// 30s is short enough to fit inside applyTimeout (also 30s on
+// the CLI side — see cmd/cli/apply.go) so a stuck fetch
+// surfaces as a typed timeout error instead of a context-
+// canceled bubble from the CLI's outer deadline. Long enough
+// for a regional R2/S3 fetch on a sluggish day.
+const defaultAssetURLTimeout = 30 * time.Second
 
 // fetchAssetURLShared retrieves the URL with a small ETag-based
 // cache so re-applies that don't change content skip the network.
@@ -435,9 +484,19 @@ func (h *AssetHandler) fetchURL(ctx context.Context, u string) ([]byte, error) {
 // successful fetch during stamping primes the cache for the
 // later reconcile, and vice versa. `logf` is optional (can be
 // nil); used only for non-fatal cache-write warnings.
-func fetchAssetURLShared(ctx context.Context, client *http.Client, logf func(string, ...any), u string) ([]byte, error) {
+//
+// `timeout` is the per-fetch budget. Zero falls back to
+// defaultAssetURLTimeout. When the deadline fires, the function
+// returns *AssetURLTimeoutError (typed) so the apply-time
+// caller can distinguish "URL slow/down" from generic network
+// errors and format a precise operator message.
+func fetchAssetURLShared(ctx context.Context, client *http.Client, logf func(string, ...any), u string, timeout time.Duration) ([]byte, error) {
+	if timeout == 0 {
+		timeout = defaultAssetURLTimeout
+	}
+
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{Timeout: timeout}
 	}
 
 	cacheKey := sha256OfString(u)
@@ -474,6 +533,14 @@ func fetchAssetURLShared(ctx context.Context, client *http.Client, logf func(str
 		// already have.
 		if cached, cerr := os.ReadFile(bytesPath); cerr == nil {
 			return cached, nil
+		}
+
+		// Surface timeout errors as a typed value so the
+		// stamping layer can format them with the URL +
+		// duration + the per-url() override hint. Generic
+		// network errors fall through to the wrapped form.
+		if isTimeout(err) {
+			return nil, &AssetURLTimeoutError{URL: u, Timeout: timeout, Cause: err}
 		}
 
 		return nil, fmt.Errorf("fetch %s: %w", u, err)
@@ -545,6 +612,39 @@ func writeCacheMeta(path string, m cacheMeta) error {
 	}
 
 	return os.WriteFile(path, raw, 0644)
+}
+
+// isTimeout reports whether err represents a hit-the-deadline
+// failure. Distinguishes context.DeadlineExceeded (the http
+// client timeout fired or the parent ctx was canceled by a
+// deadline) from generic network errors (DNS, connection
+// refused, peer reset). Used by fetchAssetURLShared to choose
+// between AssetURLTimeoutError (typed) and a wrapped network
+// error.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// net package errors expose a Timeout() method on values
+	// that came from a deadline (Dial/Read/Write timeouts).
+	// http.Client wraps these in *url.Error; the underlying
+	// error implements the interface so a typed-assert chain
+	// works.
+	type timeoutError interface {
+		Timeout() bool
+	}
+
+	var te timeoutError
+	if errors.As(err, &te) && te.Timeout() {
+		return true
+	}
+
+	return false
 }
 
 // sha256OfString returns the hex sha256 of s. Used as the

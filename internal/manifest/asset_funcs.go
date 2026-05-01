@@ -120,19 +120,94 @@ func resolveAssetPath(path, manifestPath string) string {
 // auth header plumbing required client- or server-side.
 // `Authorization: Bearer …` headers can land later as a
 // follow-up if pre-signed URLs prove inadequate.
+//
+// Optional 2nd arg is a fetch options object:
+//
+//	url("https://…", {
+//	  timeout    = "10s"     # cancel the GET after this long
+//	                          # (default: 30s)
+//	  on_failure = "stale"   # error | stale | skip
+//	                          # (default: stale)
+//	})
+//
+// `timeout` accepts a Go duration string (`"5s"`, `"2m"`,
+// `"500ms"`); the server parses with time.ParseDuration. The
+// parser doesn't validate format here — bad strings surface as
+// a clear error from the server-side materialiser.
+//
+// `on_failure` controls what the apply pipeline does when the
+// fetch fails (timeout, 5xx, DNS, network unreachable):
+//
+//   - "error": apply rejects with the underlying fetch error.
+//     Strict mode — the asset is critical, no silent fallback.
+//
+//   - "stale": use the digest from /status (the last-known-good
+//     content). Apply continues. If /status is empty (first
+//     apply), behaves like "error" so a fresh deploy doesn't
+//     ship with an empty bind mount. **DEFAULT** — matches the
+//     async-reconcile contract operators expect.
+//
+//   - "skip": omit the key from the digests map; consumers
+//     that reference this key get an unresolved-ref error,
+//     others proceed. Use sparingly — usually `stale` is
+//     what you want.
+//
+// The function is variadic over the options object so callers
+// who don't care write `url("https://…")` and get the defaults.
 func urlFunc() function.Function {
 	return function.New(&function.Spec{
 		Params: []function.Parameter{
 			{Name: "url", Type: cty.String},
 		},
+		// VarParam carries the optional opts object as a single
+		// trailing arg. cty.DynamicPseudoType lets HCL pass any
+		// object shape through; we extract known keys server-side
+		// and ignore the rest (forwards-compat for new options).
+		VarParam: &function.Parameter{Name: "opts", Type: cty.DynamicPseudoType, AllowNull: true},
 		Type: function.StaticReturnType(cty.Object(map[string]cty.Type{
-			"_source": cty.String,
-			"url":     cty.String,
+			"_source":    cty.String,
+			"url":        cty.String,
+			"timeout":    cty.String,
+			"on_failure": cty.String,
 		})),
 		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			timeout := ""
+			onFailure := ""
+
+			// args[0] = url, args[1...] = optional opts objects.
+			// We honour the LAST opts object if multiple were
+			// passed (HCL syntax doesn't actually allow multiple
+			// — VarParam just makes the second arg variadic at
+			// the cty layer; one is the realistic ceiling).
+			for _, opt := range args[1:] {
+				if opt.IsNull() || !opt.Type().IsObjectType() {
+					continue
+				}
+
+				ty := opt.Type()
+
+				if ty.HasAttribute("timeout") {
+					v := opt.GetAttr("timeout")
+
+					if !v.IsNull() && v.Type() == cty.String {
+						timeout = v.AsString()
+					}
+				}
+
+				if ty.HasAttribute("on_failure") {
+					v := opt.GetAttr("on_failure")
+
+					if !v.IsNull() && v.Type() == cty.String {
+						onFailure = v.AsString()
+					}
+				}
+			}
+
 			return cty.ObjectVal(map[string]cty.Value{
-				"_source": cty.StringVal("url"),
-				"url":     args[0],
+				"_source":    cty.StringVal("url"),
+				"url":        args[0],
+				"timeout":    cty.StringVal(timeout),
+				"on_failure": cty.StringVal(onFailure),
 			}), nil
 		},
 	})

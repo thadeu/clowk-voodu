@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -225,12 +226,21 @@ func takesValue(flag string) bool {
 // Two forwarding paths:
 //
 //   - Structured plugin dispatch (POST /plugin/{name}/{command})
-//     when the shape matches `<plugin> <link|unlink|…> <from-ref>
-//     <to-ref>`. Server pre-fetches manifest state and applies
-//     actions the plugin returns (config_set / config_unset).
+//     when the shape matches `<plugin> <link|unlink|…> <ref...>`.
+//     Server pre-fetches manifest state and applies actions the
+//     plugin returns (config_set / config_unset).
 //   - Generic forward (POST /plugins/exec) for everything else,
 //     so any plugin command outside the structured set keeps the
 //     existing fire-and-forget RPC behaviour.
+//
+// When the command IS a known dispatch verb (link / unlink /
+// new-password) but the argv lacks the required refs, we surface
+// a usage error directly instead of falling through to the
+// generic forwarder. Without this guard the operator typing
+// `vd redis:link` (no refs) would see "unknown command
+// \"redis link\"" — accurate from the forwarder's POV but
+// useless: the plugin IS installed and the verb IS registered;
+// the only thing missing is the operator's args.
 func dispatch(root *cobra.Command, args []string) error {
 	if isKnownCommand(root, args) {
 		root.SetArgs(args)
@@ -241,7 +251,39 @@ func dispatch(root *cobra.Command, args []string) error {
 		return runPluginDispatch(root, plugin, command, refs)
 	}
 
+	if err := checkDispatchArityHint(args); err != nil {
+		return err
+	}
+
 	return forwardToController(root, args)
+}
+
+// checkDispatchArityHint surfaces a precise usage error when
+// argv looks like `<plugin> <known-dispatch-verb> [...]` but
+// not enough refs follow. Returns nil for argv shapes that
+// don't trigger the hint, so the caller can keep its existing
+// fall-through path for everything else.
+func checkDispatchArityHint(args []string) error {
+	if len(args) < 2 {
+		return nil
+	}
+
+	arity, isDispatch := pluginDispatchCommands[args[1]]
+	if !isDispatch {
+		return nil
+	}
+
+	plugin := args[0]
+	command := args[1]
+
+	switch arity {
+	case 1:
+		return fmt.Errorf("usage: vd %s:%s <scope/name>", plugin, command)
+	case 2:
+		return fmt.Errorf("usage: vd %s:%s <provider-scope/name> <consumer-scope/name>", plugin, command)
+	default:
+		return fmt.Errorf("usage: vd %s:%s requires %d ref(s)", plugin, command, arity)
+	}
 }
 
 // isKnownCommand walks the command tree to see whether the first

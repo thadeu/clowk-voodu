@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // consumerKinds is the set of kinds whose specs may carry asset
@@ -133,32 +134,53 @@ func StampAssetDigests(
 	return nil
 }
 
+// On-failure modes for url() sources. Mirror what the HCL
+// `url("…", { on_failure = "…" })` option accepts.
+const (
+	OnFailureError = "error" // apply rejects on fetch failure
+	OnFailureStale = "stale" // fall back to last-known-good (default)
+	OnFailureSkip  = "skip"  // omit key; consumer ref is best-effort
+)
+
+// sourceOptions are the operator-supplied knobs that ride
+// alongside a source object. Only `url()` populates these
+// today — file/inline sources have no failure mode (they
+// either decode or don't).
+type sourceOptions struct {
+	OnFailure string // OnFailureError | OnFailureStale | OnFailureSkip
+}
+
 // resolveAssetSourceForStamping mirrors AssetHandler.resolveSource
 // but is a free function callable without an AssetHandler
 // instance. Behaviour matches byte-for-byte: inline string →
 // bytes verbatim; {_source:file,content:b64} → base64-decoded;
-// {_source:url,url:...} → fetched via the shared ETag cache.
-func resolveAssetSourceForStamping(ctx context.Context, client *http.Client, raw json.RawMessage) ([]byte, error) {
+// {_source:url,url:...,timeout?,on_failure?} → fetched via the
+// shared ETag cache with the operator-supplied timeout.
+//
+// Returns the source options alongside the bytes so the caller
+// (materializeAssetSpec) can apply on_failure semantics when
+// the fetch fails. Non-url sources return an empty sourceOptions.
+func resolveAssetSourceForStamping(ctx context.Context, client *http.Client, raw json.RawMessage) ([]byte, sourceOptions, error) {
 	trimmed := strings.TrimSpace(string(raw))
 
 	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("empty source")
+		return nil, sourceOptions{}, fmt.Errorf("empty source")
 	}
 
 	if trimmed[0] == '"' {
 		var s string
 
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, fmt.Errorf("decode inline string: %w", err)
+			return nil, sourceOptions{}, fmt.Errorf("decode inline string: %w", err)
 		}
 
-		return []byte(s), nil
+		return []byte(s), sourceOptions{}, nil
 	}
 
 	var obj map[string]any
 
 	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf("decode source object: %w", err)
+		return nil, sourceOptions{}, fmt.Errorf("decode source object: %w", err)
 	}
 
 	src, _ := obj["_source"].(string)
@@ -167,27 +189,68 @@ func resolveAssetSourceForStamping(ctx context.Context, client *http.Client, raw
 	case "file":
 		content, ok := obj["content"].(string)
 		if !ok {
-			return nil, fmt.Errorf(`file source missing "content" string`)
+			return nil, sourceOptions{}, fmt.Errorf(`file source missing "content" string`)
 		}
 
 		decoded, err := base64.StdEncoding.DecodeString(content)
 		if err != nil {
-			return nil, fmt.Errorf("file source: invalid base64: %w", err)
+			return nil, sourceOptions{}, fmt.Errorf("file source: invalid base64: %w", err)
 		}
 
-		return decoded, nil
+		return decoded, sourceOptions{}, nil
 
 	case "url":
 		u, ok := obj["url"].(string)
 		if !ok {
-			return nil, fmt.Errorf(`url source missing "url" string`)
+			return nil, sourceOptions{}, fmt.Errorf(`url source missing "url" string`)
 		}
 
-		return fetchAssetURLShared(ctx, client, nil, u)
+		timeout := parseDurationOrZero(obj["timeout"])
+		opts := sourceOptions{OnFailure: stringOr(obj["on_failure"], OnFailureStale)}
+
+		bytes, err := fetchAssetURLShared(ctx, client, nil, u, timeout)
+		if err != nil {
+			return nil, opts, err
+		}
+
+		return bytes, opts, nil
 
 	default:
-		return nil, fmt.Errorf("unknown asset source %q (want file|url|inline)", src)
+		return nil, sourceOptions{}, fmt.Errorf("unknown asset source %q (want file|url|inline)", src)
 	}
+}
+
+// parseDurationOrZero turns a JSON-decoded value into a
+// time.Duration. Accepts a Go-style duration string ("5s",
+// "2m"); empty / nil / wrong type / unparseable → 0, which
+// fetchAssetURLShared maps to the default timeout. Garbage
+// strings don't error here because the parser already
+// validated the shape; downstream is permissive on purpose.
+func parseDurationOrZero(v any) time.Duration {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return 0
+	}
+
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+
+	return d
+}
+
+// stringOr returns v as a string if it's a non-empty one;
+// otherwise the fallback. Used to apply defaults to operator-
+// supplied options without writing the same conditional
+// inline at every call site.
+func stringOr(v any, fallback string) string {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return fallback
+	}
+
+	return s
 }
 
 // loadAssetStatus reads /status/assets/<scope>-<name> and decodes
