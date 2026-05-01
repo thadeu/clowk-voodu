@@ -238,3 +238,175 @@ func writePluginScript(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// TestExpand_PassesConfigInStdin: stateful plugins (voodu-redis,
+// voodu-postgres) need to know whether prior state exists so
+// they can stay idempotent. Confirms the controller pre-fetches
+// config and includes it in the expand stdin envelope.
+func TestExpand_PassesConfigInStdin(t *testing.T) {
+	pluginDir := t.TempDir()
+	stdinSink := pluginDir + "/expand-stdin.json"
+
+	// Plugin captures stdin to disk, returns a noop manifest.
+	script := `#!/bin/sh
+cat > ` + stdinSink + `
+echo '{"status":"ok","data":{"kind":"statefulset","scope":"data","name":"redis","spec":{"image":"redis:8"}}}'
+`
+
+	writePluginScript(t, pluginDir+"/expand", script)
+
+	loaded := &plugins.LoadedPlugin{
+		Manifest: plugin.Manifest{Name: "redis"},
+		Dir:      pluginDir,
+		Commands: map[string]string{"expand": pluginDir + "/expand"},
+	}
+
+	store := newMemStore()
+
+	// Pre-seed config so the plugin sees REDIS_PASSWORD.
+	_ = store.PatchConfig(context.Background(), "data", "redis", map[string]string{
+		"REDIS_PASSWORD": "from-prior-apply",
+	})
+
+	a := &API{
+		Store:        store,
+		PluginBlocks: &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{"redis": loaded}},
+	}
+
+	in := []*Manifest{{
+		Kind:  "redis",
+		Scope: "data",
+		Name:  "redis",
+		Spec:  json.RawMessage(`{"image":"redis:8"}`),
+	}}
+
+	if _, _, _, err := a.expandPluginBlocks(context.Background(), in); err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+
+	captured, err := os.ReadFile(stdinSink)
+	if err != nil {
+		t.Fatalf("read captured stdin: %v", err)
+	}
+
+	var stdin map[string]any
+	if err := json.Unmarshal(captured, &stdin); err != nil {
+		t.Fatalf("captured stdin not JSON: %v\n%s", err, captured)
+	}
+
+	cfg, ok := stdin["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("config field missing or wrong type: %T", stdin["config"])
+	}
+
+	if cfg["REDIS_PASSWORD"] != "from-prior-apply" {
+		t.Errorf("config.REDIS_PASSWORD = %v, want from-prior-apply", cfg["REDIS_PASSWORD"])
+	}
+}
+
+// TestExpand_AppliesActionsAlongsideManifests: when a plugin
+// emits the new {manifests, actions} shape, the controller must
+// apply each action against the store before returning the
+// manifests. Pin the contract: voodu-redis depends on this to
+// persist a freshly-generated REDIS_PASSWORD on first apply.
+func TestExpand_AppliesActionsAlongsideManifests(t *testing.T) {
+	pluginDir := t.TempDir()
+
+	// Plugin emits both manifests and a config_set action.
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "manifests": [
+      {"kind": "statefulset", "scope": "data", "name": "redis", "spec": {"image":"redis:8"}}
+    ],
+    "actions": [
+      {"type": "config_set", "scope": "data", "name": "redis", "kv": {"REDIS_PASSWORD": "fresh-password"}}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginScript(t, pluginDir+"/expand", script)
+
+	loaded := &plugins.LoadedPlugin{
+		Manifest: plugin.Manifest{Name: "redis"},
+		Dir:      pluginDir,
+		Commands: map[string]string{"expand": pluginDir + "/expand"},
+	}
+
+	store := newMemStore()
+
+	a := &API{
+		Store:        store,
+		PluginBlocks: &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{"redis": loaded}},
+	}
+
+	in := []*Manifest{{
+		Kind:  "redis",
+		Scope: "data",
+		Name:  "redis",
+		Spec:  json.RawMessage(`{"image":"redis:8"}`),
+	}}
+
+	out, _, _, err := a.expandPluginBlocks(context.Background(), in)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+
+	// Manifest came through.
+	if len(out) != 1 || out[0].Kind != KindStatefulset {
+		t.Errorf("expected 1 statefulset manifest, got %+v", out)
+	}
+
+	// Action was applied to the store.
+	cfg, _ := store.GetConfig(context.Background(), "data", "redis")
+	if cfg["REDIS_PASSWORD"] != "fresh-password" {
+		t.Errorf("expand action not applied: REDIS_PASSWORD = %q", cfg["REDIS_PASSWORD"])
+	}
+}
+
+// TestExpand_LegacyArrayShapeStillWorks: existing plugins that
+// emit just an array of manifests (no actions) keep working —
+// backward compatibility is non-negotiable, voodu-postgres and
+// voodu-caddy ship that shape in production.
+func TestExpand_LegacyArrayShapeStillWorks(t *testing.T) {
+	pluginDir := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+echo '{"status":"ok","data":[{"kind":"statefulset","scope":"data","name":"main","spec":{"image":"postgres:15"}}]}'
+`
+
+	writePluginScript(t, pluginDir+"/expand", script)
+
+	loaded := &plugins.LoadedPlugin{
+		Manifest: plugin.Manifest{Name: "postgres"},
+		Dir:      pluginDir,
+		Commands: map[string]string{"expand": pluginDir + "/expand"},
+	}
+
+	a := &API{
+		Store:        newMemStore(),
+		PluginBlocks: &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{"postgres": loaded}},
+	}
+
+	in := []*Manifest{{
+		Kind:  "postgres",
+		Scope: "data",
+		Name:  "main",
+		Spec:  json.RawMessage(`{}`),
+	}}
+
+	out, _, _, err := a.expandPluginBlocks(context.Background(), in)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+
+	if len(out) != 1 || out[0].Kind != KindStatefulset {
+		t.Errorf("legacy array shape failed: got %+v", out)
+	}
+}

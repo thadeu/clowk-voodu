@@ -34,6 +34,18 @@ type expandRequest struct {
 	Scope string          `json:"scope,omitempty"`
 	Name  string          `json:"name"`
 	Spec  json.RawMessage `json:"spec,omitempty"`
+
+	// Config is the merged config bucket (scope-level + app-level)
+	// for (scope, name) at the time of expand. Stateful plugins
+	// read this to detect "first apply vs re-apply" and act
+	// idempotently — e.g. redis reads REDIS_PASSWORD: present →
+	// reuses it, absent → generates one + emits a config_set
+	// action so the next apply finds the same value. Non-stateful
+	// plugins ignore the field. Empty map when the bucket has no
+	// keys (or store fetch failed; in that case the plugin sees
+	// "first apply" and may regenerate state — operator
+	// observable, not silent).
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // expandResponseData is the shape the plugin's envelope.Data must
@@ -364,14 +376,35 @@ func extractInstallMetadata(spec json.RawMessage) (repo, version string, cleaned
 
 // runExpand invokes the plugin's `expand` command with the block
 // JSON on stdin and parses its envelope. The plugin may emit
-// either a single manifest object or an array of them under
-// envelope.Data — both shapes work.
+// either:
+//
+//   - A single manifest object (one-resource plugins)
+//   - An array of manifests (multi-resource fan-out)
+//   - An object {manifests: [...], actions: [...]} when the
+//     plugin needs to mutate config alongside the manifests
+//     (typical case: redis generates a password on first apply
+//     and stores it in the config bucket via a config_set
+//     action so subsequent applies are idempotent)
+//
+// Pre-fetches the merged config bucket for (scope, name) and
+// passes it to the plugin in stdin. Lets stateful plugins read
+// "have I been initialised before?" state without round-tripping
+// through their own commands. Errors during ResolveConfig are
+// non-fatal — the plugin gets an empty config map and decides
+// whether the absence is meaningful.
 func (a *API) runExpand(ctx context.Context, plug *plugins.LoadedPlugin, m *Manifest) ([]*Manifest, error) {
+	var existingConfig map[string]string
+
+	if a.Store != nil {
+		existingConfig, _ = a.Store.ResolveConfig(ctx, m.Scope, m.Name)
+	}
+
 	req := expandRequest{
-		Kind:  string(m.Kind),
-		Scope: m.Scope,
-		Name:  m.Name,
-		Spec:  m.Spec,
+		Kind:   string(m.Kind),
+		Scope:  m.Scope,
+		Name:   m.Name,
+		Spec:   m.Spec,
+		Config: existingConfig,
 	}
 
 	stdin, err := json.Marshal(req)
@@ -413,9 +446,24 @@ func (a *API) runExpand(ctx context.Context, plug *plugins.LoadedPlugin, m *Mani
 		return nil, fmt.Errorf("plugin %q expand: %s", plug.Manifest.Name, res.Envelope.Error)
 	}
 
-	manifests, err := decodeExpandedManifests(res.Envelope.Data)
+	manifests, actions, err := decodeExpandedPayload(res.Envelope.Data)
 	if err != nil {
 		return nil, fmt.Errorf("plugin %q expand: %w", plug.Manifest.Name, err)
+	}
+
+	// Apply expand-emitted actions before returning the manifests.
+	// Today the only emitter is voodu-redis (config_set with the
+	// freshly-generated REDIS_PASSWORD on first apply), but the
+	// shape is generic so any future plugin can persist its
+	// initialised state through the same channel. Errors here
+	// abort the expand — partial-apply (manifest persisted but
+	// action lost) would leave the bucket in an inconsistent
+	// state operators couldn't recover from without manual
+	// intervention.
+	for i, action := range actions {
+		if _, err := a.applyPluginDispatchAction(ctx, action); err != nil {
+			return nil, fmt.Errorf("plugin %q expand action %d (%s): %w", plug.Manifest.Name, i, action.Type, err)
+		}
 	}
 
 	for _, em := range manifests {
@@ -439,18 +487,30 @@ func (a *API) runExpand(ctx context.Context, plug *plugins.LoadedPlugin, m *Mani
 	return manifests, nil
 }
 
-// decodeExpandedManifests handles both shapes a plugin may emit:
+// decodeExpandedPayload handles three shapes a plugin may emit
+// from its `expand` command, in order of preference:
 //
-//   - A single manifest object: `{"kind":"statefulset", …}`
-//   - An array: `[{"kind":"statefulset", …}, {"kind":"ingress", …}]`
+//   - {"manifests": [...], "actions": [...]}  — full envelope.
+//     Plugin emits manifests AND wants the controller to apply
+//     side-effect actions (config_set, config_unset). New shape;
+//     opt-in for stateful plugins like voodu-redis.
 //
-// Plugins that fan out to several manifests (postgres-cluster
-// emitting both a statefulset AND a sidecar deployment) take the
-// array shape. Postgres single-node takes the object. Both work
-// — the wire shape is intentionally permissive.
-func decodeExpandedManifests(data any) ([]*Manifest, error) {
+//   - [...]   — an array of manifest objects. The classic shape
+//                voodu-postgres-multi and any fan-out plugin uses.
+//
+//   - {...}   — a single manifest object. The simplest shape,
+//                used by single-resource plugins like voodu-caddy
+//                ingress (one ingress in, one ingress out).
+//
+// The shape is detected by inspecting the first non-whitespace
+// byte of the re-marshalled JSON. `[` → array; `{` with a
+// `manifests` key → full envelope; `{` without → single manifest.
+//
+// Returning (manifests, actions, err) keeps the caller's call
+// site uniform regardless of which shape the plugin used.
+func decodeExpandedPayload(data any) ([]*Manifest, []pluginDispatchAction, error) {
 	if data == nil {
-		return nil, fmt.Errorf("envelope.data is empty")
+		return nil, nil, fmt.Errorf("envelope.data is empty")
 	}
 
 	// Re-marshal then re-unmarshal: the envelope's Data field is
@@ -459,31 +519,52 @@ func decodeExpandedManifests(data any) ([]*Manifest, error) {
 	// (avoids reflection surgery, keeps tags consistent).
 	raw, err := json.Marshal(data)
 	if err != nil {
-		return nil, fmt.Errorf("re-marshal envelope.data: %w", err)
+		return nil, nil, fmt.Errorf("re-marshal envelope.data: %w", err)
 	}
 
 	trimmed := []byte(strings.TrimSpace(string(raw)))
 
 	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("envelope.data is empty")
+		return nil, nil, fmt.Errorf("envelope.data is empty")
 	}
 
 	if trimmed[0] == '[' {
 		var arr []*Manifest
 
 		if err := json.Unmarshal(trimmed, &arr); err != nil {
-			return nil, fmt.Errorf("decode array of manifests: %w", err)
+			return nil, nil, fmt.Errorf("decode array of manifests: %w", err)
 		}
 
-		return arr, nil
+		return arr, nil, nil
+	}
+
+	// Object shape — try the new envelope first ({manifests,
+	// actions}); if it doesn't have a `manifests` key, fall back
+	// to single-manifest decode.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return nil, nil, fmt.Errorf("decode envelope.data object: %w", err)
+	}
+
+	if _, hasManifests := probe["manifests"]; hasManifests {
+		var combined struct {
+			Manifests []*Manifest            `json:"manifests"`
+			Actions   []pluginDispatchAction `json:"actions"`
+		}
+
+		if err := json.Unmarshal(trimmed, &combined); err != nil {
+			return nil, nil, fmt.Errorf("decode {manifests, actions}: %w", err)
+		}
+
+		return combined.Manifests, combined.Actions, nil
 	}
 
 	var m Manifest
 	if err := json.Unmarshal(trimmed, &m); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
+		return nil, nil, fmt.Errorf("decode manifest: %w", err)
 	}
 
-	return []*Manifest{&m}, nil
+	return []*Manifest{&m}, nil, nil
 }
 
 // truncateForLog clips raw plugin output for inclusion in error

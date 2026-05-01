@@ -211,6 +211,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/plugins", a.handlePlugins)
 	mux.HandleFunc("POST /plugins/install", a.handlePluginInstall)
 	mux.HandleFunc("DELETE /plugins/{name}", a.handlePluginRemove)
+	mux.HandleFunc("POST /plugin/{name}/{command}", a.handlePluginCommand)
 	mux.HandleFunc("POST /jobs/run", a.handleJobRun)
 	mux.HandleFunc("POST /cronjobs/run", a.handleCronJobRun)
 	mux.HandleFunc("/config", a.handleConfig)

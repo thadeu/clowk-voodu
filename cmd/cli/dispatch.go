@@ -221,10 +221,24 @@ func takesValue(flag string) bool {
 // dispatch runs the cobra tree. If the first positional token does not
 // resolve to a known command, the arguments are forwarded to the
 // controller over HTTP instead of producing an "unknown command" error.
+//
+// Two forwarding paths:
+//
+//   - Structured plugin dispatch (POST /plugin/{name}/{command})
+//     when the shape matches `<plugin> <link|unlink|…> <from-ref>
+//     <to-ref>`. Server pre-fetches manifest state and applies
+//     actions the plugin returns (config_set / config_unset).
+//   - Generic forward (POST /plugins/exec) for everything else,
+//     so any plugin command outside the structured set keeps the
+//     existing fire-and-forget RPC behaviour.
 func dispatch(root *cobra.Command, args []string) error {
 	if isKnownCommand(root, args) {
 		root.SetArgs(args)
 		return root.Execute()
+	}
+
+	if plugin, command, refs, ok := looksLikePluginDispatch(args); ok {
+		return runPluginDispatch(root, plugin, command, refs)
 	}
 
 	return forwardToController(root, args)
