@@ -15,32 +15,18 @@ import (
 )
 
 // pluginDispatchRequest is the wire payload for the
-// `POST /plugin/{name}/{command}` endpoint. It's the operator-side
-// CLI handing the controller two manifest references (the
-// "provider" and the "consumer" in linking parlance) plus opaque
-// extra args that go straight to the plugin's stdin.
+// `POST /plugin/{name}/{command}` endpoint. The shape is
+// deliberately minimal: the CLI doesn't know what the plugin
+// does, doesn't know how many refs the command takes, doesn't
+// pre-fetch any state. It just hands the args slice to the
+// server, which hands it to the plugin verbatim.
 //
-// The shape is deliberately generic so a plugin command isn't
-// pinned to the link/unlink use case — `from` and `to` are
-// optional, `args` and `extra` carry whatever the plugin command
-// needs. A future `vd <plugin>:<other-command>` can reuse the
-// same envelope without API churn.
+// This is the passthrough contract: CLI is dumb, server is
+// dumb, plugin is autonomous. New plugin commands require zero
+// CLI/server changes — author drops a binary in bin/ and the
+// command is reachable via `vd <plugin>:<command> [args...]`.
 type pluginDispatchRequest struct {
-	From  *pluginManifestRef `json:"from,omitempty"`
-	To    *pluginManifestRef `json:"to,omitempty"`
-	Args  []string           `json:"args,omitempty"`
-	Extra map[string]any     `json:"extra,omitempty"`
-}
-
-// pluginManifestRef points at a single manifest the plugin wants
-// to know about. Kind is optional — when empty the controller
-// skips the spec pre-fetch and only attaches the config bucket
-// (useful for the `to` side of a link, which is just a target,
-// not yet associated with any specific kind).
-type pluginManifestRef struct {
-	Kind  string `json:"kind,omitempty"`
-	Scope string `json:"scope,omitempty"`
-	Name  string `json:"name"`
+	Args []string `json:"args,omitempty"`
 }
 
 // pluginDispatchAction is one instruction the plugin asks the
@@ -60,43 +46,59 @@ type pluginDispatchAction struct {
 	Keys  []string          `json:"keys,omitempty"`
 }
 
-// pluginDispatchResponse mirrors what plugins must emit on stdout
-// inside a JSON envelope (envelope.Data is unmarshalled into this
-// shape). `message` is an operator-facing one-liner; `actions`
-// is the queue the controller applies post-invoke.
+// pluginDispatchResponse is the operator-facing data the plugin
+// emits inside its envelope. `message` is the one-line success
+// summary the CLI prints; `actions` is the queue the controller
+// applies post-invoke.
 type pluginDispatchResponse struct {
 	Message string                 `json:"message,omitempty"`
 	Actions []pluginDispatchAction `json:"actions,omitempty"`
+}
+
+// pluginInvocationContext is the JSON envelope the controller
+// writes to the plugin's stdin. The plugin reads this to learn
+// where to call back (controller_url) and to access its own
+// installation directory (plugin_dir, useful for reading
+// bundled assets like get-conf scripts).
+//
+// Plugins parse args via os.Args[2:] (standard CLI argv) — the
+// stdin envelope is purely for context the OS argv can't carry.
+type pluginInvocationContext struct {
+	Plugin        string `json:"plugin"`
+	Command       string `json:"command"`
+	ControllerURL string `json:"controller_url,omitempty"`
+	PluginDir     string `json:"plugin_dir,omitempty"`
+	NodeName      string `json:"node_name,omitempty"`
 }
 
 // handlePluginCommand dispatches `POST /plugin/{name}/{command}`.
 //
 // Lifecycle of one call:
 //
-//  1. Parse {name, command} from URL, decode body.
-//  2. Load the plugin from PluginsRoot. If the command isn't
-//     declared in plugin.yml, 400 — never invoke an
-//     undocumented command (matches the contract every other
-//     plugin call follows).
-//  3. Pre-fetch the `from` manifest's spec + merged config and
-//     the `to` config (when scope/name supplied). Plugin gets
-//     this as part of its stdin so it doesn't need a callback
-//     channel back into the controller.
-//  4. Run the plugin via the same code path as `expand`
-//     (LoadFromDir + Run). Stdin is JSON; stdout is parsed as a
-//     plugin envelope and the Data block is decoded into
-//     pluginDispatchResponse.
-//  5. Apply each action in order. Any action error aborts the
-//     remaining ones and surfaces 5xx — partial-apply semantics
-//     would be confusing for operators.
-//  6. Return 200 with the plugin's `message` and a list of the
-//     actions actually applied (operator can render this as the
-//     command's success output).
+//  1. Parse {name, command} from URL, decode `{args}` from body.
+//  2. Load the plugin from PluginsRoot. If bin/<command> doesn't
+//     exist, 400 — every subcommand needs a discoverable
+//     executable file (the plugin loader indexes by filename).
+//  3. Run bin/<command> with the operator's args verbatim. Stdin
+//     carries the invocation context (controller_url, plugin_dir)
+//     so the plugin can call back into /describe, /config, etc.
+//     when it needs platform state.
+//  4. Parse the plugin's envelope. envelope.Data may include a
+//     `message` and an `actions` list. Each action is applied
+//     against the store (config_set, config_unset).
+//  5. Return 200 with the plugin's `message` and a list of
+//     actions actually applied.
+//
+// The handler doesn't pre-fetch any manifest/config — the plugin
+// is autonomous. If it needs the redis manifest's spec, it does
+// `GET ${controller_url}/describe?kind=statefulset&...` itself.
+// Same posture as kubectl plugins: thin shell, plugin owns its
+// world.
 //
 // Failure modes the operator sees:
 //
 //   - 400 plugin not installed
-//   - 400 command not declared in plugin.yml
+//   - 400 bin/<command> doesn't exist
 //   - 400 plugin exited non-zero (with stderr in the error)
 //   - 400 plugin returned an error envelope
 //   - 400 plugin emitted a malformed action (unknown type)
@@ -136,44 +138,21 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, declared := plug.Commands[command]; !declared {
-		// Plugin commands are discovered by FILE in `bin/` (or the
-		// legacy `commands/` dir), not by the plugin.yml `commands:`
-		// list. Common mistake: declaring the command in plugin.yml
-		// without dropping a matching shim script in bin/ that
-		// re-execs the actual binary.
 		writeErr(w, http.StatusBadRequest, fmt.Errorf(
 			"plugin %q does not have an executable named %q under bin/ (each subcommand needs a shim file in bin/<name> that re-execs the plugin binary)",
 			pluginName, command))
 		return
 	}
 
-	// Pre-fetch context for both refs. Failures are non-fatal —
-	// the plugin can still decide to operate with whatever
-	// context arrived (maybe it only needs `from.spec`, maybe
-	// it doesn't care about config). We log the failure into
-	// the stdin payload so the plugin can detect partial state.
-	stdinPayload := map[string]any{
-		"plugin":  pluginName,
-		"command": command,
+	ctx := pluginInvocationContext{
+		Plugin:        pluginName,
+		Command:       command,
+		ControllerURL: a.ControllerURL,
+		PluginDir:     plug.Dir,
+		NodeName:      a.NodeName,
 	}
 
-	if req.From != nil {
-		stdinPayload["from"] = a.fetchPluginCtxForRef(r.Context(), *req.From)
-	}
-
-	if req.To != nil {
-		stdinPayload["to"] = a.fetchPluginCtxForRef(r.Context(), *req.To)
-	}
-
-	if len(req.Args) > 0 {
-		stdinPayload["args"] = req.Args
-	}
-
-	if len(req.Extra) > 0 {
-		stdinPayload["extra"] = req.Extra
-	}
-
-	stdin, err := json.Marshal(stdinPayload)
+	stdin, err := json.Marshal(ctx)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("marshal plugin stdin: %w", err))
 		return
@@ -181,6 +160,7 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 
 	res, err := plug.Run(r.Context(), plugins.RunOptions{
 		Command: command,
+		Args:    req.Args,
 		Stdin:   stdin,
 		Env: map[string]string{
 			plugin.EnvRoot:       a.PluginsRoot,
@@ -200,8 +180,18 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if res.Envelope == nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("plugin %q %s emitted no JSON envelope (got: %s)",
-			pluginName, command, truncateForLog(res.Raw, 200)))
+		// Plugin emitted plain text (no JSON envelope) — pass it
+		// through as the message. Lets simple shell plugins
+		// participate in dispatch without speaking the
+		// envelope protocol.
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data: map[string]any{
+				"message": strings.TrimRight(string(res.Raw), "\n"),
+				"applied": []string{},
+			},
+		})
+
 		return
 	}
 
@@ -245,41 +235,6 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 			"applied": applied,
 		},
 	})
-}
-
-// fetchPluginCtxForRef gathers the context a plugin command
-// typically needs about one manifest: kind/scope/name (verbatim
-// from the request) plus optionally the spec (when a kind is
-// supplied) and the merged config (always). Errors during the
-// store reads are swallowed — the plugin gets best-effort context
-// and decides whether the missing piece is fatal for its logic.
-func (a *API) fetchPluginCtxForRef(ctx context.Context, ref pluginManifestRef) map[string]any {
-	out := map[string]any{
-		"kind":  ref.Kind,
-		"scope": ref.Scope,
-		"name":  ref.Name,
-	}
-
-	if ref.Kind != "" && a.Store != nil {
-		if kind, err := ParseKind(ref.Kind); err == nil {
-			if m, err := a.Store.Get(ctx, kind, ref.Scope, ref.Name); err == nil && m != nil {
-				if len(m.Spec) > 0 {
-					var spec map[string]any
-					if err := json.Unmarshal(m.Spec, &spec); err == nil {
-						out["spec"] = spec
-					}
-				}
-			}
-		}
-	}
-
-	if a.Store != nil {
-		if cfg, err := a.Store.ResolveConfig(ctx, ref.Scope, ref.Name); err == nil && len(cfg) > 0 {
-			out["config"] = cfg
-		}
-	}
-
-	return out
 }
 
 // applyPluginDispatchActionFromRequest is the HTTP-handler path

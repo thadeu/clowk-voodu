@@ -1,22 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
 
-// TestPluginDispatch_RoutesToStructuredEndpoint pins the wire
-// shape `vd redis:link clowk-lp/redis clowk-lp/web` produces.
-// Without this the CLI could quietly fall through to the
-// generic /plugins/exec path and the structured dispatch (with
-// pre-fetched state + action applier) would never run.
-func TestPluginDispatch_RoutesToStructuredEndpoint(t *testing.T) {
+// TestPluginDispatch_ForwardsArgsVerbatim pins the passthrough
+// contract: CLI packages the operator's args into `{args: [...]}`
+// and POSTs to /plugin/{name}/{command}. The CLI doesn't inspect
+// or transform the args — that's the plugin's job.
+func TestPluginDispatch_ForwardsArgsVerbatim(t *testing.T) {
 	var (
 		gotPath string
 		gotBody []byte
@@ -28,10 +25,7 @@ func TestPluginDispatch_RoutesToStructuredEndpoint(t *testing.T) {
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data": map[string]any{
-				"message": "linked",
-				"applied": []string{"config_set clowk-lp/web: REDIS_URL"},
-			},
+			"data":   map[string]any{"message": "ok"},
 		})
 	}))
 	defer ts.Close()
@@ -40,7 +34,6 @@ func TestPluginDispatch_RoutesToStructuredEndpoint(t *testing.T) {
 	_ = root.PersistentFlags().Set("controller-url", ts.URL)
 
 	args := rewriteColonSyntax([]string{"vd", "redis:link", "clowk-lp/redis", "clowk-lp/web"})
-	// rewriteColonSyntax preserves argv[0]; dispatch consumes argv[1:].
 
 	if err := dispatch(root, args[1:]); err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -51,43 +44,38 @@ func TestPluginDispatch_RoutesToStructuredEndpoint(t *testing.T) {
 	}
 
 	var payload struct {
-		From map[string]any `json:"from"`
-		To   map[string]any `json:"to"`
+		Args []string `json:"args"`
 	}
 
 	if err := json.Unmarshal(gotBody, &payload); err != nil {
 		t.Fatalf("decode body: %v\n%s", err, gotBody)
 	}
 
-	if payload.From["scope"] != "clowk-lp" || payload.From["name"] != "redis" {
-		t.Errorf("from: %+v", payload.From)
+	want := []string{"clowk-lp/redis", "clowk-lp/web"}
+
+	if len(payload.Args) != len(want) {
+		t.Fatalf("args=%v want %v", payload.Args, want)
 	}
 
-	if payload.To["scope"] != "clowk-lp" || payload.To["name"] != "web" {
-		t.Errorf("to: %+v", payload.To)
-	}
-
-	// `from` must carry the kind hint so the server pre-fetches
-	// the right manifest. Today plugin "redis" emits statefulset.
-	if payload.From["kind"] != "statefulset" {
-		t.Errorf("from.kind=%q want statefulset", payload.From["kind"])
+	for i, w := range want {
+		if payload.Args[i] != w {
+			t.Errorf("args[%d]=%q want %q", i, payload.Args[i], w)
+		}
 	}
 }
 
-// TestPluginDispatch_UnlinkRoutesSameWay confirms unlink uses
-// the same dispatch endpoint with the same payload shape — only
-// the URL command segment differs. Without this, an asymmetric
-// implementation could land where unlink falls through to the
-// generic forward path and silently no-ops.
-func TestPluginDispatch_UnlinkRoutesSameWay(t *testing.T) {
-	var gotPath string
+// TestPluginDispatch_PassesFlagsThroughToPlugin confirms `-h`
+// and similar flags flow through as args. The CLI doesn't
+// intercept them — plugin handles its own help / flags.
+func TestPluginDispatch_PassesFlagsThroughToPlugin(t *testing.T) {
+	var gotBody []byte
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data":   map[string]any{"message": "unlinked"},
+			"data":   map[string]any{"message": "Usage: vd redis:link <a> <b>"},
 		})
 	}))
 	defer ts.Close()
@@ -95,121 +83,123 @@ func TestPluginDispatch_UnlinkRoutesSameWay(t *testing.T) {
 	root := newRootCmd()
 	_ = root.PersistentFlags().Set("controller-url", ts.URL)
 
-	args := rewriteColonSyntax([]string{"vd", "redis:unlink", "clowk-lp/redis", "clowk-lp/web"})
+	// `-h` is just another arg from the CLI's perspective.
+	args := rewriteColonSyntax([]string{"vd", "redis:link", "-h"})
 
 	if err := dispatch(root, args[1:]); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 
-	if gotPath != "/plugin/redis/unlink" {
-		t.Errorf("path=%q want /plugin/redis/unlink", gotPath)
+	var payload struct {
+		Args []string `json:"args"`
+	}
+
+	_ = json.Unmarshal(gotBody, &payload)
+
+	if len(payload.Args) != 1 || payload.Args[0] != "-h" {
+		t.Errorf("expected args=[-h], got %v", payload.Args)
 	}
 }
 
-// TestPluginDispatch_NonDispatchCommandFallsThrough: a plugin
-// command outside the dispatch set (link/unlink) keeps the
-// existing /plugins/exec behaviour. Locks the contract so we
-// don't accidentally migrate every plugin command and break
-// fire-and-forget RPCs (`vd postgres:create`, etc).
-func TestPluginDispatch_NonDispatchCommandFallsThrough(t *testing.T) {
-	var gotPath string
+// TestPluginDispatch_AnyVerbRoutes: the dispatcher has no
+// hardcoded list of verbs. `vd <plugin>:<arbitrary-cmd>` for
+// any plugin name and any verb routes through. Future plugins
+// adding `vd cassandra:add-node` or `vd mongo:replicaset-init`
+// don't need CLI changes.
+func TestPluginDispatch_AnyVerbRoutes(t *testing.T) {
+	cases := []struct {
+		colonInvocation []string
+		wantPath        string
+	}{
+		{[]string{"vd", "redis:link", "a", "b"}, "/plugin/redis/link"},
+		{[]string{"vd", "redis:unlink", "a", "b"}, "/plugin/redis/unlink"},
+		{[]string{"vd", "redis:new-password", "a"}, "/plugin/redis/new-password"},
+		{[]string{"vd", "redis:custom-verb"}, "/plugin/redis/custom-verb"},
+		{[]string{"vd", "postgres:backup", "a", "b", "c"}, "/plugin/postgres/backup"},
+	}
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
+	for _, tc := range cases {
+		t.Run(tc.wantPath, func(t *testing.T) {
+			var gotPath string
 
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status": "ok",
-			"data":   "noop",
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "ok",
+					"data":   map[string]any{"message": "ok"},
+				})
+			}))
+			defer ts.Close()
+
+			root := newRootCmd()
+			_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+			args := rewriteColonSyntax(tc.colonInvocation)
+
+			if err := dispatch(root, args[1:]); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+
+			if gotPath != tc.wantPath {
+				t.Errorf("got %q, want %q", gotPath, tc.wantPath)
+			}
 		})
-	}))
-	defer ts.Close()
-
-	root := newRootCmd()
-	_ = root.PersistentFlags().Set("controller-url", ts.URL)
-
-	args := rewriteColonSyntax([]string{"vd", "redis:create", "main"})
-
-	if err := dispatch(root, args[1:]); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-
-	if gotPath != "/plugins/exec" {
-		t.Errorf("non-dispatch command should hit /plugins/exec, got %q", gotPath)
 	}
 }
 
-// TestLooksLikePluginDispatch_RecognizedShapes covers the
-// detector that decides "structured dispatch vs generic forward".
-// Locks the rule so future arg-shape tweaks (flags, missing
-// refs, new arities) keep the routing predictable.
-func TestLooksLikePluginDispatch_RecognizedShapes(t *testing.T) {
+// TestLooksLikePluginDispatch_DetectorRules pins the rule
+// set of the dispatch detector — when does it route, when
+// does it fall through to forwardToController.
+func TestLooksLikePluginDispatch_DetectorRules(t *testing.T) {
 	cases := []struct {
 		name                string
 		args                []string
 		wantOK              bool
 		wantPlugin, wantCmd string
-		wantRefs            []string
+		wantArgs            []string
 	}{
 		{
-			name:       "link with two refs",
-			args:       []string{"redis", "link", "clowk-lp/redis", "clowk-lp/web"},
+			name:       "plugin + command + 2 refs",
+			args:       []string{"redis", "link", "a", "b"},
 			wantOK:     true,
 			wantPlugin: "redis", wantCmd: "link",
-			wantRefs: []string{"clowk-lp/redis", "clowk-lp/web"},
+			wantArgs: []string{"a", "b"},
 		},
 		{
-			name:       "unlink also routes",
-			args:       []string{"postgres", "unlink", "data/pg", "myapp/api"},
+			name:       "plugin + command + 0 refs (passthrough still works)",
+			args:       []string{"redis", "list"},
 			wantOK:     true,
-			wantPlugin: "postgres", wantCmd: "unlink",
-			wantRefs: []string{"data/pg", "myapp/api"},
+			wantPlugin: "redis", wantCmd: "list",
+			wantArgs: []string{},
 		},
 		{
-			name:       "flags interleaved — refs still detected",
-			args:       []string{"redis", "link", "-r", "prod", "clowk-lp/redis", "clowk-lp/web"},
+			name:       "plugin + command + many args including flags",
+			args:       []string{"postgres", "backup", "-f", "/tmp/dump.sql", "data/pg"},
 			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "link",
-			wantRefs: []string{"clowk-lp/redis", "clowk-lp/web"},
+			wantPlugin: "postgres", wantCmd: "backup",
+			wantArgs: []string{"-f", "/tmp/dump.sql", "data/pg"},
 		},
 		{
-			name:       "new-password takes one ref",
-			args:       []string{"redis", "new-password", "clowk-lp/redis"},
-			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "new-password",
-			wantRefs: []string{"clowk-lp/redis"},
-		},
-		{
-			name:       "new-password slurps only the first ref even when more present",
-			args:       []string{"redis", "new-password", "clowk-lp/redis", "ignored"},
-			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "new-password",
-			wantRefs: []string{"clowk-lp/redis"},
-		},
-		{
-			name:   "link with single ref — not enough",
-			args:   []string{"redis", "link", "clowk-lp/redis"},
-			wantOK: false,
-		},
-		{
-			name:   "new-password with no ref",
-			args:   []string{"redis", "new-password"},
-			wantOK: false,
-		},
-		{
-			name:   "non-dispatch command falls through",
-			args:   []string{"redis", "create", "main"},
-			wantOK: false,
-		},
-		{
-			name:   "too few args overall",
+			name:   "single token — not a plugin invocation",
 			args:   []string{"redis"},
+			wantOK: false,
+		},
+		{
+			name:   "starts with flag — not plugin syntax",
+			args:   []string{"-r", "redis"},
+			wantOK: false,
+		},
+		{
+			name:   "command with non-ident chars",
+			args:   []string{"redis", "weird/command"},
 			wantOK: false,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plugin, cmd, refs, ok := looksLikePluginDispatch(tc.args)
+			plugin, cmd, args, ok := looksLikePluginDispatch(tc.args)
 
 			if ok != tc.wantOK {
 				t.Errorf("ok=%v want %v", ok, tc.wantOK)
@@ -225,24 +215,23 @@ func TestLooksLikePluginDispatch_RecognizedShapes(t *testing.T) {
 					plugin, cmd, tc.wantPlugin, tc.wantCmd)
 			}
 
-			if len(refs) != len(tc.wantRefs) {
-				t.Errorf("refs=%v want %v", refs, tc.wantRefs)
+			if len(args) != len(tc.wantArgs) {
+				t.Errorf("args=%v want %v", args, tc.wantArgs)
 				return
 			}
 
-			for i, want := range tc.wantRefs {
-				if refs[i] != want {
-					t.Errorf("refs[%d]=%q want %q", i, refs[i], want)
+			for i, want := range tc.wantArgs {
+				if args[i] != want {
+					t.Errorf("args[%d]=%q want %q", i, args[i], want)
 				}
 			}
 		})
 	}
 }
 
-// TestPluginDispatch_RendersAppliedActions: the operator should
-// see each applied action in the success output, not just a bare
-// "linked" message. Confirms the renderer pulls Data.Applied[]
-// and prints them with a checkmark prefix.
+// TestPluginDispatch_RendersAppliedActions confirms the operator
+// sees each applied action with a checkmark in the success
+// output.
 func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -251,7 +240,6 @@ func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 				"message": "linked clowk-lp/redis → clowk-lp/web",
 				"applied": []string{
 					"config_set clowk-lp/web: REDIS_URL",
-					"config_set clowk-lp/web: REDIS_HOST",
 				},
 			},
 		})
@@ -261,15 +249,6 @@ func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 	root := newRootCmd()
 	_ = root.PersistentFlags().Set("controller-url", ts.URL)
 
-	// Capture stdout so we can assert the rendered output.
-	var buf bytes.Buffer
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-
-	// The plugin dispatch path uses fmt.Println, which writes to
-	// os.Stdout — not root.Out. To capture, we'd need to swap
-	// os.Stdout temporarily. Skipping detailed assertion here in
-	// favour of a status-code-only smoke test in the real flow.
 	args := rewriteColonSyntax([]string{"vd", "redis:link", "clowk-lp/redis", "clowk-lp/web"})
 
 	if err := dispatch(root, args[1:]); err != nil {
@@ -277,120 +256,15 @@ func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 	}
 }
 
-// TestLooksLikePluginHelp_RecognizedShapes pins the help-flag
-// detector. -h or --help on a dispatch verb routes to the
-// CLI-side printer; same flag on an unknown verb falls through
-// to the generic forwarder so the plugin's own --help can fire.
-func TestLooksLikePluginHelp_RecognizedShapes(t *testing.T) {
-	cases := []struct {
-		name                string
-		args                []string
-		wantOK              bool
-		wantPlugin, wantCmd string
-	}{
-		{
-			name:       "verb help short flag",
-			args:       []string{"redis", "link", "-h"},
-			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "link",
-		},
-		{
-			name:       "verb help long flag",
-			args:       []string{"redis", "unlink", "--help"},
-			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "unlink",
-		},
-		{
-			name:       "plugin overview short flag",
-			args:       []string{"redis", "-h"},
-			wantOK:     true,
-			wantPlugin: "redis", wantCmd: "",
-		},
-		{
-			name:       "plugin overview long flag",
-			args:       []string{"postgres", "--help"},
-			wantOK:     true,
-			wantPlugin: "postgres", wantCmd: "",
-		},
-		{
-			name:   "unknown verb with help falls through",
-			args:   []string{"redis", "weird-command", "-h"},
-			wantOK: false,
-		},
-		{
-			name:   "no help flag",
-			args:   []string{"redis", "link", "from", "to"},
-			wantOK: false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			plugin, cmd, ok := looksLikePluginHelp(tc.args)
-
-			if ok != tc.wantOK {
-				t.Errorf("ok=%v want %v", ok, tc.wantOK)
-				return
-			}
-
-			if !tc.wantOK {
-				return
-			}
-
-			if plugin != tc.wantPlugin || cmd != tc.wantCmd {
-				t.Errorf("plugin=%q cmd=%q want plugin=%q cmd=%q",
-					plugin, cmd, tc.wantPlugin, tc.wantCmd)
-			}
-		})
-	}
-}
-
-// TestPrintPluginHelp_KnownVerbs covers the rendered output for
-// each dispatch verb. Pin the placeholder substitution so a
-// plugin name shows up consistently in the Example line and the
-// Usage line.
-func TestPrintPluginHelp_KnownVerbs(t *testing.T) {
-	for verb := range pluginDispatchCommands {
-		t.Run(verb, func(t *testing.T) {
-			// Capture stdout — printPluginHelp writes via fmt.
-			old := os.Stdout
-			r, w, _ := os.Pipe()
-			os.Stdout = w
-
-			err := printPluginHelp("postgres", verb)
-
-			w.Close()
-			os.Stdout = old
-
-			out, _ := io.ReadAll(r)
-
-			if err != nil {
-				t.Fatalf("err: %v", err)
-			}
-
-			s := string(out)
-
-			if !strings.Contains(s, "vd postgres:"+verb) {
-				t.Errorf("plugin name not substituted: %s", s)
-			}
-
-			if strings.Contains(s, "<plugin>") {
-				t.Errorf("placeholder leaked into output: %s", s)
-			}
-		})
-	}
-}
-
 // TestPluginDispatch_ServerErrorSurfaces: a 4xx/5xx from the
-// dispatch endpoint reaches the operator with the actual error,
-// not a generic forwarder code. Pin the same-as-restart path:
-// envelope.error wins over status code in the message.
+// dispatch endpoint reaches the operator with the actual error
+// from the envelope, not a generic forwarder code.
 func TestPluginDispatch_ServerErrorSurfaces(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status": "error",
-			"error":  "plugin \"redis\" does not declare command \"link\"",
+			"error":  "plugin \"redis\" does not have an executable named \"link\" under bin/",
 		})
 	}))
 	defer ts.Close()
@@ -405,7 +279,7 @@ func TestPluginDispatch_ServerErrorSurfaces(t *testing.T) {
 		t.Fatal("expected error for 400")
 	}
 
-	if !strings.Contains(err.Error(), "does not declare command") {
+	if !strings.Contains(err.Error(), "does not have an executable") {
 		t.Errorf("error mismatch: %v", err)
 	}
 }

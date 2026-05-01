@@ -39,6 +39,14 @@ type API struct {
 	NodeName   string
 	EtcdClient string
 
+	// ControllerURL is the HTTP base URL plugins use to call back
+	// into the controller (GET /describe, GET /config, etc.) when
+	// they need platform state. Set by the server wiring from the
+	// configured HTTPAddr — typically http://127.0.0.1:8686 since
+	// plugins run on the same host as the controller. Empty when
+	// not configured (tests, or when plugins don't need callback).
+	ControllerURL string
+
 	// Invoker is the shared plugin-execution seam — the reconciler uses
 	// the same interface for its handlers, so /exec and reconcile-time
 	// calls go through one code path (env injection, plugin resolution,

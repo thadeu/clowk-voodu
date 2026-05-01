@@ -283,12 +283,66 @@ EOF
 	}
 }
 
+// TestPluginDispatch_PassesArgsAsArgv pins the passthrough
+// contract: the operator's args arrive at the plugin via
+// os.Args (i.e. RunOptions.Args), NOT stdin. The plugin
+// parses its own argv just like any other CLI tool.
+func TestPluginDispatch_PassesArgsAsArgv(t *testing.T) {
+	root := t.TempDir()
+	argvSink := root + "/captured-argv.txt"
+
+	// Plugin writes its positional args to a file (one per
+	// line). "$@" already excludes $0, so no shift needed.
+	script := `#!/bin/sh
+for a in "$@"; do
+  echo "$a" >> ` + argvSink + `
+done
+echo '{"status":"ok","data":{"message":"saved"}}'
+`
+
+	writePluginYAML(t, root, "redis", "link", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","clowk-lp/web","--debug"]}`)
+
+	resp, err := http.Post(srv.URL+"/plugin/redis/link", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	captured, err := os.ReadFile(argvSink)
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+
+	got := strings.Split(strings.TrimRight(string(captured), "\n"), "\n")
+
+	want := []string{"clowk-lp/redis", "clowk-lp/web", "--debug"}
+
+	if len(got) != len(want) {
+		t.Fatalf("argv=%v want %v", got, want)
+	}
+
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("argv[%d]=%q want %q", i, got[i], w)
+		}
+	}
+}
+
 // TestPluginDispatch_StdinCarriesContext: the plugin's stdin
-// must contain the {plugin, command, from, to} envelope so it
-// can act on real state. Confirmed by having the plugin write
-// its stdin to a known file (avoids JSON-in-JSON escape pain
-// of trying to inline stdin into a stdout envelope) and the
-// test reads it back.
+// must contain the {plugin, command, controller_url, plugin_dir}
+// envelope so it can call back to the controller for state.
+// Args flow through os.Args[2:] (RunOptions.Args), NOT stdin —
+// that's the passthrough contract: plugin parses its own argv.
 func TestPluginDispatch_StdinCarriesContext(t *testing.T) {
 	root := t.TempDir()
 
@@ -312,11 +366,8 @@ echo '{"status":"ok","data":{"message":"saved"}}'
 		Spec:  json.RawMessage(`{"image":"redis:8"}`),
 	})
 
-	_ = store.PatchConfig(context.Background(), "clowk-lp", "redis", map[string]string{"REDIS_PASSWORD": "s3cret"})
-
 	body := bytes.NewBufferString(`{
-		"from": {"kind": "statefulset", "scope": "clowk-lp", "name": "redis"},
-		"to":   {"scope": "clowk-lp", "name": "web"}
+		"args": ["clowk-lp/redis", "clowk-lp/web"]
 	}`)
 
 	resp, err := http.Post(srv.URL+"/plugin/redis/link", "application/json", body)
@@ -340,6 +391,9 @@ echo '{"status":"ok","data":{"message":"saved"}}'
 		t.Fatalf("captured stdin not JSON: %v\n%s", err, captured)
 	}
 
+	// Stdin envelope has plugin/command/controller_url/plugin_dir
+	// — the context needed for the plugin to call back. Args are
+	// NOT in stdin; they arrive via os.Args[2:].
 	if stdin["plugin"] != "redis" {
 		t.Errorf("plugin field: %v", stdin["plugin"])
 	}
@@ -348,24 +402,13 @@ echo '{"status":"ok","data":{"message":"saved"}}'
 		t.Errorf("command field: %v", stdin["command"])
 	}
 
-	from, _ := stdin["from"].(map[string]any)
-
-	if from["kind"] != "statefulset" || from["scope"] != "clowk-lp" || from["name"] != "redis" {
-		t.Errorf("from kind/scope/name wrong: %+v", from)
+	if _, present := stdin["plugin_dir"]; !present {
+		t.Errorf("plugin_dir should be present for plugins that read bundled files")
 	}
 
-	if spec, _ := from["spec"].(map[string]any); spec["image"] != "redis:8" {
-		t.Errorf("from.spec.image: %v", spec)
-	}
-
-	if cfg, _ := from["config"].(map[string]any); cfg["REDIS_PASSWORD"] != "s3cret" {
-		t.Errorf("from.config.REDIS_PASSWORD: %v", cfg)
-	}
-
-	to, _ := stdin["to"].(map[string]any)
-
-	if to["scope"] != "clowk-lp" || to["name"] != "web" {
-		t.Errorf("to scope/name wrong: %+v", to)
+	// from/to fields no longer exist — plugin parses os.Args[2:].
+	if _, present := stdin["from"]; present {
+		t.Error("from field should not be in passthrough stdin (plugin parses args itself)")
 	}
 }
 

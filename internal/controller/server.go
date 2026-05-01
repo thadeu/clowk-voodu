@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.voodu.clowk.in/internal/envfile"
@@ -107,10 +108,11 @@ func (s *Server) Start(ctx context.Context) error {
 	s.api = &API{
 		Store:       store,
 		Version:     s.cfg.Version,
-		PluginsRoot: s.cfg.PluginsRoot,
-		NodeName:    s.cfg.NodeName,
-		EtcdClient:  s.cfg.EtcdClient,
-		Invoker:     invoker,
+		PluginsRoot:   s.cfg.PluginsRoot,
+		NodeName:      s.cfg.NodeName,
+		EtcdClient:    s.cfg.EtcdClient,
+		ControllerURL: deriveControllerURL(s.cfg.HTTPAddr),
+		Invoker:       invoker,
 		Pods:        DockerPodsLister{},
 		// DockerContainerManager satisfies LogStreamer via its Logs
 		// method — same instance the deployment/job/cronjob handlers
@@ -425,5 +427,30 @@ func (l *loggingResponseWriter) Flush() {
 	if flusher, ok := l.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// deriveControllerURL turns an HTTPAddr like ":8686" or
+// "0.0.0.0:8686" into the URL plugins use to call back into the
+// controller. Plugins run on the same host as the controller
+// (server-side install via PluginsRoot) so 127.0.0.1 is the
+// right host regardless of what the listener binds to.
+//
+// Empty addr → empty URL (plugins won't be able to call back,
+// but voodu-redis-style plugins that need state still work
+// when invoked through the dispatch endpoint with stdin
+// envelope already populated).
+func deriveControllerURL(httpAddr string) string {
+	if httpAddr == "" {
+		return ""
+	}
+
+	// HTTPAddr can be ":8686" (any iface) or "host:8686" or
+	// "1.2.3.4:8686". Plugins run locally — always loopback.
+	port := httpAddr
+	if idx := strings.LastIndex(httpAddr, ":"); idx >= 0 {
+		port = httpAddr[idx:]
+	}
+
+	return "http://127.0.0.1" + port
 }
 
