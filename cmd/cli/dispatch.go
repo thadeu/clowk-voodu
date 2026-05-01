@@ -244,11 +244,46 @@ func dispatch(root *cobra.Command, args []string) error {
 		return root.Execute()
 	}
 
+	// `vd <plugin> -h` and `vd <plugin> --help` (no verb)
+	// synthesize a call to the plugin's `help` command. The
+	// plugin author drops a bin/help shim and decides what
+	// the overview looks like — CLI doesn't render anything
+	// itself. Without this, `-h` would fall through to the
+	// generic forwarder and the operator would see "unknown
+	// command" instead of plugin help.
+	if plugin, isHelp := looksLikePluginOverviewHelp(args); isHelp {
+		return runPluginDispatch(root, plugin, "help", nil)
+	}
+
 	if plugin, command, pluginArgs, ok := looksLikePluginDispatch(args); ok {
 		return runPluginDispatch(root, plugin, command, pluginArgs)
 	}
 
 	return forwardToController(root, args)
+}
+
+// looksLikePluginOverviewHelp matches `vd <plugin> -h` /
+// `vd <plugin> --help` shapes — operator asking for plugin-level
+// overview. Returns (plugin, true) when matched.
+//
+// Verb-specific help (`vd <plugin>:<verb> -h`) is handled by
+// looksLikePluginDispatch as a normal arg passthrough — the
+// plugin's verb command sees `-h` in its argv and decides what
+// to do.
+func looksLikePluginOverviewHelp(args []string) (plugin string, ok bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+
+	if !isIdent(args[0]) {
+		return "", false
+	}
+
+	if args[1] != "-h" && args[1] != "--help" {
+		return "", false
+	}
+
+	return args[0], true
 }
 
 // isKnownCommand walks the command tree to see whether the first

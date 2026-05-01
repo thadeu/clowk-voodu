@@ -256,6 +256,99 @@ func TestPluginDispatch_RendersAppliedActions(t *testing.T) {
 	}
 }
 
+// TestPluginDispatch_OverviewHelpSynthesizesHelpCommand pins
+// the `-h` / `--help` synthesis: when the operator types
+// `vd <plugin> -h` (no verb), the dispatcher routes to
+// /plugin/<plugin>/help so the plugin's bin/help shim renders
+// the overview. Plugin owns the help text — CLI doesn't render
+// anything itself.
+func TestPluginDispatch_OverviewHelpSynthesizesHelpCommand(t *testing.T) {
+	cases := []struct {
+		args     []string
+		wantPath string
+	}{
+		{[]string{"vd", "redis", "-h"}, "/plugin/redis/help"},
+		{[]string{"vd", "redis", "--help"}, "/plugin/redis/help"},
+		{[]string{"vd", "postgres", "-h"}, "/plugin/postgres/help"},
+	}
+
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var gotPath string
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "ok",
+					"data":   map[string]any{"message": "plugin help"},
+				})
+			}))
+			defer ts.Close()
+
+			root := newRootCmd()
+			_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+			args := rewriteColonSyntax(tc.args)
+
+			if err := dispatch(root, args[1:]); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+
+			if gotPath != tc.wantPath {
+				t.Errorf("got %q want %q", gotPath, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestPluginDispatch_VerbSpecificHelpFlowsAsArg: `vd <plugin>:<verb> -h`
+// keeps the regular passthrough — `-h` arrives at the plugin as an
+// arg, plugin handles its own usage rendering. This is distinct from
+// the synthesis path tested above (which is for plugin-level overview
+// without a verb).
+func TestPluginDispatch_VerbSpecificHelpFlowsAsArg(t *testing.T) {
+	var (
+		gotPath string
+		gotBody []byte
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data":   map[string]any{"message": "verb help"},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	args := rewriteColonSyntax([]string{"vd", "redis:link", "-h"})
+
+	if err := dispatch(root, args[1:]); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	// Path is /plugin/redis/link, NOT /plugin/redis/help.
+	if gotPath != "/plugin/redis/link" {
+		t.Errorf("path %q: verb-specific help should hit the verb's endpoint", gotPath)
+	}
+
+	var payload struct {
+		Args []string `json:"args"`
+	}
+
+	_ = json.Unmarshal(gotBody, &payload)
+
+	if len(payload.Args) != 1 || payload.Args[0] != "-h" {
+		t.Errorf("args=%v want [-h]", payload.Args)
+	}
+}
+
 // TestPluginDispatch_ServerErrorSurfaces: a 4xx/5xx from the
 // dispatch endpoint reaches the operator with the actual error
 // from the envelope, not a generic forwarder code.
