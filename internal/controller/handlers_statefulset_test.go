@@ -615,3 +615,177 @@ func TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv(t *testing.T) {
 	}
 }
 
+// TestStatefulsetHandler_RestartsOnEnvChange pins the F2.2 fix for
+// `vd redis:failover`. Failover writes REDIS_MASTER_ORDINAL via a
+// config_set action; the controller's maybeRestartAffected fan-out
+// re-fires the statefulset's apply, and the apply path must roll
+// every pod top-down so the wrapper script picks the new role at
+// boot. Without this branch (the bug Thadeu hit live), the bucket
+// changes but pods stay on the old REDIS_MASTER_ORDINAL forever
+// until a manual `vd restart -k statefulset` kicks them.
+//
+// Mirrors TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists
+// — same posture, same WriteEnv-returns-true signal, same expectation
+// of remove+ensure per existing pod.
+func TestStatefulsetHandler_RestartsOnEnvChange(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	// Three live pods at the start. Baseline status with the same
+	// spec hash the upcoming apply will compute, so the spec-drift
+	// recreate path is a no-op and the test exercises the
+	// env-change branch in isolation.
+	for i := 0; i < 3; i++ {
+		cm.seedSlot(statefulsetSlot("test", "redis", "redis:7", i))
+	}
+
+	hash := statefulsetSpecHash(statefulsetSpec{
+		Image:    "redis:7",
+		Networks: []string{"voodu0"},
+		Restart:  "unless-stopped",
+	}, nil)
+
+	pre, _ := json.Marshal(DeploymentStatus{
+		Image:    "redis:7",
+		SpecHash: hash,
+		Replicas: 3,
+	})
+
+	_ = store.PutStatus(context.Background(), KindStatefulset, "test-redis", pre)
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return true, nil }, // env CHANGED
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 3,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Top-down rolling restart: pod-2 first, then pod-1, then pod-0.
+	// Each pod removed and re-ensured under the same ordinal-derived
+	// name so the per-pod data volume re-attaches.
+	wantRemoves := []string{"test-redis.2", "test-redis.1", "test-redis.0"}
+
+	if len(cm.removes) != len(wantRemoves) {
+		t.Fatalf("removes = %v, want %v (env-change rolling restart didn't fire)",
+			cm.removes, wantRemoves)
+	}
+
+	for i, r := range cm.removes {
+		if r != wantRemoves[i] {
+			t.Errorf("removes[%d] = %q, want %q (top-down order broken)", i, r, wantRemoves[i])
+		}
+	}
+
+	// Three respawns, deterministic ordinal-derived names — proves
+	// the fresh pods come up under the same identity (same volumes,
+	// same DNS aliases) and not as new replica IDs.
+	if len(cm.ensures) != 3 {
+		t.Fatalf("ensures = %d, want 3", len(cm.ensures))
+	}
+}
+
+// TestStatefulsetHandler_NoEnvChange_NoRestart confirms the gate
+// fires ONLY when WriteEnv reports a real change. A reconcile that
+// re-runs the same env merge (no diff) must NOT churn pods —
+// otherwise every reconcile fires a phantom rolling restart.
+func TestStatefulsetHandler_NoEnvChange_NoRestart(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	for i := 0; i < 3; i++ {
+		cm.seedSlot(statefulsetSlot("test", "redis", "redis:7", i))
+	}
+
+	hash := statefulsetSpecHash(statefulsetSpec{
+		Image:    "redis:7",
+		Networks: []string{"voodu0"},
+		Restart:  "unless-stopped",
+	}, nil)
+
+	pre, _ := json.Marshal(DeploymentStatus{
+		Image:    "redis:7",
+		SpecHash: hash,
+		Replicas: 3,
+	})
+
+	_ = store.PutStatus(context.Background(), KindStatefulset, "test-redis", pre)
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil }, // unchanged
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 3,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.removes) != 0 {
+		t.Errorf("no env change should not restart pods, got removes=%v", cm.removes)
+	}
+}
+
+// TestStatefulsetHandler_FirstApply_NoEnvRestartChurn guards against
+// the first-reconcile-after-controller-upgrade case. Without prior
+// status, resolveAppEnv reports envChanged=true (the controller
+// didn't track it before, so the merge looks new), and we'd cycle
+// every freshly-spawned pod for nothing. The firstApply gate skips
+// the restart when there's no baseline to drift from.
+func TestStatefulsetHandler_FirstApply_NoEnvRestartChurn(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	// No prior status → firstApply=true. Pods get spawned by
+	// ensureOrdinalsUp. The env-change branch must NOT fire on
+	// top of that spawn.
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return true, nil }, // would-be "changed"
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 2,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Two ensures from ensureOrdinalsUp (pods 0 and 1). Zero
+	// removes — the env-change path didn't double-cycle them.
+	if len(cm.ensures) != 2 {
+		t.Errorf("expected 2 first-apply ensures, got %d", len(cm.ensures))
+	}
+
+	if len(cm.removes) != 0 {
+		t.Errorf("first apply must not env-restart freshly-spawned pods, got removes=%v", cm.removes)
+	}
+}
+

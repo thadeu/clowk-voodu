@@ -642,6 +642,89 @@ func formatRef(kind controller.Kind, scope, name string) string {
 	return fmt.Sprintf("%s/%s", kind, name)
 }
 
+// hasPluginMacro reports whether any manifest in the batch carries a
+// non-core kind — i.e. one of the macro forms a plugin (`redis`,
+// `postgres`, …) installed via `vd plugin install` expands at apply
+// time. The probe is just `controller.ParseKind`: it accepts the six
+// core kinds and rejects everything else, including plugin kinds.
+//
+// Used by runDelete to decide whether the per-manifest DELETE loop
+// can run directly or whether the batch needs a server-side expand
+// pass first.
+func hasPluginMacro(mans []controller.Manifest) bool {
+	for _, m := range mans {
+		if _, err := controller.ParseKind(string(m.Kind)); err != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+// expandManifestsViaDryRun walks the batch through POST /apply?dry_run=true
+// and returns the post-expand manifest list (the server's `applied` field).
+// Plugin macros (`redis "..." "..." {}`) become their constituent core
+// manifests (e.g. asset + statefulset for voodu-redis); core manifests
+// pass through unchanged.
+//
+// Why the apply endpoint specifically:
+//
+//   - The expand pipeline is already wired there (expandPluginBlocks).
+//     A dedicated /expand endpoint would duplicate the surface area; the
+//     dry-run flag is the documented "compute the plan, don't write"
+//     shape, and `applied` is the canonical post-expand list.
+//   - Asset stamping runs too, which is harmless for delete (we ignore
+//     the digest field — only kind/scope/name matters at the DELETE
+//     query-param layer).
+//
+// One round-trip per `vd delete -f file.hcl` invocation when the file
+// has any plugin macros. Files containing only core kinds skip this
+// path entirely (hasPluginMacro returns false).
+func expandManifestsViaDryRun(cmd *cobra.Command, mans []controller.Manifest) ([]controller.Manifest, error) {
+	body, err := json.Marshal(mans)
+	if err != nil {
+		return nil, fmt.Errorf("marshal manifests: %w", err)
+	}
+
+	resp, err := controllerDo(cmd.Root(), http.MethodPost, "/apply", "dry_run=true&prune=false", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return nil, formatControllerError(resp.StatusCode, raw)
+	}
+
+	var env struct {
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+		Data   struct {
+			Applied []controller.Manifest `json:"applied"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode dry-run response: %w", err)
+	}
+
+	if env.Status == "error" {
+		return nil, fmt.Errorf("%s", env.Error)
+	}
+
+	if len(env.Data.Applied) == 0 {
+		// Defensive: a successful response with an empty `applied`
+		// slice would silently swallow every input. Surface it
+		// instead of falling through to a no-op delete.
+		return nil, fmt.Errorf("dry-run apply returned no expanded manifests (server may be on an older version)")
+	}
+
+	return env.Data.Applied, nil
+}
+
 func runDelete(cmd *cobra.Command, f applyFlags) error {
 	// Mirrors runApply's shape: server-side / direct invocations don't
 	// prompt. The y/N confirmation lives one layer up in
@@ -660,6 +743,33 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 
 	if len(mans) == 0 {
 		return fmt.Errorf("no manifests found")
+	}
+
+	// Macro expansion before the per-manifest DELETE loop. A `redis "..." "..." {}`
+	// block in the file is a plugin macro; the controller's /desired store
+	// doesn't hold a "redis" kind — only the asset + statefulset (or whatever
+	// shape the plugin emits) that came out of `redis:expand`. Issuing
+	// DELETE /apply?kind=redis would 400 with "unknown kind redis".
+	//
+	// Two-step solve:
+	//
+	//   1. Round-trip the manifest set through POST /apply?dry_run=true.
+	//      The server runs every plugin's expand command and returns the
+	//      post-expand list under `applied`. No /desired writes happen
+	//      because dry_run=true.
+	//   2. Use that expanded list as the iteration basis for the actual
+	//      DELETEs. Each entry is now a guaranteed-core kind the existing
+	//      delete handler accepts.
+	//
+	// Skipped when nothing in the batch is a plugin macro — the existing
+	// fast path stays a single network call per manifest.
+	if hasPluginMacro(mans) {
+		expanded, err := expandManifestsViaDryRun(cmd, mans)
+		if err != nil {
+			return fmt.Errorf("expand plugin manifests for delete: %w", err)
+		}
+
+		mans = expanded
 	}
 
 	// Plan rendering lives in the orchestrator (runDeleteForwarded),

@@ -229,7 +229,8 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return err
 	}
 
-	if _, err := resolveAppEnv(ctx, h.Store, h.WriteEnv, h.logf, ev.Scope, ev.Name, app, spec.Env, "statefulset"); err != nil {
+	envChanged, err := resolveAppEnv(ctx, h.Store, h.WriteEnv, h.logf, ev.Scope, ev.Name, app, spec.Env, "statefulset")
+	if err != nil {
 		return err
 	}
 
@@ -291,8 +292,35 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// reconcile after upgrade" baseline path mirrors deployment:
 	// without prior status, baseline silently and let the next
 	// apply detect drift.
-	if err := h.recreateOrdinalsIfSpecChanged(ctx, ev.Scope, ev.Name, app, spec, hash, applyReleaseID); err != nil {
+	specDriftRestarted, err := h.recreateOrdinalsIfSpecChanged(ctx, ev.Scope, ev.Name, app, spec, hash, applyReleaseID)
+	if err != nil {
 		return err
+	}
+
+	// Env-change rolling restart, top-down. Mirrors the
+	// DeploymentHandler's `envChanged && !recreatedAny` branch —
+	// docker reads --env-file at `docker run` time, so a config
+	// bucket change (e.g. REDIS_MASTER_ORDINAL flipped by
+	// `vd redis:failover`) only reaches the running redis-server
+	// process if we recreate the pod. Without this, failover
+	// writes the bucket but the wrapper script never sees the
+	// new ordinal, leaving the cluster wedged on the old role
+	// assignment.
+	//
+	// Skipped when the spec-drift recreate above already cycled
+	// every pod — the new containers came up with the freshly-
+	// linked env mounted, so a second restart in the same
+	// reconcile would just churn.
+	//
+	// firstApply is the upgrade-from-old-controller signal — no
+	// prior status means we just baseline-stamped, and the
+	// current `envChanged=true` is reporting "the env file
+	// existed before but the controller didn't track it",
+	// which is not a real change.
+	if envChanged && !specDriftRestarted && !firstApply {
+		if err := h.rollingReplaceTopDown(ctx, ev.Scope, ev.Name, app, spec, hash, ""); err != nil {
+			h.logf("statefulset/%s env-change rolling restart failed: %v", ev.Name, err)
+		}
 	}
 
 	if applyReleaseID != "" {
@@ -528,15 +556,20 @@ func (h *StatefulsetHandler) pruneOrdinalsAbove(scope, name, app string, want in
 // to the new image. Failover risk is minimised because the new
 // followers can keep streaming from the old primary right up until
 // the very end.
-func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string) error {
+// recreateOrdinalsIfSpecChanged returns (restarted, err) — restarted=true
+// signals that every pod was just cycled, so the caller should NOT
+// fire a second rolling restart in the same reconcile (env-change
+// path). Pre-existing single-return-value callers are gone; the
+// tuple is the contract going forward.
+func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string) (bool, error) {
 	prev, err := h.loadStatus(ctx, app)
 	if err != nil {
-		return fmt.Errorf("read statefulset status: %w", err)
+		return false, fmt.Errorf("read statefulset status: %w", err)
 	}
 
 	if prev.SpecHash == "" {
 		// Baseline only.
-		return h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
+		return false, h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
 	}
 
 	driftHash := prev.SpecHash != hash
@@ -556,7 +589,7 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 		// Hash and image both stable — only the replica count
 		// could have moved. Persist the current declared count
 		// so scale-only changes don't get lost on the next replay.
-		return h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
+		return false, h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
 	}
 
 	reason := fmt.Sprintf("spec drift (hash %s → %s)", shortHash(prev.SpecHash), shortHash(hash))
@@ -567,10 +600,10 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 	h.logf("statefulset/%s %s, rolling restart top-down", app, reason)
 
 	if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, hash, releaseID); err != nil {
-		return err
+		return false, err
 	}
 
-	return h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
+	return true, h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
 }
 
 // rollingReplaceTopDown iterates ordinals from highest to lowest

@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/controller"
 )
 
@@ -374,6 +375,16 @@ func autoPrependEnv(envs []string, key, fallback string) []string {
 func pickExecTarget(cmd *cobra.Command, ref, containerOverride string) (string, error) {
 	if containerOverride != "" {
 		return containerOverride, nil
+	}
+
+	// Per-replica shape — `<scope>/<name>.<replica>`. Translates
+	// directly to the container name; no ambiguity, no /pods
+	// round-trip needed. Operator hits the docker container via
+	// the deterministic name; if the ordinal doesn't exist, the
+	// downstream exec call surfaces "container not found" which
+	// is the same path a typo'd full container name takes.
+	if scope, name, replica, ok := splitReplicaRef(ref); ok {
+		return containers.ContainerName(scope, name, replica), nil
 	}
 
 	if strings.Contains(ref, ".") && !strings.Contains(ref, "/") {

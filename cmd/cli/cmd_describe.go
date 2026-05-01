@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/controller"
 )
 
@@ -837,6 +838,13 @@ func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error 
 	}
 
 	switch {
+	// Per-replica shape — `<scope>/<name>.<replica>`. Translates
+	// directly to the container name. Mirrors logs / exec.
+	case mustResolveReplicaRef(ref):
+		scope, name, replica, _ := splitReplicaRef(ref)
+
+		return runDescribePodByContainerName(cmd, containers.ContainerName(scope, name, replica), opts)
+
 	case strings.Contains(ref, "/"):
 		scope, name := splitJobRef(ref)
 
@@ -848,6 +856,16 @@ func runDescribePod(cmd *cobra.Command, ref string, opts describeOptions) error 
 	default:
 		return runDescribePodByFilter(cmd, ref, ref /* scope */, "" /* name */, opts)
 	}
+}
+
+// mustResolveReplicaRef is the boolean adapter for splitReplicaRef
+// in switch-case form — Go switch can't bind a tuple-returning
+// helper to a guard. Returns true when the ref matches the
+// per-replica shape.
+func mustResolveReplicaRef(ref string) bool {
+	_, _, _, ok := splitReplicaRef(ref)
+
+	return ok
 }
 
 // runDescribePodByContainerName is the original single-pod path:

@@ -226,3 +226,60 @@ func TestConfig_RestartFalseSkipsReconcile(t *testing.T) {
 		t.Errorf("status=%d want 200", resp.StatusCode)
 	}
 }
+
+// TestConfig_FansOutRestartToStatefulset pins the F2.2 fix.
+// `vd redis:failover` lands a config_set on the redis bucket; the
+// fan-out must re-fire the statefulset's apply so the env-change
+// rolling restart picks up the new REDIS_MASTER_ORDINAL. Before
+// the fix, the kinds list was [deployment, job, cronjob] and
+// statefulsets stayed wedged on the old bucket value.
+//
+// Test shape: pre-store a statefulset manifest, POST /config to
+// set a value, then read the manifest back and confirm its
+// metadata.revision bumped (memStore.Put increments revision on
+// every successful write). A revision bump proves Put was called
+// — i.e. the fan-out reached statefulsets.
+func TestConfig_FansOutRestartToStatefulset(t *testing.T) {
+	api, store := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	// Pre-store a statefulset manifest. Set initial revision is
+	// what the post-config-set Put will bump.
+	body := `{"kind":"statefulset","scope":"clowk-lp","name":"redis","spec":{"image":"redis:7","replicas":3}}`
+
+	resp := postBody(t, ts.URL+"/apply", body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status=%d", resp.StatusCode)
+	}
+
+	pre, err := store.Get(t.Context(), KindStatefulset, "clowk-lp", "redis")
+	if err != nil || pre == nil {
+		t.Fatalf("manifest missing post-apply: %v", err)
+	}
+
+	preRevision := pre.Metadata.Revision
+
+	// POST a config_set on the same (scope, name). Without the
+	// fan-out fix, this would NOT re-Put the statefulset (kinds
+	// list excluded statefulset), so the manifest revision stays
+	// where it was.
+	resp = postBody(t, ts.URL+"/config?scope=clowk-lp&name=redis", `{"REDIS_MASTER_ORDINAL":"1"}`)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("config status=%d", resp.StatusCode)
+	}
+
+	post, err := store.Get(t.Context(), KindStatefulset, "clowk-lp", "redis")
+	if err != nil || post == nil {
+		t.Fatalf("manifest missing post-config: %v", err)
+	}
+
+	if post.Metadata.Revision <= preRevision {
+		t.Errorf("statefulset revision didn't bump after config_set (%d → %d) — fan-out missing statefulset?",
+			preRevision, post.Metadata.Revision)
+	}
+}

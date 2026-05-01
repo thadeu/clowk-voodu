@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/controller"
 )
 
@@ -47,12 +48,14 @@ func newLogsCmd() *cobra.Command {
 		Short: "Stream container logs by ref (scope, scope/name, or container name)",
 		Long: `Stream stdout+stderr from voodu-managed containers.
 
-<ref> accepts the same three shapes as 'voodu get pd':
+<ref> accepts four shapes:
 
-  <scope>             every container in this scope, across kinds
-  <scope>/<name>      all replicas of one resource (deployment / job /
-                      cronjob)
-  <container_name>    a specific replica, copied from 'voodu get pods'
+  <scope>                  every container in this scope, across kinds
+  <scope>/<name>           all replicas of one resource (deployment /
+                           statefulset / job / cronjob)
+  <scope>/<name>.<replica> one specific replica — ordinal "0" for
+                           statefulsets, hex id for deployments
+  <container_name>         the full docker name (e.g. clowk-lp-web.a3f9)
 
 When the ref matches more than one container, every line is prefixed
 with the container name in brackets so it stays visually distinguishable
@@ -69,7 +72,8 @@ clowk-lp/migrate' replays the most recent execution without re-running.
 Examples:
   voodu logs clowk-lp                              every pod in scope
   voodu logs clowk-lp/web                          all replicas of web
-  voodu logs clowk-lp/web -f                       follow live
+  voodu logs clowk-lp/redis.0                      master pod of redis
+  voodu logs clowk-lp/redis.1 -f                   follow replica 1
   voodu logs clowk-lp/web --tail 100               last 100 lines each
   voodu logs clowk-lp-web.a3f9                     one specific replica`,
 		Args: cobra.ExactArgs(1),
@@ -155,15 +159,27 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 }
 
 // resolveLogsTargets translates the ref into a list of docker container
-// names. Three shapes:
+// names. Four shapes:
 //
-//   - has '.'  → already a container name, return as-is (1 element)
-//   - has '/'  → splitJobRef → /pods?scope=&name=
-//   - bare     → /pods?scope=
+//   - has '/' AND the name part has '.'  → per-replica ref, e.g.
+//                  clowk-lp/redis.0 → container clowk-lp-redis.0 (1 elem)
+//   - has '.'  → already a full container name, return as-is (1 elem)
+//   - has '/'  → splitJobRef → /pods?scope=&name= (every replica)
+//   - bare     → /pods?scope= (everything in scope)
 //
 // Mirrors the dispatch in runDescribePod so users get one consistent
 // mental model across get pd / describe pod / logs.
 func resolveLogsTargets(cmd *cobra.Command, ref string) ([]string, error) {
+	// Per-replica shape — `<scope>/<name>.<replica>`. Translates
+	// directly to the container name without a controller round-trip:
+	// the docker name is deterministic, so we don't need /pods to
+	// confirm existence here. If the operator typo'd the ordinal,
+	// streamOneLog surfaces the controller's "container not found"
+	// instead — same error path as a bad full container name.
+	if scope, name, replica, ok := splitReplicaRef(ref); ok {
+		return []string{containers.ContainerName(scope, name, replica)}, nil
+	}
+
 	if strings.Contains(ref, ".") && !strings.Contains(ref, "/") {
 		return []string{ref}, nil
 	}

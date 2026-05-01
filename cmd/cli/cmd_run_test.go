@@ -42,6 +42,73 @@ func TestSplitJobRef(t *testing.T) {
 	}
 }
 
+// TestSplitReplicaRef covers the per-replica parser used by
+// logs / exec / describe pod to recognise `<scope>/<name>.<replica>`
+// shape. Hot path — every CLI invocation that takes a pod ref
+// runs this. The cases below pin the boundary conditions
+// explicitly so a future edit can't accidentally widen ok=true
+// to non-replica refs (which would silently bypass the
+// /pods listing path).
+func TestSplitReplicaRef(t *testing.T) {
+	cases := []struct {
+		in    string
+		scope string
+		name  string
+		repl  string
+		ok    bool
+	}{
+		// Statefulset ordinal — the user's reported shape.
+		{"clowk-lp/redis.0", "clowk-lp", "redis", "0", true},
+		{"clowk-lp/redis.7", "clowk-lp", "redis", "7", true},
+
+		// Deployment hex replica id — same shape works.
+		{"clowk-lp/web.a3f9", "clowk-lp", "web", "a3f9", true},
+
+		// Whitespace tolerated.
+		{"  clowk-lp/redis.0  ", "clowk-lp", "redis", "0", true},
+
+		// scope/name (no dot) → not a replica ref, fall through.
+		{"clowk-lp/redis", "", "", "", false},
+
+		// Bare resource name — no slash, no replica.
+		{"redis", "", "", "", false},
+
+		// Bare full container name (clowk-lp-redis.0) — no slash,
+		// not the per-replica shape. The caller's "has '.' but no '/'"
+		// branch handles this verbatim.
+		{"clowk-lp-redis.0", "", "", "", false},
+
+		// Pathological: empty replica part (`scope/name.`).
+		{"clowk-lp/redis.", "", "", "", false},
+
+		// Pathological: empty basename (`scope/.0`) — the dot is at
+		// position 0 of the name part, no resource name to address.
+		{"clowk-lp/.0", "", "", "", false},
+
+		// Empty.
+		{"", "", "", "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			scope, name, repl, ok := splitReplicaRef(tc.in)
+
+			if ok != tc.ok {
+				t.Fatalf("splitReplicaRef(%q) ok = %v, want %v", tc.in, ok, tc.ok)
+			}
+
+			if !ok {
+				return
+			}
+
+			if scope != tc.scope || name != tc.name || repl != tc.repl {
+				t.Errorf("splitReplicaRef(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					tc.in, scope, name, repl, tc.scope, tc.name, tc.repl)
+			}
+		})
+	}
+}
+
 // runRouter is a stub controller for the unified run tests. Each
 // test wires a different combination of:
 //

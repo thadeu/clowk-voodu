@@ -52,6 +52,60 @@ func TestLogsContainerNameRoutesToPodLogs(t *testing.T) {
 	}
 }
 
+// TestLogsReplicaRefRoutesDirectly pins the per-replica shape:
+// `vd logs clowk-lp/redis.0` translates to the deterministic
+// container name `clowk-lp-redis.0` and hits /pods/{name}/logs
+// in a SINGLE round-trip — no /pods listing query, no risk of
+// "no containers match" on a typo'd ordinal beating the actual
+// stream fetch's "container not found" error.
+//
+// Without this test, a regression in splitReplicaRef would silently
+// fall through to the listing path and re-introduce the user-
+// reported failure mode.
+func TestLogsReplicaRefRoutesDirectly(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		hits     []string
+		listSeen bool
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		hits = append(hits, r.URL.Path)
+
+		if r.URL.Path == "/pods" {
+			listSeen = true
+		}
+
+		w.Header().Set("X-Voodu-Container", "clowk-lp-redis.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello from redis-0\n"))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stdout)
+	root.SetArgs([]string{"logs", "clowk-lp/redis.0"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if listSeen {
+		t.Errorf("per-replica ref should NOT consult /pods listing; hits=%v", hits)
+	}
+
+	if len(hits) != 1 || hits[0] != "/pods/clowk-lp-redis.0/logs" {
+		t.Errorf("expected single hit on /pods/clowk-lp-redis.0/logs, got %v", hits)
+	}
+}
+
 // TestLogsScopeNameResolvesViaPodsList confirms the scope/name path:
 // the CLI lists matching pods first via /pods?scope=&name=, then
 // streams /pods/{name}/logs for each. Two replicas → two stream

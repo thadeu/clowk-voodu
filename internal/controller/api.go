@@ -1830,9 +1830,17 @@ func (a *API) configDelete(w http.ResponseWriter, r *http.Request) {
 // maybeRestartAffected re-emits Apply events for every container-
 // producing manifest the config change touches. When name is set,
 // only that resource. When name is empty (scope-level), every
-// deployment / job / cronjob in the scope. The reconciler's
-// existing change detection handles the "no actual env changed →
-// no-op" case so it's safe to over-trigger.
+// deployment / statefulset / job / cronjob in the scope. The
+// reconciler's existing change detection handles the "no actual env
+// changed → no-op" case so it's safe to over-trigger.
+//
+// Statefulset is in the list because plugins (voodu-redis at
+// minimum) emit `config_set` actions that must propagate into the
+// running pods — REDIS_PASSWORD on first apply, REDIS_MASTER_ORDINAL
+// on `vd redis:failover`. Leaving statefulset out of this fan-out
+// means failover writes the bucket but never restarts the pods,
+// stranding the cluster on the old role assignment until the
+// operator runs a manual `vd restart`.
 //
 // The ?restart=false query param turns this off — useful when the
 // operator wants to batch multiple set/unset calls and only restart
@@ -1848,7 +1856,7 @@ func (a *API) maybeRestartAffected(r *http.Request, scope, name string) {
 
 	ctx := r.Context()
 
-	kinds := []Kind{KindDeployment, KindJob, KindCronJob}
+	kinds := []Kind{KindDeployment, KindStatefulset, KindJob, KindCronJob}
 
 	for _, kind := range kinds {
 		mans, err := a.Store.ListByScope(ctx, kind, scope)

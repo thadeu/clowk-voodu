@@ -114,6 +114,51 @@ func splitJobRef(ref string) (scope, name string) {
 	return "", ref
 }
 
+// splitReplicaRef parses the per-pod ref shape `<scope>/<name>.<replica>`
+// — the natural extension of `<scope>/<name>` for picking ONE specific
+// replica out of a fan-out. Examples:
+//
+//	clowk-lp/redis.0     → ("clowk-lp", "redis", "0")    (statefulset ordinal)
+//	clowk-lp/web.a3f9    → ("clowk-lp", "web",   "a3f9") (deployment hex id)
+//
+// Returns ok=false when the ref doesn't match the shape (no slash, or
+// no dot in the name part). Callers fall back to the existing
+// scope/name (list all replicas) or container-name resolution paths.
+//
+// Why a dedicated parser:
+//
+//   - The on-disk container name is `<scope>-<name>.<replica>` —
+//     hyphen between scope and name, dot before replica. Operators
+//     don't think about that shape; they think `<scope>/<name>` for
+//     the resource and `.N` for the pod.
+//   - splitJobRef stops at the first `/` and returns everything after
+//     verbatim — `clowk-lp/redis.0` becomes scope=clowk-lp, name=redis.0,
+//     which then doesn't match anything in the /pods list because the
+//     resource is named `redis`, not `redis.0`.
+//   - Splitting at the LAST dot in the name part recovers the boundary:
+//     statefulset names can't contain dots (HCL-validated), so any dot
+//     in the name part is unambiguously the replica separator.
+func splitReplicaRef(ref string) (scope, name, replica string, ok bool) {
+	ref = strings.TrimSpace(ref)
+
+	slash := strings.Index(ref, "/")
+	if slash < 0 {
+		return "", "", "", false
+	}
+
+	namePart := ref[slash+1:]
+
+	dot := strings.LastIndex(namePart, ".")
+	if dot <= 0 || dot == len(namePart)-1 {
+		// No dot, dot at position 0 (empty basename), or dot at the
+		// very end (empty replica) — none of these shapes can address
+		// a pod, so treat the ref as scope/name.
+		return "", "", "", false
+	}
+
+	return ref[:slash], namePart[:dot], namePart[dot+1:], true
+}
+
 // renderJobRun prints a compact human-readable summary of one job
 // execution. Two lines: the headline (succeeded / failed + duration),
 // then a detail line with run id and exit code so a future `voodu

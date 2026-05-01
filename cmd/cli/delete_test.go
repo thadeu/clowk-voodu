@@ -90,6 +90,168 @@ cronjob "clowk-lp" "crawler1" {
 	}
 }
 
+// TestRunDeleteExpandsPluginMacrosBeforeDeleting pins the bug fix:
+// a `redis "scope" "name" {}` macro in the manifest file is NOT a
+// core kind, so iterating DELETE /apply?kind=redis straight-up
+// errors with "unknown kind redis". The fix dispatches a
+// dry-run apply round-trip first to expand the macro into its
+// constituent core kinds (asset + statefulset for voodu-redis),
+// then runs the DELETE loop over the expanded list.
+//
+// Without this test, a regression that re-introduces the
+// straight-pass behaviour would silently revive the user-reported
+// failure (delete redis/<name>: unknown kind "redis").
+func TestRunDeleteExpandsPluginMacrosBeforeDeleting(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	dir := t.TempDir()
+
+	// File declares ONE plugin-kind macro. The expanded form (what
+	// the dry-run apply returns) emits asset + statefulset for the
+	// same scope/name, mirroring voodu-redis's actual output shape.
+	mustWrite(t, filepath.Join(dir, "redis.hcl"), `
+redis "clowk-lp" "cache" {
+  replicas = 3
+}
+`)
+
+	var (
+		mu          sync.Mutex
+		dryRunSeen  bool
+		deleteCalls []string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.URL.Path == "/apply" && r.Method == http.MethodPost:
+			// Dry-run pre-expand. Return the macro expanded into
+			// asset + statefulset, same shape voodu-redis emits
+			// in production.
+			if r.URL.Query().Get("dry_run") != "true" {
+				t.Errorf("expand pre-pass should set dry_run=true; query=%q", r.URL.RawQuery)
+			}
+
+			dryRunSeen = true
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"status": "ok",
+				"data": {
+					"applied": [
+						{"kind": "asset", "scope": "clowk-lp", "name": "cache"},
+						{"kind": "statefulset", "scope": "clowk-lp", "name": "cache"}
+					]
+				}
+			}`))
+
+		case r.URL.Path == "/apply" && r.Method == http.MethodDelete:
+			deleteCalls = append(deleteCalls,
+				r.URL.Query().Get("kind")+"/"+
+					r.URL.Query().Get("scope")+"/"+
+					r.URL.Query().Get("name"))
+
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "boom", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	out := captureStdout(t, func() {
+		f := applyFlags{files: []string{dir}}
+
+		if err := runDelete(root, f); err != nil {
+			t.Fatalf("runDelete: %v", err)
+		}
+	})
+
+	if !dryRunSeen {
+		t.Errorf("expected a POST /apply?dry_run=true pre-pass to expand the redis macro; output:\n%s", out)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Both expansions must be deleted, in the order the server
+	// returned them. The macro `redis/clowk-lp/cache` itself must
+	// NOT appear — that's the failing kind from before the fix.
+	want := []string{
+		"asset/clowk-lp/cache",
+		"statefulset/clowk-lp/cache",
+	}
+
+	if len(deleteCalls) != len(want) {
+		t.Fatalf("DELETE calls = %v, want %v", deleteCalls, want)
+	}
+
+	for i, w := range want {
+		if deleteCalls[i] != w {
+			t.Errorf("DELETE[%d] = %q, want %q", i, deleteCalls[i], w)
+		}
+	}
+
+	for _, dc := range deleteCalls {
+		if strings.HasPrefix(dc, "redis/") {
+			t.Errorf("plugin macro kind leaked into DELETE: %s", dc)
+		}
+	}
+}
+
+// TestRunDeleteSkipsExpandWhenNoPluginKinds: the dry-run pre-pass
+// is an extra round-trip we only pay when the file actually has a
+// plugin macro. Pure-core-kind files keep the single-call-per-
+// manifest fast path.
+func TestRunDeleteSkipsExpandWhenNoPluginKinds(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk-lp" "web" {
+  image = "x:1"
+}
+`)
+
+	var (
+		mu         sync.Mutex
+		postCalled bool
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if r.Method == http.MethodPost {
+			postCalled = true
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	if err := runDelete(root, applyFlags{files: []string{dir}}); err != nil {
+		t.Fatalf("runDelete: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postCalled {
+		t.Errorf("core-only delete should NOT make a POST /apply round-trip")
+	}
+}
+
 // TestRunDeleteDryRunSkipsServerCalls locks in --dry-run: the plan
 // renders but no DELETE ever reaches the controller. Without this
 // test someone could refactor the dry-run check below the request
