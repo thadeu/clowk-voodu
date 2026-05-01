@@ -48,6 +48,8 @@ Use ":" syntax as shorthand for subcommands:
 		newGetCmd(),
 		newRunCmd(),
 		newRestartCmd(),
+		newStopCmd(),
+		newStartCmd(),
 		newReleaseCmd(),
 		newRollbackCmd(),
 		newDescribeCmd(),

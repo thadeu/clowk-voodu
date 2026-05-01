@@ -23,6 +23,7 @@ const (
 	prefixConfig  = "/config/"
 	prefixPlugins = "/plugins/"
 	prefixStatus  = "/status/"
+	prefixFrozen  = "/frozen/"
 )
 
 // Kind is the type of a declared resource. New kinds added in later
@@ -159,4 +160,24 @@ func ConfigPrefix(scope, name string) string {
 // resource's own name-level).
 func ConfigScopeRoot(scope string) string {
 	return prefixConfig + scope + "/"
+}
+
+// FrozenKey returns "/frozen/<kind>s/<scope>/<name>" — the etcd key
+// holding the JSON-encoded list of frozen ordinals for one
+// statefulset. Scoped kinds embed the scope segment; unscoped kinds
+// (none today) would skip it.
+func FrozenKey(kind Kind, scope, name string) string {
+	if scope == "" {
+		return prefixFrozen + string(kind) + "s/" + name
+	}
+
+	return prefixFrozen + string(kind) + "s/" + scope + "/" + name
+}
+
+// FrozenScopeRoot returns "/frozen/<kind>s/<scope>/" — used by the
+// scope-wipe path to clear every freeze annotation when a scope is
+// nuked, so a re-applied scope doesn't inherit phantom freezes from
+// a previous tenant.
+func FrozenScopeRoot(scope string) string {
+	return prefixFrozen + scope + "/"
 }

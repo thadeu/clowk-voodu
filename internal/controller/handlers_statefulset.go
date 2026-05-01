@@ -89,6 +89,22 @@ type volumeClaim struct {
 	Size      string `json:"size,omitempty"`
 }
 
+// buildFrozenSet turns the on-disk frozen-ordinals slice into the
+// O(1)-lookup map every handler-internal path expects. nil/empty
+// input returns nil — callers' `if frozen[n]` checks are nil-safe.
+func buildFrozenSet(ordinals []int) map[int]bool {
+	if len(ordinals) == 0 {
+		return nil
+	}
+
+	out := make(map[int]bool, len(ordinals))
+	for _, n := range ordinals {
+		out[n] = true
+	}
+
+	return out
+}
+
 // statefulsetReplicas mirrors effectiveReplicas for deployments —
 // missing/zero replica counts default to 1. Statefulsets with
 // replicas=0 have no meaning at the controller layer (no pods, no
@@ -241,6 +257,15 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("list statefulset %s replicas: %w", app, err)
 	}
 
+	// Frozen ordinals — pods the operator stopped via `vd stop --freeze`.
+	// Loaded once per reconcile and threaded through ensureOrdinalsUp +
+	// the rolling restart paths so a frozen ordinal stays offline across
+	// every spawn / recreate trigger (env-change, spec-drift, image-id
+	// drift, scale-up). Empty when no operator intent exists (the
+	// majority case).
+	frozen, _ := h.Store.GetFrozenOrdinals(ctx, KindStatefulset, ev.Scope, ev.Name)
+	frozenSet := buildFrozenSet(frozen)
+
 	// Detect release-worthy applies. Same shape as
 	// DeploymentHandler — first-apply, spec drift, replica
 	// count change, and image-id drift each mint a new
@@ -280,7 +305,7 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// follows the opposite order so scale-down peels off the
 	// highest ordinals — pod-0 is the convention-bearer ("primary"
 	// for postgres) and outlives the rest.
-	if err := h.ensureOrdinalsUp(ctx, ev.Scope, ev.Name, app, live, want, spec, hash, applyReleaseID); err != nil {
+	if err := h.ensureOrdinalsUp(ctx, ev.Scope, ev.Name, app, live, want, spec, hash, applyReleaseID, frozenSet); err != nil {
 		return err
 	}
 
@@ -292,7 +317,7 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// reconcile after upgrade" baseline path mirrors deployment:
 	// without prior status, baseline silently and let the next
 	// apply detect drift.
-	specDriftRestarted, err := h.recreateOrdinalsIfSpecChanged(ctx, ev.Scope, ev.Name, app, spec, hash, applyReleaseID)
+	specDriftRestarted, err := h.recreateOrdinalsIfSpecChanged(ctx, ev.Scope, ev.Name, app, spec, hash, applyReleaseID, frozenSet)
 	if err != nil {
 		return err
 	}
@@ -318,7 +343,7 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 	// existed before but the controller didn't track it",
 	// which is not a real change.
 	if envChanged && !specDriftRestarted && !firstApply {
-		if err := h.rollingReplaceTopDown(ctx, ev.Scope, ev.Name, app, spec, hash, ""); err != nil {
+		if err := h.rollingReplaceTopDown(ctx, ev.Scope, ev.Name, app, spec, hash, "", frozenSet); err != nil {
 			h.logf("statefulset/%s env-change rolling restart failed: %v", ev.Name, err)
 		}
 	}
@@ -395,7 +420,7 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 // pod-N has time to reach a serving state before pod-(N+1) tries
 // to bootstrap against it. Without health probes (M-S5), the sleep
 // is the only synchronization we have.
-func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, app string, live []ContainerSlot, want int, spec statefulsetSpec, hash, releaseID string) error {
+func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, app string, live []ContainerSlot, want int, spec statefulsetSpec, hash, releaseID string, frozen map[int]bool) error {
 	if spec.Image == "" {
 		return fmt.Errorf("statefulset/%s: image is required (statefulsets do not support build-mode in M-S1)", app)
 	}
@@ -415,6 +440,18 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 
 	for n := 0; n < want; n++ {
 		if present[n] {
+			continue
+		}
+
+		// Frozen ordinal — operator parked this pod via
+		// `vd stop --freeze`. Don't spawn a fresh container
+		// here; the freeze annotation persists until
+		// `vd start` clears it. If the operator's intent
+		// later includes this ordinal again, the unfreeze
+		// path fires another reconcile that lands here
+		// without the freeze flag.
+		if frozen[n] {
+			h.logf("statefulset/%s ordinal %d frozen, skipping spawn", name, n)
 			continue
 		}
 
@@ -561,7 +598,7 @@ func (h *StatefulsetHandler) pruneOrdinalsAbove(scope, name, app string, want in
 // fire a second rolling restart in the same reconcile (env-change
 // path). Pre-existing single-return-value callers are gone; the
 // tuple is the contract going forward.
-func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string) (bool, error) {
+func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string, frozen map[int]bool) (bool, error) {
 	prev, err := h.loadStatus(ctx, app)
 	if err != nil {
 		return false, fmt.Errorf("read statefulset status: %w", err)
@@ -599,7 +636,7 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 
 	h.logf("statefulset/%s %s, rolling restart top-down", app, reason)
 
-	if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, hash, releaseID); err != nil {
+	if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, hash, releaseID, frozen); err != nil {
 		return false, err
 	}
 
@@ -611,7 +648,7 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 // two concurrent reconciles from racing on the same fleet — a
 // race would otherwise interleave Remove/Ensure calls and produce
 // stranded ordinals.
-func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string) error {
+func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string, frozen map[int]bool) error {
 	val, _ := h.rolloutLocks.LoadOrStore(app, &sync.Mutex{})
 
 	mu, _ := val.(*sync.Mutex)
@@ -639,6 +676,15 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 		ord, ok := s.Identity.Ordinal()
 		if !ok {
 			h.logf("statefulset/%s replica %s missing ordinal, skipping in restart", app, s.Name)
+			continue
+		}
+
+		// Frozen ordinals stay parked through env-change /
+		// spec-drift / image-id rolling restarts. Operator's
+		// `vd stop --freeze` intent persists until they
+		// explicitly `vd start` to bring the pod back.
+		if frozen[ord] {
+			h.logf("statefulset/%s ordinal %d frozen, skipping in rolling restart", name, ord)
 			continue
 		}
 
@@ -996,10 +1042,16 @@ func (h *StatefulsetHandler) Restart(ctx context.Context, scope, name string) er
 
 	h.logf("statefulset/%s rolling restart of %d replica(s) requested", app, len(live))
 
+	// Frozen ordinals stay parked on imperative restarts too — the
+	// operator's `vd stop --freeze` intent is more durable than a
+	// `vd restart` invocation. To bring a frozen pod back into the
+	// fleet, the operator runs `vd start` first.
+	frozen, _ := h.Store.GetFrozenOrdinals(ctx, KindStatefulset, scope, name)
+
 	// Imperative restart — operator-driven, no release context
 	// to inherit. Pods spawn with empty release_id (matches
 	// DeploymentHandler.Restart's posture).
-	return h.rollingReplaceTopDown(ctx, scope, name, app, spec, hash, "")
+	return h.rollingReplaceTopDown(ctx, scope, name, app, spec, hash, "", buildFrozenSet(frozen))
 }
 
 // appendReleaseRecord prepends a record to the statefulset's
@@ -1138,6 +1190,14 @@ func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, a
 
 	want := statefulsetReplicas(spec)
 
+	// Rollback honours frozen ordinals — operator's `vd stop`
+	// intent is preserved. Snapshot's spec defines what role each
+	// pod runs after the rollback; freeze decides whether THIS
+	// reconcile cycle re-spawns the pod or leaves it parked for
+	// `vd start` to revive later.
+	frozen, _ := h.Store.GetFrozenOrdinals(ctx, KindStatefulset, scope, name)
+	frozenSet := buildFrozenSet(frozen)
+
 	// Phase 1: scale down. pruneOrdinalsAbove already drops
 	// containers top-down; volumes survive because we never call
 	// RemoveVolume here (only `vd delete --prune` does).
@@ -1154,7 +1214,7 @@ func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, a
 	// runs the rolled-back image/command. Same name → same
 	// volume re-mounts, data preserved.
 	if len(live) > 0 {
-		if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, target.SpecHash, newReleaseID); err != nil {
+		if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, target.SpecHash, newReleaseID, frozenSet); err != nil {
 			return err
 		}
 	}
@@ -1166,7 +1226,7 @@ func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, a
 	}
 
 	if len(live) < want {
-		if err := h.ensureOrdinalsUp(ctx, scope, name, app, live, want, spec, target.SpecHash, newReleaseID); err != nil {
+		if err := h.ensureOrdinalsUp(ctx, scope, name, app, live, want, spec, target.SpecHash, newReleaseID, frozenSet); err != nil {
 			return fmt.Errorf("scale up for rollback: %w", err)
 		}
 	}
@@ -1189,7 +1249,7 @@ func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, a
 		h.logf("statefulset/%s rollback re-stamping %d replica(s) to release_id=%s",
 			app, len(stale), newReleaseID)
 
-		if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, target.SpecHash, newReleaseID); err != nil {
+		if err := h.rollingReplaceTopDown(ctx, scope, name, app, spec, target.SpecHash, newReleaseID, frozenSet); err != nil {
 			return fmt.Errorf("re-stamp replicas: %w", err)
 		}
 	}

@@ -73,6 +73,22 @@ type Store interface {
 	// wipe path to clear scope-level + every per-app bucket. No-op
 	// when the bucket is empty.
 	DeleteConfig(ctx context.Context, scope, name string) error
+
+	// Frozen-ordinals annotation. Records which ordinals of a
+	// statefulset are intentionally stopped — the handler skips
+	// them in ensureOrdinalsUp (don't spawn) and rollingReplaceTopDown
+	// (don't recreate). Lets `vd stop scope/name.N --freeze` keep a
+	// pod offline across reconciles.
+	//
+	// Today only statefulset uses this — deployment replica IDs are
+	// regenerated on every spawn (hex), so per-replica freeze can't
+	// survive scale events. The Kind argument exists for future
+	// expansion.
+	//
+	// Empty list / nil result == nothing frozen (the no-op path).
+	GetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) ([]int, error)
+	SetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string, ordinals []int) error
+	DeleteFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) error
 }
 
 // WatchEvent is a single change observed on /desired/*.
@@ -336,6 +352,68 @@ func (s *EtcdStore) DeleteConfigKey(ctx context.Context, scope, name, key string
 func (s *EtcdStore) DeleteConfig(ctx context.Context, scope, name string) error {
 	if _, err := s.client.Delete(ctx, ConfigPrefix(scope, name), clientv3.WithPrefix()); err != nil {
 		return fmt.Errorf("etcd delete config bucket: %w", err)
+	}
+
+	return nil
+}
+
+// frozenPayload is the on-disk shape of the frozen-ordinals
+// annotation. Wrapping the slice in a struct gives us a
+// versionable JSON envelope without paying the cost today —
+// future fields (frozen_at timestamps, who-froze-it operator
+// identity, etc.) can land without breaking older readers.
+type frozenPayload struct {
+	Ordinals []int `json:"ordinals"`
+}
+
+// GetFrozenOrdinals reads the frozen-ordinals list for a
+// resource. Empty list / missing key both return (nil, nil) —
+// callers should treat both as "nothing frozen" and not branch
+// on the difference.
+func (s *EtcdStore) GetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) ([]int, error) {
+	resp, err := s.client.Get(ctx, FrozenKey(kind, scope, name))
+	if err != nil {
+		return nil, fmt.Errorf("etcd get frozen: %w", err)
+	}
+
+	if len(resp.Kvs) == 0 {
+		return nil, nil
+	}
+
+	var p frozenPayload
+
+	if err := json.Unmarshal(resp.Kvs[0].Value, &p); err != nil {
+		return nil, fmt.Errorf("decode frozen payload: %w", err)
+	}
+
+	return p.Ordinals, nil
+}
+
+// SetFrozenOrdinals writes the list verbatim. Empty / nil list
+// deletes the key — keeps etcd clean of phantom annotations
+// when the last ordinal unfreezes.
+func (s *EtcdStore) SetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string, ordinals []int) error {
+	if len(ordinals) == 0 {
+		return s.DeleteFrozenOrdinals(ctx, kind, scope, name)
+	}
+
+	raw, err := json.Marshal(frozenPayload{Ordinals: ordinals})
+	if err != nil {
+		return fmt.Errorf("encode frozen payload: %w", err)
+	}
+
+	if _, err := s.client.Put(ctx, FrozenKey(kind, scope, name), string(raw)); err != nil {
+		return fmt.Errorf("etcd put frozen: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteFrozenOrdinals removes the annotation entirely.
+// Idempotent — missing key is success.
+func (s *EtcdStore) DeleteFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) error {
+	if _, err := s.client.Delete(ctx, FrozenKey(kind, scope, name)); err != nil {
+		return fmt.Errorf("etcd delete frozen: %w", err)
 	}
 
 	return nil

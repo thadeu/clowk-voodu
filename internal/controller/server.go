@@ -123,6 +123,11 @@ func (s *Server) Start(ctx context.Context) error {
 		// Same instance — its Exec method satisfies the Execer seam.
 		Execer: DockerContainerManager{},
 
+		// Same instance — its Stop / Start / InspectLabels methods
+		// satisfy the PodLifecycler seam used by `vd stop` /
+		// `vd start`.
+		PodLifecycle: DockerContainerManager{},
+
 		// Plugin-block expansion: discovers plugins under
 		// PluginsRoot at apply time and routes non-core kinds
 		// through their `expand` command. M-D2+ kicks in.

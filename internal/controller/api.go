@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
@@ -99,6 +101,13 @@ type API struct {
 	// streamer is wired correctly.
 	Logs LogStreamer
 
+	// PodLifecycle powers `POST /pods/{name}/stop` and
+	// `POST /pods/{name}/start` — the imperative pod-lifecycle entry
+	// points used by `vd stop` / `vd start`. Nil → 503. Production
+	// wires DockerContainerManager (which already has Stop/Start +
+	// InspectLabels methods).
+	PodLifecycle PodLifecycler
+
 	// PluginBlocks resolves plugin-block kinds (`postgres { … }`,
 	// `redis { … }`) to the on-disk plugin that expands them into
 	// core kinds. Nil → no plugin support; non-core kinds 400 with
@@ -148,6 +157,21 @@ type CronJobRunner interface {
 // hijacked HTTP connection without buffering.
 type Execer interface {
 	Exec(name string, command []string, opts ExecOptions) (int, error)
+}
+
+// PodLifecycler is the seam `POST /pods/{name}/stop` and
+// `POST /pods/{name}/start` dispatch through. DockerContainerManager
+// satisfies this via its Stop/Start methods; tests substitute a fake
+// to record calls without touching docker.
+//
+// InspectLabels is part of the surface because the freeze annotation
+// keys off the container's voodu.* labels — the API needs to recover
+// (kind, scope, name, ordinal) before it can persist the freeze.
+// Bundling it here keeps the seam coherent: one fake fits all three.
+type PodLifecycler interface {
+	Stop(name string) error
+	Start(name string) error
+	InspectLabels(name string) (map[string]string, error)
 }
 
 // DeploymentRestarter is the seam `POST /restart?kind=deployment&...`
@@ -216,6 +240,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
+	mux.HandleFunc("POST /pods/{name}/stop", a.handlePodStop)
+	mux.HandleFunc("POST /pods/{name}/start", a.handlePodStart)
 	mux.HandleFunc("/plugins", a.handlePlugins)
 	mux.HandleFunc("POST /plugins/install", a.handlePluginInstall)
 	mux.HandleFunc("DELETE /plugins/{name}", a.handlePluginRemove)
@@ -1380,6 +1406,212 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// handlePodStop stops one container by docker name. When the
+// `?freeze=true` query param is set (default in the CLI), the
+// pod's ordinal is also added to the persistent frozen-ordinals
+// list so the reconciler skips it on every subsequent
+// ensureOrdinalsUp / rolling-restart pass — extended downtime
+// without docker-shell access. Without freeze, the stop is
+// transient: any next env-change or spec-drift event will
+// recreate the container.
+//
+//	POST /pods/{name}/stop?freeze=true|false
+//
+// Today supported only for statefulset pods (deployment replica
+// IDs are non-stable across spawns; freeze can't survive scale
+// events). Containers without a recognised voodu identity
+// (legacy / hand-spawned) error with 400 — the operator can
+// still `docker stop` them directly.
+func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
+	if a.PodLifecycle == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("pod lifecycle manager not configured"))
+		return
+	}
+
+	freeze := r.URL.Query().Get("freeze") != "false"
+
+	// Recover identity from the container's labels so we know
+	// what (kind, scope, name, ordinal) to add to the frozen list.
+	// Skipped when freeze=false — that path doesn't touch the
+	// store, so the identity lookup is wasted work.
+	var (
+		ident   containers.Identity
+		hasID   bool
+		ordinal int
+	)
+
+	if freeze {
+		labels, err := a.PodLifecycle.InspectLabels(name)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("inspect %s: %w", name, err))
+			return
+		}
+
+		ident, hasID = containers.ParseLabels(labels)
+
+		if !hasID {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("pod %q has no voodu identity (was it created by `vd apply`?); cannot persist freeze", name))
+			return
+		}
+
+		if ident.Kind != containers.KindStatefulset {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("freeze is only supported for statefulset pods; %q is kind=%s", name, ident.Kind))
+			return
+		}
+
+		var ok bool
+
+		ordinal, ok = ident.Ordinal()
+		if !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("statefulset pod %q has no ordinal label", name))
+			return
+		}
+	}
+
+	if err := a.PodLifecycle.Stop(name); err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("stop %s: %w", name, err))
+		return
+	}
+
+	if freeze {
+		current, _ := a.Store.GetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
+
+		updated := addOrdinal(current, ordinal)
+
+		if err := a.Store.SetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("persist frozen ordinals: %w", err))
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"name":   name,
+			"freeze": freeze,
+		},
+	})
+}
+
+// handlePodStart starts a stopped container by docker name and
+// removes its ordinal from the frozen list (if present), so
+// subsequent reconciles include it in the rolling restart paths
+// again.
+//
+//	POST /pods/{name}/start
+//
+// Idempotent — already-running containers and never-frozen pods
+// both succeed. Errors when the container doesn't exist on the
+// host (the `Ensure`-shaped "create if missing" semantic doesn't
+// belong here; that's `vd apply`'s job).
+func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
+	if a.PodLifecycle == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("pod lifecycle manager not configured"))
+		return
+	}
+
+	// Recover identity to clear the freeze (best-effort — labels
+	// may be missing on legacy containers, in which case there's
+	// nothing to unfreeze and we just start the container).
+	labels, _ := a.PodLifecycle.InspectLabels(name)
+
+	ident, hasID := containers.ParseLabels(labels)
+
+	if err := a.PodLifecycle.Start(name); err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("start %s: %w", name, err))
+		return
+	}
+
+	cleared := false
+
+	if hasID && ident.Kind == containers.KindStatefulset {
+		if ord, ok := ident.Ordinal(); ok {
+			current, _ := a.Store.GetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
+
+			updated := removeOrdinal(current, ord)
+
+			if len(updated) != len(current) {
+				if err := a.Store.SetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
+					writeErr(w, http.StatusInternalServerError, fmt.Errorf("clear frozen ordinal: %w", err))
+					return
+				}
+
+				cleared = true
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"name":          name,
+			"unfroze":       cleared,
+			"started_clean": true,
+		},
+	})
+}
+
+// addOrdinal returns the frozen-ordinals list with `n` added,
+// deduped and sorted. Sort is for deterministic etcd writes —
+// same set of ordinals always serialises identically.
+func addOrdinal(existing []int, n int) []int {
+	for _, e := range existing {
+		if e == n {
+			// Already in list — return a deterministic copy
+			// instead of mutating the caller's slice.
+			out := append([]int(nil), existing...)
+			sort.Ints(out)
+
+			return out
+		}
+	}
+
+	out := append([]int(nil), existing...)
+	out = append(out, n)
+	sort.Ints(out)
+
+	return out
+}
+
+// removeOrdinal returns the frozen-ordinals list with every
+// occurrence of `n` removed. Returns the SAME slice reference
+// (or a copy of it) when nothing changed, so callers can detect
+// the no-op via length comparison.
+func removeOrdinal(existing []int, n int) []int {
+	out := make([]int, 0, len(existing))
+	for _, e := range existing {
+		if e == n {
+			continue
+		}
+
+		out = append(out, e)
+	}
+
+	return out
 }
 
 // handlePlugins lists plugins currently installed under PluginsRoot.

@@ -746,6 +746,141 @@ func TestStatefulsetHandler_NoEnvChange_NoRestart(t *testing.T) {
 	}
 }
 
+// TestStatefulsetHandler_FrozenOrdinalNotSpawned pins the
+// `vd stop --freeze` contract: the operator's intent persists in
+// the store as a frozen-ordinals annotation, and the apply path
+// must respect it on the spawn side. Without this, the next
+// reconcile after a freeze would re-spawn the pod the operator
+// just stopped, undoing the intent.
+//
+// Test shape: pre-seed the frozen list with ordinal 1, run an
+// apply against a fresh statefulset declaring 3 replicas. We
+// expect ensureOrdinalsUp to skip ordinal 1 entirely — pods 0
+// and 2 are spawned, pod-1 is left absent.
+func TestStatefulsetHandler_FrozenOrdinalNotSpawned(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	// Persist the operator's freeze intent BEFORE apply runs.
+	if err := store.SetFrozenOrdinals(context.Background(), KindStatefulset, "test", "redis", []int{1}); err != nil {
+		t.Fatalf("seed frozen: %v", err)
+	}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 3,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Two ensures (ordinals 0 and 2), zero ensure for ordinal 1.
+	if len(cm.ensures) != 2 {
+		t.Fatalf("expected 2 ensures (frozen ord-1 skipped), got %d: %+v", len(cm.ensures), cm.ensures)
+	}
+
+	wantNames := map[string]bool{
+		"test-redis.0": true,
+		"test-redis.2": true,
+	}
+
+	for _, e := range cm.ensures {
+		if !wantNames[e.Name] {
+			t.Errorf("unexpected ensure for %q (ordinal 1 should be frozen)", e.Name)
+		}
+	}
+}
+
+// TestStatefulsetHandler_FrozenOrdinalNotRestarted: even when an
+// env-change rolling restart fires, frozen ordinals stay parked.
+// Otherwise a `vd config set` (or any fan-out trigger) would
+// undo the freeze the operator's `vd stop --freeze` just set.
+func TestStatefulsetHandler_FrozenOrdinalNotRestarted(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	// Three live pods, one of them frozen (its container can be
+	// stopped or running; the test cares about the freeze gate,
+	// not the docker state).
+	for i := 0; i < 3; i++ {
+		cm.seedSlot(statefulsetSlot("test", "redis", "redis:7", i))
+	}
+
+	// Mark ordinal 2 as frozen.
+	if err := store.SetFrozenOrdinals(context.Background(), KindStatefulset, "test", "redis", []int{2}); err != nil {
+		t.Fatalf("seed frozen: %v", err)
+	}
+
+	// Status that matches the upcoming spec hash so spec-drift
+	// recreate is a no-op — we want to exercise the env-change
+	// branch.
+	hash := statefulsetSpecHash(statefulsetSpec{
+		Image:    "redis:7",
+		Networks: []string{"voodu0"},
+		Restart:  "unless-stopped",
+	}, nil)
+
+	pre, _ := json.Marshal(DeploymentStatus{
+		Image:    "redis:7",
+		SpecHash: hash,
+		Replicas: 3,
+	})
+
+	_ = store.PutStatus(context.Background(), KindStatefulset, "test-redis", pre)
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return true, nil }, // env CHANGED
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindStatefulset, "redis", map[string]any{
+		"image":    "redis:7",
+		"replicas": 3,
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Top-down rolling restart over ordinals 0 and 1; ordinal 2
+	// stays parked. Removes are 1 and 0 (top-down skipping 2).
+	wantRemoves := []string{"test-redis.1", "test-redis.0"}
+
+	if len(cm.removes) != len(wantRemoves) {
+		t.Fatalf("removes = %v, want %v (frozen ord-2 should be skipped)",
+			cm.removes, wantRemoves)
+	}
+
+	for i, r := range cm.removes {
+		if r != wantRemoves[i] {
+			t.Errorf("removes[%d] = %q, want %q", i, r, wantRemoves[i])
+		}
+	}
+
+	// Confirm pod-2 was NEVER touched.
+	for _, r := range cm.removes {
+		if r == "test-redis.2" {
+			t.Errorf("frozen pod-2 was removed: %v", cm.removes)
+		}
+	}
+}
+
 // TestStatefulsetHandler_FirstApply_NoEnvRestartChurn guards against
 // the first-reconcile-after-controller-upgrade case. Without prior
 // status, resolveAppEnv reports envChanged=true (the controller

@@ -144,6 +144,31 @@ type ContainerManager interface {
 	// the caller via opts so the API handler can wire them to a
 	// hijacked HTTP connection. Returns the child's exit code.
 	Exec(name string, command []string, opts ExecOptions) (int, error)
+
+	// Stop sends SIGTERM (then SIGKILL after grace) to the running
+	// container. Used by `vd stop` to take a pod offline without
+	// removing it; the persistent volume + identity stay intact, the
+	// container just transitions to 'exited' state. Idempotent —
+	// stopping an already-stopped or missing container returns nil.
+	//
+	// Distinct from Remove (which deletes the container) and Restart
+	// (which recreates from spec). Stop is the imperative pause —
+	// container can be brought back with Start without losing data
+	// or replica identity.
+	Stop(name string) error
+
+	// Start brings a stopped container back to running. Idempotent
+	// against an already-running container. Errors when the container
+	// doesn't exist (use Ensure for the create-if-missing semantic).
+	Start(name string) error
+
+	// InspectLabels returns the flat label map of the named container
+	// — the same shape `docker inspect --format '{{json .Config.Labels}}'`
+	// produces. Used by stop/start endpoints to recover voodu identity
+	// (kind, scope, name, ordinal) so freeze annotations land on the
+	// right (scope, name) tuple. Returns nil + nil on missing container
+	// so the caller can treat "no labels" and "no container" the same.
+	InspectLabels(name string) (map[string]string, error)
 }
 
 // LogsOptions tunes the docker logs invocation. Both fields are
@@ -394,6 +419,71 @@ func (DockerContainerManager) Remove(name string) error {
 	}
 
 	return docker.RemoveContainer(name, true)
+}
+
+// Stop is the imperative pause for `vd stop`: send SIGTERM (then
+// SIGKILL after grace) to the container's process so the container
+// transitions to 'exited' state without removing it. Idempotent —
+// missing or already-stopped containers return nil so the caller's
+// retry loop is safe.
+//
+// Doesn't touch the persistent volume, the per-pod identity, or the
+// network alias registration (other than the daemon auto-removing
+// the alias from the embedded DNS while stopped). `Start` brings
+// the same container back, same data, same identity.
+func (DockerContainerManager) Stop(name string) error {
+	if !docker.ContainerExists(name) {
+		return nil
+	}
+
+	running, err := docker.IsRunning(name)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	if !running {
+		// Already stopped — nothing to do. Avoids the noisy "container
+		// not running" stderr that `docker stop` emits in this case.
+		return nil
+	}
+
+	return docker.StopContainer(name)
+}
+
+// Start brings a stopped container back to running. Errors only
+// when the container doesn't exist — that's the create-if-missing
+// territory `Ensure` owns, and conflating the two would let
+// callers accidentally re-spawn a container they meant to revive.
+// Already-running containers return nil (idempotent).
+func (DockerContainerManager) Start(name string) error {
+	if !docker.ContainerExists(name) {
+		return fmt.Errorf("container %s does not exist", name)
+	}
+
+	running, err := docker.IsRunning(name)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	if running {
+		return nil
+	}
+
+	return docker.StartContainer(name)
+}
+
+// InspectLabels delegates to docker.InspectLabels. Wrapped here so
+// the ContainerManager interface stays the single seam for the API
+// layer — handlers can `a.PodLifecycle.InspectLabels(name)` without
+// reaching into the docker package directly. Returns nil + nil for
+// missing containers so callers can treat "no identity" the same as
+// "container gone".
+func (DockerContainerManager) InspectLabels(name string) (map[string]string, error) {
+	if !docker.ContainerExists(name) {
+		return nil, nil
+	}
+
+	return docker.InspectLabels(name)
 }
 
 // ListByIdentity asks docker for every container matching the

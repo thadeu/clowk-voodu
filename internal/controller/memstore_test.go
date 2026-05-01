@@ -15,6 +15,7 @@ type memStore struct {
 	kv     map[string]*Manifest
 	status map[string][]byte
 	config map[string]map[string]string // bucket → key:value
+	frozen map[string][]int             // FrozenKey(kind, scope, name) → sorted ordinals
 	rev    int64
 
 	watchers []chan WatchEvent
@@ -25,6 +26,7 @@ func newMemStore() *memStore {
 		kv:     map[string]*Manifest{},
 		status: map[string][]byte{},
 		config: map[string]map[string]string{},
+		frozen: map[string][]int{},
 	}
 }
 
@@ -133,6 +135,47 @@ func (m *memStore) DeleteConfig(_ context.Context, scope, name string) error {
 	defer m.mu.Unlock()
 
 	delete(m.config, configBucketKey(scope, name))
+
+	return nil
+}
+
+func (m *memStore) GetFrozenOrdinals(_ context.Context, kind Kind, scope, name string) ([]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stored := m.frozen[FrozenKey(kind, scope, name)]
+	if len(stored) == 0 {
+		return nil, nil
+	}
+
+	out := make([]int, len(stored))
+	copy(out, stored)
+
+	return out, nil
+}
+
+func (m *memStore) SetFrozenOrdinals(_ context.Context, kind Kind, scope, name string, ordinals []int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(ordinals) == 0 {
+		delete(m.frozen, FrozenKey(kind, scope, name))
+
+		return nil
+	}
+
+	cp := make([]int, len(ordinals))
+	copy(cp, ordinals)
+	m.frozen[FrozenKey(kind, scope, name)] = cp
+
+	return nil
+}
+
+func (m *memStore) DeleteFrozenOrdinals(_ context.Context, kind Kind, scope, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.frozen, FrozenKey(kind, scope, name))
 
 	return nil
 }

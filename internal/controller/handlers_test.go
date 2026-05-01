@@ -203,6 +203,8 @@ type fakeContainers struct {
 	restarts  []string
 	recreates []ContainerSpec
 	removes   []string
+	stops     []string
+	starts    []string
 
 	// containerImageIDs maps container name → the image ID the container
 	// was frozen against at create time. tagImageIDs maps tag → the image
@@ -435,6 +437,69 @@ func (f *fakeContainers) Ensure(spec ContainerSpec) (bool, error) {
 func (f *fakeContainers) Restart(name string) error {
 	f.restarts = append(f.restarts, name)
 	return nil
+}
+
+func (f *fakeContainers) Stop(name string) error {
+	f.stops = append(f.stops, name)
+
+	// Mirror the production contract: Stop transitions running →
+	// stopped without removing the slot. Tests inspecting Identity
+	// or volume continuity post-Stop find the slot still present.
+	if s, ok := f.slots[name]; ok {
+		s.Running = false
+	}
+
+	return nil
+}
+
+func (f *fakeContainers) Start(name string) error {
+	f.starts = append(f.starts, name)
+
+	if s, ok := f.slots[name]; ok {
+		s.Running = true
+	}
+
+	return nil
+}
+
+// InspectLabels reconstructs the voodu.* label map for a seeded
+// slot — same shape docker would return on a real container,
+// derived from the slot's Identity. Lets API-level tests of
+// `vd stop` / `vd start` exercise the freeze-by-ordinal path
+// without a real docker daemon. Missing slots return nil + nil
+// (matches the production InspectLabels contract for a missing
+// container).
+func (f *fakeContainers) InspectLabels(name string) (map[string]string, error) {
+	s, ok := f.slots[name]
+	if !ok {
+		return nil, nil
+	}
+
+	out := map[string]string{
+		containers.LabelCreatedBy: containers.LabelCreatedByValue,
+	}
+
+	if s.Identity.Kind != "" {
+		out[containers.LabelKind] = s.Identity.Kind
+	}
+
+	if s.Identity.Scope != "" {
+		out[containers.LabelScope] = s.Identity.Scope
+	}
+
+	if s.Identity.Name != "" {
+		out[containers.LabelName] = s.Identity.Name
+	}
+
+	if s.Identity.ReplicaID != "" {
+		out[containers.LabelReplicaID] = s.Identity.ReplicaID
+	}
+
+	if s.Identity.Kind == containers.KindStatefulset && s.Identity.ReplicaOrdinal >= 0 {
+		out[containers.LabelReplicaOrdinal] = containers.OrdinalReplicaID(s.Identity.ReplicaOrdinal)
+	}
+
+	return out, nil
 }
 
 // Exec is a no-op stub for tests that don't exercise the exec path.
