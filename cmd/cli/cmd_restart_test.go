@@ -9,11 +9,12 @@ import (
 	"testing"
 )
 
-// TestRestartPostsCorrectQuery locks in the wire shape: `vd restart
-// clowk-lp/web` POSTs to /restart with kind=deployment + scope +
-// name. Without this assert, a regression in splitJobRef or the
-// query builder could quietly send the wrong kind and miss the
-// rolling-restart path entirely.
+// TestRestartPostsCorrectQuery locks in the wire shape: `vd
+// restart clowk-lp/web` POSTs to /restart with scope + name and
+// NO kind — the server auto-detects which kind has a manifest at
+// (scope, name). The CLI no longer assumes deployment; the
+// kind=deployment query was a footgun for redis/postgres that
+// forced operators to remember `-k statefulset`.
 func TestRestartPostsCorrectQuery(t *testing.T) {
 	var (
 		gotMethod string
@@ -28,7 +29,7 @@ func TestRestartPostsCorrectQuery(t *testing.T) {
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
-			"data":   map[string]string{"scope": "clowk-lp", "name": "web"},
+			"data":   map[string]string{"scope": "clowk-lp", "name": "web", "kind": "deployment"},
 		})
 	}))
 	defer ts.Close()
@@ -53,10 +54,14 @@ func TestRestartPostsCorrectQuery(t *testing.T) {
 		t.Errorf("path=%q want /restart", gotPath)
 	}
 
-	for _, want := range []string{"kind=deployment", "scope=clowk-lp", "name=web"} {
+	for _, want := range []string{"scope=clowk-lp", "name=web"} {
 		if !strings.Contains(gotQuery, want) {
 			t.Errorf("query missing %q: %q", want, gotQuery)
 		}
+	}
+
+	if strings.Contains(gotQuery, "kind=") {
+		t.Errorf("query should NOT include kind when operator omits -k (server auto-detects); got %q", gotQuery)
 	}
 }
 
@@ -98,50 +103,72 @@ func TestRestartBareNameOmitsScope(t *testing.T) {
 	}
 }
 
-// TestRestartKindFlag pins the -k/--kind plumbing so a future
-// refactor doesn't quietly drop the flag and silently route every
-// restart to deployments.
+// TestRestartKindFlag pins the -k/--kind plumbing for the
+// disambiguation case: when both a deployment AND a statefulset
+// exist under the same name, the operator passes -k to pick.
+// Bare invocation (no -k) sends NO kind on the wire — server
+// auto-detects.
 func TestRestartKindFlag(t *testing.T) {
 	cases := []struct {
-		args     []string
-		wantKind string
+		name        string
+		args        []string
+		wantKind    string // "" when no kind should be sent
+		expectKind  bool
 	}{
-		{[]string{"restart", "clowk-lp/redis"}, "deployment"},
-		{[]string{"restart", "-k", "statefulset", "clowk-lp/redis"}, "statefulset"},
-		{[]string{"restart", "--kind=statefulset", "clowk-lp/redis"}, "statefulset"},
+		{
+			name:       "no -k, server auto-detects",
+			args:       []string{"restart", "clowk-lp/redis"},
+			expectKind: false,
+		},
+		{
+			name:       "explicit -k statefulset",
+			args:       []string{"restart", "-k", "statefulset", "clowk-lp/redis"},
+			wantKind:   "statefulset",
+			expectKind: true,
+		},
+		{
+			name:       "long form --kind=statefulset",
+			args:       []string{"restart", "--kind=statefulset", "clowk-lp/redis"},
+			wantKind:   "statefulset",
+			expectKind: true,
+		},
 	}
 
 	for _, tc := range cases {
-		var gotQuery string
+		t.Run(tc.name, func(t *testing.T) {
+			var gotQuery string
 
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			gotQuery = r.URL.RawQuery
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
 
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data":   map[string]string{"scope": "clowk-lp", "name": "redis"},
-			})
-		}))
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "ok",
+					"data":   map[string]string{"scope": "clowk-lp", "name": "redis", "kind": "statefulset"},
+				})
+			}))
+			defer ts.Close()
 
-		root := newRootCmd()
-		_ = root.PersistentFlags().Set("controller-url", ts.URL)
+			root := newRootCmd()
+			_ = root.PersistentFlags().Set("controller-url", ts.URL)
 
-		var buf bytes.Buffer
-		root.SetOut(&buf)
-		root.SetErr(&buf)
-		root.SetArgs(tc.args)
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetErr(&buf)
+			root.SetArgs(tc.args)
 
-		if err := root.Execute(); err != nil {
-			ts.Close()
-			t.Fatalf("execute %v: %v", tc.args, err)
-		}
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute %v: %v", tc.args, err)
+			}
 
-		ts.Close()
-
-		want := "kind=" + tc.wantKind
-		if !strings.Contains(gotQuery, want) {
-			t.Errorf("args=%v: query=%q, want contains %q", tc.args, gotQuery, want)
-		}
+			if tc.expectKind {
+				want := "kind=" + tc.wantKind
+				if !strings.Contains(gotQuery, want) {
+					t.Errorf("args=%v: query=%q, want contains %q", tc.args, gotQuery, want)
+				}
+			} else if strings.Contains(gotQuery, "kind=") {
+				t.Errorf("args=%v: query should NOT include kind (server auto-detects); got %q", tc.args, gotQuery)
+			}
+		})
 	}
 }
 

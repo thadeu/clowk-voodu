@@ -2244,17 +2244,41 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default kind to deployment for ergonomics — `vd restart X`
-	// almost always means "restart the deployment". Statefulsets
-	// must be addressed explicitly via kind=statefulset.
-	if kindStr == "" {
-		kindStr = string(KindDeployment)
-	}
+	// Auto-detect kind when not specified — operator types
+	// `vd restart clowk-lp/redis` and shouldn't have to know
+	// whether redis is backed by a deployment or a statefulset.
+	// Probe both restartable kinds at (scope, name); exactly one
+	// match advances, zero matches 404, more than one (rare:
+	// deployment + statefulset under same scope/name, or scope
+	// omitted with name appearing in multiple scopes) demands
+	// disambiguation via -k or scope/name.
+	//
+	// Skipped when operator explicitly passed kind — they own the
+	// dispatch and we trust their input verbatim.
+	var (
+		kind Kind
+		err  error
+	)
 
-	kind, err := ParseKind(kindStr)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
+	if kindStr == "" {
+		var resolvedScope string
+
+		kind, resolvedScope, err = autoDetectRestartable(r.Context(), a.Store, scope, name)
+		if err != nil {
+			writeErr(w, restartLookupStatus(err), err)
+			return
+		}
+
+		// autoDetect resolves both kind AND scope as part of
+		// finding the unique match — short-circuit the later
+		// resolveScope call.
+		scope = resolvedScope
+	} else {
+		kind, err = ParseKind(kindStr)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 
 	type restartFn func(ctx context.Context, scope, name string) error
@@ -2334,6 +2358,129 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 			"unfroze": cleared,
 		},
 	})
+}
+
+// errRestartAmbiguous is returned by autoDetectRestartable when
+// the (scope, name) ref matches more than one restartable
+// resource — typically a deployment AND a statefulset under the
+// same scope+name, or the same name appearing in multiple
+// scopes when scope was omitted. Distinct from errScopeNotFound
+// so the HTTP layer can return 400 (operator must disambiguate)
+// vs 404 (operator typo'd).
+var errRestartAmbiguous = errors.New("ambiguous restart target — pass -k <kind> or use full scope/name")
+
+// autoDetectRestartable resolves (kind, scope) for `vd restart
+// <ref>` when one or both are unspecified. Probes the two
+// restartable kinds (deployment, statefulset) and looks for
+// exactly one (kind, scope) match where m.Name == name.
+//
+// Operator-provided scope narrows the search: only that scope
+// is checked. Empty scope scans all scopes — useful when the
+// CLI gets a bare name like `vd restart redis` and the
+// platform should figure out where it lives.
+//
+// Errors:
+//
+//   - errScopeNotFound when no kind has a manifest matching the
+//     ref. Maps to 404.
+//   - errRestartAmbiguous when multiple matches found. Maps to
+//     400 — operator must add -k or qualify the scope.
+//   - any underlying store error bubbles up as 500.
+//
+// On success, returns the unique match's kind and scope —
+// callers can skip the legacy resolveScope step that handles
+// scope-only resolution for a known kind.
+func autoDetectRestartable(ctx context.Context, store Store, scope, name string) (Kind, string, error) {
+	candidates := []Kind{KindDeployment, KindStatefulset}
+
+	type match struct {
+		kind  Kind
+		scope string
+	}
+
+	var matches []match
+
+	for _, k := range candidates {
+		if scope != "" {
+			m, err := store.Get(ctx, k, scope, name)
+			if err != nil {
+				return "", "", fmt.Errorf("lookup %s/%s/%s: %w", k, scope, name, err)
+			}
+
+			if m != nil {
+				matches = append(matches, match{k, scope})
+			}
+
+			continue
+		}
+
+		// scope unknown — scan every manifest of this kind for
+		// a name match. Fan-out is bounded by the kind's
+		// manifest count, which is small even on large clusters.
+		list, err := store.List(ctx, k)
+		if err != nil {
+			return "", "", fmt.Errorf("list %s: %w", k, err)
+		}
+
+		for _, m := range list {
+			if m == nil || m.Name != name {
+				continue
+			}
+
+			matches = append(matches, match{k, m.Scope})
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		// Reuse errScopeNotFound's sentinel so the existing
+		// 404-mapping shared with the explicit-kind path stays
+		// consistent. The wrapped message names the ref the
+		// operator typed so they see what didn't match.
+		return "", "", fmt.Errorf("%w: no deployment or statefulset for %s", errScopeNotFound, formatRestartRef(scope, name))
+
+	case 1:
+		return matches[0].kind, matches[0].scope, nil
+
+	default:
+		// Build a one-line summary of every match so the
+		// disambiguation message is actionable. "ambiguous: X,
+		// Y, Z" beats "ambiguous: 3 candidates" by every UX
+		// measure.
+		summary := make([]string, 0, len(matches))
+		for _, m := range matches {
+			summary = append(summary, fmt.Sprintf("%s/%s/%s", m.kind, m.scope, name))
+		}
+
+		return "", "", fmt.Errorf("%w: matches %s", errRestartAmbiguous, strings.Join(summary, ", "))
+	}
+}
+
+// formatRestartRef renders the operator-typed reference for
+// error messages. Bare names show as "name"; scoped refs show
+// as "scope/name".
+func formatRestartRef(scope, name string) string {
+	if scope == "" {
+		return name
+	}
+
+	return scope + "/" + name
+}
+
+// restartLookupStatus picks the right HTTP code for an error
+// returned by autoDetectRestartable. 404 for "not found", 400
+// for "ambiguous", 500 for unexpected store failures. Keeping
+// the mapping in one place stops the handler body from
+// branching on three errors.is checks inline.
+func restartLookupStatus(err error) int {
+	switch {
+	case errors.Is(err, errScopeNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, errRestartAmbiguous):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // handleReleaseRun manually triggers the release-phase command(s)
