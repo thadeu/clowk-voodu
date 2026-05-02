@@ -186,7 +186,11 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 		EnvFilePath:   paths.AppEnvFile,
 		Containers:    DockerContainerManager{},
-		ControllerURL: deriveControllerURL(s.cfg.HTTPAddr),
+		// Container-side URL (host.docker.internal-based) — this
+		// flows into pod env via BuildPlatformEnv. Different from
+		// API.ControllerURL above (which is 127.0.0.1-based for
+		// host-process plugin callbacks).
+		ControllerURL: deriveContainerControllerURL(s.cfg.HTTPAddr),
 	}
 
 	ingHandler := &IngressHandler{
@@ -436,33 +440,61 @@ func (l *loggingResponseWriter) Flush() {
 }
 
 // deriveControllerURL turns an HTTPAddr like ":8686" or
-// "0.0.0.0:8686" into the URL plugins / containers use to call
-// back into the controller. Uses `host.docker.internal` because:
+// "0.0.0.0:8686" into the URL HOST-PROCESS plugins use to call
+// back into the controller. Plugin processes are forked by the
+// controller during dispatch and run on the same host — 127.0.0.1
+// always works.
 //
-//   - Plugins running as host processes (forked by the controller
-//     during dispatch) hit the host loopback — host.docker.internal
-//     resolves to the host on Docker Desktop, and on Linux we
-//     pass --add-host host.docker.internal:host-gateway on every
-//     container so the alias is also valid from inside containers.
-//   - Containers reach the host via the same alias — no special
-//     casing for "is this URL going to a host process or to a
-//     containerized one". One URL, works everywhere voodu runs.
+// Empty addr → empty URL (plugins won't be able to call back,
+// but voodu-redis-style plugins that need state still work
+// when invoked through the dispatch endpoint with stdin envelope
+// already populated).
 //
-// Pre-fix this returned 127.0.0.1:<port> which was broken from
-// inside containers (loopback there is the container itself, not
-// the host). Sentinel's failover hook + M-S4 preflight needed
-// this to work for auto-failover to round-trip back to the store.
-//
-// Empty addr → empty URL (plugins won't be able to call back).
+// For CONTAINER env injection (sentinel pods + future plugins
+// that call back from inside docker), use deriveContainerControllerURL
+// — that one returns a host.docker.internal-based URL so the call
+// crosses the docker bridge correctly.
 func deriveControllerURL(httpAddr string) string {
 	if httpAddr == "" {
 		return ""
 	}
 
 	// HTTPAddr can be ":8686" (any iface) or "host:8686" or
-	// "1.2.3.4:8686". We only care about the port — host portion
-	// is replaced with host.docker.internal so the URL works from
-	// host AND from containers (with --add-host host-gateway).
+	// "1.2.3.4:8686". Plugins run locally — always loopback.
+	port := httpAddr
+	if idx := strings.LastIndex(httpAddr, ":"); idx >= 0 {
+		port = httpAddr[idx:]
+	}
+
+	return "http://127.0.0.1" + port
+}
+
+// deriveContainerControllerURL is the container-side peer of
+// deriveControllerURL. Returns host.docker.internal:<port> so
+// in-container scripts (sentinel failover hook, M-S4 preflight,
+// future probe-style plugins) reach the controller across the
+// docker bridge.
+//
+// Pairs with the --add-host host.docker.internal:host-gateway
+// flag voodu passes on every container in CreateContainer —
+// that flag makes the alias resolvable on Linux (Docker Desktop
+// already provides it natively on Mac/Win).
+//
+// IMPORTANT: the controller MUST bind to an address reachable
+// from the docker bridge gateway (0.0.0.0:<port> or the bridge
+// IP). A controller bound to 127.0.0.1:<port> won't accept the
+// connection arriving from the gateway, even though the alias
+// resolves correctly. The controller's --http flag default is
+// `:8686` which binds all interfaces; setups overriding to
+// 127.0.0.1:8686 break in-container callbacks.
+//
+// Empty addr → empty URL (containers detect and skip the
+// callback path; sentinel hook degrades gracefully).
+func deriveContainerControllerURL(httpAddr string) string {
+	if httpAddr == "" {
+		return ""
+	}
+
 	port := httpAddr
 	if idx := strings.LastIndex(httpAddr, ":"); idx >= 0 {
 		port = httpAddr[idx:]
