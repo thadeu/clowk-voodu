@@ -144,6 +144,12 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 		wg sync.WaitGroup
 	)
 
+	// Per-pod color — same hash-based assignment as sequential
+	// mode so the SAME pod has the SAME color whether the
+	// operator runs `vd logs` or `vd logs -f`. Eye trains once,
+	// applies everywhere.
+	prefixPalette := newPodPalette(os.Stdout)
+
 	errs := make(chan error, len(containers))
 
 	for _, name := range containers {
@@ -152,7 +158,7 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 		go func(name string) {
 			defer wg.Done()
 
-			prefix := "[" + name + "] "
+			prefix := prefixPalette.ColorFor(name)("["+name+"]") + " "
 			writer := &lockedPrefixWriter{w: os.Stdout, mu: &mu, prefix: prefix}
 
 			if err := streamOneLog(ctx, cmd, name, follow, tail, writer, prefix); err != nil {
@@ -188,11 +194,18 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 // operator can tell where one pod's output ends and the next
 // begins. stdout stays clean (just the log lines, with the
 // container's `[name] ` prefix on each).
+//
+// Header AND prefix share the pod's hash-derived color — operator
+// scanning the output associates pod ↔ color visually without
+// reading the full container suffix.
 func streamSequentialLogs(ctx context.Context, cmd *cobra.Command, containers []string, tail int) error {
-	for _, name := range containers {
-		fmt.Fprintf(os.Stderr, "==> %s <==\n", name)
+	headerPalette := newPodPalette(os.Stderr)
+	prefixPalette := newPodPalette(os.Stdout)
 
-		prefix := "[" + name + "] "
+	for _, name := range containers {
+		fmt.Fprintln(os.Stderr, headerPalette.ColorFor(name)("==> "+name+" <=="))
+
+		prefix := prefixPalette.ColorFor(name)("[" + name + "]") + " "
 		writer := &lockedPrefixWriter{w: os.Stdout, mu: &sync.Mutex{}, prefix: prefix}
 
 		// follow=false here because this path only runs in the
