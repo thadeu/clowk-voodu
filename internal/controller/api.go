@@ -355,13 +355,23 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	// the CLI can render a proper field-by-field diff client-side.
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 
-	// `?prune=false` is the escape hatch for shared-scope setups where
-	// several independent applies (different repos, different pipelines)
-	// each declare only a slice of the scope. Default remains prune=on —
-	// that's the source-of-truth contract most mono-repo users want, and
-	// renames don't leave zombies behind. See README "Shared scope" for
-	// the intended usage pattern.
-	prune := r.URL.Query().Get("prune") != "false"
+	// Default upsert-only: existing siblings in the same (scope, kind)
+	// that aren't declared in this apply are LEFT ALONE. Operator
+	// passes `?prune=true` (CLI: `vd apply --prune`) to opt into
+	// the source-of-truth cleanup that removes them.
+	//
+	// Default-off matches the realistic operator workflow — refactoring
+	// HCL across files, splitting a stack into smaller files, partial
+	// applies during incremental migration. Default-on is too easy to
+	// trigger accidentally ("I forgot --no-prune and it deleted my
+	// production job"). The footgun is real; the destructive default
+	// is the CVE-grade variety where operator's typo or misremembering
+	// can take down a service.
+	//
+	// Explicit `prune=true` keeps the source-of-truth semantic for
+	// operators who want it (mono-repo + CI-driven applies that DO
+	// own the entire scope).
+	prune := r.URL.Query().Get("prune") == "true"
 
 	// Plugin-block expansion: any manifest whose Kind is not a
 	// core kind gets expanded by an installed plugin into one or

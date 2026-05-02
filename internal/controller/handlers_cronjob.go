@@ -235,6 +235,13 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		return JobRun{}, err
 	}
 
+	// Stack env_from sources before the cronjob's own env file
+	// (same semantics as one-off jobs).
+	extraEnvFiles, err := resolveEnvFromList(spec.Job.EnvFrom, scope, h.logf)
+	if err != nil {
+		return JobRun{}, fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	runID := containers.NewReplicaID()
 	cname := containers.ContainerName(scope, name, runID)
 
@@ -261,15 +268,22 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 	}
 
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:           cname,
-		Image:          spec.Job.Image,
-		Command:        spec.Job.Command,
-		Volumes:        spec.Job.Volumes,
-		Networks:       spec.Job.Networks,
-		NetworkMode:    spec.Job.NetworkMode,
-		NetworkAliases: BuildNetworkAliases(scope, name),
-		EnvFile:        envFile,
-		Labels:         labels,
+		Name:        cname,
+		Image:       spec.Job.Image,
+		Command:     spec.Job.Command,
+		Volumes:     spec.Job.Volumes,
+		Networks:    spec.Job.Networks,
+		NetworkMode: spec.Job.NetworkMode,
+		// Cronjobs deliberately do NOT register network aliases —
+		// same rationale as one-off jobs. See handlers_job.go's
+		// Recreate call for the full reasoning. Cron ticks fire
+		// repeatedly with new run ids; registering an alias per
+		// run would put the cron container into the DNS round-
+		// robin briefly during each tick, with even more chance
+		// of accidental collision than one-off jobs.
+		EnvFile:       envFile,
+		ExtraEnvFiles: extraEnvFiles,
+		Labels:        labels,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs cronjob
 		// <name>` can read them post-tick. The runner GCs old run

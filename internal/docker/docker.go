@@ -58,6 +58,15 @@ type ContainerConfig struct {
 	Ports   []string
 	EnvFile string
 
+	// ExtraEnvFiles holds additional --env-file paths emitted
+	// BEFORE the primary EnvFile. Used by job/cronjob env_from
+	// stacking — each entry resolves to another resource's
+	// materialised env file, layered in declared order. Docker's
+	// last-wins semantics mean EnvFile (passed last) overrides
+	// every entry here, and within the slice itself later entries
+	// override earlier ones.
+	ExtraEnvFiles []string
+
 	// Env carries per-container environment variables emitted as
 	// `-e KEY=VAL` on `docker run`. Distinct from EnvFile: the file
 	// holds operator secrets and changes between restarts, while Env
@@ -198,6 +207,19 @@ func CreateContainer(cfg ContainerConfig) error {
 		for _, port := range cfg.Ports {
 			args = append(args, "-p", port)
 		}
+	}
+
+	// ExtraEnvFiles come BEFORE the primary EnvFile so the latter
+	// (the resource's own merged env) wins on conflicts. Within
+	// the slice, declared order is preserved — later entries
+	// override earlier ones, matching the operator's `env_from =
+	// [a, b, c]` mental model.
+	for _, ef := range cfg.ExtraEnvFiles {
+		if ef == "" {
+			continue
+		}
+
+		args = append(args, "--env-file", ef)
 	}
 
 	if cfg.EnvFile != "" {

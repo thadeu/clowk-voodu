@@ -238,6 +238,24 @@ type ContainerSpec struct {
 	// only require restart, not recreate.
 	EnvFile string
 
+	// ExtraEnvFiles lists additional --env-file paths to pass to
+	// the container BEFORE EnvFile. Used by jobs/cronjobs that
+	// declare `env_from = [...]` in HCL — each entry resolves to
+	// another resource's env file path, stacked in declared order.
+	//
+	// Docker's last-wins semantics: each subsequent --env-file
+	// overrides earlier ones, and EnvFile (passed last) overrides
+	// every entry in ExtraEnvFiles. So the layering for a job is:
+	//
+	//   ExtraEnvFiles[0]   → most "shared" / base layer
+	//   ExtraEnvFiles[1]   → next layer
+	//   ...
+	//   EnvFile            → job's own (scope + bucket + spec.env merged)
+	//
+	// Empty / nil for resources that don't use env stacking
+	// (deployments, statefulsets) — they only have EnvFile.
+	ExtraEnvFiles []string
+
 	// Env carries platform-injected per-container identity vars
 	// (VOODU_REPLICA_ORDINAL, VOODU_REPLICA_ID, VOODU_SCOPE,
 	// VOODU_NAME, ...). These are emitted as `-e KEY=VAL` AFTER
@@ -343,6 +361,7 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		NetworkAliases: spec.NetworkAliases,
 		RestartPolicy:  spec.Restart,
 		EnvFile:        spec.EnvFile,
+		ExtraEnvFiles:  spec.ExtraEnvFiles,
 		Env:            spec.Env,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,
@@ -679,6 +698,7 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		NetworkAliases: spec.NetworkAliases,
 		RestartPolicy:  spec.Restart,
 		EnvFile:        spec.EnvFile,
+		ExtraEnvFiles:  spec.ExtraEnvFiles,
 		Env:            spec.Env,
 		Labels:         spec.Labels,
 		AutoRemove:     spec.AutoRemove,

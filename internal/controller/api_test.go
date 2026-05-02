@@ -157,13 +157,14 @@ func TestApplyPruneRemovesMissing(t *testing.T) {
 		}
 	}
 
-	// Apply only `deployment app-a/web`. Expectation:
+	// Apply only `deployment app-a/web` WITH ?prune=true (the
+	// opt-in flag for source-of-truth cleanup). Expectation:
 	//   - app-a/worker is pruned (same kind+scope, missing from input)
 	//   - app-b/api is kept (different scope entirely — not touched)
 	//   - app-a/lb is kept (different kind; prune is per-(scope,kind))
 	body := `[{"kind":"deployment","scope":"app-a","name":"web","spec":{}}]`
 
-	resp, err := http.Post(ts.URL+"/apply", "application/json", strings.NewReader(body))
+	resp, err := http.Post(ts.URL+"/apply?prune=true", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +221,11 @@ func TestApplyDryRunDoesNotPersist(t *testing.T) {
 
 	body := `[{"kind":"deployment","scope":"app","name":"web","spec":{"replicas":5}}]`
 
-	resp, err := http.Post(ts.URL+"/apply?dry_run=true", "application/json", strings.NewReader(body))
+	// Pass ?prune=true alongside dry_run so the test exercises
+	// the source-of-truth path (pruning siblings missing from
+	// the input). Without it, the new upsert-only default would
+	// leave worker untouched and the pruned list would be empty.
+	resp, err := http.Post(ts.URL+"/apply?dry_run=true&prune=true", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

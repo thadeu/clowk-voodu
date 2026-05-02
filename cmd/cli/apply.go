@@ -45,7 +45,7 @@ type controllerExpansionRef struct {
 type applyFlags struct {
 	files            []string
 	format           string // stdin only: "hcl" | "yaml"
-	noPrune          bool   // apply + diff: upsert without deleting siblings in the same (scope, kind)
+	applyPrune       bool   // apply + diff: opt-in to delete siblings in the same (scope, kind) not declared in this apply
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
 	autoApprove      bool   // apply + delete: skip the interactive confirmation
 	force            bool   // apply only: force rebuild even when the tarball hash already has a release
@@ -77,10 +77,12 @@ a public port.
 ${VAR} in the file body is interpolated from the current process
 environment before parsing. Use ${VAR:-default} to fall back.
 
-By default, apply is source-of-truth: anything in the same
-(scope, kind) that isn't in this apply gets pruned. Pass --no-prune
-when several independent applies (different repos, different CI
-pipelines) share a scope and each declares only a slice of it.
+By default, apply is upsert-only: existing resources not declared
+in this apply are LEFT ALONE. To clean up siblings in the same
+(scope, kind) that aren't in this apply, pass --prune. Default-off
+matches the operator workflow of refactoring HCL across multiple
+files — splitting a stack into smaller files shouldn't accidentally
+delete the resources you split out.
 
 When forwarded to a remote, apply runs diff first, shows the plan,
 and prompts for y/N on your local terminal. Pass --auto-approve
@@ -104,7 +106,7 @@ raw stream when debugging a failed build.`,
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
-	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "upsert only; do not delete other resources in the same (scope, kind)")
+	cmd.Flags().BoolVar(&f.applyPrune, "prune", false, "delete sibling resources in the same (scope, kind) that aren't declared in this apply (default: upsert-only, leave existing siblings alone)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
 	cmd.Flags().BoolVarP(&f.verbose, "verbose", "v", false, "show raw docker build output (default: collapse into a spinner)")
@@ -129,9 +131,10 @@ The diff calls the controller with ?dry_run=true, so nothing is
 persisted and the output matches byte-for-byte what the next
 'voodu apply' would do with the same flags.
 
-By default, the pruned section reflects the source-of-truth apply
-behavior. Pass --no-prune to simulate an upsert-only apply (for
-shared-scope cross-repo workflows).`,
+By default, diff matches the upsert-only apply behavior — the
+pruned section is empty. Pass --prune to preview which sibling
+resources in the same (scope, kind) would be deleted IF you
+ran 'vd apply --prune'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDiff(cmd, f)
 		},
@@ -139,7 +142,7 @@ shared-scope cross-repo workflows).`,
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
-	cmd.Flags().BoolVar(&f.noPrune, "no-prune", false, "simulate an apply that wouldn't prune siblings in the same (scope, kind)")
+	cmd.Flags().BoolVar(&f.applyPrune, "prune", false, "preview which siblings would be deleted by 'apply --prune' (default: upsert-only)")
 	cmd.Flags().BoolVar(&f.detailedExitcode, "detailed-exitcode", false, "exit 0 when no changes, 2 when changes, 1 on error (CI-friendly)")
 
 	// --detailed-exitcode returns errExitWithChanges to signal code 2.
@@ -241,8 +244,8 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	}
 
 	query := ""
-	if f.noPrune {
-		query = "prune=false"
+	if f.applyPrune {
+		query = "prune=true"
 	}
 
 	resp, err := controllerDo(root, http.MethodPost, "/apply", query, bytes.NewReader(body))
@@ -424,8 +427,8 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	// same validation, same ordering. Whatever the server would do on
 	// a real apply shows up here, nothing more.
 	query := "dry_run=true"
-	if f.noPrune {
-		query += "&prune=false"
+	if f.applyPrune {
+		query += "&prune=true"
 	}
 
 	resp, err := controllerDo(cmd.Root(), http.MethodPost, "/apply", query, bytes.NewReader(body))
@@ -616,16 +619,17 @@ func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modi
 	return added, modified
 }
 
-// renderPrunePlan prints the footer block listing resources that would
-// be removed. Skipped when empty so clean diffs stay terse; the hint
-// about --no-prune reminds operators about the shared-scope escape
-// hatch without forcing them to recall the flag name.
+// renderPrunePlan prints the footer block listing resources that
+// WOULD be removed if --prune were active. Diff only invokes this
+// when the operator passed --prune (otherwise the prune set is
+// always empty by request), so the section header reminds them
+// what they're seeing.
 func renderPrunePlan(w io.Writer, pruned []string, p diffPalette) {
 	if len(pruned) == 0 {
 		return
 	}
 
-	fmt.Fprintln(w, "\n--- Would prune (pass --no-prune to keep) ---")
+	fmt.Fprintln(w, "\n--- Would prune (--prune passed; remove flag to keep) ---")
 
 	for _, ref := range pruned {
 		fmt.Fprintf(w, "%s %s\n", p.Del("-"), ref)

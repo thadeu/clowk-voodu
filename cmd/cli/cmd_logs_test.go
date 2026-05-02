@@ -183,6 +183,89 @@ func TestLogsScopeNameResolvesViaPodsList(t *testing.T) {
 	}
 }
 
+// TestLogsMultiPodChronologicalOrder pins the "oldest pod's logs
+// first, newest last" output order. Operator reads top-to-bottom
+// in a terminal; latest output should land at the bottom near
+// the cursor without scroll-up.
+//
+// The non-follow path streams sequentially in CreatedAt-asc order
+// to avoid races between goroutines that would shuffle the
+// per-pod sections non-deterministically.
+func TestLogsMultiPodChronologicalOrder(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		streamPaths []string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.URL.Path == "/pods":
+			// Server returns pods in arbitrary order — CLI is
+			// responsible for the chronological sort.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"data": map[string]any{
+					"pods": []controller.Pod{
+						// Newer first to prove the CLI re-sorts.
+						{Name: "test-job.bbbb", CreatedAt: "2026-05-02T12:00:00Z"},
+						{Name: "test-job.aaaa", CreatedAt: "2026-05-02T10:00:00Z"},
+						{Name: "test-job.cccc", CreatedAt: "2026-05-02T11:00:00Z"},
+					},
+				},
+			})
+
+		case strings.HasSuffix(r.URL.Path, "/logs"):
+			streamPaths = append(streamPaths, r.URL.Path)
+
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(r.URL.Path + " content\n"))
+
+		default:
+			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"logs", "test/job"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Stream paths fired in chronological order (CreatedAt asc):
+	// aaaa (10:00) → cccc (11:00) → bbbb (12:00). Sequential
+	// streaming guarantees deterministic order — concurrent
+	// fan-out wouldn't.
+	want := []string{
+		"/pods/test-job.aaaa/logs",
+		"/pods/test-job.cccc/logs",
+		"/pods/test-job.bbbb/logs",
+	}
+
+	if len(streamPaths) != len(want) {
+		t.Fatalf("got %d streams, want %d: %v", len(streamPaths), len(want), streamPaths)
+	}
+
+	for i, w := range want {
+		if streamPaths[i] != w {
+			t.Errorf("streamPaths[%d] = %q, want %q (chronological order broken)",
+				i, streamPaths[i], w)
+		}
+	}
+}
+
 // TestLogsBareScopeListsAllPodsInScope mirrors the get pd bare scope
 // behavior: no slash, no dot → treat the ref as a scope filter.
 func TestLogsBareScopeListsAllPodsInScope(t *testing.T) {

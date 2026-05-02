@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -249,6 +250,165 @@ func TestJobHandler_RunOnceSpawnsContainerAndRecordsSuccess(t *testing.T) {
 
 	if st.LastRun == nil {
 		t.Errorf("LastRun should be populated after a run")
+	}
+}
+
+// TestJobHandler_RunOnceStacksEnvFromFiles pins the env_from
+// contract: declared refs resolve to env files that get passed
+// to docker as additional --env-file flags BEFORE the job's own
+// env file. Order in the spec.EnvFrom slice is preserved so
+// docker's last-wins semantics match the operator's mental
+// model ("later in the list = higher priority within env_from").
+func TestJobHandler_RunOnceStacksEnvFromFiles(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("VOODU_ROOT", tmp)
+
+	// Pre-seed env files on disk so the resolver finds them.
+	mustTouch(t, filepath.Join(tmp, "apps", "secrets-aws", "shared", ".env"))
+	mustTouch(t, filepath.Join(tmp, "apps", "test-web", "shared", ".env"))
+
+	store := newMemStore()
+
+	spec := map[string]any{
+		"image":    "ghcr.io/acme/api:1.0.0",
+		"command":  []string{"./crawler.sh"},
+		"env_from": []string{"secrets/aws", "web"},
+	}
+	seedManifest(t, store, KindJob, "crawler", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	if err := apply.Handle(context.Background(), putEvent(t, KindJob, "crawler", spec)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cm := &fakeContainers{}
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "crawler"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(cm.recreates))
+	}
+
+	got := cm.recreates[0]
+
+	if len(got.ExtraEnvFiles) != 2 {
+		t.Fatalf("ExtraEnvFiles = %v, want 2 entries (secrets/aws + web)", got.ExtraEnvFiles)
+	}
+
+	// Order preserved: secrets/aws first (env_from[0]), web second.
+	if !strings.HasSuffix(got.ExtraEnvFiles[0], "/secrets-aws/shared/.env") {
+		t.Errorf("ExtraEnvFiles[0] = %q, want ends with secrets-aws/shared/.env", got.ExtraEnvFiles[0])
+	}
+
+	if !strings.HasSuffix(got.ExtraEnvFiles[1], "/test-web/shared/.env") {
+		t.Errorf("ExtraEnvFiles[1] = %q, want ends with test-web/shared/.env", got.ExtraEnvFiles[1])
+	}
+
+	// Job's own env file path comes from h.EnvFilePath; the test
+	// harness leaves it nil so envFile is empty. The contract that
+	// matters for env_from is "ExtraEnvFiles fired in declared
+	// order"; production wiring sets EnvFilePath via paths.AppEnvFile
+	// and the spec's job-id resolves at run time.
+}
+
+// TestJobHandler_RunOnceWithoutEnvFromHasEmptyExtraEnvFiles is
+// the negative path: jobs that don't declare env_from get
+// empty ExtraEnvFiles. Confirms the feature is opt-in.
+func TestJobHandler_RunOnceWithoutEnvFromHasEmptyExtraEnvFiles(t *testing.T) {
+	store := newMemStore()
+
+	spec := map[string]any{
+		"image":   "ghcr.io/acme/api:1.0.0",
+		"command": []string{"./migrate.sh"},
+	}
+	seedManifest(t, store, KindJob, "migrate", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	if err := apply.Handle(context.Background(), putEvent(t, KindJob, "migrate", spec)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cm := &fakeContainers{}
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "migrate"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(cm.recreates))
+	}
+
+	if len(cm.recreates[0].ExtraEnvFiles) != 0 {
+		t.Errorf("expected no ExtraEnvFiles for job without env_from, got %v", cm.recreates[0].ExtraEnvFiles)
+	}
+}
+
+// TestJobHandler_RunOnceDoesNotRegisterDNSAliases pins the
+// "jobs join voodu0 but stay invisible to Docker DNS round-robin"
+// contract.
+//
+// Why: a job with the same (scope, name) as a deployment would
+// otherwise share aliases (`<name>.<scope>` and `<name>.<scope>.voodu`),
+// causing Docker DNS to round-robin between the steady-state app
+// container and the transient job container during the few seconds
+// the job runs. Ingress traffic could land on the job mid-execution
+// and return weird responses or 5xx.
+//
+// Even when names don't collide, registering an alias for a one-shot
+// container is misleading — clients shouldn't dial jobs as services.
+//
+// Containers still join the voodu0 network (via validateJobNetwork's
+// auto-injection) so the job can reach internal services like
+// redis.scope.voodu, postgres.scope.voodu, etc. Just no inbound
+// addressability.
+func TestJobHandler_RunOnceDoesNotRegisterDNSAliases(t *testing.T) {
+	store := newMemStore()
+
+	spec := map[string]any{
+		"image":   "ghcr.io/acme/api:1.0.0",
+		"command": []string{"./migrate.sh"},
+	}
+	seedManifest(t, store, KindJob, "migrate", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	if err := apply.Handle(context.Background(), putEvent(t, KindJob, "migrate", spec)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cm := &fakeContainers{}
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "migrate"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(cm.recreates))
+	}
+
+	got := cm.recreates[0]
+
+	if len(got.NetworkAliases) != 0 {
+		t.Errorf("job container should NOT register DNS aliases (jobs aren't services); got %v", got.NetworkAliases)
+	}
+
+	// voodu0 network membership is still expected — the job needs
+	// to reach internal services (redis.scope.voodu, etc.). The
+	// "no aliases" rule is about INCOMING traffic, not outgoing.
+	hasVoodu0 := false
+	for _, n := range got.Networks {
+		if n == "voodu0" {
+			hasVoodu0 = true
+			break
+		}
+	}
+
+	if !hasVoodu0 {
+		t.Errorf("job container should still join voodu0 to dial internal services; networks=%v", got.Networks)
 	}
 }
 

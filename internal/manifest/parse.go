@@ -574,6 +574,7 @@ type hclJob struct {
 	Path        string            `hcl:"path,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
+	EnvFrom     []string          `hcl:"env_from,optional"`
 	Volumes     []string          `hcl:"volumes,optional"`
 	Network     string            `hcl:"network,optional"`
 	Networks    []string          `hcl:"networks,optional"`
@@ -595,6 +596,7 @@ func (b hclJob) spec() JobSpec {
 		Path:                   b.Path,
 		Command:                b.Command,
 		Env:                    b.Env,
+		EnvFrom:                b.EnvFrom,
 		Volumes:                b.Volumes,
 		Network:                b.Network,
 		Networks:               b.Networks,
@@ -647,6 +649,7 @@ type hclCronJob struct {
 	Path        string            `hcl:"path,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
+	EnvFrom     []string          `hcl:"env_from,optional"`
 	Volumes     []string          `hcl:"volumes,optional"`
 	Network     string            `hcl:"network,optional"`
 	Networks    []string          `hcl:"networks,optional"`
@@ -665,6 +668,7 @@ func (b hclCronJob) spec() CronJobSpec {
 		Path:        b.Path,
 		Command:     b.Command,
 		Env:         b.Env,
+		EnvFrom:     b.EnvFrom,
 		Volumes:     b.Volumes,
 		Network:     b.Network,
 		Networks:    b.Networks,

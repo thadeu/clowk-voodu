@@ -102,10 +102,11 @@ ingress "test" "api" {
 	}
 }
 
-// TestApplyNoPrunePropagatesQuery verifies the CLI flag translates to
-// the controller's ?prune=false query param — the wire contract that
-// lets shared-scope cross-repo applies coexist.
-func TestApplyNoPrunePropagatesQuery(t *testing.T) {
+// TestApplyPruneFlagPropagatesQuery verifies the CLI --prune flag
+// translates to the controller's ?prune=true query param. Default
+// behavior (flag absent) sends NO query — server-side default is
+// upsert-only, so omitting the param keeps the safe path.
+func TestApplyPruneFlagPropagatesQuery(t *testing.T) {
 	dir := t.TempDir()
 
 	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
@@ -140,7 +141,7 @@ deployment "clowk" "lp" {
 		t.Fatal(err)
 	}
 
-	if err := runApply(cmd, applyFlags{files: []string{dir}, noPrune: true}); err != nil {
+	if err := runApply(cmd, applyFlags{files: []string{dir}, applyPrune: true}); err != nil {
 		t.Fatalf("runApply: %v", err)
 	}
 
@@ -155,14 +156,15 @@ deployment "clowk" "lp" {
 		t.Errorf("path = %q, want /apply", gotPath)
 	}
 
-	if gotRawQuery != "prune=false" {
-		t.Errorf("raw query = %q, want prune=false", gotRawQuery)
+	if gotRawQuery != "prune=true" {
+		t.Errorf("raw query = %q, want prune=true", gotRawQuery)
 	}
 }
 
 // TestApplyDefaultPruneSendsNoQuery verifies the default apply does NOT
 // include a prune query param — the controller sees an empty query and
-// applies the source-of-truth contract (prune on).
+// applies the upsert-only default (prune off). Operator opts into the
+// destructive cleanup with --prune.
 func TestApplyDefaultPruneSendsNoQuery(t *testing.T) {
 	dir := t.TempDir()
 
@@ -202,7 +204,7 @@ deployment "clowk" "lp" {
 	defer mu.Unlock()
 
 	if gotRawQuery != "" {
-		t.Errorf("raw query = %q, want empty (default prune=on)", gotRawQuery)
+		t.Errorf("raw query = %q, want empty (default upsert-only, no query needed)", gotRawQuery)
 	}
 }
 

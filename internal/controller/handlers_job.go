@@ -27,6 +27,34 @@ type jobSpec struct {
 	NetworkMode string            `json:"network_mode,omitempty"`
 	Timeout     string            `json:"timeout,omitempty"`
 
+	// EnvFrom lists other resources whose env files should be
+	// stacked into this job's container at run time. Each entry
+	// is a `<scope>/<name>` ref (or a bare `<name>` for the
+	// current scope) pointing at any voodu-managed resource that
+	// has a materialised env file at /var/lib/voodu/apps/<id>.env
+	// (deployment, statefulset, even another job).
+	//
+	// Docker `--env-file` flags are emitted in the declared order,
+	// followed by the job's OWN env file (which carries
+	// scope-level config + per-app bucket + spec.env merged via
+	// resolveAppEnv). Docker's last-wins semantics apply: keys in
+	// later sources override earlier ones, and the job's own env
+	// (last) trumps every env_from source.
+	//
+	// Layered model (operator-visible):
+	//
+	//   env_from[0]  base layer (e.g. shared AWS secrets bucket)
+	//   env_from[1]  next layer (e.g. paired deployment's env)
+	//   ...
+	//   job's own   final layer (scope + bucket + HCL spec.env)
+	//
+	// Operators who want a "clone of pod X with extra overrides"
+	// pattern declare `env_from = ["X"]` plus per-job
+	// `env = {...}` overrides — the spec.env keys land in the
+	// job's own env file via resolveAppEnv and win over the
+	// inherited env_from layer.
+	EnvFrom []string `json:"env_from,omitempty"`
+
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 
@@ -256,6 +284,15 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		return JobRun{}, err
 	}
 
+	// Resolve env_from refs to additional --env-file paths.
+	// Stacked BEFORE the job's own env file so the job's spec.env
+	// + per-app bucket + scope-level config (all merged into the
+	// job's env file via linkEnv above) wins on key collisions.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return JobRun{}, fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	runID := containers.NewReplicaID()
 	cname := containers.ContainerName(scope, name, runID)
 
@@ -287,15 +324,44 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 	}
 
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:           cname,
-		Image:          spec.Image,
-		Command:        spec.Command,
-		Volumes:        spec.Volumes,
-		Networks:       spec.Networks,
-		NetworkMode:    spec.NetworkMode,
-		NetworkAliases: BuildNetworkAliases(scope, name),
-		EnvFile:        envFile,
-		Labels:         labels,
+		Name:        cname,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Volumes:     spec.Volumes,
+		Networks:    spec.Networks,
+		NetworkMode: spec.NetworkMode,
+		// Jobs deliberately do NOT register network aliases on
+		// the bridge. They join voodu0 (so the job container can
+		// dial internal services like redis.scope.voodu, postgres.
+		// scope.voodu, etc.) but are NOT addressable as a service.
+		//
+		// Why no aliases:
+		//
+		//   - Jobs are one-shot, not steady-state services. Other
+		//     containers shouldn't be dialing them by name; that
+		//     would be racy (alias appears for ~seconds during the
+		//     run, then disappears).
+		//
+		//   - When a job and a deployment share (scope, name) — say
+		//     `deployment/clowk-lp/app` and `job/clowk-lp/app` —
+		//     identical aliases would make Docker DNS round-robin
+		//     between the long-running app container and the
+		//     transient job container. Ingress traffic could land
+		//     on the job mid-execution, returning weird responses
+		//     or 5xx. The fix is platform-side (don't register the
+		//     job's alias) rather than naming convention (operators
+		//     would still hit it on a typo).
+		//
+		//   - Per-run alias by run id (`<name>-<runid>.<scope>`)
+		//     would be dialable but pointless — clients don't know
+		//     the run id ahead of time.
+		//
+		// Operators who really want a stable alias for a job can
+		// still override via spec.Volumes / NetworkMode etc. — the
+		// surface stays open. Default-no-aliases is the safe path.
+		EnvFile:       envFile,
+		ExtraEnvFiles: extraEnvFiles,
+		Labels:        labels,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs job <name>`
 		// can read them post-exit. The runner GCs old run containers

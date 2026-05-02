@@ -385,6 +385,18 @@ type JobSpec struct {
 	Networks    []string          `yaml:"networks,omitempty"      json:"networks,omitempty"`
 	NetworkMode string            `yaml:"network_mode,omitempty"  json:"network_mode,omitempty"`
 
+	// EnvFrom stacks env files from other resources at run time.
+	// Each entry is a `<scope>/<name>` ref (or bare `<name>` for
+	// the current scope). At RunOnce, voodu emits a `--env-file`
+	// per entry BEFORE the job's own env file, so the job's
+	// merged env (scope + per-app + spec.env) wins on conflicts.
+	//
+	// Typical use: pair a job with the deployment whose image it
+	// shares, so the job inherits DATABASE_URL/REDIS_URL/etc.
+	// without redeclaration. Multiple sources stack in declared
+	// order — common pattern is `[shared-secrets, paired-app]`.
+	EnvFrom []string `yaml:"env_from,omitempty" json:"env_from,omitempty"`
+
 	// Lang mirrors the deployment's lang block — same handler dispatch,
 	// same escape-hatch via build_args. Jobs typically reuse a
 	// deployment's image via `image = "my-app:latest"`, so the lang

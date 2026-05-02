@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,14 +112,32 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 		return streamOneLog(cmd.Context(), cmd, containers[0], follow, tail, os.Stdout, "" /* no prefix */)
 	}
 
-	// Multi-container: fan out N goroutines, each writing to a shared
-	// stdout under a mutex (so per-line prefixes don't interleave) with
-	// the container name as a `[name] ` lead. Every stream gets its
-	// own context derived from the parent so a Ctrl-C stops all of them.
+	// Multi-container splits into two paths based on follow mode:
+	//
+	//   - Non-follow (historical dump): stream pods sequentially
+	//     in the chronologically-sorted order from
+	//     resolveLogsTargets. Oldest pod's logs print first,
+	//     newest last. Operator reads top-to-bottom, latest output
+	//     lands at the bottom near the cursor — no scroll-up
+	//     needed. Concurrent fan-out would race and produce
+	//     non-deterministic ordering between pods (lines from
+	//     each pod still atomic, but pod-A's chunk could land
+	//     before or after pod-B's depending on goroutine timing).
+	//
+	//   - Follow mode (-f): concurrent fan-out IS the right
+	//     behaviour. Operator wants live updates from every pod
+	//     interleaved as events happen; they don't care about
+	//     "show pod-A's history fully before pod-B starts."
+	//     Per-line prefix + locked writer guarantees lines stay
+	//     attributable.
 	fmt.Fprintf(os.Stderr, "==> tailing %d container(s) for %q\n", len(containers), ref)
 
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
+
+	if !follow {
+		return streamSequentialLogs(ctx, cmd, containers, tail)
+	}
 
 	var (
 		mu sync.Mutex
@@ -156,6 +175,39 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 	}
 
 	return firstErr
+}
+
+// streamSequentialLogs walks the (already chronologically-sorted)
+// container list and prints each pod's logs in full before moving
+// to the next. Used by the non-follow path so output reflects the
+// sort order from resolveLogsTargets — oldest pod's logs appear
+// at the top, newest at the bottom, no race with concurrent
+// goroutines.
+//
+// Each pod's section is bracketed by a header on stderr so the
+// operator can tell where one pod's output ends and the next
+// begins. stdout stays clean (just the log lines, with the
+// container's `[name] ` prefix on each).
+func streamSequentialLogs(ctx context.Context, cmd *cobra.Command, containers []string, tail int) error {
+	for _, name := range containers {
+		fmt.Fprintf(os.Stderr, "==> %s <==\n", name)
+
+		prefix := "[" + name + "] "
+		writer := &lockedPrefixWriter{w: os.Stdout, mu: &sync.Mutex{}, prefix: prefix}
+
+		// follow=false here because this path only runs in the
+		// non-follow branch — stream is bounded by EOF on the
+		// HTTP body.
+		if err := streamOneLog(ctx, cmd, name, false, tail, writer, prefix); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+
+	return nil
 }
 
 // resolveLogsTargets translates the ref into a list of docker container
@@ -206,6 +258,15 @@ func resolveLogsTargets(cmd *cobra.Command, ref string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Sort by CreatedAt ascending — oldest first, newest last.
+	// Operators read top-to-bottom in a terminal; chronological
+	// order means the most recent (and usually most relevant)
+	// output lands at the bottom near the cursor when streaming
+	// finishes, no scroll-up required.
+	sort.SliceStable(pods, func(i, j int) bool {
+		return pods[i].CreatedAt < pods[j].CreatedAt
+	})
 
 	out := make([]string, 0, len(pods))
 	for _, p := range pods {

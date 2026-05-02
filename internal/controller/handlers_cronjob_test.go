@@ -160,6 +160,15 @@ func TestCronJobHandler_TickSpawnsContainerAndRecordsSuccess(t *testing.T) {
 		t.Errorf("cronjob container must run with AutoRemove=false so docker keeps the stopped container (and its logs) for `voodu logs cronjob`")
 	}
 
+	// Cronjob ticks must NOT register DNS aliases — same rationale
+	// as one-off jobs (see TestJobHandler_RunOnceDoesNotRegisterDNSAliases).
+	// Ticking briefly puts the container into Docker's name resolution
+	// would put the cron container into the round-robin during each
+	// tick, especially bad with multiple ticks in flight.
+	if len(got.NetworkAliases) != 0 {
+		t.Errorf("cronjob tick should NOT register DNS aliases; got %v", got.NetworkAliases)
+	}
+
 	id := identityFromSpec(got)
 	if id.Kind != containers.KindCronJob || id.Scope != "test" || id.Name != "purge" {
 		t.Errorf("identity labels wrong: %+v (want kind=cronjob)", id)
