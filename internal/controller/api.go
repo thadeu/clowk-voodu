@@ -161,16 +161,28 @@ type Execer interface {
 
 // PodLifecycler is the seam `POST /pods/{name}/stop` and
 // `POST /pods/{name}/start` dispatch through. DockerContainerManager
-// satisfies this via its Stop/Start methods; tests substitute a fake
-// to record calls without touching docker.
+// satisfies this via its Stop/Start/Remove methods; tests substitute
+// a fake to record calls without touching docker.
 //
-// InspectLabels is part of the surface because the freeze annotation
-// keys off the container's voodu.* labels — the API needs to recover
-// (kind, scope, name, ordinal) before it can persist the freeze.
-// Bundling it here keeps the seam coherent: one fake fits all three.
+// Remove is on the surface because `vd start` does NOT just call
+// `docker start` on the existing container — that would skip a
+// re-read of `--env-file`, leaving the container with stale env
+// vars from its original `docker run` (REDIS_MASTER_ORDINAL=0 from
+// before a failover, etc.). Instead the start handler removes the
+// stopped container and re-fires the reconciler, which spawns a
+// fresh container with current env. The Remove call is the
+// "destroy old container so reconciler sees a missing slot" half
+// of that dance.
+//
+// InspectLabels is part of the surface because the freeze
+// annotation keys off the container's voodu.* labels — the API
+// needs to recover (kind, scope, name, replica_id) before it can
+// persist the freeze. Bundling all four here keeps the seam
+// coherent: one fake fits everything.
 type PodLifecycler interface {
 	Stop(name string) error
 	Start(name string) error
+	Remove(name string) error
 	InspectLabels(name string) (map[string]string, error)
 }
 
@@ -1501,17 +1513,51 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePodStart starts a stopped container by docker name and
-// removes its ordinal from the frozen list (if present), so
-// subsequent reconciles include it in the rolling restart paths
-// again.
+// handlePodStart brings a parked pod back online and clears its
+// freeze annotation (if any). The implementation is recreate-via-
+// reconcile, NOT plain `docker start` — see the long comment
+// below for why.
 //
 //	POST /pods/{name}/start
 //
-// Idempotent — already-running containers and never-frozen pods
-// both succeed. Errors when the container doesn't exist on the
-// host (the `Ensure`-shaped "create if missing" semantic doesn't
-// belong here; that's `vd apply`'s job).
+// # Why recreate, not start
+//
+// docker reads `--env-file` only at `docker run` (container
+// creation time). After that the file's contents live in the
+// container's namespace, immutable until the container is
+// destroyed. `docker start` re-runs the container's CMD with
+// THOSE baked-in env vars, ignoring any updates written to the
+// env file in the meantime.
+//
+// That breaks the failover flow:
+//
+//   1. operator: `vd stop redis.0`            (pod-0 frozen, master)
+//   2. operator: `vd redis:failover --to 1`   (env file: REDIS_MASTER_ORDINAL=1)
+//   3. operator: `vd start redis.0`           (pod-0 starts)
+//   4. wrapper script reads MASTER_ORDINAL... but pod-0's
+//      container has the OLD env from step 1's `docker run`,
+//      so it sees MASTER_ORDINAL=0 → boots as master AGAIN.
+//   5. cluster has TWO masters; subsequent failovers can lose
+//      writes via async-replication's "old master came back as
+//      master" data-loss path.
+//
+// Fix: on `vd start`, remove the stopped container and re-fire
+// the manifest's reconcile event. The handler's apply path sees
+// a missing slot, spawns a fresh container — at THAT `docker
+// run`, the env file is re-read, the wrapper picks up the
+// current MASTER_ORDINAL, and the role decision is correct.
+//
+// Trade-off: the original container is destroyed, so any logs
+// it accumulated before the stop are lost. Operators who need
+// pre-stop logs should pull them via `vd logs --tail` BEFORE
+// running `vd start`. The volume (statefulset) stays put;
+// deployments are stateless so there's no data to preserve.
+//
+// Containers without a recognised voodu identity (legacy /
+// hand-spawned) fall back to plain `docker start` — we have no
+// manifest to re-fire, so the pre-baked env is the only env
+// available. Operators should re-`vd apply` to refresh
+// non-managed containers.
 func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
 	if name == "" {
@@ -1529,18 +1575,14 @@ func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Recover identity to clear the freeze (best-effort — labels
-	// may be missing on legacy containers, in which case there's
-	// nothing to unfreeze and we just start the container).
+	// Recover voodu identity from labels. Drives the "is this a
+	// managed pod we can reconcile?" branch.
 	labels, _ := a.PodLifecycle.InspectLabels(name)
 
 	ident, hasID := containers.ParseLabels(labels)
 
-	if err := a.PodLifecycle.Start(name); err != nil {
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("start %s: %w", name, err))
-		return
-	}
-
+	// Clear the freeze annotation first so the upcoming
+	// reconcile doesn't immediately re-skip the slot.
 	cleared := false
 
 	if hasID && ident.ReplicaID != "" {
@@ -1558,12 +1600,67 @@ func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Recreate-via-reconcile path for managed pods. Plain
+	// docker-start fallback for orphans / legacy.
+	if !hasID {
+		if err := a.PodLifecycle.Start(name); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("start %s: %w", name, err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data: map[string]any{
+				"name":      name,
+				"recreated": false,
+				"unfroze":   cleared,
+			},
+		})
+
+		return
+	}
+
+	// Remove the stopped container so the reconciler sees an
+	// empty slot. Idempotent against running / missing containers
+	// at the docker layer (docker.RemoveContainer's `force=true`
+	// stops + removes in one shot).
+	if err := a.PodLifecycle.Remove(name); err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("remove stale container %s: %w", name, err))
+		return
+	}
+
+	// Re-fire the manifest's reconcile by re-Putting it. Same
+	// content, new revision → watch event fires → handler runs
+	// the apply path → ensureOrdinalsUp / ensureReplicaCount
+	// detects the missing slot → spawns a fresh container with
+	// current env. (We can't avoid the round-trip via etcd here:
+	// the watcher is the only source of reconcile events.)
+	manifest, err := a.Store.Get(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("read manifest %s/%s/%s: %w", ident.Kind, ident.Scope, ident.Name, err))
+		return
+	}
+
+	if manifest == nil {
+		// Pod was managed but its manifest is gone — operator
+		// must have run `vd delete` between freeze and start.
+		// The slot is removed, no spawn target exists. Surface
+		// it; operator decides whether to re-apply.
+		writeErr(w, http.StatusGone, fmt.Errorf("manifest %s/%s/%s no longer exists; container removed but no spawn target — `vd apply` first", ident.Kind, ident.Scope, ident.Name))
+		return
+	}
+
+	if _, err := a.Store.Put(r.Context(), manifest); err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("re-fire reconcile: %w", err))
+		return
+	}
+
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
 		Data: map[string]any{
-			"name":          name,
-			"unfroze":       cleared,
-			"started_clean": true,
+			"name":      name,
+			"recreated": true,
+			"unfroze":   cleared,
 		},
 	})
 }
@@ -2201,6 +2298,28 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		scope = resolved
 	}
 
+	// `vd restart` is the operator's explicit "rebuild everything
+	// in this resource" command. Frozen replicas (parked via
+	// `vd stop --freeze`) are cleared so the rolling-restart that
+	// follows recreates them too — otherwise the operator's
+	// natural recovery path ("just restart it") leaves the frozen
+	// pod behind, surprising them.
+	//
+	// Internal reconcile triggers (config_set fan-out, env-change,
+	// failover) still respect the freeze: they go through
+	// Store.Put without touching this annotation. The split keeps
+	// "operator says restart" loud and "platform says reconcile"
+	// quiet — frozen pods stay parked unless the operator
+	// explicitly asks for them back.
+	cleared, _ := a.Store.GetFrozenReplicaIDs(r.Context(), kind, scope, name)
+
+	if len(cleared) > 0 {
+		if err := a.Store.DeleteFrozenReplicaIDs(r.Context(), kind, scope, name); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("clear frozen replicas: %w", err))
+			return
+		}
+	}
+
 	if err := fn(r.Context(), scope, name); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -2208,10 +2327,11 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data: map[string]string{
-			"scope": scope,
-			"name":  name,
-			"kind":  string(kind),
+		Data: map[string]any{
+			"scope":   scope,
+			"name":    name,
+			"kind":    string(kind),
+			"unfroze": cleared,
 		},
 	})
 }
