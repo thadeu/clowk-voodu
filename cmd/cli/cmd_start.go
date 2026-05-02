@@ -28,23 +28,30 @@ import (
 func newStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start <ref>",
-		Short: "Start one or all pods of a statefulset (clears any freeze)",
+		Short: "Start one or all pods of a resource (clears any freeze)",
 		Long: `Brings stopped pods back online and clears the persistent
-frozen-ordinals annotation so the controller's reconciler includes
+frozen-replicas annotation so the controller's reconciler includes
 them again on every subsequent apply / config_set / failover.
 
 <ref> accepts two shapes:
 
-  <scope>/<name>             every pod of the statefulset
-  <scope>/<name>.<ordinal>   one specific pod
+  <scope>/<name>             every pod of the resource
+  <scope>/<name>.<replica>   one specific pod (ordinal for
+                             statefulset, hex id for deployment)
 
 Idempotent — already-running and never-frozen pods both succeed.
 Errors when the container doesn't exist on the host (use 'vd apply'
 to spawn from scratch).
 
+For deployment pods that were frozen across a rolling restart of
+the fleet, 'vd start' boots the pod with its ORIGINAL config (the
+fleet may have moved on to new image/env). Run 'vd restart' after
+to bring it onto the current spec.
+
 Examples:
   vd start clowk-lp/redis              # start every pod, clear all freezes
-  vd start clowk-lp/redis.0            # just pod-0`,
+  vd start clowk-lp/redis.0            # just pod-0
+  vd start clowk-lp/web.a3f9           # specific deployment replica`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStart(cmd, args[0])

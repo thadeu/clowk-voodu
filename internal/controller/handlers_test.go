@@ -1084,6 +1084,79 @@ func TestDeploymentHandler_RestartsWhenEnvChangedAndContainerExists(t *testing.T
 	}
 }
 
+// TestDeploymentHandler_FrozenReplicaSkippedInRollingRestart pins
+// the deployment-side freeze: a replica id in the frozen list is
+// kept across env-change rolling restart. Without this, freezing
+// `clowk-lp-web.a3f9` would still let the next config_set wipe it.
+//
+// The pod's container keeps its ORIGINAL image/env (stale config —
+// documented trade-off; operator runs `vd restart` after `vd start`
+// to refresh). The OTHER replicas get rolling-restarted normally.
+func TestDeploymentHandler_FrozenReplicaSkippedInRollingRestart(t *testing.T) {
+	store := newMemStore()
+
+	// Two replicas; one will be frozen, the other should still
+	// rolling-restart on env change.
+	frozenSlot := deploymentSlot("test", "api", "img:1", "frozen1")
+	livePodSlot := deploymentSlot("test", "api", "img:1", "live001")
+
+	// Replicas=2 explicit so the scale-down prune doesn't kill the
+	// non-frozen pod before the rolling-replace fires. Pre-seeded
+	// status carries the same defaulted spec the apply will compute,
+	// so spec-drift recreate is a no-op and the test exercises the
+	// env-change rolling-replace branch in isolation.
+	declaredSpec := deploymentSpec{
+		Image:    "img:1",
+		Replicas: 2,
+		Networks: []string{"voodu0"},
+		Restart:  "unless-stopped",
+	}
+	pre, _ := json.Marshal(DeploymentStatus{Image: declaredSpec.Image, SpecHash: deploymentSpecHash(declaredSpec, nil), Replicas: 2})
+	_ = store.PutStatus(context.Background(), KindDeployment, "test-api", pre)
+
+	// Mark frozen1 as frozen BEFORE the apply runs.
+	if err := store.SetFrozenReplicaIDs(context.Background(), KindDeployment, "test", "api", []string{"frozen1"}); err != nil {
+		t.Fatalf("seed frozen: %v", err)
+	}
+
+	cm := &fakeContainers{}
+	cm.seedSlot(frozenSlot)
+	cm.seedSlot(livePodSlot)
+
+	h := &DeploymentHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return true, nil }, // env CHANGED
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
+		Image:    "img:1",
+		Replicas: 2,
+		Env:      map[string]string{"X": "new"},
+	})
+
+	h.Handle(context.Background(), ev)
+
+	// frozen1 must NOT have been touched by remove or ensure paths.
+	for _, removed := range cm.removes {
+		if removed == frozenSlot.Name {
+			t.Errorf("frozen replica %q was removed; freeze didn't stick", removed)
+		}
+	}
+
+	// Exactly one rolling-replace cycle on live001 (Remove + Ensure
+	// with a fresh hex id). frozen1 stayed put.
+	if len(cm.removes) != 1 || cm.removes[0] != livePodSlot.Name {
+		t.Errorf("expected exactly one remove of %s, got %v", livePodSlot.Name, cm.removes)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Errorf("expected 1 ensure (replacement for live, frozen skipped), got %d", len(cm.ensures))
+	}
+}
+
 func TestDeploymentHandler_RecreatesOnImageDrift(t *testing.T) {
 	store := newMemStore()
 

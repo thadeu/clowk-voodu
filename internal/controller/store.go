@@ -74,21 +74,24 @@ type Store interface {
 	// when the bucket is empty.
 	DeleteConfig(ctx context.Context, scope, name string) error
 
-	// Frozen-ordinals annotation. Records which ordinals of a
-	// statefulset are intentionally stopped — the handler skips
-	// them in ensureOrdinalsUp (don't spawn) and rollingReplaceTopDown
-	// (don't recreate). Lets `vd stop scope/name.N --freeze` keep a
-	// pod offline across reconciles.
+	// Frozen replica-ID annotation. Records which replicas of a
+	// resource are intentionally stopped — the handler skips them
+	// in spawn / rolling-restart paths so a `vd stop --freeze`
+	// stays sticky across reconciles.
 	//
-	// Today only statefulset uses this — deployment replica IDs are
-	// regenerated on every spawn (hex), so per-replica freeze can't
-	// survive scale events. The Kind argument exists for future
-	// expansion.
+	// Replica-ID values:
+	//   - statefulset: ordinal as string ("0", "1", "2") — stable
+	//     across reconciles by construction
+	//   - deployment: hex string ("a3f9", "bb01") — stable for the
+	//     lifetime of one container; a rolling restart that
+	//     recreates the pod erases the ID, so the freeze is
+	//     respected by skipping the recreate (the pod keeps its
+	//     original container, with stale config, until `vd start`)
 	//
 	// Empty list / nil result == nothing frozen (the no-op path).
-	GetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) ([]int, error)
-	SetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string, ordinals []int) error
-	DeleteFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) error
+	GetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) ([]string, error)
+	SetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string, ids []string) error
+	DeleteFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) error
 }
 
 // WatchEvent is a single change observed on /desired/*.
@@ -357,20 +360,20 @@ func (s *EtcdStore) DeleteConfig(ctx context.Context, scope, name string) error 
 	return nil
 }
 
-// frozenPayload is the on-disk shape of the frozen-ordinals
+// frozenPayload is the on-disk shape of the frozen-replica-IDs
 // annotation. Wrapping the slice in a struct gives us a
 // versionable JSON envelope without paying the cost today —
 // future fields (frozen_at timestamps, who-froze-it operator
 // identity, etc.) can land without breaking older readers.
 type frozenPayload struct {
-	Ordinals []int `json:"ordinals"`
+	ReplicaIDs []string `json:"replica_ids"`
 }
 
-// GetFrozenOrdinals reads the frozen-ordinals list for a
-// resource. Empty list / missing key both return (nil, nil) —
-// callers should treat both as "nothing frozen" and not branch
-// on the difference.
-func (s *EtcdStore) GetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) ([]int, error) {
+// GetFrozenReplicaIDs reads the frozen list for a resource.
+// Empty list / missing key both return (nil, nil) — callers
+// should treat both as "nothing frozen" and not branch on the
+// difference.
+func (s *EtcdStore) GetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) ([]string, error) {
 	resp, err := s.client.Get(ctx, FrozenKey(kind, scope, name))
 	if err != nil {
 		return nil, fmt.Errorf("etcd get frozen: %w", err)
@@ -386,18 +389,18 @@ func (s *EtcdStore) GetFrozenOrdinals(ctx context.Context, kind Kind, scope, nam
 		return nil, fmt.Errorf("decode frozen payload: %w", err)
 	}
 
-	return p.Ordinals, nil
+	return p.ReplicaIDs, nil
 }
 
-// SetFrozenOrdinals writes the list verbatim. Empty / nil list
-// deletes the key — keeps etcd clean of phantom annotations
-// when the last ordinal unfreezes.
-func (s *EtcdStore) SetFrozenOrdinals(ctx context.Context, kind Kind, scope, name string, ordinals []int) error {
-	if len(ordinals) == 0 {
-		return s.DeleteFrozenOrdinals(ctx, kind, scope, name)
+// SetFrozenReplicaIDs writes the list verbatim. Empty / nil
+// list deletes the key — keeps etcd clean of phantom
+// annotations when the last replica unfreezes.
+func (s *EtcdStore) SetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string, ids []string) error {
+	if len(ids) == 0 {
+		return s.DeleteFrozenReplicaIDs(ctx, kind, scope, name)
 	}
 
-	raw, err := json.Marshal(frozenPayload{Ordinals: ordinals})
+	raw, err := json.Marshal(frozenPayload{ReplicaIDs: ids})
 	if err != nil {
 		return fmt.Errorf("encode frozen payload: %w", err)
 	}
@@ -409,9 +412,9 @@ func (s *EtcdStore) SetFrozenOrdinals(ctx context.Context, kind Kind, scope, nam
 	return nil
 }
 
-// DeleteFrozenOrdinals removes the annotation entirely.
+// DeleteFrozenReplicaIDs removes the annotation entirely.
 // Idempotent — missing key is success.
-func (s *EtcdStore) DeleteFrozenOrdinals(ctx context.Context, kind Kind, scope, name string) error {
+func (s *EtcdStore) DeleteFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) error {
 	if _, err := s.client.Delete(ctx, FrozenKey(kind, scope, name)); err != nil {
 		return fmt.Errorf("etcd delete frozen: %w", err)
 	}

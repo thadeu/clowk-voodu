@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"go.voodu.clowk.in/internal/containers"
@@ -84,13 +83,13 @@ func TestPodStop_FreezePersistsOrdinal(t *testing.T) {
 		t.Errorf("Stop calls = %v, want [clowk-lp-redis.2]", lifecycle.stops)
 	}
 
-	got, err := store.GetFrozenOrdinals(context.Background(), KindStatefulset, "clowk-lp", "redis")
+	got, err := store.GetFrozenReplicaIDs(context.Background(), KindStatefulset, "clowk-lp", "redis")
 	if err != nil {
-		t.Fatalf("GetFrozenOrdinals: %v", err)
+		t.Fatalf("GetFrozenReplicaIDs: %v", err)
 	}
 
-	if len(got) != 1 || got[0] != 2 {
-		t.Errorf("frozen ordinals = %v, want [2]", got)
+	if len(got) != 1 || got[0] != "2" {
+		t.Errorf("frozen replicas = %v, want [\"2\"]", got)
 	}
 }
 
@@ -118,9 +117,9 @@ func TestPodStop_NoFreezeSkipsStore(t *testing.T) {
 	}
 
 	// Store stays empty.
-	got, _ := store.GetFrozenOrdinals(context.Background(), KindStatefulset, "clowk-lp", "redis")
+	got, _ := store.GetFrozenReplicaIDs(context.Background(), KindStatefulset, "clowk-lp", "redis")
 	if len(got) != 0 {
-		t.Errorf("frozen ordinals should be empty for --no-freeze, got %v", got)
+		t.Errorf("frozen replicas should be empty for --no-freeze, got %v", got)
 	}
 }
 
@@ -146,7 +145,7 @@ func TestPodStart_ClearsFreeze(t *testing.T) {
 	_, store, ts := setupPodLifecycleTestAPI(t, lifecycle)
 
 	// Pre-seed: ordinal 2 frozen.
-	if err := store.SetFrozenOrdinals(context.Background(), KindStatefulset, "clowk-lp", "redis", []int{2}); err != nil {
+	if err := store.SetFrozenReplicaIDs(context.Background(), KindStatefulset, "clowk-lp", "redis", []string{"2"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -165,24 +164,15 @@ func TestPodStart_ClearsFreeze(t *testing.T) {
 	}
 
 	// Annotation was cleared.
-	got, _ := store.GetFrozenOrdinals(context.Background(), KindStatefulset, "clowk-lp", "redis")
+	got, _ := store.GetFrozenReplicaIDs(context.Background(), KindStatefulset, "clowk-lp", "redis")
 	if len(got) != 0 {
-		t.Errorf("frozen ordinals should be empty after start, got %v", got)
+		t.Errorf("frozen replicas should be empty after start, got %v", got)
 	}
 
 	// Response surfaces the unfreeze signal so CLI can render
 	// "started (unfrozen)" vs plain "started".
-	var env struct {
-		Data struct {
-			Unfroze bool `json:"unfroze"`
-		} `json:"data"`
-	}
-
-	body, _ := json.Marshal(resp)
-	_ = body
-
-	// Re-fetch and decode the body explicitly. (The request was
-	// already drained above; re-fire to assert the body shape.)
+	// Second start with no remaining freeze: unfroze should be
+	// false. Re-fire the request and decode the response body.
 	resp2, err := http.Post(ts.URL+"/pods/clowk-lp-redis.2/start", "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -190,22 +180,33 @@ func TestPodStart_ClearsFreeze(t *testing.T) {
 
 	defer resp2.Body.Close()
 
+	var env struct {
+		Data struct {
+			Unfroze bool `json:"unfroze"`
+		} `json:"data"`
+	}
+
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 
-	// Second start with no remaining freeze: unfroze=false.
 	if env.Data.Unfroze {
 		t.Errorf("expected unfroze=false on second start (already cleared); got true")
 	}
 }
 
-// TestPodStop_RejectsDeployment: freeze is statefulset-only.
-// Deployment replica IDs are hex and regenerated on every spawn,
-// so a per-replica freeze annotation can't survive scale events.
-// Surface this loudly at the API instead of silently writing a
-// useless freeze key.
-func TestPodStop_RejectsDeployment(t *testing.T) {
+// TestPodStop_FreezeWorksForDeployment: deployment replica IDs
+// are hex strings (regenerated per spawn) but the freeze list
+// stores them as-is. The rolling-restart path skips containers
+// whose ID is in the list, leaving the frozen pod intact across
+// any reconcile that recreates its siblings. Operator's
+// `vd start <ref>` clears the entry.
+//
+// Trade-off documented elsewhere: the frozen pod keeps its
+// original image/env across rolling restarts (stale config),
+// since we can't recreate it without losing the ID. Operator
+// runs `vd restart` after `vd start` if they need fresh config.
+func TestPodStop_FreezeWorksForDeployment(t *testing.T) {
 	lifecycle := &fakePodLifecycle{
 		labelsByName: map[string]map[string]string{
 			"clowk-lp-web.a3f9": {
@@ -218,7 +219,7 @@ func TestPodStop_RejectsDeployment(t *testing.T) {
 		},
 	}
 
-	_, _, ts := setupPodLifecycleTestAPI(t, lifecycle)
+	_, store, ts := setupPodLifecycleTestAPI(t, lifecycle)
 
 	resp, err := http.Post(ts.URL+"/pods/clowk-lp-web.a3f9/stop?freeze=true", "", nil)
 	if err != nil {
@@ -226,19 +227,17 @@ func TestPodStop_RejectsDeployment(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status=%d want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status=%d want 200", resp.StatusCode)
 	}
 
-	body := readAll(t, resp)
-	if !strings.Contains(body, "statefulset") {
-		t.Errorf("error should mention statefulset-only restriction; got: %s", body)
+	if len(lifecycle.stops) != 1 || lifecycle.stops[0] != "clowk-lp-web.a3f9" {
+		t.Errorf("Stop calls = %v, want [clowk-lp-web.a3f9]", lifecycle.stops)
 	}
 
-	// Stop must NOT have been called — freeze rejection is a
-	// pre-flight check that aborts before docker.
-	if len(lifecycle.stops) != 0 {
-		t.Errorf("Stop should not fire when freeze rejected, got %v", lifecycle.stops)
+	got, _ := store.GetFrozenReplicaIDs(context.Background(), KindDeployment, "clowk-lp", "web")
+	if len(got) != 1 || got[0] != "a3f9" {
+		t.Errorf("frozen replicas for deployment = %v, want [\"a3f9\"]", got)
 	}
 }
 
@@ -263,25 +262,3 @@ func TestPodStop_NotConfigured(t *testing.T) {
 	}
 }
 
-// readAll drains a response body to a string. Test helper.
-func readAll(t *testing.T, resp *http.Response) string {
-	t.Helper()
-
-	var sb strings.Builder
-
-	buf := make([]byte, 4096)
-
-	for {
-		n, err := resp.Body.Read(buf)
-
-		if n > 0 {
-			sb.Write(buf[:n])
-		}
-
-		if err != nil {
-			break
-		}
-	}
-
-	return sb.String()
-}

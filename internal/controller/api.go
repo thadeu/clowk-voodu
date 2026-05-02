@@ -1444,13 +1444,12 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 	freeze := r.URL.Query().Get("freeze") != "false"
 
 	// Recover identity from the container's labels so we know
-	// what (kind, scope, name, ordinal) to add to the frozen list.
-	// Skipped when freeze=false — that path doesn't touch the
-	// store, so the identity lookup is wasted work.
+	// what (kind, scope, name, replica_id) to add to the frozen
+	// list. Skipped when freeze=false — that path doesn't touch
+	// the store, so the identity lookup is wasted work.
 	var (
-		ident   containers.Identity
-		hasID   bool
-		ordinal int
+		ident containers.Identity
+		hasID bool
 	)
 
 	if freeze {
@@ -1467,16 +1466,12 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if ident.Kind != containers.KindStatefulset {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("freeze is only supported for statefulset pods; %q is kind=%s", name, ident.Kind))
-			return
-		}
-
-		var ok bool
-
-		ordinal, ok = ident.Ordinal()
-		if !ok {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("statefulset pod %q has no ordinal label", name))
+		// Both statefulset (ordinal-as-string) and deployment
+		// (hex) replica IDs flow through the same annotation
+		// list — buildFrozenSet's lookup is map[string]bool, so
+		// "0" and "a3f9" coexist without type juggling.
+		if ident.ReplicaID == "" {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("pod %q has no replica_id label", name))
 			return
 		}
 	}
@@ -1487,12 +1482,12 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if freeze {
-		current, _ := a.Store.GetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
+		current, _ := a.Store.GetFrozenReplicaIDs(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
 
-		updated := addOrdinal(current, ordinal)
+		updated := addReplicaID(current, ident.ReplicaID)
 
-		if err := a.Store.SetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
-			writeErr(w, http.StatusInternalServerError, fmt.Errorf("persist frozen ordinals: %w", err))
+		if err := a.Store.SetFrozenReplicaIDs(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("persist frozen replicas: %w", err))
 			return
 		}
 	}
@@ -1548,20 +1543,18 @@ func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
 
 	cleared := false
 
-	if hasID && ident.Kind == containers.KindStatefulset {
-		if ord, ok := ident.Ordinal(); ok {
-			current, _ := a.Store.GetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
+	if hasID && ident.ReplicaID != "" {
+		current, _ := a.Store.GetFrozenReplicaIDs(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name)
 
-			updated := removeOrdinal(current, ord)
+		updated := removeReplicaID(current, ident.ReplicaID)
 
-			if len(updated) != len(current) {
-				if err := a.Store.SetFrozenOrdinals(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
-					writeErr(w, http.StatusInternalServerError, fmt.Errorf("clear frozen ordinal: %w", err))
-					return
-				}
-
-				cleared = true
+		if len(updated) != len(current) {
+			if err := a.Store.SetFrozenReplicaIDs(r.Context(), Kind(ident.Kind), ident.Scope, ident.Name, updated); err != nil {
+				writeErr(w, http.StatusInternalServerError, fmt.Errorf("clear frozen replica: %w", err))
+				return
 			}
+
+			cleared = true
 		}
 	}
 
@@ -1575,36 +1568,35 @@ func (a *API) handlePodStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// addOrdinal returns the frozen-ordinals list with `n` added,
-// deduped and sorted. Sort is for deterministic etcd writes —
-// same set of ordinals always serialises identically.
-func addOrdinal(existing []int, n int) []int {
+// addReplicaID returns the frozen list with `id` added, deduped
+// and sorted. Sort is for deterministic etcd writes — same set
+// of replicas always serialises identically.
+func addReplicaID(existing []string, id string) []string {
 	for _, e := range existing {
-		if e == n {
+		if e == id {
 			// Already in list — return a deterministic copy
 			// instead of mutating the caller's slice.
-			out := append([]int(nil), existing...)
-			sort.Ints(out)
+			out := append([]string(nil), existing...)
+			sort.Strings(out)
 
 			return out
 		}
 	}
 
-	out := append([]int(nil), existing...)
-	out = append(out, n)
-	sort.Ints(out)
+	out := append([]string(nil), existing...)
+	out = append(out, id)
+	sort.Strings(out)
 
 	return out
 }
 
-// removeOrdinal returns the frozen-ordinals list with every
-// occurrence of `n` removed. Returns the SAME slice reference
-// (or a copy of it) when nothing changed, so callers can detect
-// the no-op via length comparison.
-func removeOrdinal(existing []int, n int) []int {
-	out := make([]int, 0, len(existing))
+// removeReplicaID returns the frozen list with every occurrence
+// of `id` removed. Length comparison vs the input lets callers
+// detect the no-op cheaply.
+func removeReplicaID(existing []string, id string) []string {
+	out := make([]string, 0, len(existing))
 	for _, e := range existing {
-		if e == n {
+		if e == id {
 			continue
 		}
 

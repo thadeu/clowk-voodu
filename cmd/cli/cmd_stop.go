@@ -21,24 +21,30 @@ import (
 //
 // Two ref shapes:
 //
-//	vd stop clowk-lp/redis             # all pods of a statefulset
-//	vd stop clowk-lp/redis.0           # one specific pod
+//	vd stop clowk-lp/redis             # all pods
+//	vd stop clowk-lp/redis.0           # one specific pod (statefulset ordinal)
+//	vd stop clowk-lp/web.a3f9          # one specific pod (deployment hex id)
 //
-// Default behaviour is `--freeze`: the pod's ordinal is added to
-// the persistent frozen-ordinals annotation in the controller's
-// store, so subsequent reconciles (env-change, spec-drift, scale,
-// failover) skip it. The pod stays parked until `vd start` clears
-// the freeze.
+// Default behaviour is `--freeze`: the pod's replica ID is added
+// to the persistent frozen-replicas annotation in the controller's
+// store, so subsequent reconciles (env-change, spec-drift, rolling
+// restart, failover) skip it. The pod stays parked until
+// `vd start` clears the freeze.
 //
 // `--no-freeze` makes the stop transient: the next reconcile that
-// touches the resource recreates the container. Useful for quick
-// chaos tests where you want the controller's self-healing to
-// kick in.
+// recreates the resource's pods will recreate this one too.
 //
-// Today only statefulsets are supported. Deployment replica IDs
-// are regenerated on every spawn (hex), so per-replica freeze
-// can't survive scale events; the CLI errors with a clear message
-// if pointed at a deployment pod.
+// Statefulset vs deployment behaviour on freeze:
+//
+//   - statefulset: ordinal is stable. Frozen pod's container also
+//     keeps the same image/env across reconciles (volumes preserve
+//     data anyway). Clean.
+//
+//   - deployment: replica IDs are regenerated on every recreate.
+//     A frozen pod KEEPS its original container (with original
+//     image/env) while siblings get rolling-restarted with new
+//     IDs. When unfrozen via `vd start`, the pod has stale config
+//     until the operator runs `vd restart` to refresh it.
 func newStopCmd() *cobra.Command {
 	var (
 		freezeFlag   bool
@@ -47,30 +53,35 @@ func newStopCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "stop <ref>",
-		Short: "Stop one or all pods of a statefulset",
+		Short: "Stop one or all pods of a resource (statefulset or deployment)",
 		Long: `Stops voodu-managed pods without removing them.
 
 <ref> accepts two shapes:
 
-  <scope>/<name>             every pod of the statefulset
-  <scope>/<name>.<ordinal>   one specific pod
+  <scope>/<name>             every pod of the resource
+  <scope>/<name>.<replica>   one specific pod (ordinal for
+                             statefulset, hex id for deployment)
 
-Default --freeze: the pod's ordinal is recorded in the controller's
-persistent annotation, so subsequent reconciles (env-change,
-spec-drift, scale, failover) skip it. The pod stays parked until
-'vd start' clears the freeze.
+Default --freeze: the pod's replica ID is recorded in the
+controller's persistent annotation, so subsequent reconciles
+(env-change, spec-drift, rolling restart, failover) skip it.
+The pod stays parked until 'vd start' clears the freeze.
 
---no-freeze: transient stop. The next reconcile that touches the
-resource (apply / config_set / failover) recreates the container.
+--no-freeze: transient stop. The next reconcile that recreates
+the resource's pods will recreate this one too.
 
-Today supported only for statefulsets. Deployment replica IDs are
-regenerated on every spawn, so per-replica freeze can't survive
-scale events.
+Caveat for deployments: when frozen, the pod keeps its ORIGINAL
+image/env across rolling restarts (the rest of the fleet gets
+fresh config). When you 'vd start' it, the pod boots with the
+stale config; run 'vd restart <scope>/<name>' to refresh it.
+Statefulsets don't have this problem (volumes preserve data
+which is the actual concern there).
 
 Examples:
-  vd stop clowk-lp/redis                  # stop all 3 pods, freeze each ordinal
-  vd stop clowk-lp/redis.0                # stop just pod-0, freeze ordinal-0
-  vd stop clowk-lp/redis.2 --no-freeze    # transient stop
+  vd stop clowk-lp/redis                  # all 3 pods of a redis statefulset
+  vd stop clowk-lp/redis.0                # just ordinal 0
+  vd stop clowk-lp/web.a3f9               # one specific deployment replica
+  vd stop clowk-lp/redis.2 --no-freeze    # transient
   vd start clowk-lp/redis.0               # bring it back, clears freeze`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

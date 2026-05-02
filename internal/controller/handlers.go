@@ -899,13 +899,30 @@ func (h *DeploymentHandler) recreateReplicasIfSpecChanged(ctx context.Context, s
 // Reconciler-driven restarts (no release context) pass ""; the
 // release-phase orchestrator and rollback path pass their record
 // ID so `vd describe` can correlate pods to releases.
-func (h *DeploymentHandler) rollingReplaceReplicas(_ context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash, releaseID string) error {
+func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, name, app string, live []ContainerSlot, spec deploymentSpec, hash, releaseID string) error {
 	envFile := ""
 	if h.EnvFilePath != nil {
 		envFile = h.EnvFilePath(app)
 	}
 
+	// Frozen replica IDs — pods the operator parked via
+	// `vd stop --freeze`. The deployment recreates pods with
+	// brand-new hex IDs on every rolling restart, but the
+	// FROZEN container keeps its original ID (we skip
+	// Remove+Ensure on it). Stale image/env on that pod is
+	// the documented trade-off — `vd start` revives it as-is;
+	// operators wanting fresh config run `vd restart` after.
+	frozen, _ := h.Store.GetFrozenReplicaIDs(ctx, KindDeployment, scope, name)
+	frozenSet := buildFrozenSet(frozen)
+
 	for i, s := range live {
+		// Frozen pod stays put across rolling restarts — same
+		// container, same data, same (now-stale) config.
+		if frozenSet[s.Identity.ReplicaID] {
+			h.logf("deployment/%s replica %s frozen, skipping in rolling restart", name, s.Identity.ReplicaID)
+			continue
+		}
+
 		newReplicaID := containers.NewReplicaID()
 		newName := containers.ContainerName(scope, name, newReplicaID)
 

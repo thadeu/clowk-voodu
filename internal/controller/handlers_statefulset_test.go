@@ -764,7 +764,7 @@ func TestStatefulsetHandler_FrozenOrdinalNotSpawned(t *testing.T) {
 	cm := &fakeContainers{}
 
 	// Persist the operator's freeze intent BEFORE apply runs.
-	if err := store.SetFrozenOrdinals(context.Background(), KindStatefulset, "test", "redis", []int{1}); err != nil {
+	if err := store.SetFrozenReplicaIDs(context.Background(), KindStatefulset, "test", "redis", []string{"1"}); err != nil {
 		t.Fatalf("seed frozen: %v", err)
 	}
 
@@ -820,7 +820,7 @@ func TestStatefulsetHandler_FrozenOrdinalNotRestarted(t *testing.T) {
 	}
 
 	// Mark ordinal 2 as frozen.
-	if err := store.SetFrozenOrdinals(context.Background(), KindStatefulset, "test", "redis", []int{2}); err != nil {
+	if err := store.SetFrozenReplicaIDs(context.Background(), KindStatefulset, "test", "redis", []string{"2"}); err != nil {
 		t.Fatalf("seed frozen: %v", err)
 	}
 

@@ -15,7 +15,7 @@ type memStore struct {
 	kv     map[string]*Manifest
 	status map[string][]byte
 	config map[string]map[string]string // bucket → key:value
-	frozen map[string][]int             // FrozenKey(kind, scope, name) → sorted ordinals
+	frozen map[string][]string          // FrozenKey(kind, scope, name) → replica IDs
 	rev    int64
 
 	watchers []chan WatchEvent
@@ -26,7 +26,7 @@ func newMemStore() *memStore {
 		kv:     map[string]*Manifest{},
 		status: map[string][]byte{},
 		config: map[string]map[string]string{},
-		frozen: map[string][]int{},
+		frozen: map[string][]string{},
 	}
 }
 
@@ -139,7 +139,7 @@ func (m *memStore) DeleteConfig(_ context.Context, scope, name string) error {
 	return nil
 }
 
-func (m *memStore) GetFrozenOrdinals(_ context.Context, kind Kind, scope, name string) ([]int, error) {
+func (m *memStore) GetFrozenReplicaIDs(_ context.Context, kind Kind, scope, name string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -148,30 +148,30 @@ func (m *memStore) GetFrozenOrdinals(_ context.Context, kind Kind, scope, name s
 		return nil, nil
 	}
 
-	out := make([]int, len(stored))
+	out := make([]string, len(stored))
 	copy(out, stored)
 
 	return out, nil
 }
 
-func (m *memStore) SetFrozenOrdinals(_ context.Context, kind Kind, scope, name string, ordinals []int) error {
+func (m *memStore) SetFrozenReplicaIDs(_ context.Context, kind Kind, scope, name string, ids []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if len(ordinals) == 0 {
+	if len(ids) == 0 {
 		delete(m.frozen, FrozenKey(kind, scope, name))
 
 		return nil
 	}
 
-	cp := make([]int, len(ordinals))
-	copy(cp, ordinals)
+	cp := make([]string, len(ids))
+	copy(cp, ids)
 	m.frozen[FrozenKey(kind, scope, name)] = cp
 
 	return nil
 }
 
-func (m *memStore) DeleteFrozenOrdinals(_ context.Context, kind Kind, scope, name string) error {
+func (m *memStore) DeleteFrozenReplicaIDs(_ context.Context, kind Kind, scope, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
