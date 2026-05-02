@@ -167,6 +167,22 @@ func CreateContainer(cfg ContainerConfig) error {
 		args = append(args, "--restart", cfg.RestartPolicy)
 	}
 
+	// host.docker.internal:host-gateway makes the host reachable
+	// from inside the container under a stable name. On Mac/Win
+	// Docker Desktop this is built-in; on Linux it requires the
+	// explicit --add-host flag (Docker 20.10+). We always pass it
+	// so plugin-authored entrypoint scripts (sentinel's failover
+	// hook, M-S4 preflight, future probes) can call back to the
+	// controller via VOODU_CONTROLLER_URL = http://host.docker.internal:<port>
+	// regardless of the host OS.
+	//
+	// Skipped for host/none network modes — those don't use
+	// docker's resolver, so --add-host has no effect (and host
+	// mode IS the host, no need for the alias).
+	if cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
+		args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	}
+
 	// NetworkMode (host/none) wins when explicitly set — it bypasses
 	// docker's bridge stack entirely, so Networks is irrelevant. The
 	// handler validates mutual exclusivity before we get here; this

@@ -436,27 +436,38 @@ func (l *loggingResponseWriter) Flush() {
 }
 
 // deriveControllerURL turns an HTTPAddr like ":8686" or
-// "0.0.0.0:8686" into the URL plugins use to call back into the
-// controller. Plugins run on the same host as the controller
-// (server-side install via PluginsRoot) so 127.0.0.1 is the
-// right host regardless of what the listener binds to.
+// "0.0.0.0:8686" into the URL plugins / containers use to call
+// back into the controller. Uses `host.docker.internal` because:
 //
-// Empty addr → empty URL (plugins won't be able to call back,
-// but voodu-redis-style plugins that need state still work
-// when invoked through the dispatch endpoint with stdin
-// envelope already populated).
+//   - Plugins running as host processes (forked by the controller
+//     during dispatch) hit the host loopback — host.docker.internal
+//     resolves to the host on Docker Desktop, and on Linux we
+//     pass --add-host host.docker.internal:host-gateway on every
+//     container so the alias is also valid from inside containers.
+//   - Containers reach the host via the same alias — no special
+//     casing for "is this URL going to a host process or to a
+//     containerized one". One URL, works everywhere voodu runs.
+//
+// Pre-fix this returned 127.0.0.1:<port> which was broken from
+// inside containers (loopback there is the container itself, not
+// the host). Sentinel's failover hook + M-S4 preflight needed
+// this to work for auto-failover to round-trip back to the store.
+//
+// Empty addr → empty URL (plugins won't be able to call back).
 func deriveControllerURL(httpAddr string) string {
 	if httpAddr == "" {
 		return ""
 	}
 
 	// HTTPAddr can be ":8686" (any iface) or "host:8686" or
-	// "1.2.3.4:8686". Plugins run locally — always loopback.
+	// "1.2.3.4:8686". We only care about the port — host portion
+	// is replaced with host.docker.internal so the URL works from
+	// host AND from containers (with --add-host host-gateway).
 	port := httpAddr
 	if idx := strings.LastIndex(httpAddr, ":"); idx >= 0 {
 		port = httpAddr[idx:]
 	}
 
-	return "http://127.0.0.1" + port
+	return "http://host.docker.internal" + port
 }
 
