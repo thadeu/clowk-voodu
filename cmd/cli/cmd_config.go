@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 
@@ -43,7 +44,10 @@ import (
 //	vd config clowk-lp/web get LOG               match-all keys containing LOG
 //	vd config clowk-lp/web unset LOG_LEVEL       remove + restart
 func newConfigCmd() *cobra.Command {
-	var noRestart bool
+	var (
+		noRestart bool
+		output    string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "config <ref> [verb] [args...]",
@@ -62,6 +66,13 @@ Verbs:
                          whose name contains PATTERN (case-insensitive)
   unset KEY [...]        delete one or more keys
 
+Output formats (-o / --output, applies to list / get / set):
+
+  text (default)         KEY=VALUE one per line, copy-paste-able into a .env
+  json                   {"KEY": "VALUE"} object — pipe into jq / scripts
+  hcl                    env = { KEY = "VALUE" } — paste into a manifest's
+                         spec.env block
+
 By default, set / unset trigger an automatic reconcile of every
 container the change affects so the new env reaches running pods
 without manual intervention. Pass --no-restart to batch edits and
@@ -69,13 +80,19 @@ defer the restart.
 
 Examples:
   vd config clowk-lp/web                       # list (default verb)
+  vd config clowk-lp/web -o json               # list as JSON
+  vd config clowk-lp/web get LOG -o hcl        # filtered, HCL-formatted
   vd config clowk-lp/web set LOG_LEVEL=debug
   vd config clowk-lp set DATABASE_URL=...      # scope-level
-  vd config clowk-lp/web get LOG               # substring match
   vd config clowk-lp/web unset LOG_LEVEL`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, err := parseConfigRef(args[0])
+			if err != nil {
+				return err
+			}
+
+			format, err := parseConfigOutputFormat(output)
 			if err != nil {
 				return err
 			}
@@ -90,20 +107,20 @@ Examples:
 
 			switch verb {
 			case "list", "":
-				return runConfigList(cmd, target)
+				return runConfigList(cmd, target, format)
 			case "set":
 				if len(verbArgs) == 0 {
 					return fmt.Errorf("set: at least one KEY=VALUE is required")
 				}
 
-				return runConfigSet(cmd, target, verbArgs, !noRestart)
+				return runConfigSet(cmd, target, verbArgs, !noRestart, format)
 			case "get":
 				pattern := ""
 				if len(verbArgs) > 0 {
 					pattern = verbArgs[0]
 				}
 
-				return runConfigGet(cmd, target, pattern)
+				return runConfigGet(cmd, target, pattern, format)
 			case "unset":
 				if len(verbArgs) == 0 {
 					return fmt.Errorf("unset: at least one KEY is required")
@@ -117,8 +134,137 @@ Examples:
 	}
 
 	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not auto-restart affected containers (set/unset only)")
+	cmd.Flags().StringVarP(&output, "output", "o", "text", "output format: text | json | hcl")
 
 	return cmd
+}
+
+// configOutputFormat is the closed enum of -o values vd config
+// accepts. Three formats cover the realistic operator workflows:
+//
+//   text  — KEY=VALUE per line, paste into a .env file or copy
+//           a single value from the terminal
+//   json  — pipe through jq / consume from scripts
+//   hcl   — paste straight into a manifest's `env = { ... }` block
+//
+// YAML was considered and dropped — the output `KEY: VALUE` per
+// line is functionally redundant with text's `KEY=VALUE`. Operators
+// who want YAML for k8s/compose docs can `sed 's/=/: /'` the text
+// output, or use json + yq.
+type configOutputFormat string
+
+const (
+	configOutputText configOutputFormat = "text"
+	configOutputJSON configOutputFormat = "json"
+	configOutputHCL  configOutputFormat = "hcl"
+)
+
+// parseConfigOutputFormat normalises and validates the operator-
+// supplied -o value. Empty string defaults to text — Cobra's
+// default value handles that case but the helper still accepts
+// it explicitly so test harnesses can call with "".
+func parseConfigOutputFormat(s string) (configOutputFormat, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "text":
+		return configOutputText, nil
+	case "json":
+		return configOutputJSON, nil
+	case "hcl":
+		return configOutputHCL, nil
+	default:
+		return "", fmt.Errorf("invalid output format %q (want text, json, or hcl)", s)
+	}
+}
+
+// renderConfigVars writes the (key,value) map to stdout in the
+// requested format. Sorted by key so output is deterministic
+// across runs — important for diff-friendly piping into git or
+// scripts that snapshot operator output.
+//
+// Empty input prints the format-appropriate empty marker (empty
+// JSON object, empty HCL block, empty YAML map) — text mode
+// stays silent because an empty list of `KEY=VALUE` lines is
+// still valid.
+func renderConfigVars(w io.Writer, vars map[string]string, format configOutputFormat) error {
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	switch format {
+	case configOutputJSON:
+		// MarshalIndent for human-readability when piping to
+		// terminal; jq / scripts handle whitespace fine.
+		raw, err := json.MarshalIndent(vars, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode json: %w", err)
+		}
+
+		fmt.Fprintln(w, string(raw))
+
+		return nil
+
+	case configOutputHCL:
+		fmt.Fprintln(w, "env = {")
+
+		for _, k := range keys {
+			// HCL string values need backslashes + double-quotes
+			// escaped. strconv.Quote covers both plus produces
+			// a valid HCL string literal as a side effect of
+			// being a valid Go string literal (HCL adopted Go's
+			// string syntax for quoted strings).
+			fmt.Fprintf(w, "  %s = %s\n", k, hclQuote(vars[k]))
+		}
+
+		fmt.Fprintln(w, "}")
+
+		return nil
+
+	default: // text
+		for _, k := range keys {
+			fmt.Fprintf(w, "%s=%s\n", k, vars[k])
+		}
+
+		return nil
+	}
+}
+
+// hclQuote wraps a string in HCL-compatible double quotes,
+// escaping internal `"` and `\` per HCL2's string-literal grammar
+// (which mirrors JSON's). Used by the `-o hcl` formatter to make
+// the output safely paste-able into a `spec.env = {...}` block.
+func hclQuote(s string) string {
+	// Reuse Go's strconv to escape — HCL2 accepts the same
+	// double-quoted escape sequences (\n, \t, \", \\, \uXXXX).
+	// Operator-supplied env values rarely have weird chars, but
+	// we shouldn't break when they do.
+	var b strings.Builder
+
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+
+	b.WriteByte('"')
+
+	return b.String()
 }
 
 // configTarget is the (scope, name) tuple the /config endpoint
@@ -157,36 +303,32 @@ func parseConfigRef(ref string) (configTarget, error) {
 
 // runConfigList prints every var visible to the target. App-level
 // targets get the merged scope+app view; scope-level targets get
-// the bucket directly.
-func runConfigList(cmd *cobra.Command, target configTarget) error {
+// the bucket directly. Output format follows the operator's -o
+// flag (text by default).
+func runConfigList(cmd *cobra.Command, target configTarget, format configOutputFormat) error {
 	vars, err := configFetch(cmd, target.scope, target.name, "")
 	if err != nil {
 		return err
 	}
 
-	if len(vars) == 0 {
+	if len(vars) == 0 && format == configOutputText {
+		// Empty + text → friendly message. Other formats emit
+		// the format-appropriate empty marker (JSON `{}`, HCL
+		// `env = {}`, YAML `{}`) so script consumers always get
+		// valid syntax.
 		fmt.Println("No environment variables set")
 		return nil
 	}
 
-	keys := make([]string, 0, len(vars))
-	for k := range vars {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		fmt.Printf("%s=%s\n", k, vars[k])
-	}
-
-	return nil
+	return renderConfigVars(os.Stdout, vars, format)
 }
 
 // runConfigSet posts the parsed KEY=VALUE pairs to /config. Empty
 // VALUE is allowed (set-to-empty intent); a missing `=` errors so
-// the operator doesn't accidentally pass a bare key.
-func runConfigSet(cmd *cobra.Command, target configTarget, args []string, restart bool) error {
+// the operator doesn't accidentally pass a bare key. Echoes the
+// just-set keys in the operator's chosen output format — useful
+// for piping confirmation through jq / direct paste-back into HCL.
+func runConfigSet(cmd *cobra.Command, target configTarget, args []string, restart bool, format configOutputFormat) error {
 	payload, err := parseKeyValuePairs(args)
 	if err != nil {
 		return err
@@ -196,18 +338,7 @@ func runConfigSet(cmd *cobra.Command, target configTarget, args []string, restar
 		return err
 	}
 
-	keys := make([]string, 0, len(payload))
-	for k := range payload {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		fmt.Printf("%s=%s\n", k, payload[k])
-	}
-
-	return nil
+	return renderConfigVars(os.Stdout, payload, format)
 }
 
 // runConfigGet reads vars and filters by PATTERN. Empty PATTERN is
@@ -219,43 +350,41 @@ func runConfigSet(cmd *cobra.Command, target configTarget, args []string, restar
 // remembering "the var about logging" not the exact spelling), and
 // substring is a strict superset: an exact key is a substring of
 // itself.
-func runConfigGet(cmd *cobra.Command, target configTarget, pattern string) error {
+func runConfigGet(cmd *cobra.Command, target configTarget, pattern string, format configOutputFormat) error {
 	vars, err := configFetch(cmd, target.scope, target.name, "")
 	if err != nil {
 		return err
 	}
 
-	keys := make([]string, 0, len(vars))
+	// Filter by substring pattern (case-insensitive). Empty
+	// pattern is the no-op identity filter.
+	filtered := vars
 
-	if pattern == "" {
-		for k := range vars {
-			keys = append(keys, k)
-		}
-	} else {
+	if pattern != "" {
 		needle := strings.ToUpper(pattern)
-		for k := range vars {
+		filtered = make(map[string]string, len(vars))
+
+		for k, v := range vars {
 			if strings.Contains(strings.ToUpper(k), needle) {
-				keys = append(keys, k)
+				filtered[k] = v
 			}
 		}
 	}
 
-	if len(keys) == 0 {
+	if len(filtered) == 0 {
 		if pattern == "" {
-			fmt.Println("No environment variables set")
-			return nil
+			if format == configOutputText {
+				fmt.Println("No environment variables set")
+				return nil
+			}
+			// Other formats emit the empty-map marker — keep
+			// consumers (jq, scripts) happy with valid syntax.
+		} else {
+			return fmt.Errorf("no keys match %q", pattern)
 		}
-
-		return fmt.Errorf("no keys match %q", pattern)
 	}
 
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		fmt.Printf("%s=%s\n", k, vars[k])
-	}
-
-	return nil
+	return renderConfigVars(os.Stdout, filtered, format)
 }
 
 // runConfigUnset deletes one or more keys, one per /config DELETE.
