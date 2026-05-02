@@ -44,6 +44,20 @@ type pluginDispatchAction struct {
 	Name  string            `json:"name"`
 	KV    map[string]string `json:"kv,omitempty"`
 	Keys  []string          `json:"keys,omitempty"`
+
+	// SkipRestart, when true, applies the store mutation but
+	// suppresses the usual restart fan-out on (Scope, Name).
+	// Per-action grain because some envelopes mix
+	// "restart-needed" and "store-only" writes — notably the
+	// sentinel auto-failover callback in voodu-redis: the
+	// data-redis action skips restart (sentinel already moved
+	// roles), while consumer URL refreshes in the same envelope
+	// fire restarts so apps pick up the new URL.
+	//
+	// Default false (omitted in JSON) preserves the historical
+	// "every config_set rolls affected workloads" behaviour for
+	// every existing plugin — opt-in only.
+	SkipRestart bool `json:"skip_restart,omitempty"`
 }
 
 // pluginDispatchResponse is the operator-facing data the plugin
@@ -247,10 +261,24 @@ func (a *API) applyPluginDispatchActionFromRequest(r *http.Request, action plugi
 		return "", err
 	}
 
+	// SkipRestart=true short-circuits the fan-out for THIS action
+	// only. The use case is sentinel auto-failover: the data-redis
+	// action records the new master ordinal in the store but
+	// skips the rolling restart (sentinel has already moved roles
+	// inside Redis; rolling pods would drop active connections
+	// AND risk a ping-pong with sentinel re-electing during the
+	// reboot window). Other actions in the same envelope (consumer
+	// URL refreshes) keep SkipRestart=false so apps still restart
+	// to pick up the new URL.
+	if action.SkipRestart {
+		return summary, nil
+	}
+
 	// Trigger the same restart fan-out `vd config set` does so
 	// consumer pods pick up the new env file without a manual
-	// nudge. Always-on for plugin dispatch: the operator
-	// invoking `vd <plugin>:link` expects the link to be live.
+	// nudge. Always-on for plugin dispatch unless the action
+	// explicitly opted out: the operator invoking `vd <plugin>:link`
+	// expects the link to be live.
 	a.maybeRestartAffected(r, action.Scope, action.Name)
 
 	return summary, nil

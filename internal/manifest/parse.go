@@ -449,6 +449,7 @@ type hclStatefulset struct {
 	Replicas    int               `hcl:"replicas,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
+	EnvFrom     []string          `hcl:"env_from,optional"`
 	Ports       []string          `hcl:"ports,optional"`
 	Volumes     []string          `hcl:"volumes,optional"`
 	Network     string            `hcl:"network,optional"`
@@ -477,6 +478,7 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 		Replicas:    b.Replicas,
 		Command:     b.Command,
 		Env:         b.Env,
+		EnvFrom:     b.EnvFrom,
 		Ports:       b.Ports,
 		Volumes:     b.Volumes,
 		Network:     b.Network,

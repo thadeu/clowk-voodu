@@ -73,30 +73,93 @@ func TestBuildDeploymentPodEnv(t *testing.T) {
 	}
 }
 
-// TestMergePodEnv_PlatformWins is the security-relevant invariant:
-// even if an operator (or worse, a malicious HCL) sets VOODU_SCOPE
-// in their own env block, the platform-stamped value lands on the
-// container. Plugins authoring entrypoint scripts trust these names
-// to hold ground-truth identity.
-func TestMergePodEnv_PlatformWins(t *testing.T) {
+// TestMergePodEnv_OperatorWins pins the last-wins contract —
+// platform defaults inject first (low priority), operator's
+// own env layers on top and beats collisions. Mirrors docker
+// `-e` semantics (later flag wins) and gives operators a real
+// override hatch (e.g., point VOODU_CONTROLLER_URL at a mock
+// for local testing, or use a logical VOODU_SCOPE alias).
+//
+// Cross-tenant safety isn't enforced by env (voodu uses manifest
+// source + container labels for authorization), so an operator
+// "spoofing" VOODU_SCOPE in their OWN pod just confuses their
+// OWN application — no platform invariant is broken, no other
+// tenant's data is exposed.
+func TestMergePodEnv_OperatorWins(t *testing.T) {
 	platform := map[string]string{
-		"VOODU_SCOPE": "real-scope",
-		"VOODU_NAME":  "real-name",
+		"VOODU_SCOPE": "platform-default",
+		"VOODU_NAME":  "platform-name",
 	}
 
 	extra := map[string]string{
-		"VOODU_SCOPE":  "spoofed-scope",
+		"VOODU_SCOPE":   "operator-override",
 		"APP_LOG_LEVEL": "info",
 	}
 
 	merged := MergePodEnv(platform, extra)
 
-	if merged["VOODU_SCOPE"] != "real-scope" {
-		t.Errorf("VOODU_SCOPE = %q, want %q (platform must win)", merged["VOODU_SCOPE"], "real-scope")
+	if merged["VOODU_SCOPE"] != "operator-override" {
+		t.Errorf("VOODU_SCOPE = %q, want %q (operator override must win, last-wins semantics)",
+			merged["VOODU_SCOPE"], "operator-override")
+	}
+
+	if merged["VOODU_NAME"] != "platform-name" {
+		t.Errorf("VOODU_NAME = %q, want %q (platform default must survive when operator doesn't override)",
+			merged["VOODU_NAME"], "platform-name")
 	}
 
 	if merged["APP_LOG_LEVEL"] != "info" {
 		t.Errorf("operator-supplied APP_LOG_LEVEL got dropped: %q", merged["APP_LOG_LEVEL"])
+	}
+}
+
+// TestBuildPlatformEnv_EmitsControllerURL pins the auto-injection
+// of VOODU_CONTROLLER_URL — the env key plugin entrypoint scripts
+// (sentinel's failover hook, future probes) read to call back
+// into /describe, /config, /plugin/<name>/<command> without
+// operator-set env. Without this, every plugin needing controller
+// callback would force the operator to set VOODU_CONTROLLER_URL
+// manually in HCL — exactly the friction this auto-injection
+// removes.
+func TestBuildPlatformEnv_EmitsControllerURL(t *testing.T) {
+	env := BuildPlatformEnv("http://controller.voodu:8686")
+
+	if got := env[EnvControllerURL]; got != "http://controller.voodu:8686" {
+		t.Errorf("VOODU_CONTROLLER_URL = %q, want %q", got, "http://controller.voodu:8686")
+	}
+}
+
+// TestBuildPlatformEnv_EmptyURLReturnsNil is the test-friendly
+// path: setups without a controller URL configured (unit tests,
+// development) get a nil map and skip the platform layer entirely
+// — no spurious empty env var leaks into pod specs.
+func TestBuildPlatformEnv_EmptyURLReturnsNil(t *testing.T) {
+	env := BuildPlatformEnv("")
+
+	if env != nil {
+		t.Errorf("BuildPlatformEnv(\"\") = %+v, want nil", env)
+	}
+}
+
+// TestMergePodEnv_OperatorOverridesControllerURL pins the
+// override hatch — operator can deliberately point
+// VOODU_CONTROLLER_URL at a mock for local testing, a private
+// reverse proxy for cross-VM setups where the auto-derived URL
+// isn't reachable, or any other case where the platform default
+// doesn't fit. Same last-wins semantics as the rest of the env
+// merge.
+func TestMergePodEnv_OperatorOverridesControllerURL(t *testing.T) {
+	platform := BuildPlatformEnv("http://controller.voodu:8686")
+
+	extra := map[string]string{
+		EnvControllerURL: "http://my-mock:3000",
+	}
+
+	merged := MergePodEnv(platform, extra)
+
+	if got := merged[EnvControllerURL]; got != "http://my-mock:3000" {
+		t.Errorf("VOODU_CONTROLLER_URL = %q, want %q (operator override must win)",
+			got, "http://my-mock:3000")
 	}
 }
 

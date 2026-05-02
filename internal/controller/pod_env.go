@@ -17,6 +17,23 @@ const (
 	EnvPodReplica = "VOODU_REPLICA_ID"
 	EnvPodScope   = "VOODU_SCOPE"
 	EnvPodName    = "VOODU_NAME"
+
+	// EnvControllerURL exposes the controller's HTTP base URL to
+	// every managed container. Plugin-authored entrypoint scripts
+	// (sentinel's failover hook, future probes, etc.) call back
+	// to /describe, /config, /plugin/<name>/<command> using this
+	// without any operator boilerplate. Auto-injected by
+	// BuildPlatformEnv when the controller knows its own URL —
+	// empty string in tests / setups without HTTP plumbing leaves
+	// the var unset, callers detect and skip the callback path.
+	//
+	// The address must be reachable from inside container network.
+	// On a single-VM setup, host.docker.internal (Mac) or the
+	// host gateway IP (Linux) typically work; on multi-VM, the
+	// controller's private IP. The controller doesn't pick the
+	// address — server wiring sets it from --controller-addr or
+	// VOODU_CONTROLLER_URL at startup.
+	EnvControllerURL = "VOODU_CONTROLLER_URL"
 )
 
 // BuildStatefulsetPodEnv emits the per-pod identity env for a
@@ -50,14 +67,48 @@ func BuildDeploymentPodEnv(scope, name string) map[string]string {
 	}
 }
 
-// MergePodEnv layers caller-supplied env on top of the platform
-// identity env. The platform always wins on key collision — if an
-// operator (or plugin) set VOODU_SCOPE in their HCL, the per-pod
-// scope from the handler still lands. Returns a new map so the
-// caller's input is left untouched.
+// BuildPlatformEnv emits cluster-wide env every managed container
+// gets — currently just VOODU_CONTROLLER_URL so in-container
+// plugin scripts can reach back to the controller without operator
+// gymnastics (no `env = { VOODU_CONTROLLER_URL = ... }` boilerplate).
 //
-// Order: extra is materialised first, then platform stamps on top.
+// Empty controllerURL → nil map (caller's merge stays a no-op).
+// This shape lets tests and bare setups skip the platform layer
+// without paying for an empty merge.
+//
+// Why a separate function (vs cramming into BuildStatefulsetPodEnv):
+// the platform env is INDEPENDENT of pod kind — deployments and
+// statefulsets and (future) standalone pods all want it. Keeping
+// it as its own function lets each handler do exactly one merge
+// regardless of which other pod-kind env they stack.
+func BuildPlatformEnv(controllerURL string) map[string]string {
+	if controllerURL == "" {
+		return nil
+	}
+
+	return map[string]string{
+		EnvControllerURL: controllerURL,
+	}
+}
+
+// MergePodEnv layers caller-supplied env on top of the platform
+// defaults — last-wins, the operator's value beats the platform
+// default on key collision. Mirrors docker's `-e` semantics
+// (later -e flag wins) and the env file precedence operators
+// already understand.
+//
+// Order on disk: platform first (low priority), extra later
+// (high priority). When the operator deliberately sets
+// VOODU_CONTROLLER_URL = "http://my-mock:8000" or VOODU_SCOPE
+// to a logical alias, that override lands. Cross-tenant
+// boundaries are NOT enforced by env (voodu's authorization
+// uses manifest source + container labels), so an operator
+// "spoofing" VOODU_SCOPE in their own pod just confuses their
+// own application — no platform invariant is broken.
+//
 // nil-safe on both sides; returns nil only when both are nil.
+//
+// Returns a new map so the caller's input is left untouched.
 func MergePodEnv(platform, extra map[string]string) map[string]string {
 	if len(platform) == 0 && len(extra) == 0 {
 		return nil
@@ -65,11 +116,11 @@ func MergePodEnv(platform, extra map[string]string) map[string]string {
 
 	merged := make(map[string]string, len(platform)+len(extra))
 
-	for k, v := range extra {
+	for k, v := range platform {
 		merged[k] = v
 	}
 
-	for k, v := range platform {
+	for k, v := range extra {
 		merged[k] = v
 	}
 

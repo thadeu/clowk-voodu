@@ -222,6 +222,21 @@ type StatefulsetSpec struct {
 	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
 	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
 
+	// EnvFrom stacks env files from other resources, same shape +
+	// semantics as JobSpec.EnvFrom: each entry is `<scope>/<name>`
+	// (or bare `<name>` for the current scope), the controller emits
+	// a `--env-file` per entry BEFORE the statefulset's own env file
+	// so the pod's merged env wins on conflicts. Multiple sources
+	// stack in declared order.
+	//
+	// The canonical use case is a sentinel resource inheriting from
+	// the data redis it monitors — REDIS_PASSWORD and
+	// REDIS_MASTER_ORDINAL flow automatically without an operator
+	// `vd config set` chore. Generalises beyond redis: any
+	// statefulset that needs config from a peer (postgres replica
+	// inheriting from primary's bucket, etc.).
+	EnvFrom []string `yaml:"env_from,omitempty" json:"env_from,omitempty"`
+
 	// VolumeClaims is the set of per-pod volume templates. Each
 	// claim materialises into one docker volume per ordinal:
 	// `voodu-<scope>-<name>-<claim>-<ordinal>`. Filled in M-S2;

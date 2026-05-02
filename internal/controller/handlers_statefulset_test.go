@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"go.voodu.clowk.in/internal/containers"
@@ -560,12 +562,24 @@ func TestStatefulsetHandler_InjectsPodIdentityEnv(t *testing.T) {
 	}
 }
 
-// TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv guards
-// the security-relevant invariant: an operator can NOT override
-// the platform identity by stuffing VOODU_SCOPE into their HCL
-// `env { ... }` block. The handler stamps the real values last,
-// so plugin entrypoints always see ground-truth scope/name/ordinal.
-func TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv(t *testing.T) {
+// TestStatefulsetHandler_OperatorEnvOverridesPlatformDefaults
+// pins the last-wins contract — operators can deliberately
+// override platform-stamped VOODU_* keys by setting them in
+// their HCL `env { ... }` block. Examples:
+//
+//   - point VOODU_CONTROLLER_URL at a mock for local testing
+//   - alias VOODU_SCOPE for legacy app code expecting a logical
+//     scope name different from voodu's
+//   - override VOODU_REPLICA_ORDINAL for unusual setups where
+//     the app's "ordinal" semantics differ from voodu's
+//
+// Cross-tenant safety isn't enforced by env (voodu's authorization
+// uses manifest source + container labels), so an operator
+// "spoofing" their own pod's identity just confuses their own
+// application — no cross-tenant boundary is broken. The flexibility
+// matches docker `-e` precedence and lets operators escape
+// inconvenient platform defaults without forking the controller.
+func TestStatefulsetHandler_OperatorEnvOverridesPlatformDefaults(t *testing.T) {
 	withZeroRolloutPause(t)
 
 	store := newMemStore()
@@ -583,7 +597,7 @@ func TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv(t *testing.T) {
 		"image":    "redis:7",
 		"replicas": 1,
 		"env": map[string]any{
-			"VOODU_SCOPE":           "spoofed",
+			"VOODU_SCOPE":           "operator-alias",
 			"VOODU_REPLICA_ORDINAL": "99",
 			"APP_LOG_LEVEL":         "debug",
 		},
@@ -599,17 +613,20 @@ func TestStatefulsetHandler_PlatformEnvWinsOverOperatorEnv(t *testing.T) {
 
 	got := cm.ensures[0].Env
 
-	if got["VOODU_SCOPE"] != "test" {
-		t.Errorf("VOODU_SCOPE = %q, want %q (operator-supplied value leaked through)", got["VOODU_SCOPE"], "test")
+	if got["VOODU_SCOPE"] != "operator-alias" {
+		t.Errorf("VOODU_SCOPE = %q, want %q (operator override must win)", got["VOODU_SCOPE"], "operator-alias")
 	}
 
-	if got["VOODU_REPLICA_ORDINAL"] != "0" {
-		t.Errorf("VOODU_REPLICA_ORDINAL = %q, want %q (operator-supplied ordinal leaked through)", got["VOODU_REPLICA_ORDINAL"], "0")
+	if got["VOODU_REPLICA_ORDINAL"] != "99" {
+		t.Errorf("VOODU_REPLICA_ORDINAL = %q, want %q (operator override must win)", got["VOODU_REPLICA_ORDINAL"], "99")
 	}
 
-	// Non-reserved operator env still flows through. The handler
-	// only protects the VOODU_* namespace; everything else is the
-	// operator's domain.
+	// Platform defaults survive on keys the operator did NOT touch.
+	if got["VOODU_NAME"] != "redis" {
+		t.Errorf("VOODU_NAME = %q, want %q (platform default should land when operator doesn't override)", got["VOODU_NAME"], "redis")
+	}
+
+	// Non-reserved operator env flows through as before.
 	if got["APP_LOG_LEVEL"] != "debug" {
 		t.Errorf("APP_LOG_LEVEL = %q, want %q (operator env got dropped)", got["APP_LOG_LEVEL"], "debug")
 	}
@@ -921,6 +938,175 @@ func TestStatefulsetHandler_FirstApply_NoEnvRestartChurn(t *testing.T) {
 
 	if len(cm.removes) != 0 {
 		t.Errorf("first apply must not env-restart freshly-spawned pods, got removes=%v", cm.removes)
+	}
+}
+
+// TestStatefulsetHandler_EnvFromStacksAcrossOrdinals pins the
+// env_from feature on statefulsets — symmetric to JobHandler's
+// stacking. Every ordinal in the same reconcile gets the SAME
+// ExtraEnvFiles slice; resolution happens once per reconcile,
+// reused for each spawn.
+//
+// The canonical use case is a sentinel resource inheriting the
+// data redis's REDIS_PASSWORD + REDIS_MASTER_ORDINAL via
+// env_from = ["scope/redis"]. This test pins the underlying
+// machinery — voodu-redis's expand emits this declaration
+// automatically; the controller-side wiring is generic.
+func TestStatefulsetHandler_EnvFromStacksAcrossOrdinals(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	tmp := t.TempDir()
+	t.Setenv("VOODU_ROOT", tmp)
+
+	// Pre-seed env files on disk so the resolver finds them.
+	// Format mirrors mustTouch from env_from_test.go.
+	mustTouch(t, filepath.Join(tmp, "apps", "test-redis", "shared", ".env"))
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	spec := map[string]any{
+		"image":    "redis:8",
+		"replicas": 3,
+		"env_from": []string{"redis"}, // current scope (test) → test-redis
+	}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "redis-ha", spec)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.ensures) != 3 {
+		t.Fatalf("expected 3 ordinal ensures, got %d", len(cm.ensures))
+	}
+
+	// Every ordinal got the same env_from resolution — without
+	// per-pod variance. If we accidentally re-resolved in a way
+	// that depended on ordinal, the slices would diverge.
+	for n, e := range cm.ensures {
+		if len(e.ExtraEnvFiles) != 1 {
+			t.Errorf("ordinal %d: ExtraEnvFiles = %v, want 1 entry", n, e.ExtraEnvFiles)
+			continue
+		}
+
+		if !strings.HasSuffix(e.ExtraEnvFiles[0], "/test-redis/shared/.env") {
+			t.Errorf("ordinal %d: ExtraEnvFiles[0] = %q, want ends with /test-redis/shared/.env",
+				n, e.ExtraEnvFiles[0])
+		}
+	}
+}
+
+// TestStatefulsetHandler_NoEnvFromIsEmpty pins the negative
+// path — statefulsets without env_from get nil ExtraEnvFiles
+// (or empty), no spurious --env-file flags. Confirms the
+// feature is opt-in and doesn't change behaviour for existing
+// statefulsets.
+func TestStatefulsetHandler_NoEnvFromIsEmpty(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+
+	spec := map[string]any{
+		"image":    "redis:8",
+		"replicas": 2,
+	}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "redis", spec)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	for n, e := range cm.ensures {
+		if len(e.ExtraEnvFiles) != 0 {
+			t.Errorf("ordinal %d: expected no ExtraEnvFiles, got %v", n, e.ExtraEnvFiles)
+		}
+	}
+}
+
+// TestStatefulsetHandler_AutoInjectsControllerURL pins the
+// VOODU_CONTROLLER_URL auto-injection — when the handler has
+// ControllerURL set (production wiring), every spawned pod
+// gets the env var without operator declaration. This is the
+// other half of "plugin resolves everything" — sentinel's
+// failover hook + preflight need this URL to call back, and
+// the operator should never have to set it manually.
+func TestStatefulsetHandler_AutoInjectsControllerURL(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:         store,
+		Log:           quietLogger(),
+		WriteEnv:      func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath:   func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:    cm,
+		ControllerURL: "http://controller.voodu:8686",
+	}
+
+	spec := map[string]any{
+		"image":    "redis:8",
+		"replicas": 1,
+	}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "redis", spec)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure, got %d", len(cm.ensures))
+	}
+
+	got := cm.ensures[0].Env[EnvControllerURL]
+	if got != "http://controller.voodu:8686" {
+		t.Errorf("VOODU_CONTROLLER_URL = %q, want auto-injected to %q",
+			got, "http://controller.voodu:8686")
+	}
+}
+
+// TestStatefulsetHandler_NoControllerURLLeavesEnvUnset is the
+// inverse — when ControllerURL is empty (test setup, no HTTP
+// plumbing), VOODU_CONTROLLER_URL must NOT appear in pod env.
+// Otherwise we'd leak an empty string that shells / scripts
+// might mistake for a configured-but-empty value.
+func TestStatefulsetHandler_NoControllerURLLeavesEnvUnset(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	store := newMemStore()
+	cm := &fakeContainers{}
+
+	h := &StatefulsetHandler{
+		Store:       store,
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+		// ControllerURL deliberately unset.
+	}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "redis",
+		map[string]any{"image": "redis:8", "replicas": 1})); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if _, present := cm.ensures[0].Env[EnvControllerURL]; present {
+		t.Errorf("VOODU_CONTROLLER_URL must NOT appear when handler.ControllerURL is empty (would leak empty string)")
 	}
 }
 

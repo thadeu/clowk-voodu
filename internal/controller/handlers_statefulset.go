@@ -43,6 +43,14 @@ type StatefulsetHandler struct {
 
 	Containers ContainerManager
 
+	// ControllerURL flows from the API server's wiring down to the
+	// per-pod env builder so every managed container can reach
+	// /describe, /config, /plugin/... without operator-set env.
+	// Empty string is fine — it just means VOODU_CONTROLLER_URL
+	// won't be auto-injected; the entrypoint scripts that need it
+	// detect and skip the callback path. Tests leave it empty.
+	ControllerURL string
+
 	// rolloutLocks serialises rolling restart per (scope, name).
 	// Two concurrent reconciles for the same statefulset would
 	// otherwise race on container creation order — mutex granularity
@@ -67,6 +75,14 @@ type statefulsetSpec struct {
 	NetworkMode string             `json:"network_mode,omitempty"`
 	Restart     string             `json:"restart,omitempty"`
 	HealthCheck string             `json:"health_check,omitempty"`
+
+	// EnvFrom mirrors JobSpec.EnvFrom — each entry is a "scope/name"
+	// (or bare "name" for the current scope) ref to another resource
+	// whose env file gets stacked under the statefulset's own env
+	// via --env-file. Resolution + last-wins semantics are
+	// identical to the job path. See manifest.StatefulsetSpec.EnvFrom
+	// for the operator-facing contract.
+	EnvFrom []string `json:"env_from,omitempty"`
 
 	// VolumeClaims is the per-pod volume-template list. M-S2 wires
 	// the docker volume creation; M-S1 ignores the field but keeps
@@ -444,6 +460,16 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 		envFile = h.EnvFilePath(app)
 	}
 
+	// Resolve env_from refs to additional --env-file paths once per
+	// reconcile (not per-ordinal — the resolution is identical for
+	// every replica). Same shape + last-wins semantics as the job
+	// path. When env_from is empty this is a nil slice and the
+	// container creation skips the extra --env-file flags.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	for n := 0; n < want; n++ {
 		if present[n] {
 			continue
@@ -508,8 +534,11 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 		// on collision so a typo'd `env.VOODU_SCOPE = "x"`
 		// doesn't poison the pod's identity.
 		podEnv := MergePodEnv(
-			BuildStatefulsetPodEnv(scope, name, n),
-			spec.Env,
+			BuildPlatformEnv(h.ControllerURL),
+			MergePodEnv(
+				BuildStatefulsetPodEnv(scope, name, n),
+				spec.Env,
+			),
 		)
 
 		_, err = h.Containers.Ensure(ContainerSpec{
@@ -523,6 +552,7 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			NetworkAliases: aliases,
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			ExtraEnvFiles:  extraEnvFiles,
 			Env:            podEnv,
 			Labels:         labels,
 		})
@@ -678,6 +708,14 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 		envFile = h.EnvFilePath(app)
 	}
 
+	// Same env_from resolution as ensureOrdinalsUp — runs once per
+	// rolling-replace cycle, reused for every replica recreated in
+	// this pass. Empty list when env_from isn't declared.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	for i, s := range live {
 		ord, ok := s.Identity.Ordinal()
 		if !ok {
@@ -735,8 +773,11 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 		// so the role decision (master vs replica) doesn't
 		// flip just because the pod was recreated.
 		podEnv := MergePodEnv(
-			BuildStatefulsetPodEnv(scope, name, ord),
-			spec.Env,
+			BuildPlatformEnv(h.ControllerURL),
+			MergePodEnv(
+				BuildStatefulsetPodEnv(scope, name, ord),
+				spec.Env,
+			),
 		)
 
 		if _, err := h.Containers.Ensure(ContainerSpec{
@@ -750,6 +791,7 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			NetworkAliases: aliases,
 			Restart:        spec.Restart,
 			EnvFile:        envFile,
+			ExtraEnvFiles:  extraEnvFiles,
 			Env:            podEnv,
 			Labels:         labels,
 		}); err != nil {

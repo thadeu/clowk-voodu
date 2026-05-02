@@ -184,8 +184,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 			return !stringMapsEqual(before, after), nil
 		},
-		EnvFilePath: paths.AppEnvFile,
-		Containers:  DockerContainerManager{},
+		EnvFilePath:   paths.AppEnvFile,
+		Containers:    DockerContainerManager{},
+		ControllerURL: deriveControllerURL(s.cfg.HTTPAddr),
 	}
 
 	ingHandler := &IngressHandler{

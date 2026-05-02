@@ -153,6 +153,173 @@ EOF
 	}
 }
 
+// TestPluginDispatch_SkipRestartSuppressesFanOut pins the
+// per-action "skip restart" hatch the sentinel auto-failover
+// path uses. With SkipRestart=true, the config write still
+// lands but maybeRestartAffected is NOT called, so the target
+// manifest's revision stays put (no restart-fan-out re-Put).
+//
+// Without this gate, sentinel's callback would roll the redis
+// statefulset → drop active connections on the freshly promoted
+// master → risk ping-pong with sentinel re-electing during the
+// reboot window. The flag is the sentinel-aware path's only
+// way to record state without triggering side-effects.
+func TestPluginDispatch_SkipRestartSuppressesFanOut(t *testing.T) {
+	root := t.TempDir()
+
+	// Plugin emits one config_set with skip_restart: true. Only
+	// thing the dispatch handler needs to exercise.
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<EOF
+{
+  "status": "ok",
+  "data": {
+    "message": "sentinel sync",
+    "actions": [
+      {
+        "type": "config_set",
+        "scope": "clowk-lp",
+        "name": "redis",
+        "kv": { "REDIS_MASTER_ORDINAL": "1" },
+        "skip_restart": true
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "redis", "failover", script)
+
+	srv, store := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	// Pre-store the redis statefulset so we have something to
+	// observe revision on. memStore Put bumps revision on every
+	// successful write, so a non-bump after the dispatch proves
+	// the fan-out was suppressed.
+	pre, err := store.Put(context.Background(), &Manifest{
+		Kind:  KindStatefulset,
+		Scope: "clowk-lp",
+		Name:  "redis",
+		Spec:  json.RawMessage(`{"image":"redis:8","replicas":3}`),
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preRevision := pre.Metadata.Revision
+
+	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--to","1","--no-restart"]}`)
+
+	resp, err := http.Post(srv.URL+"/plugin/redis/failover", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	// The config write MUST have landed — SkipRestart only
+	// suppresses the fan-out, not the write itself.
+	cfg, err := store.GetConfig(context.Background(), "clowk-lp", "redis")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cfg["REDIS_MASTER_ORDINAL"]; got != "1" {
+		t.Errorf("config write didn't land; REDIS_MASTER_ORDINAL=%q", got)
+	}
+
+	// And the manifest revision MUST NOT bump — that's the proof
+	// that maybeRestartAffected was skipped (it re-Puts every
+	// matching manifest, which would bump revision).
+	post, err := store.Get(context.Background(), KindStatefulset, "clowk-lp", "redis")
+	if err != nil || post == nil {
+		t.Fatalf("manifest missing post-dispatch: %v", err)
+	}
+
+	if post.Metadata.Revision != preRevision {
+		t.Errorf("statefulset revision changed (%d → %d); SkipRestart=true should have suppressed the restart fan-out",
+			preRevision, post.Metadata.Revision)
+	}
+}
+
+// TestPluginDispatch_NoSkipRestartFiresFanOut is the inverse pin.
+// Same wire shape as the SkipRestart test but with the field
+// omitted (default false) — the manifest revision MUST bump,
+// proving the historical "config_set rolls affected workloads"
+// behaviour is still the default for plugin actions.
+func TestPluginDispatch_NoSkipRestartFiresFanOut(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<EOF
+{
+  "status": "ok",
+  "data": {
+    "message": "manual failover",
+    "actions": [
+      {
+        "type": "config_set",
+        "scope": "clowk-lp",
+        "name": "redis",
+        "kv": { "REDIS_MASTER_ORDINAL": "1" }
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "redis", "failover", script)
+
+	srv, store := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	pre, err := store.Put(context.Background(), &Manifest{
+		Kind:  KindStatefulset,
+		Scope: "clowk-lp",
+		Name:  "redis",
+		Spec:  json.RawMessage(`{"image":"redis:8","replicas":3}`),
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preRevision := pre.Metadata.Revision
+
+	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--to","1"]}`)
+
+	resp, err := http.Post(srv.URL+"/plugin/redis/failover", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	post, err := store.Get(context.Background(), KindStatefulset, "clowk-lp", "redis")
+	if err != nil || post == nil {
+		t.Fatalf("manifest missing: %v", err)
+	}
+
+	if post.Metadata.Revision <= preRevision {
+		t.Errorf("statefulset revision didn't bump (%d → %d); default-no-skip should fire fan-out",
+			preRevision, post.Metadata.Revision)
+	}
+}
+
 // TestPluginDispatch_UnknownCommand pins the 400 path: a plugin
 // whose plugin.yml doesn't declare the command must reject the
 // dispatch even though the binary might exist on disk. Prevents
