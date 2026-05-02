@@ -212,7 +212,7 @@ EOF
 
 	preRevision := pre.Metadata.Revision
 
-	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--to","1","--no-restart"]}`)
+	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--replica","1","--no-restart"]}`)
 
 	resp, err := http.Post(srv.URL+"/plugin/redis/failover", "application/json", body)
 	if err != nil {
@@ -296,7 +296,7 @@ EOF
 
 	preRevision := pre.Metadata.Revision
 
-	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--to","1"]}`)
+	body := bytes.NewBufferString(`{"args":["clowk-lp/redis","--replica","1"]}`)
 
 	resp, err := http.Post(srv.URL+"/plugin/redis/failover", "application/json", body)
 	if err != nil {

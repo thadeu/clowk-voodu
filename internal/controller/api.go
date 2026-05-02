@@ -1542,7 +1542,7 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 // That breaks the failover flow:
 //
 //   1. operator: `vd stop redis.0`            (pod-0 frozen, master)
-//   2. operator: `vd redis:failover --to 1`   (env file: REDIS_MASTER_ORDINAL=1)
+//   2. operator: `vd redis:failover --replica 1`   (env file: REDIS_MASTER_ORDINAL=1)
 //   3. operator: `vd start redis.0`           (pod-0 starts)
 //   4. wrapper script reads MASTER_ORDINAL... but pod-0's
 //      container has the OLD env from step 1's `docker run`,
