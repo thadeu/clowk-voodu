@@ -1,8 +1,6 @@
 package controller
 
 import (
-	"path/filepath"
-
 	"go.voodu.clowk.in/internal/plugins"
 )
 
@@ -47,14 +45,19 @@ type DirPluginRegistry struct {
 }
 
 // LookupByBlock implements PluginBlockRegistry.
+//
+// Resolves blockType via plugins.LoadByName, which tries the
+// directory-name fast path first and falls back to scanning
+// installed plugins for one whose Manifest.Aliases list
+// contains blockType. So `pg "data" "main" {}` matches the
+// postgres plugin when its plugin.yml declares
+// `aliases: [pg]`.
 func (r *DirPluginRegistry) LookupByBlock(blockType string) (*plugins.LoadedPlugin, bool) {
 	if r.PluginsRoot == "" || blockType == "" {
 		return nil, false
 	}
 
-	dir := filepath.Join(r.PluginsRoot, blockType)
-
-	loaded, err := plugins.LoadFromDir(dir)
+	loaded, err := plugins.LoadByName(r.PluginsRoot, blockType)
 	if err != nil {
 		return nil, false
 	}

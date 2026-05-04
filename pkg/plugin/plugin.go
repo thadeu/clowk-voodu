@@ -86,13 +86,47 @@ type Envelope struct {
 // Manifest is the parsed shape of plugin.yml. All fields are optional;
 // missing values are filled from directory conventions at load time.
 type Manifest struct {
-	Name        string            `yaml:"name"              json:"name"`
-	Version     string            `yaml:"version,omitempty" json:"version,omitempty"`
+	Name        string            `yaml:"name"                  json:"name"`
+	Version     string            `yaml:"version,omitempty"     json:"version,omitempty"`
 	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
 	Homepage    string            `yaml:"homepage,omitempty"    json:"homepage,omitempty"`
-	Commands    []Command         `yaml:"commands,omitempty"    json:"commands,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty"         json:"env,omitempty"`
-	Source      string            `yaml:"-"                     json:"source,omitempty"`
+
+	// Aliases are alternate names operators can type instead of
+	// Name on `vd <name>:<command>`. Each alias resolves to the
+	// same plugin via plugins.LoadByName's fallback scan.
+	//
+	// Use case: short ergonomic names alongside the canonical one.
+	// Plugin postgres declares `aliases: [pg]` so `vd pg:psql`
+	// works the same as `vd postgres:psql`. Heroku CLI parity
+	// (heroku pg:* vs heroku postgres:*).
+	//
+	// Aliases must NOT collide with another plugin's Name or
+	// Aliases — first-match-wins on collision (LoadByName scans
+	// in directory order). Operators see a clear error from
+	// `vd plugins:list` highlighting the duplicate.
+	Aliases []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
+
+	Commands []Command         `yaml:"commands,omitempty" json:"commands,omitempty"`
+	Env      map[string]string `yaml:"env,omitempty"      json:"env,omitempty"`
+	Source   string            `yaml:"-"                  json:"source,omitempty"`
+}
+
+// HasAlias reports whether the given name appears in the plugin's
+// Aliases list. Case-sensitive — aliases are typically lowercase
+// (`pg`, `r`, etc.) so case-folding adds confusion for marginal
+// gain. Returns false on the zero-value Manifest.
+func (m Manifest) HasAlias(name string) bool {
+	if name == "" {
+		return false
+	}
+
+	for _, a := range m.Aliases {
+		if a == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Command documents one plugin subcommand for `plugins:list` and help

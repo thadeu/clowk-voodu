@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -145,7 +144,11 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plug, err := plugins.LoadFromDir(filepath.Join(a.PluginsRoot, pluginName))
+	// LoadByName honours plugin.yml `aliases:` — `vd pg:psql`
+	// resolves to the postgres plugin (which declares
+	// aliases: [pg]) without the operator having to know
+	// the canonical name.
+	plug, err := plugins.LoadByName(a.PluginsRoot, pluginName)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("plugin %q: %w", pluginName, err))
 		return

@@ -126,6 +126,113 @@ func TestLoadAllSkipsBadPlugins(t *testing.T) {
 	}
 }
 
+func TestLoadByName_DirectoryMatchFastPath(t *testing.T) {
+	// Canonical case: <root>/postgres exists → LoadByName returns
+	// it without scanning sibling directories.
+	root := t.TempDir()
+
+	pgDir := filepath.Join(root, "postgres")
+	mkdir(t, pgDir)
+
+	writeFile(t, filepath.Join(pgDir, "plugin.yml"), `
+name: postgres
+aliases: [pg]
+`)
+
+	mkdir(t, filepath.Join(pgDir, "bin"))
+	writeFile(t, filepath.Join(pgDir, "bin", "expand"), "#!/bin/bash\n")
+
+	p, err := LoadByName(root, "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p.Manifest.Name != "postgres" {
+		t.Errorf("got name %q", p.Manifest.Name)
+	}
+}
+
+func TestLoadByName_AliasFallbackScan(t *testing.T) {
+	// `vd pg:psql` lookup: /opt/voodu/plugins/pg/ doesn't exist,
+	// but /opt/voodu/plugins/postgres/plugin.yml has
+	// aliases: [pg]. LoadByName must scan + match.
+	root := t.TempDir()
+
+	pgDir := filepath.Join(root, "postgres")
+	mkdir(t, pgDir)
+
+	writeFile(t, filepath.Join(pgDir, "plugin.yml"), `
+name: postgres
+aliases: [pg, postgresql]
+`)
+
+	mkdir(t, filepath.Join(pgDir, "bin"))
+	writeFile(t, filepath.Join(pgDir, "bin", "psql"), "#!/bin/bash\n")
+
+	for _, alias := range []string{"pg", "postgresql"} {
+		p, err := LoadByName(root, alias)
+		if err != nil {
+			t.Errorf("alias %q: %v", alias, err)
+			continue
+		}
+
+		if p.Manifest.Name != "postgres" {
+			t.Errorf("alias %q resolved to wrong plugin %q", alias, p.Manifest.Name)
+		}
+	}
+}
+
+func TestLoadByName_NotFound(t *testing.T) {
+	root := t.TempDir()
+
+	pgDir := filepath.Join(root, "postgres")
+	mkdir(t, pgDir)
+	writeFile(t, filepath.Join(pgDir, "plugin.yml"), "name: postgres\n")
+	mkdir(t, filepath.Join(pgDir, "bin"))
+
+	_, err := LoadByName(root, "nonexistent")
+	if err == nil {
+		t.Fatal("expected error when neither dir match nor alias match")
+	}
+}
+
+func TestLoadByName_BrokenSiblingPluginDoesntBlockAliasMatch(t *testing.T) {
+	// Defensive: one corrupted plugin.yml in the plugins root
+	// shouldn't prevent an unrelated alias from resolving. The
+	// fallback scan tolerates per-plugin load errors.
+	root := t.TempDir()
+
+	pgDir := filepath.Join(root, "postgres")
+	mkdir(t, pgDir)
+	writeFile(t, filepath.Join(pgDir, "plugin.yml"), "name: postgres\naliases: [pg]\n")
+	mkdir(t, filepath.Join(pgDir, "bin"))
+
+	// Broken plugin: invalid YAML.
+	brokenDir := filepath.Join(root, "broken")
+	mkdir(t, brokenDir)
+	writeFile(t, filepath.Join(brokenDir, "plugin.yml"), "this is not: { valid yaml")
+	mkdir(t, filepath.Join(brokenDir, "bin"))
+
+	p, err := LoadByName(root, "pg")
+	if err != nil {
+		t.Fatalf("alias resolution should succeed despite sibling broken plugin: %v", err)
+	}
+
+	if p.Manifest.Name != "postgres" {
+		t.Errorf("got %q", p.Manifest.Name)
+	}
+}
+
+func TestLoadByName_EmptyArguments(t *testing.T) {
+	if _, err := LoadByName("", "postgres"); err == nil {
+		t.Error("expected error for empty root")
+	}
+
+	if _, err := LoadByName("/tmp", ""); err == nil {
+		t.Error("expected error for empty name")
+	}
+}
+
 func mkdir(t *testing.T, path string) {
 	t.Helper()
 

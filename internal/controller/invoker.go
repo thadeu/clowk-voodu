@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
@@ -36,7 +35,11 @@ func (d *DirInvoker) Invoke(ctx context.Context, pluginName, command string, arg
 		return nil, fmt.Errorf("no plugins root configured")
 	}
 
-	loaded, err := plugins.LoadFromDir(filepath.Join(d.PluginsRoot, pluginName))
+	// LoadByName honours plugin.yml `aliases:` — reconciler-side
+	// invocations from the controller (e.g. ingress kind dispatch
+	// to voodu-caddy) match the same resolution rules as
+	// operator-typed `vd <name>:<cmd>`.
+	loaded, err := plugins.LoadByName(d.PluginsRoot, pluginName)
 	if err != nil {
 		return nil, fmt.Errorf("plugin %q: %w", pluginName, err)
 	}
