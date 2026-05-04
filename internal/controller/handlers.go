@@ -79,6 +79,12 @@ type deploymentSpec struct {
 	HealthCheck string            `json:"health_check,omitempty"`
 	Release     *releaseSpec      `json:"release,omitempty"`
 
+	// Resources mirrors manifest.ResourcesSpec — kernel-level
+	// CPU/memory caps via cgroups. nil means "no limit", which
+	// is the safe operator-default (the `vd describe` audit
+	// surface still shows the field as absent when unset).
+	Resources *resourcesWireSpec `json:"resources,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
@@ -654,19 +660,26 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			spec.Env,
 		)
 
-		_, err := h.Containers.Ensure(ContainerSpec{
-			Name:           cname,
-			Image:          spec.Image,
-			Command:        spec.Command,
-			Ports:          spec.Ports,
-			Volumes:        spec.Volumes,
-			Networks:       spec.Networks,
-			NetworkMode:    spec.NetworkMode,
-			NetworkAliases: BuildNetworkAliases(scope, name),
-			Restart:        spec.Restart,
-			EnvFile:        envFile,
-			Env:            podEnv,
-			Labels:         labels,
+		cpu, memBytes, err := dockerResources(spec.Resources)
+		if err != nil {
+			return created, fmt.Errorf("deployment/%s replica %s: %w", name, cname, err)
+		}
+
+		_, err = h.Containers.Ensure(ContainerSpec{
+			Name:             cname,
+			Image:            spec.Image,
+			Command:          spec.Command,
+			Ports:            spec.Ports,
+			Volumes:          spec.Volumes,
+			Networks:         spec.Networks,
+			NetworkMode:      spec.NetworkMode,
+			NetworkAliases:   BuildNetworkAliases(scope, name),
+			Restart:          spec.Restart,
+			EnvFile:          envFile,
+			Env:              podEnv,
+			Labels:           labels,
+			CPULimit:         cpu,
+			MemoryLimitBytes: memBytes,
 		})
 		if err != nil {
 			return created, fmt.Errorf("ensure %s: %w", cname, err)
@@ -945,19 +958,26 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			spec.Env,
 		)
 
+		cpu, memBytes, err := dockerResources(spec.Resources)
+		if err != nil {
+			return fmt.Errorf("deployment/%s rolling restart %s: %w", name, newName, err)
+		}
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
-			Name:           newName,
-			Image:          spec.Image,
-			Command:        spec.Command,
-			Ports:          spec.Ports,
-			Volumes:        spec.Volumes,
-			Networks:       spec.Networks,
-			NetworkMode:    spec.NetworkMode,
-			NetworkAliases: BuildNetworkAliases(scope, name),
-			Restart:        spec.Restart,
-			EnvFile:        envFile,
-			Env:            podEnv,
-			Labels:         labels,
+			Name:             newName,
+			Image:            spec.Image,
+			Command:          spec.Command,
+			Ports:            spec.Ports,
+			Volumes:          spec.Volumes,
+			Networks:         spec.Networks,
+			NetworkMode:      spec.NetworkMode,
+			NetworkAliases:   BuildNetworkAliases(scope, name),
+			Restart:          spec.Restart,
+			EnvFile:          envFile,
+			Env:              podEnv,
+			Labels:           labels,
+			CPULimit:         cpu,
+			MemoryLimitBytes: memBytes,
 		}); err != nil {
 			return fmt.Errorf("spawn replacement %s: %w", newName, err)
 		}

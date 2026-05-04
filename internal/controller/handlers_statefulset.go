@@ -90,6 +90,10 @@ type statefulsetSpec struct {
 	// schema don't need a re-spec.
 	VolumeClaims []volumeClaim `json:"volume_claims,omitempty"`
 
+	// Resources mirrors manifest.ResourcesSpec — kernel-level
+	// CPU/memory caps via cgroups, applied to every replica pod.
+	Resources *resourcesWireSpec `json:"resources,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. Server-managed (StampAssetDigests
 	// writes it post plugin-expand); operators don't author this
@@ -541,20 +545,27 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			),
 		)
 
+		cpu, memBytes, err := dockerResources(spec.Resources)
+		if err != nil {
+			return fmt.Errorf("statefulset/%s ordinal %d: %w", name, n, err)
+		}
+
 		_, err = h.Containers.Ensure(ContainerSpec{
-			Name:           cname,
-			Image:          spec.Image,
-			Command:        spec.Command,
-			Ports:          spec.Ports,
-			Volumes:        mountedVolumes,
-			Networks:       spec.Networks,
-			NetworkMode:    spec.NetworkMode,
-			NetworkAliases: aliases,
-			Restart:        spec.Restart,
-			EnvFile:        envFile,
-			ExtraEnvFiles:  extraEnvFiles,
-			Env:            podEnv,
-			Labels:         labels,
+			Name:             cname,
+			Image:            spec.Image,
+			Command:          spec.Command,
+			Ports:            spec.Ports,
+			Volumes:          mountedVolumes,
+			Networks:         spec.Networks,
+			NetworkMode:      spec.NetworkMode,
+			NetworkAliases:   aliases,
+			Restart:          spec.Restart,
+			EnvFile:          envFile,
+			ExtraEnvFiles:    extraEnvFiles,
+			Env:              podEnv,
+			Labels:           labels,
+			CPULimit:         cpu,
+			MemoryLimitBytes: memBytes,
 		})
 		if err != nil {
 			return fmt.Errorf("ensure ordinal %d (%s): %w", n, cname, err)
@@ -780,20 +791,27 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			),
 		)
 
+		cpu, memBytes, err := dockerResources(spec.Resources)
+		if err != nil {
+			return fmt.Errorf("statefulset/%s respawn ordinal %d: %w", name, ord, err)
+		}
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
-			Name:           newName,
-			Image:          spec.Image,
-			Command:        spec.Command,
-			Ports:          spec.Ports,
-			Volumes:        mountedVolumes,
-			Networks:       spec.Networks,
-			NetworkMode:    spec.NetworkMode,
-			NetworkAliases: aliases,
-			Restart:        spec.Restart,
-			EnvFile:        envFile,
-			ExtraEnvFiles:  extraEnvFiles,
-			Env:            podEnv,
-			Labels:         labels,
+			Name:             newName,
+			Image:            spec.Image,
+			Command:          spec.Command,
+			Ports:            spec.Ports,
+			Volumes:          mountedVolumes,
+			Networks:         spec.Networks,
+			NetworkMode:      spec.NetworkMode,
+			NetworkAliases:   aliases,
+			Restart:          spec.Restart,
+			EnvFile:          envFile,
+			ExtraEnvFiles:    extraEnvFiles,
+			Env:              podEnv,
+			Labels:           labels,
+			CPULimit:         cpu,
+			MemoryLimitBytes: memBytes,
 		}); err != nil {
 			return fmt.Errorf("respawn ordinal %d: %w", ord, err)
 		}

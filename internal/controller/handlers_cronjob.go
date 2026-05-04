@@ -267,13 +267,26 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		h.logf("cronjob/%s status persist failed (pre-run): %v", app, err)
 	}
 
+	cpu, memBytes, resErr := dockerResources(spec.Job.Resources)
+	if resErr != nil {
+		run.Status = JobStatusFailed
+		run.EndedAt = time.Now().UTC()
+		run.Error = fmt.Sprintf("invalid resources: %v", resErr)
+
+		_ = h.appendRun(ctx, app, spec.Schedule, spec.Job.Image, run, successCap, failureCap)
+
+		return run, fmt.Errorf("cronjob/%s: %w", app, resErr)
+	}
+
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:        cname,
-		Image:       spec.Job.Image,
-		Command:     spec.Job.Command,
-		Volumes:     spec.Job.Volumes,
-		Networks:    spec.Job.Networks,
-		NetworkMode: spec.Job.NetworkMode,
+		Name:             cname,
+		Image:            spec.Job.Image,
+		Command:          spec.Job.Command,
+		Volumes:          spec.Job.Volumes,
+		Networks:         spec.Job.Networks,
+		NetworkMode:      spec.Job.NetworkMode,
+		CPULimit:         cpu,
+		MemoryLimitBytes: memBytes,
 		// Cronjobs deliberately do NOT register network aliases —
 		// same rationale as one-off jobs. See handlers_job.go's
 		// Recreate call for the full reasoning. Cron ticks fire

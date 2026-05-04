@@ -88,6 +88,11 @@ type DeploymentSpec struct {
 	// into AssetDigests at apply time.
 	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
 
+	// Resources caps the container's CPU/memory at the kernel level
+	// via cgroups (--cpus / --memory on docker run). See ResourcesSpec
+	// for the field shape and value conventions.
+	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
+
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
 	// asset content drift triggers rolling restart without the
@@ -95,6 +100,44 @@ type DeploymentSpec struct {
 	// this field — the apply pipeline stamps it post plugin-expand.
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// ResourcesSpec is the k8s-shape resource constraint block. Voodu
+// is a single-host docker runner today, so only the kernel-cap
+// half of k8s (`limits`) is wired — `requests` is reserved for a
+// future multi-host scheduler-aware mode and currently silently
+// ignored when present.
+//
+//	resources {
+//	  limits {
+//	    cpu    = "2"        # 2 full CPUs (-> docker --cpus=2)
+//	    memory = "4Gi"      # 4 binary gibibytes (-> docker --memory=4294967296)
+//	  }
+//	}
+//
+// CPU value formats:
+//   - "2"      → 2 cpus
+//   - "1.5"    → 1.5 cpus
+//   - "500m"   → 0.5 cpus (millicores, k8s convention)
+//
+// Memory value formats:
+//   - "4Gi"    → 4 * 1024^3 bytes (binary, k8s convention)
+//   - "512Mi"  → 512 * 1024^2 bytes
+//   - "1G"     → 1 * 1000^3 bytes (decimal SI)
+//   - "1024"   → 1024 bytes (no suffix = bytes)
+//
+// Validation lands at parse time so apply fails loudly on a typo
+// instead of silently emitting a container without limits.
+type ResourcesSpec struct {
+	Limits *ResourceLimits `yaml:"limits,omitempty" json:"limits,omitempty"`
+}
+
+// ResourceLimits caps the container at the kernel level via cgroups.
+// Empty / unset fields mean "no limit" — docker daemon defaults apply
+// (effectively unlimited until the host is exhausted).
+type ResourceLimits struct {
+	CPU    string `yaml:"cpu,omitempty"    json:"cpu,omitempty"`
+	Memory string `yaml:"memory,omitempty" json:"memory,omitempty"`
 }
 
 // ReleaseSpec describes the one-shot command voodu runs between
@@ -260,6 +303,10 @@ type StatefulsetSpec struct {
 	// DeploymentSpec.DependsOn for semantics. Same shape, same
 	// stamping behaviour.
 	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+
+	// Resources caps the container's CPU/memory at the kernel level
+	// — see DeploymentSpec.Resources for shape and value rules.
+	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
@@ -464,6 +511,12 @@ type JobSpec struct {
 	// DependsOn declares explicit dependencies — see
 	// DeploymentSpec.DependsOn for semantics.
 	DependsOn *DependsOn `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+
+	// Resources caps the container's CPU/memory at the kernel level
+	// — see DeploymentSpec.Resources for shape and value rules.
+	// Per-run cap; cron + standalone jobs share the same constraint
+	// model as long-running deployments.
+	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`

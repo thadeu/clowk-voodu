@@ -290,6 +290,186 @@ func TestParseHCLStatefulsetRegistryModeKeepsPathEmpty(t *testing.T) {
 	}
 }
 
+func TestParseHCLDeploymentResourcesBlock(t *testing.T) {
+	// resources { limits { cpu = "2" memory = "4Gi" } } — parsed
+	// into the wire spec verbatim (k8svalues normalises later, at
+	// the controller's docker-translation step). Tests pin that the
+	// HCL surface round-trips through JSON.
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_resources.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Resources == nil || spec.Resources.Limits == nil {
+		t.Fatal("resources.limits missing in parsed spec")
+	}
+
+	if spec.Resources.Limits.CPU != "2" {
+		t.Errorf("cpu: got %q, want 2", spec.Resources.Limits.CPU)
+	}
+
+	if spec.Resources.Limits.Memory != "4Gi" {
+		t.Errorf("memory: got %q, want 4Gi", spec.Resources.Limits.Memory)
+	}
+}
+
+func TestParseHCLStatefulsetResourcesBlock(t *testing.T) {
+	// Same shape as deployment — voodu-postgres / voodu-redis
+	// operators in production lean on this for the steady-state
+	// services that need bounded memory.
+	src := `
+statefulset "data" "db" {
+  image    = "postgres:16"
+  replicas = 3
+
+  resources {
+    limits {
+      cpu    = "500m"
+      memory = "2Gi"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "stateful_resources.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec StatefulsetSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Resources == nil || spec.Resources.Limits == nil {
+		t.Fatal("resources.limits missing in parsed spec")
+	}
+
+	if spec.Resources.Limits.CPU != "500m" {
+		t.Errorf("cpu: got %q", spec.Resources.Limits.CPU)
+	}
+
+	if spec.Resources.Limits.Memory != "2Gi" {
+		t.Errorf("memory: got %q", spec.Resources.Limits.Memory)
+	}
+}
+
+func TestParseHCLResourcesBlockOptional(t *testing.T) {
+	// Operator omitting `resources { }` entirely → spec.Resources
+	// is nil. No-limit container, docker daemon defaults apply.
+	src := `deployment "test" "api" { image = "nginx:1.27" }`
+
+	tmp := writeTemp(t, "no_resources.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Resources != nil {
+		t.Errorf("expected nil resources when omitted, got %+v", spec.Resources)
+	}
+}
+
+func TestParseHCLResourcesBlockEmptyLimitsOK(t *testing.T) {
+	// `resources { limits { } }` with no inner fields — valid;
+	// surfaces as &ResourcesSpec{Limits: &ResourceLimits{}} and
+	// dockerResources translates that to ("", 0, nil) = no limit.
+	src := `
+deployment "test" "api" {
+  image = "nginx:1.27"
+
+  resources {
+    limits {}
+  }
+}
+`
+	tmp := writeTemp(t, "empty_limits.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Resources == nil || spec.Resources.Limits == nil {
+		t.Fatal("resources.limits should be present (empty body)")
+	}
+
+	if spec.Resources.Limits.CPU != "" || spec.Resources.Limits.Memory != "" {
+		t.Errorf("expected empty cpu/memory, got %+v", spec.Resources.Limits)
+	}
+}
+
+func TestParseHCLJobResourcesBlock(t *testing.T) {
+	src := `
+job "scope" "migrate" {
+  image   = "ghcr.io/clowk/web:latest"
+  command = ["rails", "db:migrate"]
+
+  resources {
+    limits {
+      cpu    = "1"
+      memory = "1Gi"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "job_resources.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec JobSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Resources == nil || spec.Resources.Limits == nil {
+		t.Fatal("resources.limits missing on job")
+	}
+
+	if spec.Resources.Limits.CPU != "1" || spec.Resources.Limits.Memory != "1Gi" {
+		t.Errorf("limits: %+v", spec.Resources.Limits)
+	}
+}
+
 func TestParseHCLMultiKind(t *testing.T) {
 	src := `
 deployment "test" "api" {

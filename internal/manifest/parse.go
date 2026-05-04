@@ -205,9 +205,10 @@ type hclDeployment struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang      *hclLangBlock    `hcl:"lang,block"`
-	Release   *hclReleaseBlock `hcl:"release,block"`
-	DependsOn *hclDependsOn    `hcl:"depends_on,block"`
+	Lang      *hclLangBlock      `hcl:"lang,block"`
+	Release   *hclReleaseBlock   `hcl:"release,block"`
+	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
+	Resources *hclResourcesBlock `hcl:"resources,block"`
 }
 
 // hclDependsOn is the HCL surface for explicit dependencies. The
@@ -217,6 +218,39 @@ type hclDeployment struct {
 // visible as textual `${asset.…}` refs.
 type hclDependsOn struct {
 	Assets []string `hcl:"assets,optional"`
+}
+
+// hclResourcesBlock is the HCL surface for `resources { limits {…} }`.
+// Mirrors k8s shape; voodu currently honours only the `limits` half
+// (kernel cap via cgroups → docker run --cpus / --memory). The
+// `requests` half is reserved for a future multi-host scheduler.
+type hclResourcesBlock struct {
+	Limits *hclResourceLimits `hcl:"limits,block"`
+}
+
+type hclResourceLimits struct {
+	CPU    string `hcl:"cpu,optional"`
+	Memory string `hcl:"memory,optional"`
+}
+
+// resourcesBlockToSpec converts the HCL surface into the wire-shape
+// ResourcesSpec. nil-in / nil-out so callers don't synthesise an
+// empty block when the operator omitted resources entirely.
+func resourcesBlockToSpec(b *hclResourcesBlock) *ResourcesSpec {
+	if b == nil {
+		return nil
+	}
+
+	out := &ResourcesSpec{}
+
+	if b.Limits != nil {
+		out.Limits = &ResourceLimits{
+			CPU:    b.Limits.CPU,
+			Memory: b.Limits.Memory,
+		}
+	}
+
+	return out
 }
 
 type hclLangBlock struct {
@@ -274,6 +308,12 @@ func (b hclDeployment) spec() DeploymentSpec {
 			Timeout:     b.Release.Timeout,
 		}
 	}
+
+	if b.DependsOn != nil {
+		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
+	}
+
+	s.Resources = resourcesBlockToSpec(b.Resources)
 
 	s.applyDefaults()
 
@@ -461,9 +501,10 @@ type hclStatefulset struct {
 	Restart     string            `hcl:"restart,optional"`
 	HealthCheck string            `hcl:"health_check,optional"`
 
-	Lang         *hclLangBlock    `hcl:"lang,block"`
-	VolumeClaims []hclVolumeClaim `hcl:"volume_claim,block"`
-	DependsOn    *hclDependsOn    `hcl:"depends_on,block"`
+	Lang         *hclLangBlock      `hcl:"lang,block"`
+	VolumeClaims []hclVolumeClaim   `hcl:"volume_claim,block"`
+	DependsOn    *hclDependsOn      `hcl:"depends_on,block"`
+	Resources    *hclResourcesBlock `hcl:"resources,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -518,6 +559,8 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 	if b.DependsOn != nil {
 		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
+
+	s.Resources = resourcesBlockToSpec(b.Resources)
 
 	s.applyDefaults()
 
@@ -604,8 +647,9 @@ type hclJob struct {
 	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
 	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
 
-	Lang      *hclLangBlock `hcl:"lang,block"`
-	DependsOn *hclDependsOn `hcl:"depends_on,block"`
+	Lang      *hclLangBlock      `hcl:"lang,block"`
+	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
+	Resources *hclResourcesBlock `hcl:"resources,block"`
 }
 
 func (b hclJob) spec() JobSpec {
@@ -638,6 +682,8 @@ func (b hclJob) spec() JobSpec {
 	if b.DependsOn != nil {
 		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
+
+	s.Resources = resourcesBlockToSpec(b.Resources)
 
 	return s
 }
@@ -676,8 +722,9 @@ type hclCronJob struct {
 	NetworkMode string            `hcl:"network_mode,optional"`
 	Timeout     string            `hcl:"timeout,optional"`
 
-	Lang      *hclLangBlock `hcl:"lang,block"`
-	DependsOn *hclDependsOn `hcl:"depends_on,block"`
+	Lang      *hclLangBlock      `hcl:"lang,block"`
+	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
+	Resources *hclResourcesBlock `hcl:"resources,block"`
 }
 
 func (b hclCronJob) spec() CronJobSpec {
@@ -708,6 +755,8 @@ func (b hclCronJob) spec() CronJobSpec {
 	if b.DependsOn != nil {
 		job.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
+
+	job.Resources = resourcesBlockToSpec(b.Resources)
 
 	return CronJobSpec{
 		Schedule:               b.Schedule,

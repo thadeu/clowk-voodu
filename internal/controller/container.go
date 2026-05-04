@@ -297,6 +297,20 @@ type ContainerSpec struct {
 	// streaming. Operators see migration output flow live instead of
 	// in one final dump.
 	TTY bool
+
+	// CPULimit caps the container's CPU usage at the kernel level
+	// via cgroups (--cpus on docker run). Empty = no limit. Pre-
+	// validated by the manifest layer (manifest.ParseK8sCPU)
+	// — the value here is already in docker-compatible decimal
+	// form ("0.5", "2", "1.5"), no further parsing required.
+	CPULimit string
+
+	// MemoryLimitBytes caps the container's memory at the kernel
+	// level via cgroups (--memory on docker run). 0 = no limit.
+	// Pre-validated and converted from k8s suffixes by the manifest
+	// layer (manifest.ParseK8sMemoryBytes) — the value here is
+	// already in bytes.
+	MemoryLimitBytes int64
 }
 
 // DockerContainerManager is the production ContainerManager backed by
@@ -351,21 +365,23 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 	}
 
 	cfg := docker.ContainerConfig{
-		Name:           spec.Name,
-		Image:          spec.Image,
-		Command:        spec.Command,
-		Ports:          spec.Ports,
-		Volumes:        spec.Volumes,
-		NetworkMode:    spec.NetworkMode,
-		Networks:       spec.Networks,
-		NetworkAliases: spec.NetworkAliases,
-		RestartPolicy:  spec.Restart,
-		EnvFile:        spec.EnvFile,
-		ExtraEnvFiles:  spec.ExtraEnvFiles,
-		Env:            spec.Env,
-		Labels:         spec.Labels,
-		AutoRemove:     spec.AutoRemove,
-		TTY:            spec.TTY,
+		Name:             spec.Name,
+		Image:            spec.Image,
+		Command:          spec.Command,
+		Ports:            spec.Ports,
+		Volumes:          spec.Volumes,
+		NetworkMode:      spec.NetworkMode,
+		Networks:         spec.Networks,
+		NetworkAliases:   spec.NetworkAliases,
+		RestartPolicy:    spec.Restart,
+		EnvFile:          spec.EnvFile,
+		ExtraEnvFiles:    spec.ExtraEnvFiles,
+		Env:              spec.Env,
+		Labels:           spec.Labels,
+		AutoRemove:       spec.AutoRemove,
+		TTY:              spec.TTY,
+		CPULimit:         spec.CPULimit,
+		MemoryLimitBytes: spec.MemoryLimitBytes,
 	}
 
 	if err := docker.CreateContainer(cfg); err != nil {
@@ -688,21 +704,23 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 	}
 
 	cfg := docker.ContainerConfig{
-		Name:           spec.Name,
-		Image:          spec.Image,
-		Command:        spec.Command,
-		Ports:          spec.Ports,
-		Volumes:        spec.Volumes,
-		NetworkMode:    spec.NetworkMode,
-		Networks:       spec.Networks,
-		NetworkAliases: spec.NetworkAliases,
-		RestartPolicy:  spec.Restart,
-		EnvFile:        spec.EnvFile,
-		ExtraEnvFiles:  spec.ExtraEnvFiles,
-		Env:            spec.Env,
-		Labels:         spec.Labels,
-		AutoRemove:     spec.AutoRemove,
-		TTY:            spec.TTY,
+		Name:             spec.Name,
+		Image:            spec.Image,
+		Command:          spec.Command,
+		Ports:            spec.Ports,
+		Volumes:          spec.Volumes,
+		NetworkMode:      spec.NetworkMode,
+		Networks:         spec.Networks,
+		NetworkAliases:   spec.NetworkAliases,
+		RestartPolicy:    spec.Restart,
+		EnvFile:          spec.EnvFile,
+		ExtraEnvFiles:    spec.ExtraEnvFiles,
+		Env:              spec.Env,
+		Labels:           spec.Labels,
+		AutoRemove:       spec.AutoRemove,
+		TTY:              spec.TTY,
+		CPULimit:         spec.CPULimit,
+		MemoryLimitBytes: spec.MemoryLimitBytes,
 	}
 
 	return docker.CreateContainer(cfg)

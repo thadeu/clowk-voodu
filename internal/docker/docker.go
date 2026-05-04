@@ -129,6 +129,18 @@ type ContainerConfig struct {
 	// TTY=true on those one-shot runs forces line-buffering so
 	// `docker logs -f` flows naturally.
 	TTY bool
+
+	// CPULimit becomes `--cpus <CPULimit>` on docker run when
+	// non-empty. Pre-validated by the manifest layer — the value
+	// here is already in the docker-accepted decimal float form
+	// ("0.5", "2", "1.5"). Empty = no limit (cgroup defaults to
+	// the host's full CPU count).
+	CPULimit string
+
+	// MemoryLimitBytes becomes `--memory <bytes>` on docker run
+	// when > 0. Pre-validated and converted from k8s suffixes
+	// (4Gi, 512Mi, 1G, etc.) by the manifest layer. 0 = no limit.
+	MemoryLimitBytes int64
 }
 
 // DeploymentConfig represents deployment configuration.
@@ -273,6 +285,18 @@ func CreateContainer(cfg ContainerConfig) error {
 
 	args = append(args, "--ulimit", "nofile=65536:65536")
 	args = append(args, "--ulimit", "nproc=4096:4096")
+
+	// Resource caps via cgroups. Empty/zero values mean "no limit"
+	// — docker daemon's defaults apply (effectively unbounded
+	// until the host runs out). Pre-validated by the manifest
+	// layer, so any non-empty value is safe to splice as-is.
+	if cfg.CPULimit != "" {
+		args = append(args, "--cpus", cfg.CPULimit)
+	}
+
+	if cfg.MemoryLimitBytes > 0 {
+		args = append(args, "--memory", fmt.Sprintf("%d", cfg.MemoryLimitBytes))
+	}
 
 	// TTY allocation forces line-buffered stdout in the container's
 	// process. Plumbed in for release-phase one-shots; long-running

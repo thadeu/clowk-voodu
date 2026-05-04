@@ -58,6 +58,11 @@ type jobSpec struct {
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 
+	// Resources mirrors manifest.ResourcesSpec — kernel-level
+	// CPU/memory caps via cgroups. For cron jobs the same shape
+	// applies to each tick's run container.
+	Resources *resourcesWireSpec `json:"resources,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the job touches. Job hashing folds it in the same way
 	// deployments / statefulsets do — see statefulsetSpec.AssetDigests
@@ -323,13 +328,26 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		h.logf("job/%s status persist failed (pre-run): %v", app, err)
 	}
 
+	cpu, memBytes, resErr := dockerResources(spec.Resources)
+	if resErr != nil {
+		run.Status = JobStatusFailed
+		run.EndedAt = time.Now().UTC()
+		run.Error = fmt.Sprintf("invalid resources: %v", resErr)
+
+		_ = h.appendRun(ctx, app, spec.Image, run, successCap, failureCap)
+
+		return run, fmt.Errorf("job/%s: %w", app, resErr)
+	}
+
 	if err := h.Containers.Recreate(ContainerSpec{
-		Name:        cname,
-		Image:       spec.Image,
-		Command:     spec.Command,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
+		Name:             cname,
+		Image:            spec.Image,
+		Command:          spec.Command,
+		Volumes:          spec.Volumes,
+		Networks:         spec.Networks,
+		NetworkMode:      spec.NetworkMode,
+		CPULimit:         cpu,
+		MemoryLimitBytes: memBytes,
 		// Jobs deliberately do NOT register network aliases on
 		// the bridge. They join voodu0 (so the job container can
 		// dial internal services like redis.scope.voodu, postgres.
