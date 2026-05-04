@@ -446,6 +446,9 @@ func (b hclApp) ingressSpec() IngressSpec {
 // VolumeClaim becomes a block list in M-S2.
 type hclStatefulset struct {
 	Image       string            `hcl:"image,optional"`
+	Workdir     string            `hcl:"workdir,optional"`
+	Dockerfile  string            `hcl:"dockerfile,optional"`
+	Path        string            `hcl:"path,optional"`
 	Replicas    int               `hcl:"replicas,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
@@ -458,6 +461,7 @@ type hclStatefulset struct {
 	Restart     string            `hcl:"restart,optional"`
 	HealthCheck string            `hcl:"health_check,optional"`
 
+	Lang         *hclLangBlock    `hcl:"lang,block"`
 	VolumeClaims []hclVolumeClaim `hcl:"volume_claim,block"`
 	DependsOn    *hclDependsOn    `hcl:"depends_on,block"`
 }
@@ -475,6 +479,9 @@ type hclVolumeClaim struct {
 func (b hclStatefulset) spec() StatefulsetSpec {
 	s := StatefulsetSpec{
 		Image:       b.Image,
+		Workdir:     b.Workdir,
+		Dockerfile:  b.Dockerfile,
+		Path:        b.Path,
 		Replicas:    b.Replicas,
 		Command:     b.Command,
 		Env:         b.Env,
@@ -486,6 +493,15 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 		NetworkMode: b.NetworkMode,
 		Restart:     b.Restart,
 		HealthCheck: b.HealthCheck,
+	}
+
+	if b.Lang != nil {
+		s.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+			BuildArgs:  b.Lang.BuildArgs,
+		}
 	}
 
 	if len(b.VolumeClaims) > 0 {
@@ -502,6 +518,8 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 	if b.DependsOn != nil {
 		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
+
+	s.applyDefaults()
 
 	return s
 }
@@ -1347,7 +1365,13 @@ func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, err
 
 	case controller.KindStatefulset:
 		var s StatefulsetSpec
-		return s, node.Decode(&s)
+		if err := node.Decode(&s); err != nil {
+			return s, err
+		}
+
+		s.applyDefaults()
+
+		return s, nil
 
 	case controller.KindIngress:
 		var s IngressSpec

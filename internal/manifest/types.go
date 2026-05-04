@@ -199,10 +199,13 @@ func (s *DeploymentSpec) applyDefaults() {
 //   - Rollouts are ordered: scale-up provisions 0→N-1 sequentially,
 //     scale-down removes N-1→0, rolling-replace iterates top-down.
 //
-// Image-mode only on M-S0/M-S1; build-mode (`lang {}`) and release-phase
-// commands (`release {}`) are deferred — statefulset workloads in
-// practice are databases / queues / caches with prebuilt registry
-// images. Adding either later is mechanical (mirror DeploymentSpec).
+// Build-mode (`workdir`/`dockerfile`/`path`/`lang {}`) is supported the
+// same way DeploymentSpec supports it — when `Image` is empty the
+// reconciler streams the operator's source via `voodu receive-pack`,
+// runs the standard build pipeline, and tags `<scope>-<name>:latest`
+// for the statefulset to pull. Use case: postgres + pgvector or redis
+// with custom modules without needing a separate CI to publish the
+// image.
 //
 // Networking and env behave identically to DeploymentSpec: voodu0
 // auto-join, ports loopback by default, env from manifest+config
@@ -211,6 +214,9 @@ func (s *DeploymentSpec) applyDefaults() {
 // new affordance.
 type StatefulsetSpec struct {
 	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
+	Workdir     string            `yaml:"workdir,omitempty"      json:"workdir,omitempty"`
+	Dockerfile  string            `yaml:"dockerfile,omitempty"   json:"dockerfile,omitempty"`
+	Path        string            `yaml:"path,omitempty"         json:"path,omitempty"`
 	Replicas    int               `yaml:"replicas,omitempty"     json:"replicas,omitempty"`
 	Command     []string          `yaml:"command,omitempty"      json:"command,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"          json:"env,omitempty"`
@@ -221,6 +227,12 @@ type StatefulsetSpec struct {
 	NetworkMode string            `yaml:"network_mode,omitempty" json:"network_mode,omitempty"`
 	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
 	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
+
+	// Lang carries build-time inputs when Image is empty — same shape
+	// and semantics as DeploymentSpec.Lang. Optional; the lang
+	// handlers auto-detect from marker files (Gemfile, package.json,
+	// go.mod, …) when omitted.
+	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
 
 	// EnvFrom stacks env files from other resources, same shape +
 	// semantics as JobSpec.EnvFrom: each entry is `<scope>/<name>`
@@ -251,6 +263,23 @@ type StatefulsetSpec struct {
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// applyDefaults fills implicit values for the build-mode case (mirror
+// of DeploymentSpec.applyDefaults). Image-mode statefulsets skip this
+// because Path/Workdir/Dockerfile are meaningless when no build runs.
+//
+// No HealthCheck default: statefulset workloads (postgres, redis,
+// kafka) don't have a universal HTTP probe path the way HTTP apps do —
+// the operator picks `pg_isready`, `redis-cli ping`, etc.
+func (s *StatefulsetSpec) applyDefaults() {
+	if s.Image != "" {
+		return
+	}
+
+	if s.Path == "" {
+		s.Path = "."
+	}
 }
 
 // VolumeClaim is one per-pod storage template. Voodu provisions a

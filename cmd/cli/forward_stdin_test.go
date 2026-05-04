@@ -178,6 +178,115 @@ deployment "prod" "api" {
 	}
 }
 
+func TestRewriteForStdinStream_BuildModeStatefulset(t *testing.T) {
+	// Statefulset with no Image triggers the same source-push pipeline
+	// as a build-mode deployment. Use case: postgres + pgvector built
+	// inline from a Dockerfile that does `FROM postgres:16` + apt-get.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stack.hcl")
+
+	stack := `statefulset "prod" "db" {
+  workdir    = "infra/postgres"
+  dockerfile = "Dockerfile.pg"
+  replicas   = 1
+}
+`
+
+	if err := os.WriteFile(path, []byte(stack), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.buildModeDeploys) != 1 {
+		t.Fatalf("expected 1 build-mode statefulset, got %d: %+v", len(got.buildModeDeploys), got.buildModeDeploys)
+	}
+
+	bm := got.buildModeDeploys[0]
+	if bm.Scope != "prod" || bm.Name != "db" {
+		t.Errorf("ref = %s/%s, want prod/db", bm.Scope, bm.Name)
+	}
+
+	// applyDefaults should fill Path = "." for build-mode statefulset
+	// (no explicit path = root context, like deployment).
+	if bm.Path != "." {
+		t.Errorf("path = %q, want %q (applyDefaults should fill root)", bm.Path, ".")
+	}
+}
+
+func TestRewriteForStdinStream_RegistryModeStatefulsetSkipsPush(t *testing.T) {
+	// Statefulset with explicit image — must NOT trigger source push.
+	// Mirror of the deployment registry-mode test.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stack.hcl")
+
+	stack := `statefulset "prod" "redis" {
+  image    = "redis:8"
+  replicas = 1
+}
+`
+
+	if err := os.WriteFile(path, []byte(stack), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.buildModeDeploys) > 0 {
+		t.Errorf("registry-mode statefulset must not trigger source push, got %+v", got.buildModeDeploys)
+	}
+}
+
+func TestRewriteForStdinStream_BuildModeDeploymentAndStatefulset(t *testing.T) {
+	// Mixed file: one deployment + one statefulset, both build-mode.
+	// Both should appear in buildModeDeploys (same source-push pipeline
+	// services both kinds).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stack.hcl")
+
+	stack := `deployment "prod" "api" {
+  ports = ["3000"]
+
+  lang {
+    name    = "go"
+    version = "1.25"
+  }
+}
+
+statefulset "prod" "db" {
+  dockerfile = "Dockerfile.pg"
+}
+`
+
+	if err := os.WriteFile(path, []byte(stack), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.buildModeDeploys) != 2 {
+		t.Fatalf("expected 2 build-mode entries (deployment + statefulset), got %d: %+v", len(got.buildModeDeploys), got.buildModeDeploys)
+	}
+
+	names := map[string]bool{}
+	for _, bm := range got.buildModeDeploys {
+		names[bm.Name] = true
+	}
+
+	if !names["api"] || !names["db"] {
+		t.Errorf("expected both 'api' (deployment) and 'db' (statefulset) flagged, got %v", names)
+	}
+}
+
 func TestSplitFileAndFormatFlags(t *testing.T) {
 	paths, format, rest := splitFileAndFormatFlags([]string{
 		"apply", "-f", "a.hcl", "--file", "b.yml", "--format=yaml", "-a", "api",

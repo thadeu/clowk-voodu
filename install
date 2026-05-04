@@ -31,7 +31,7 @@ set -euo pipefail
 REPO="${VOODU_INSTALL_REPO:-thadeu/clowk-voodu}"
 VERSION="${VERSION:-}"
 VOODU_ROOT="${VOODU_ROOT:-/opt/voodu}"
-VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-127.0.0.1:8686}"
+VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-0.0.0.0:8686}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 BIN_DIR="/usr/local/bin"
 UNIT_PATH="/etc/systemd/system/voodu-controller.service"

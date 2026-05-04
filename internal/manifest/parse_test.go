@@ -209,6 +209,87 @@ func TestParseHCLDeploymentImageOptional(t *testing.T) {
 	}
 }
 
+func TestParseHCLStatefulsetBuildMode(t *testing.T) {
+	// Statefulset with no Image + dockerfile + lang block — exercises
+	// the build-mode path. Mirror of TestParseHCLDeploymentImageOptional
+	// but for the stateful kind. Use case: postgres + pgvector built
+	// inline (FROM postgres:16, apt-get install postgresql-16-pgvector)
+	// without a separate CI to publish a custom registry image.
+	src := `statefulset "data" "pg" {
+  workdir    = "infra/postgres"
+  dockerfile = "Dockerfile.pg"
+  replicas   = 1
+
+  lang {
+    name = "generic"
+  }
+}`
+
+	tmp := writeTemp(t, "stateful_build.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("statefulset build-mode parse: %v", err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	var spec StatefulsetSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Image != "" {
+		t.Errorf("image should stay empty (build mode): %q", spec.Image)
+	}
+
+	if spec.Workdir != "infra/postgres" {
+		t.Errorf("workdir lost: %q", spec.Workdir)
+	}
+
+	if spec.Dockerfile != "Dockerfile.pg" {
+		t.Errorf("dockerfile lost: %q", spec.Dockerfile)
+	}
+
+	if spec.Path != "." {
+		t.Errorf("applyDefaults should fill Path = \".\", got %q", spec.Path)
+	}
+
+	if spec.Lang == nil || spec.Lang.Name != "generic" {
+		t.Errorf("lang block lost: %+v", spec.Lang)
+	}
+}
+
+func TestParseHCLStatefulsetRegistryModeKeepsPathEmpty(t *testing.T) {
+	// Image-mode: applyDefaults should NOT fill Path. Mirrors the
+	// deployment behaviour — Path/Workdir/Dockerfile are meaningless
+	// when no build runs.
+	src := `statefulset "data" "redis" {
+  image    = "redis:8"
+  replicas = 1
+}`
+
+	tmp := writeTemp(t, "stateful_registry.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec StatefulsetSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Path != "" {
+		t.Errorf("registry-mode statefulset must not get Path default, got %q", spec.Path)
+	}
+}
+
 func TestParseHCLMultiKind(t *testing.T) {
 	src := `
 deployment "test" "api" {

@@ -118,32 +118,57 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 	return result, nil
 }
 
-// extractBuildModeDeploys returns one entry per deployment whose Image
-// field is empty — those are the manifests that need source on the
-// server before the controller can reconcile. The returned Path is
-// already defaulted ("." for root), so callers don't repeat the
-// defaulting logic. Path is CWD-relative: the build context is whatever
-// directory the operator invoked `voodu apply` from, matching the
-// mental model of docker/podman (`docker build .` = "here").
+// extractBuildModeDeploys returns one entry per build-capable manifest
+// (deployment OR statefulset) whose Image field is empty — those are
+// the manifests that need source on the server before the controller
+// can reconcile. The returned Path is already defaulted ("." for
+// root), so callers don't repeat the defaulting logic. Path is
+// CWD-relative: the build context is whatever directory the operator
+// invoked `voodu apply` from, matching the mental model of
+// docker/podman (`docker build .` = "here").
+//
+// Statefulset is included because postgres/redis/etc. operators may
+// want to bake extensions (pgvector, RediSearch) into a custom image
+// without a separate CI — same Image/Dockerfile/Workdir/Path/Lang
+// surface as deployment, same receive-pack pipeline.
 func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 	var out []buildModeDep
 
 	for _, m := range mans {
-		if m.Kind != controller.KindDeployment {
+		var (
+			image string
+			path  string
+		)
+
+		switch m.Kind {
+		case controller.KindDeployment:
+			var spec manifest.DeploymentSpec
+
+			if err := json.Unmarshal(m.Spec, &spec); err != nil {
+				continue
+			}
+
+			image = spec.Image
+			path = spec.Path
+
+		case controller.KindStatefulset:
+			var spec manifest.StatefulsetSpec
+
+			if err := json.Unmarshal(m.Spec, &spec); err != nil {
+				continue
+			}
+
+			image = spec.Image
+			path = spec.Path
+
+		default:
 			continue
 		}
 
-		var spec manifest.DeploymentSpec
-
-		if err := json.Unmarshal(m.Spec, &spec); err != nil {
+		if image != "" {
 			continue
 		}
 
-		if spec.Image != "" {
-			continue
-		}
-
-		path := spec.Path
 		if path == "" {
 			path = "."
 		}
