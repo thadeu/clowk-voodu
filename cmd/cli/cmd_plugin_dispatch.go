@@ -18,12 +18,16 @@ import (
 // All semantics live in the plugin itself; the CLI just packages
 // the operator's args and POSTs them.
 //
-// Detection rule: argv has at least 2 tokens, both are plain
-// alphanumeric identifiers (after rewriteColonSyntax has split
-// any `:` shorthand). Everything after argv[1] is treated as
-// the plugin command's args, including flags like `-h` —
-// those flow through to the plugin which is responsible for
-// its own help output.
+// Detection rule: argv has at least 2 tokens; argv[0] is a plain
+// alphanumeric identifier (the plugin); argv[1] is a command
+// path — one or more idents separated by colons, e.g. `info`,
+// `backups:capture`, etc. Multi-segment commands let plugins
+// expose nested verbs (heroku-style `pg:backups:capture`) without
+// the CLI needing to know about them.
+//
+// Everything after argv[1] is treated as the plugin command's
+// args, including flags like `-h` — those flow through to the
+// plugin which is responsible for its own help output.
 //
 // Returns (plugin, command, args, true) on a match.
 func looksLikePluginDispatch(argv []string) (plugin, command string, args []string, ok bool) {
@@ -31,11 +35,33 @@ func looksLikePluginDispatch(argv []string) (plugin, command string, args []stri
 		return "", "", nil, false
 	}
 
-	if !isIdent(argv[0]) || !isIdent(argv[1]) {
+	if !isIdent(argv[0]) || !isCommandPath(argv[1]) {
 		return "", "", nil, false
 	}
 
 	return argv[0], argv[1], argv[2:], true
+}
+
+// isCommandPath reports whether s is a colon-separated chain of
+// idents (`info`, `backups:capture`, `a:b:c`). Used to validate
+// the command segment of a plugin dispatch invocation.
+//
+// Defined here (vs alongside isIdent in dispatch.go) so the
+// dispatch test file in this package — which exercises
+// looksLikePluginDispatch — sees both helpers without a circular
+// import.
+func isCommandPath(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") {
+		return false
+	}
+
+	for _, chunk := range strings.Split(s, ":") {
+		if !isIdent(chunk) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // pluginDispatchPayload mirrors the server-side

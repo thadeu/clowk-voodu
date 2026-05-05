@@ -70,6 +70,30 @@ func LoadFromDir(dir string) (*LoadedPlugin, error) {
 		}
 	}
 
+	// Entrypoint mode: when plugin.yml declares a single binary
+	// for every command, override the bin/<command> map so all
+	// declared commands resolve to the entrypoint path. The exec
+	// layer then prepends the command name as argv[1]. Plugin
+	// authors get to ship one binary + plugin.yml, no shim parade.
+	if manifest.Entrypoint != "" {
+		entrypointPath := filepath.Join(dir, manifest.Entrypoint)
+
+		if info, err := os.Stat(entrypointPath); err != nil || info.IsDir() {
+			return nil, fmt.Errorf("plugin %q: entrypoint %q not found or not a file (looked at %s)",
+				manifest.Name, manifest.Entrypoint, entrypointPath)
+		}
+
+		// Replace the discovered commands map. Every command the
+		// plugin declares now points at the entrypoint; bin/ files
+		// (if any) are ignored for routing purposes.
+		entrypointCmds := make(map[string]string, len(manifest.Commands))
+		for _, c := range manifest.Commands {
+			entrypointCmds[c.Name] = entrypointPath
+		}
+
+		cmds = entrypointCmds
+	}
+
 	return &LoadedPlugin{
 		Manifest: manifest,
 		Dir:      dir,

@@ -106,6 +106,24 @@ type Manifest struct {
 	// `vd plugins:list` highlighting the duplicate.
 	Aliases []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
 
+	// Entrypoint is the path (relative to the plugin's install
+	// directory) of a single binary that handles every command
+	// declared in Commands. When set, the controller invokes the
+	// entrypoint and prepends the command name as argv[1] —
+	// internal command routing is the plugin's responsibility
+	// (typically a switch on os.Args[1] or cobra inside the binary).
+	//
+	// Plugins that DON'T set this fall back to per-command
+	// resolution: every subcommand needs its own file under bin/
+	// (`bin/foo`, `bin/foo:bar`, ...). Legacy / shell plugins use
+	// that shape; new Go plugins should set Entrypoint and skip
+	// the shim parade.
+	//
+	// Resolution: relative to the plugin's install dir. A typical
+	// value is `bin/<plugin-name>` (e.g. `bin/voodu-postgres`),
+	// but anything goes — the controller doesn't impose a layout.
+	Entrypoint string `yaml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
+
 	Commands []Command         `yaml:"commands,omitempty" json:"commands,omitempty"`
 	Env      map[string]string `yaml:"env,omitempty"      json:"env,omitempty"`
 	Source   string            `yaml:"-"                  json:"source,omitempty"`

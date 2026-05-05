@@ -118,6 +118,106 @@ func TestRunUnknownCommand(t *testing.T) {
 	}
 }
 
+// TestRunEntrypointPrependsCommandName pins the entrypoint
+// dispatch contract: when plugin.yml declares a single binary,
+// every command invocation reaches the binary with the command
+// name as argv[1]. Plugin's internal switch / cobra router uses
+// argv[1] to dispatch, so the prepend is mandatory.
+func TestRunEntrypointPrependsCommandName(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plugin emits "$@" verbatim so the test can read the args
+	// it received from the controller.
+	if err := os.WriteFile(filepath.Join(dir, "plugin.yml"), []byte(`
+name: demo
+entrypoint: bin/demo
+commands:
+  - name: foo
+  - name: bar:baz
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(binDir, "demo"),
+		[]byte("#!/bin/bash\necho \"received: $*\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	t.Run("simple command", func(t *testing.T) {
+		res, err := p.Run(context.Background(), RunOptions{
+			Command: "foo",
+			Args:    []string{"alpha", "beta"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got := strings.TrimSpace(string(res.Raw))
+		want := "received: foo alpha beta"
+
+		if got != want {
+			t.Errorf("\n  got:  %q\n  want: %q", got, want)
+		}
+	})
+
+	t.Run("colon command", func(t *testing.T) {
+		// Multi-segment command (heroku-style nested) reaches
+		// the binary as a single argv element. Plugin's router
+		// receives `bar:baz` as argv[1].
+		res, err := p.Run(context.Background(), RunOptions{
+			Command: "bar:baz",
+			Args:    []string{"ref", "--flag"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got := strings.TrimSpace(string(res.Raw))
+		want := "received: bar:baz ref --flag"
+
+		if got != want {
+			t.Errorf("\n  got:  %q\n  want: %q", got, want)
+		}
+	})
+}
+
+// TestRunLegacyDoesNotPrependCommandName confirms back-compat:
+// per-command bin/<cmd> shims still get the args verbatim, with
+// no command-name prepend. The shim file IS the dispatch already
+// — adding a prepend would break every existing plugin that uses
+// the old shape (voodu-redis, voodu-caddy, etc.).
+func TestRunLegacyDoesNotPrependCommandName(t *testing.T) {
+	p := newTestPlugin(t, map[string]string{
+		"echo-args": "#!/bin/bash\necho \"received: $*\"\n",
+	})
+
+	res, err := p.Run(context.Background(), RunOptions{
+		Command: "echo-args",
+		Args:    []string{"alpha", "beta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := strings.TrimSpace(string(res.Raw))
+	want := "received: alpha beta"
+
+	if got != want {
+		t.Errorf("legacy mode must NOT prepend command name:\n  got:  %q\n  want: %q",
+			got, want)
+	}
+}
+
 func newTestPlugin(t *testing.T, commands map[string]string) *LoadedPlugin {
 	t.Helper()
 

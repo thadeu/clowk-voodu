@@ -195,6 +195,30 @@ func TestLooksLikePluginDispatch_DetectorRules(t *testing.T) {
 			args:   []string{"redis", "weird/command"},
 			wantOK: false,
 		},
+		{
+			name:       "command with single colon (heroku-style nested)",
+			args:       []string{"postgres", "backups:capture", "clowk-lp/db"},
+			wantOK:     true,
+			wantPlugin: "postgres", wantCmd: "backups:capture",
+			wantArgs: []string{"clowk-lp/db"},
+		},
+		{
+			name:       "command with multiple colons (deeper nesting)",
+			args:       []string{"plugin", "verb:sub:leaf", "ref"},
+			wantOK:     true,
+			wantPlugin: "plugin", wantCmd: "verb:sub:leaf",
+			wantArgs: []string{"ref"},
+		},
+		{
+			name:   "command with empty colon-segment is rejected",
+			args:   []string{"plugin", "verb::leaf"},
+			wantOK: false,
+		},
+		{
+			name:   "command with trailing colon is rejected",
+			args:   []string{"plugin", "verb:"},
+			wantOK: false,
+		},
 	}
 
 	for _, tc := range cases {

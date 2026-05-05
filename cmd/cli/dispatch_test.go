@@ -81,6 +81,26 @@ func TestRewriteColonSyntax(t *testing.T) {
 			in:   []string{"voodu", "foo:"},
 			want: []string{"voodu", "foo:"},
 		},
+		{
+			name: "multi-colon plugin command (heroku-style nested)",
+			in:   []string{"voodu", "pg:backups:capture", "clowk-lp/db"},
+			want: []string{"voodu", "pg", "backups:capture", "clowk-lp/db"},
+		},
+		{
+			name: "multi-colon plugin command with flag",
+			in:   []string{"voodu", "pg:backups:cancel", "clowk-lp/db", "b008"},
+			want: []string{"voodu", "pg", "backups:cancel", "clowk-lp/db", "b008"},
+		},
+		{
+			name: "deep colon chain (a:b:c:d) all valid idents splits on first",
+			in:   []string{"voodu", "a:b:c:d"},
+			want: []string{"voodu", "a", "b:c:d"},
+		},
+		{
+			name: "multi-colon with invalid chunk (slash inside) NOT rewritten",
+			in:   []string{"voodu", "pg:backups:capture/x", "ref"},
+			want: []string{"voodu", "pg:backups:capture/x", "ref"},
+		},
 	}
 
 	for _, tc := range cases {

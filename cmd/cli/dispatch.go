@@ -169,12 +169,27 @@ func splitCommandColon(tok string) (string, string, bool) {
 	left := tok[:idx]
 	right := tok[idx+1:]
 
-	if strings.ContainsAny(right, ":/@") {
+	// Reject paths/URLs masquerading as commands. URLs typically
+	// contain `/` (s3://bucket/key) or `@` (user@host:path); plain
+	// `host:port` strings would accidentally split, but operators
+	// don't pass those as positional command names.
+	if strings.ContainsAny(right, "/@") {
 		return "", "", false
 	}
 
-	if !isIdent(left) || !isIdent(right) {
+	if !isIdent(left) {
 		return "", "", false
+	}
+
+	// Right side may itself contain colons for chained subcommands
+	// (heroku-style: `pg:backups:capture` → plugin=pg,
+	// command=`backups:capture`). Each colon-separated chunk must
+	// be a plain identifier so we don't mangle URLs/paths sneaking
+	// past the slash check above.
+	for _, chunk := range strings.Split(right, ":") {
+		if !isIdent(chunk) {
+			return "", "", false
+		}
 	}
 
 	return left, right, true

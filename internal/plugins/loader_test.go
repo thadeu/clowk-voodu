@@ -196,6 +196,134 @@ func TestLoadByName_NotFound(t *testing.T) {
 	}
 }
 
+// TestLoadFromDir_EntrypointModeRoutesAllCommandsToOneBinary pins
+// the entrypoint convention: when plugin.yml declares
+// `entrypoint: bin/<plugin>`, every command in the manifest
+// resolves to that single binary. No per-command bin/<cmd> shims
+// needed.
+func TestLoadFromDir_EntrypointModeRoutesAllCommandsToOneBinary(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "plugin.yml"), `
+name: postgres
+entrypoint: bin/voodu-postgres
+commands:
+  - name: info
+  - name: backups
+  - name: backups:capture
+  - name: backups:cancel
+`)
+
+	mkdir(t, filepath.Join(dir, "bin"))
+	writeFile(t, filepath.Join(dir, "bin", "voodu-postgres"), "#!/bin/bash\necho ok\n")
+	os.Chmod(filepath.Join(dir, "bin", "voodu-postgres"), 0755)
+
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	wantPath := filepath.Join(dir, "bin", "voodu-postgres")
+
+	for _, cmd := range []string{"info", "backups", "backups:capture", "backups:cancel"} {
+		got, ok := p.Commands[cmd]
+		if !ok {
+			t.Errorf("command %q not registered: %v", cmd, p.Commands)
+			continue
+		}
+
+		if got != wantPath {
+			t.Errorf("command %q resolved to %q, want %q", cmd, got, wantPath)
+		}
+	}
+}
+
+// TestLoadFromDir_EntrypointModeIgnoresStalePerCommandBins pins
+// the priority: when entrypoint is set, lingering bin/<command>
+// files (e.g. from a half-migrated plugin) are ignored. Otherwise
+// the loader could route the same command to two different
+// executables non-deterministically.
+func TestLoadFromDir_EntrypointModeIgnoresStalePerCommandBins(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "plugin.yml"), `
+name: demo
+entrypoint: bin/demo
+commands:
+  - name: foo
+`)
+
+	mkdir(t, filepath.Join(dir, "bin"))
+	writeFile(t, filepath.Join(dir, "bin", "demo"), "#!/bin/bash\necho hi\n")
+	writeFile(t, filepath.Join(dir, "bin", "foo"), "#!/bin/bash\necho stale\n")
+	os.Chmod(filepath.Join(dir, "bin", "demo"), 0755)
+	os.Chmod(filepath.Join(dir, "bin", "foo"), 0755)
+
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	wantPath := filepath.Join(dir, "bin", "demo")
+	if p.Commands["foo"] != wantPath {
+		t.Errorf("entrypoint should win over stale bin/foo: got %q, want %q",
+			p.Commands["foo"], wantPath)
+	}
+}
+
+// TestLoadFromDir_EntrypointMissingFileErrors pins the safety
+// guard: a plugin.yml that points entrypoint at a non-existent
+// file fails LoadFromDir loud. Otherwise dispatch would fail at
+// invocation time with a less obvious error.
+func TestLoadFromDir_EntrypointMissingFileErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "plugin.yml"), `
+name: demo
+entrypoint: bin/missing-binary
+commands:
+  - name: foo
+`)
+
+	_, err := LoadFromDir(dir)
+	if err == nil {
+		t.Fatal("expected error for missing entrypoint file")
+	}
+}
+
+// TestLoadFromDir_NoEntrypointKeepsLegacyBehaviour confirms
+// back-compat: plugins without entrypoint still get per-command
+// bin/<command> resolution, unchanged from before this feature.
+func TestLoadFromDir_NoEntrypointKeepsLegacyBehaviour(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "plugin.yml"), `
+name: legacy
+commands:
+  - name: foo
+  - name: bar
+`)
+
+	mkdir(t, filepath.Join(dir, "bin"))
+	writeFile(t, filepath.Join(dir, "bin", "foo"), "#!/bin/bash\necho foo\n")
+	writeFile(t, filepath.Join(dir, "bin", "bar"), "#!/bin/bash\necho bar\n")
+	os.Chmod(filepath.Join(dir, "bin", "foo"), 0755)
+	os.Chmod(filepath.Join(dir, "bin", "bar"), 0755)
+
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if p.Commands["foo"] != filepath.Join(dir, "bin", "foo") {
+		t.Errorf("legacy: foo should resolve to bin/foo, got %q", p.Commands["foo"])
+	}
+
+	if p.Commands["bar"] != filepath.Join(dir, "bin", "bar") {
+		t.Errorf("legacy: bar should resolve to bin/bar, got %q", p.Commands["bar"])
+	}
+}
+
 func TestLoadByName_BrokenSiblingPluginDoesntBlockAliasMatch(t *testing.T) {
 	// Defensive: one corrupted plugin.yml in the plugins root
 	// shouldn't prevent an unrelated alias from resolving. The

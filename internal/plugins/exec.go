@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,6 +47,12 @@ const DefaultTimeout = 60 * time.Second
 // Run executes one command from a loaded plugin and captures its output.
 // The executable is resolved from the plugin's Commands map, which
 // already encodes the bin/ > commands/ precedence.
+//
+// Entrypoint mode: when plugin.yml declares a single Entrypoint, the
+// loader collapses every command to the same binary. We detect that
+// here by comparing the resolved path to the manifest's Entrypoint
+// (resolved against Dir) and prepend the command name as argv[1] so
+// the plugin's internal switch / cobra router can dispatch.
 func (p *LoadedPlugin) Run(ctx context.Context, opts RunOptions) (*Result, error) {
 	path, ok := p.Commands[opts.Command]
 	if !ok {
@@ -60,7 +67,21 @@ func (p *LoadedPlugin) Run(ctx context.Context, opts RunOptions) (*Result, error
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, path, opts.Args...)
+	// Compose argv. In entrypoint mode the binary handles every
+	// command, so we prepend the command name. Per-command bin/
+	// shims get the args verbatim (the file IS the dispatch).
+	args := opts.Args
+	if p.Manifest.Entrypoint != "" {
+		// Defensive: only prepend when the resolved path matches
+		// the entrypoint. This guards against a misconfigured
+		// manifest where some commands somehow resolve elsewhere.
+		entrypointPath := filepath.Join(p.Dir, p.Manifest.Entrypoint)
+		if path == entrypointPath {
+			args = append([]string{opts.Command}, opts.Args...)
+		}
+	}
+
+	cmd := exec.CommandContext(runCtx, path, args...)
 	cmd.Env = buildEnv(p, opts.Env)
 	cmd.Dir = p.Dir
 
