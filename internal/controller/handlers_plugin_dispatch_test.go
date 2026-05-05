@@ -631,3 +631,550 @@ EOF
 		t.Errorf("OTHER should be preserved: %q", cfg["OTHER"])
 	}
 }
+
+// TestPluginDispatch_ApplyManifest pins the apply_manifest action:
+// plugin emits a manifest spec inline, controller persists it via
+// Store.Put. Same write path as `vd apply`, so the watch loop's
+// reconcile handlers pick up the new resource on the next tick.
+//
+// Used (in production) by plugins that materialise runtime
+// resources — e.g. `vd pg:backups:capture` emitting a job manifest
+// that voodu's job runner spawns as a sibling container.
+func TestPluginDispatch_ApplyManifest(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "backup b008 capturing",
+    "actions": [
+      {
+        "type": "apply_manifest",
+        "scope": "clowk-lp",
+        "name": "db",
+        "manifest": {
+          "kind": "job",
+          "scope": "clowk-lp",
+          "name": "db-backup-b008",
+          "spec": {
+            "image": "postgres:16",
+            "command": ["bash", "-c", "pg_dump ..."],
+            "volumes": ["/opt/voodu/backups/clowk-lp/db:/backups:rw"]
+          }
+        }
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "postgres", "backups:capture", script)
+
+	srv, store := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/postgres/backups:capture", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	var out struct {
+		Data struct {
+			Message string   `json:"message"`
+			Applied []string `json:"applied"`
+		} `json:"data"`
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// Applied summary should mention the manifest's kind/scope/name.
+	if len(out.Data.Applied) != 1 || !strings.Contains(out.Data.Applied[0], "job/clowk-lp/db-backup-b008") {
+		t.Errorf("applied: %v", out.Data.Applied)
+	}
+
+	// Store reflects the new manifest.
+	got, err := store.Get(context.Background(), KindJob, "clowk-lp", "db-backup-b008")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got == nil {
+		t.Fatal("manifest was not persisted")
+	}
+
+	if got.Kind != KindJob {
+		t.Errorf("kind: got %q, want job", got.Kind)
+	}
+
+	// Spec round-trips as JSON; check one field landed.
+	var spec map[string]any
+	if err := json.Unmarshal(got.Spec, &spec); err != nil {
+		t.Fatalf("spec decode: %v", err)
+	}
+
+	if spec["image"] != "postgres:16" {
+		t.Errorf("spec image: got %v", spec["image"])
+	}
+}
+
+// TestPluginDispatch_ApplyManifest_RejectsMissingPayload covers
+// the validator path: action.Type=apply_manifest without an
+// embedded manifest is a plugin authoring bug, must surface as
+// a 500 with a clear error.
+func TestPluginDispatch_ApplyManifest_RejectsMissingPayload(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "buggy plugin emitted apply_manifest with no payload",
+    "actions": [
+      {"type": "apply_manifest", "scope": "x", "name": "y"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "buggy", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/buggy", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected error status, got 200 with body=%s", raw)
+	}
+
+	if !bytes.Contains(raw, []byte("manifest payload")) {
+		t.Errorf("error should mention missing manifest, got: %s", raw)
+	}
+}
+
+// TestPluginDispatch_ApplyManifest_RejectsInvalidManifest covers
+// validation passthrough: malformed manifest (e.g. job without a
+// scope, missing required field) surfaces Store.Put's error to
+// the operator. Plugin authors get loud feedback for invalid
+// generated manifests.
+func TestPluginDispatch_ApplyManifest_RejectsInvalidManifest(t *testing.T) {
+	root := t.TempDir()
+
+	// Job kind requires scope (it's in ScopedKinds). Empty scope
+	// should fail Store.Put -> Manifest.Validate().
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "buggy: job without scope",
+    "actions": [
+      {
+        "type": "apply_manifest",
+        "scope": "x",
+        "name": "y",
+        "manifest": {"kind": "job", "name": "no-scope-job", "spec": {}}
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "bad-job", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/bad-job", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected error status for unscoped job, got 200")
+	}
+}
+
+// TestPluginDispatch_DeleteManifest pins the delete_manifest
+// action: plugin asks the controller to remove a manifest by
+// (kind, scope, name). Used by `vd pg:backups:cancel` (eventually)
+// to remove an in-flight job, triggering the watch loop's remove
+// path which tears down the docker container.
+func TestPluginDispatch_DeleteManifest(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "backup b008 cancelled",
+    "actions": [
+      {
+        "type": "delete_manifest",
+        "scope": "clowk-lp",
+        "name": "db-backup-b008",
+        "kind": "job"
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "postgres", "backups:cancel", script)
+
+	srv, store := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	// Pre-seed the manifest the plugin will ask us to delete.
+	_, _ = store.Put(context.Background(), &Manifest{
+		Kind:  KindJob,
+		Scope: "clowk-lp",
+		Name:  "db-backup-b008",
+		Spec:  json.RawMessage(`{"image":"postgres:16"}`),
+	})
+
+	resp, err := http.Post(srv.URL+"/plugin/postgres/backups:cancel", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	// Manifest should be gone.
+	got, _ := store.Get(context.Background(), KindJob, "clowk-lp", "db-backup-b008")
+	if got != nil {
+		t.Errorf("manifest still present after delete: %+v", got)
+	}
+}
+
+// TestPluginDispatch_DeleteManifest_NoOpOnMissing pins the
+// idempotent semantics: deleting a non-existent manifest is not
+// an error. Mirrors `vd delete` behaviour so action queues can
+// re-run safely after partial failure.
+func TestPluginDispatch_DeleteManifest_NoOpOnMissing(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "delete (idempotent)",
+    "actions": [
+      {"type": "delete_manifest", "scope": "x", "name": "ghost", "kind": "job"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "delete-missing", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/delete-missing", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 (idempotent), got %d: %s", resp.StatusCode, raw)
+	}
+
+	var out struct {
+		Data struct {
+			Applied []string `json:"applied"`
+		} `json:"data"`
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(raw, &out)
+
+	if len(out.Data.Applied) != 1 || !strings.Contains(out.Data.Applied[0], "no-op") {
+		t.Errorf("applied should mention no-op: %v", out.Data.Applied)
+	}
+}
+
+// TestPluginDispatch_DeleteManifest_RejectsMissingKind covers the
+// validator path. Scope/Name without Kind is ambiguous (could
+// match any kind at that name) — must be rejected.
+func TestPluginDispatch_DeleteManifest_RejectsMissingKind(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "buggy: delete without kind",
+    "actions": [
+      {"type": "delete_manifest", "scope": "x", "name": "y"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "delete-no-kind", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/delete-no-kind", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("expected error status, got 200")
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(raw, []byte("requires kind")) {
+		t.Errorf("error should mention 'requires kind', got: %s", raw)
+	}
+}
+
+// TestPluginDispatch_ApplyManifest_DoesNotFanOutRestart pins the
+// restart-fanout suppression: applying a manifest is reconciled
+// via the watch loop's WatchPut → kind handler path, NOT via
+// restarting (action.Scope, action.Name). Without this guard, a
+// plugin emitting `apply_manifest{scope: postgres-owner}` would
+// roll the postgres pod on every backup capture — wrong.
+//
+// We assert the suppression by writing a deployment manifest at
+// (action.Scope, action.Name), then applying an apply_manifest
+// action with the same scope/name: the deployment's revision
+// should NOT change (no restart-induced re-Put), confirming the
+// fanout was skipped.
+func TestPluginDispatch_ApplyManifest_DoesNotFanOutRestart(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "backup",
+    "actions": [
+      {
+        "type": "apply_manifest",
+        "scope": "clowk-lp",
+        "name": "db",
+        "manifest": {
+          "kind": "job",
+          "scope": "clowk-lp",
+          "name": "db-backup-b008",
+          "spec": {"image": "postgres:16"}
+        }
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "postgres", "backups:capture", script)
+
+	srv, store := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	// Pre-seed the "owner context" manifest the action.Scope/Name
+	// points to. If restart fanout fired, this manifest's revision
+	// would bump.
+	put, _ := store.Put(context.Background(), &Manifest{
+		Kind:  KindStatefulset,
+		Scope: "clowk-lp",
+		Name:  "db",
+		Spec:  json.RawMessage(`{"image":"postgres:16"}`),
+	})
+	revBefore := put.Metadata.Revision
+
+	resp, err := http.Post(srv.URL+"/plugin/postgres/backups:capture", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	got, _ := store.Get(context.Background(), KindStatefulset, "clowk-lp", "db")
+
+	if got == nil {
+		t.Fatal("postgres manifest disappeared")
+	}
+
+	if got.Metadata.Revision != revBefore {
+		t.Errorf("apply_manifest must NOT bump owner revision (restart suppression): before=%d, after=%d",
+			revBefore, got.Metadata.Revision)
+	}
+}
+
+// TestPluginDispatch_RunJob_QueuesAsyncRun pins the run_job
+// action: plugin asks the controller to start a registered job;
+// controller spawns a goroutine that calls Jobs.RunOnce. The
+// dispatch response returns "queued" instantly — operator is NOT
+// blocked on the run's duration.
+//
+// Used (in production) by `vd pg:backups:capture` to chain
+// apply_manifest + run_job: register a one-shot backup job, then
+// kick it off, all in one operator command.
+func TestPluginDispatch_RunJob_QueuesAsyncRun(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "backup b008 capturing",
+    "actions": [
+      {"type": "run_job", "scope": "clowk-lp", "name": "db-backup-b008"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "postgres", "backups:capture", script)
+
+	store := newMemStore()
+	runner := &fakeRunner{run: JobRun{RunID: "run-xyz", Status: JobStatusSucceeded}}
+
+	api := &API{
+		Store:       store,
+		PluginsRoot: root,
+		Jobs:        runner,
+	}
+
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/postgres/backups:capture", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	var out struct {
+		Data struct {
+			Applied []string `json:"applied"`
+		} `json:"data"`
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(raw, &out)
+
+	if len(out.Data.Applied) != 1 || !strings.Contains(out.Data.Applied[0], "queued") {
+		t.Errorf("expected 'queued' summary, got: %v", out.Data.Applied)
+	}
+
+	// Goroutine ran in the background; runner saw the call. Use
+	// Eventually-style poll because the goroutine fires off the
+	// HTTP-handler thread.
+	deadline := 0
+	for runner.gotScope == "" && deadline < 50 {
+		// busy-wait briefly — fakeRunner.RunOnce returns instantly,
+		// but goroutine scheduling has a few microseconds of slop.
+		deadline++
+	}
+
+	if runner.gotScope != "clowk-lp" || runner.gotName != "db-backup-b008" {
+		t.Errorf("runner called with scope=%q name=%q, want clowk-lp/db-backup-b008",
+			runner.gotScope, runner.gotName)
+	}
+}
+
+// TestPluginDispatch_RunJob_NoRunnerErrors covers the safety
+// path: a controller without a JobRunner configured (e.g. during
+// bring-up of a new node) must fail loudly instead of silently
+// no-op'ing the run.
+func TestPluginDispatch_RunJob_NoRunnerErrors(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "queued",
+    "actions": [
+      {"type": "run_job", "scope": "x", "name": "y"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "run-no-runner", script)
+
+	// API without Jobs configured.
+	api := &API{Store: newMemStore(), PluginsRoot: root}
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/run-no-runner", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected error status with no JobRunner, got 200: %s", raw)
+	}
+
+	if !bytes.Contains(raw, []byte("no job runner")) {
+		t.Errorf("error should mention missing runner, got: %s", raw)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 
@@ -34,15 +35,55 @@ type pluginDispatchRequest struct {
 // directly — every write is mediated by the controller, which
 // validates the action type and applies via existing primitives.
 //
-// Today only `config_set` and `config_unset` are recognised.
+// Recognised types:
+//
+//   - config_set       — write KV pairs to the (Scope, Name) bucket
+//   - config_unset     — remove Keys from the (Scope, Name) bucket
+//   - apply_manifest   — upsert a manifest via Store.Put. The
+//                        embedded Manifest carries kind+scope+
+//                        name+spec; action's top-level Scope/Name
+//                        are the "owner context" (typically the
+//                        plugin resource emitting the apply).
+//   - delete_manifest  — Store.Delete(Kind, Scope, Name). The
+//                        action's top-level Scope/Name + Kind
+//                        identify the manifest to remove.
+//   - run_job          — async Jobs.RunOnce(Scope, Name) on an
+//                        already-applied job manifest. Spawns a
+//                        goroutine and returns immediately with
+//                        a "queued" summary. Errors during the
+//                        run surface via /describe?kind=job and
+//                        the per-job status, never to this
+//                        dispatch response (fire-and-forget by
+//                        design — plugin already exited when the
+//                        run starts).
+//
 // Unknown action types are rejected (loud failure beats silent
 // no-op when a plugin author typos a type).
+//
+// Why this exists at all: plugins are isolated processes; they
+// must not touch etcd directly. Funnelling every write through
+// dispatch keeps validation, audit, and restart fan-out
+// centralised. The same shape will back the SDK + future Web UI
+// — every "thing a plugin can do" is an action type the
+// controller recognises.
 type pluginDispatchAction struct {
-	Type  string            `json:"type"`
-	Scope string            `json:"scope"`
-	Name  string            `json:"name"`
-	KV    map[string]string `json:"kv,omitempty"`
-	Keys  []string          `json:"keys,omitempty"`
+	Type string `json:"type"`
+
+	// Scope/Name describe the owner context for the action. For
+	// config_*, they identify the bucket to write. For
+	// delete_manifest, they identify the manifest to remove
+	// (paired with Kind below). For apply_manifest, they're the
+	// plugin's own (scope, name) — used for restart fan-out and
+	// audit; the actual manifest applied is described by the
+	// Manifest field.
+	Scope string `json:"scope"`
+	Name  string `json:"name"`
+
+	// config_set payload.
+	KV map[string]string `json:"kv,omitempty"`
+
+	// config_unset payload.
+	Keys []string `json:"keys,omitempty"`
 
 	// SkipRestart, when true, applies the store mutation but
 	// suppresses the usual restart fan-out on (Scope, Name).
@@ -55,8 +96,36 @@ type pluginDispatchAction struct {
 	//
 	// Default false (omitted in JSON) preserves the historical
 	// "every config_set rolls affected workloads" behaviour for
-	// every existing plugin — opt-in only.
+	// every existing plugin — opt-in only. Ignored for
+	// apply_manifest / delete_manifest (they don't fan out
+	// restarts on (action.Scope, action.Name) — the manifest
+	// being applied/removed has its own reconcile path through
+	// the watch loop).
 	SkipRestart bool `json:"skip_restart,omitempty"`
+
+	// apply_manifest payload — the full manifest to upsert.
+	Manifest *pluginDispatchManifest `json:"manifest,omitempty"`
+
+	// delete_manifest payload — Kind of manifest at
+	// (Scope, Name) to remove. (Scope/Name come from the
+	// top-level fields above so we don't duplicate them.)
+	Kind string `json:"kind,omitempty"`
+}
+
+// pluginDispatchManifest is the wire shape the plugin emits when
+// asking the controller to apply (upsert) a manifest. Mirrors the
+// store's Manifest{} shape minus the metadata fields the
+// controller fills in itself.
+//
+// Spec is decoded as a generic map and re-marshalled before going
+// into Store.Put — same pipeline expand uses for plugin-emitted
+// macro outputs, so all the validation and asset-stamping that
+// applies to vd apply also applies to a plugin-dispatched apply.
+type pluginDispatchManifest struct {
+	Kind  string         `json:"kind"`
+	Scope string         `json:"scope,omitempty"`
+	Name  string         `json:"name"`
+	Spec  map[string]any `json:"spec"`
 }
 
 // pluginDispatchResponse is the operator-facing data the plugin
@@ -277,6 +346,17 @@ func (a *API) applyPluginDispatchActionFromRequest(r *http.Request, action plugi
 		return summary, nil
 	}
 
+	// apply_manifest / delete_manifest / run_job have their OWN
+	// reconcile path through the watch loop or the JobRunner —
+	// restarting (action.Scope, action.Name) here would roll the
+	// owner resource (e.g. the postgres a backup job belongs to)
+	// on every plugin-emitted action, which is wrong. The watched
+	// kind's handler picks up WatchPut/WatchDelete; run_job's
+	// goroutine drives container lifecycle on its own.
+	if action.Type == "apply_manifest" || action.Type == "delete_manifest" || action.Type == "run_job" {
+		return summary, nil
+	}
+
 	// Trigger the same restart fan-out `vd config set` does so
 	// consumer pods pick up the new env file without a manual
 	// nudge. Always-on for plugin dispatch unless the action
@@ -340,9 +420,172 @@ func (a *API) applyPluginDispatchAction(ctx context.Context, action pluginDispat
 
 		return fmt.Sprintf("config_unset %s/%s: %s", action.Scope, action.Name, strings.Join(sorted, ",")), nil
 
+	case "apply_manifest":
+		return a.applyDispatchApplyManifest(ctx, action)
+
+	case "delete_manifest":
+		return a.applyDispatchDeleteManifest(ctx, action)
+
+	case "run_job":
+		return a.applyDispatchRunJob(ctx, action)
+
 	default:
-		return "", fmt.Errorf("unknown action type %q (supported: config_set, config_unset)", action.Type)
+		return "", fmt.Errorf("unknown action type %q (supported: config_set, config_unset, apply_manifest, delete_manifest, run_job)", action.Type)
 	}
+}
+
+// applyDispatchApplyManifest persists a plugin-emitted manifest
+// via Store.Put. The same write path `vd apply` uses, so all
+// downstream invariants (manifest validation, scoped-kind
+// enforcement, asset-digest stamping when applicable, watch loop
+// fan-out to handlers) hold automatically.
+//
+// Why this exists: imperative plugin commands (capture a backup,
+// trigger a release, schedule a one-shot) need to materialise
+// runtime resources that the operator didn't author. Plugins can
+// emit those as manifests through this action instead of touching
+// docker / etcd directly. The watch loop then dispatches to the
+// kind's reconcile handler (e.g. JobHandler.apply for kind=job),
+// keeping the plugin uninvolved in container lifecycle.
+//
+// Note on triggering job runs: applying a job manifest registers
+// it in the store and fires the watch loop's `apply` path, which
+// only writes baseline status — it does NOT execute the job.
+// Plugins that want immediate execution emit a follow-up call to
+// /jobs/run (or, in a future iteration, a `run_job` dispatch
+// action that wraps it).
+func (a *API) applyDispatchApplyManifest(ctx context.Context, action pluginDispatchAction) (string, error) {
+	if action.Manifest == nil {
+		return "", fmt.Errorf("apply_manifest requires a manifest payload")
+	}
+
+	m := action.Manifest
+
+	if m.Kind == "" || m.Name == "" {
+		return "", fmt.Errorf("apply_manifest manifest requires kind and name")
+	}
+
+	specRaw, err := json.Marshal(m.Spec)
+	if err != nil {
+		return "", fmt.Errorf("apply_manifest: marshal spec: %w", err)
+	}
+
+	manifest := &Manifest{
+		Kind:  Kind(m.Kind),
+		Scope: m.Scope,
+		Name:  m.Name,
+		Spec:  specRaw,
+	}
+
+	// Store.Put runs Validate() — kind enforcement, scoped-kind
+	// enforcement (e.g. job MUST carry a scope), name non-empty.
+	// Errors here are surfaced verbatim so plugin authors get
+	// loud feedback when their generated manifest is malformed.
+	if _, err := a.Store.Put(ctx, manifest); err != nil {
+		return "", fmt.Errorf("apply_manifest: %w", err)
+	}
+
+	if m.Scope == "" {
+		return fmt.Sprintf("apply_manifest %s/%s", m.Kind, m.Name), nil
+	}
+
+	return fmt.Sprintf("apply_manifest %s/%s/%s", m.Kind, m.Scope, m.Name), nil
+}
+
+// applyDispatchDeleteManifest removes a manifest from the store
+// via Store.Delete. The watch loop fires the kind's reconcile
+// handler with WatchDelete, which in turn tears down any docker
+// containers / asset files / etc. associated with the manifest.
+//
+// Same idempotent semantics as `vd delete`: missing manifests are
+// not an error (returns "delete_manifest <kind>/<name> (no-op)"
+// so the caller can compose action queues without pre-checking
+// existence).
+//
+// The action's top-level Scope/Name + Kind identify the target.
+// No payload field — Kind reuses the existing top-level slot to
+// keep delete shape minimal.
+func (a *API) applyDispatchDeleteManifest(ctx context.Context, action pluginDispatchAction) (string, error) {
+	if action.Kind == "" {
+		return "", fmt.Errorf("delete_manifest requires kind")
+	}
+
+	kind, err := ParseKind(action.Kind)
+	if err != nil {
+		return "", fmt.Errorf("delete_manifest: %w", err)
+	}
+
+	deleted, err := a.Store.Delete(ctx, kind, action.Scope, action.Name)
+	if err != nil {
+		return "", fmt.Errorf("delete_manifest: %w", err)
+	}
+
+	suffix := ""
+	if !deleted {
+		suffix = " (no-op)"
+	}
+
+	if action.Scope == "" {
+		return fmt.Sprintf("delete_manifest %s/%s%s", action.Kind, action.Name, suffix), nil
+	}
+
+	return fmt.Sprintf("delete_manifest %s/%s/%s%s", action.Kind, action.Scope, action.Name, suffix), nil
+}
+
+// applyDispatchRunJob spawns Jobs.RunOnce in a goroutine and
+// returns immediately. The dispatch handler is fire-and-forget by
+// design — plugin authors who need the run's outcome query it
+// after the fact via /describe?kind=job&scope=&name= or by
+// listing containers labelled kind=job.
+//
+// Why goroutine + background context: RunOnce blocks until the
+// container exits (could be seconds to hours for a backup
+// capture). Holding the dispatch HTTP connection open for the
+// duration would tie the operator's `vd` invocation to the run,
+// defeating the detached-default UX. The action returns "queued"
+// the instant the goroutine is scheduled.
+//
+// Errors surface to logs (plugin author can grep for the queue
+// summary) but NOT to the operator's dispatch response — by the
+// time the run actually fails, the operator has already gotten
+// the "queued" success. Plugins compose this with apply_manifest:
+//
+//	Actions: [
+//	  { type: "apply_manifest", manifest: {kind: "job", ...} },
+//	  { type: "run_job", scope: "...", name: "..." },
+//	]
+//
+// Both actions run in order on the controller side. apply_manifest
+// persists the manifest (so RunOnce can read it via Store.Get);
+// run_job kicks off the actual execution.
+func (a *API) applyDispatchRunJob(ctx context.Context, action pluginDispatchAction) (string, error) {
+	if a.Jobs == nil {
+		return "", fmt.Errorf("run_job: no job runner configured on this controller")
+	}
+
+	scope := action.Scope
+	name := action.Name
+
+	// Background ctx because the goroutine outlives the HTTP
+	// request. Using r.Context() (via the dispatch path) would
+	// cancel the run when the operator's HTTP client disconnects
+	// — wrong shape for fire-and-forget.
+	go func() {
+		bgCtx := context.Background()
+
+		run, err := a.Jobs.RunOnce(bgCtx, scope, name)
+		if err != nil {
+			// Surface to controller logs only. Operators query
+			// /describe?kind=job to see status of failed runs.
+			fmt.Fprintf(os.Stderr, "run_job %s/%s failed: %v\n", scope, name, err)
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "run_job %s/%s completed: run_id=%s status=%s\n",
+			scope, name, run.RunID, run.Status)
+	}()
+
+	return fmt.Sprintf("run_job %s/%s queued", scope, name), nil
 }
 
 func keysSorted(m map[string]string) []string {
