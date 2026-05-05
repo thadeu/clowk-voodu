@@ -77,6 +77,16 @@ func (p *LoadedPlugin) Run(ctx context.Context, opts RunOptions) (*Result, error
 		// manifest where some commands somehow resolve elsewhere.
 		entrypointPath := filepath.Join(p.Dir, p.Manifest.Entrypoint)
 		if path == entrypointPath {
+			// Verify the binary actually exists. The loader
+			// deliberately doesn't check at load time (install
+			// lifecycle hooks fetch the binary AFTER LoadFromDir),
+			// so the invocation path is the right place for the
+			// "did the install hook run?" guard.
+			if info, statErr := os.Stat(path); statErr != nil || info.IsDir() {
+				return nil, fmt.Errorf("plugin %q: entrypoint %q not found or not a file at %s — did the install hook fetch the binary?",
+					p.Manifest.Name, p.Manifest.Entrypoint, path)
+			}
+
 			args = append([]string{opts.Command}, opts.Args...)
 		}
 	}

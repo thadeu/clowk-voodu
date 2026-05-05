@@ -75,17 +75,17 @@ func LoadFromDir(dir string) (*LoadedPlugin, error) {
 	// declared commands resolve to the entrypoint path. The exec
 	// layer then prepends the command name as argv[1]. Plugin
 	// authors get to ship one binary + plugin.yml, no shim parade.
+	//
+	// We deliberately do NOT validate that the file exists at
+	// load time: the Installer flow runs LoadFromDir on the
+	// staging dir BEFORE the install lifecycle hook fires, and
+	// that hook is exactly where many plugins fetch their binary
+	// (download from GitHub Releases, untar, etc.). Validating
+	// here would forbid that pattern. Run() validates at exec
+	// time with a clear error, which is the right grain.
 	if manifest.Entrypoint != "" {
 		entrypointPath := filepath.Join(dir, manifest.Entrypoint)
 
-		if info, err := os.Stat(entrypointPath); err != nil || info.IsDir() {
-			return nil, fmt.Errorf("plugin %q: entrypoint %q not found or not a file (looked at %s)",
-				manifest.Name, manifest.Entrypoint, entrypointPath)
-		}
-
-		// Replace the discovered commands map. Every command the
-		// plugin declares now points at the entrypoint; bin/ files
-		// (if any) are ignored for routing purposes.
 		entrypointCmds := make(map[string]string, len(manifest.Commands))
 		for _, c := range manifest.Commands {
 			entrypointCmds[c.Name] = entrypointPath

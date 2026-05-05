@@ -271,11 +271,16 @@ commands:
 	}
 }
 
-// TestLoadFromDir_EntrypointMissingFileErrors pins the safety
-// guard: a plugin.yml that points entrypoint at a non-existent
-// file fails LoadFromDir loud. Otherwise dispatch would fail at
-// invocation time with a less obvious error.
-func TestLoadFromDir_EntrypointMissingFileErrors(t *testing.T) {
+// TestLoadFromDir_EntrypointMissingFileTolerated pins the
+// install-hook-friendly behaviour: LoadFromDir does NOT validate
+// that the entrypoint file exists. Many plugins fetch their
+// binary in the post-install lifecycle hook, which fires AFTER
+// LoadFromDir. Strict validation here would forbid that pattern.
+//
+// Run() handles the missing-file case with a clear error at
+// invocation time — see exec_test.go's
+// TestRunEntrypointMissingBinaryErrors.
+func TestLoadFromDir_EntrypointMissingFileTolerated(t *testing.T) {
 	dir := t.TempDir()
 
 	writeFile(t, filepath.Join(dir, "plugin.yml"), `
@@ -285,9 +290,15 @@ commands:
   - name: foo
 `)
 
-	_, err := LoadFromDir(dir)
-	if err == nil {
-		t.Fatal("expected error for missing entrypoint file")
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("LoadFromDir should tolerate missing entrypoint (install hook fetches it): %v", err)
+	}
+
+	// The Commands map still resolves to the (not-yet-existing)
+	// path so Run can produce a clear error later.
+	if got := p.Commands["foo"]; got != filepath.Join(dir, "bin", "missing-binary") {
+		t.Errorf("entrypoint should still resolve in Commands map: got %q", got)
 	}
 }
 

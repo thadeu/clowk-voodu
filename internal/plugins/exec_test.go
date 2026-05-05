@@ -191,6 +191,39 @@ commands:
 	})
 }
 
+// TestRunEntrypointMissingBinaryErrors pins the deferred
+// validation: when plugin.yml declares an entrypoint that
+// doesn't exist on disk, Run surfaces a clear error mentioning
+// the install hook. LoadFromDir tolerates the missing file
+// (install hooks populate it after load), so Run is the actual
+// guard.
+func TestRunEntrypointMissingBinaryErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "plugin.yml"), []byte(`
+name: demo
+entrypoint: bin/never-fetched
+commands:
+  - name: foo
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load (should tolerate missing): %v", err)
+	}
+
+	_, err = p.Run(context.Background(), RunOptions{Command: "foo"})
+	if err == nil {
+		t.Fatal("expected error for missing entrypoint binary")
+	}
+
+	if !strings.Contains(err.Error(), "install hook") {
+		t.Errorf("error should mention install hook, got: %v", err)
+	}
+}
+
 // TestRunLegacyDoesNotPrependCommandName confirms back-compat:
 // per-command bin/<cmd> shims still get the args verbatim, with
 // no command-name prepend. The shim file IS the dispatch already
