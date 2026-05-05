@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -74,10 +77,23 @@ type pluginDispatchPayload struct {
 type pluginDispatchResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Message string   `json:"message"`
-		Applied []string `json:"applied"`
+		Message   string                       `json:"message"`
+		Applied   []string                     `json:"applied"`
+		ExecLocal []pluginDispatchExecLocalCmd `json:"exec_local,omitempty"`
 	} `json:"data"`
 	Error string `json:"error,omitempty"`
+}
+
+// pluginDispatchExecLocalCmd is one command the plugin asked the
+// CLI to run locally on the operator's host with TTY attached.
+// Mirrors the controller's pluginDispatchExecLocal — kept in
+// lockstep so dispatch JSON deserialises cleanly both ways.
+//
+// CLI executes each entry sequentially in the order returned by
+// the controller (preserving plugin emit order). Exit codes from
+// the local commands propagate as the CLI's exit code.
+type pluginDispatchExecLocalCmd struct {
+	Command []string `json:"command"`
 }
 
 // runPluginDispatch POSTs the operator's args to the plugin
@@ -139,6 +155,51 @@ func runPluginDispatch(root *cobra.Command, plugin, command string, args []strin
 
 	for _, a := range out.Data.Applied {
 		fmt.Printf("  ✓ %s\n", a)
+	}
+
+	// exec_local: plugin asked us to invoke commands locally
+	// (typically interactive shells). Each command runs with the
+	// operator's stdin/stdout/stderr attached so TTY-dependent
+	// flows work — psql, redis-cli, etc.
+	//
+	// Sequential execution: we run them in plugin emit order and
+	// stop on the first non-zero exit. The exit code propagates
+	// up so shell pipelines / scripts see the underlying
+	// command's status, not just the dispatch wrapper's.
+	for _, ex := range out.Data.ExecLocal {
+		if err := runExecLocal(ex.Command); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// runExecLocal invokes one exec_local command with the operator's
+// TTY attached. Stdin/stdout/stderr forward as-is so interactive
+// programs (psql, redis-cli, etc.) feel like the operator ran
+// them directly. Non-zero exit from the child surfaces as the
+// CLI's exit (via os.Exit on the parent's error path).
+func runExecLocal(command []string) error {
+	if len(command) == 0 {
+		return fmt.Errorf("exec_local: empty command")
+	}
+
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		// ExitError carries the child's exit code; surface it
+		// verbatim so `vd pg:psql` followed by `;` exits with
+		// the same code psql would have.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+
+		return fmt.Errorf("exec_local %s: %w", command[0], err)
 	}
 
 	return nil

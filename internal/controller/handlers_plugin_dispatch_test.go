@@ -346,8 +346,10 @@ func TestPluginDispatch_UnknownCommand(t *testing.T) {
 
 	raw, _ := io.ReadAll(resp.Body)
 
-	if !strings.Contains(string(raw), "does not have an executable") {
-		t.Errorf("error mismatch: %s", raw)
+	// Error mentions the typo'd command + lists available ones
+	// so the operator can correct without reading plugin.yml.
+	if !strings.Contains(string(raw), "no command") || !strings.Contains(string(raw), "available:") {
+		t.Errorf("error should mention 'no command' + 'available:', got: %s", raw)
 	}
 }
 
@@ -1176,5 +1178,136 @@ EOF
 
 	if !bytes.Contains(raw, []byte("no job runner")) {
 		t.Errorf("error should mention missing runner, got: %s", raw)
+	}
+}
+
+// TestPluginDispatch_ExecLocal_PassesThroughToCLI pins the
+// exec_local action's passthrough semantics: controller does
+// NOT execute the command server-side; instead, it surfaces the
+// command vector in the response under `exec_local` so the CLI
+// can run it locally with the operator's TTY attached.
+//
+// Used by `vd pg:psql` and any future plugin verb that needs an
+// interactive shell — controller-side exec doesn't have a
+// terminal, only the operator's CLI does.
+func TestPluginDispatch_ExecLocal_PassesThroughToCLI(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "opening psql",
+    "actions": [
+      {
+        "type": "exec_local",
+        "scope": "clowk-lp",
+        "name": "db",
+        "command": ["docker", "exec", "-it", "clowk-lp-db.0", "psql", "-U", "postgres"]
+      }
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "postgres", "psql", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/postgres/psql", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	var out struct {
+		Data struct {
+			Message   string                  `json:"message"`
+			Applied   []string                `json:"applied"`
+			ExecLocal []pluginDispatchExecLocal `json:"exec_local"`
+		} `json:"data"`
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(out.Data.ExecLocal) != 1 {
+		t.Fatalf("expected 1 exec_local entry, got %d", len(out.Data.ExecLocal))
+	}
+
+	wantCmd := []string{"docker", "exec", "-it", "clowk-lp-db.0", "psql", "-U", "postgres"}
+
+	if len(out.Data.ExecLocal[0].Command) != len(wantCmd) {
+		t.Fatalf("command length mismatch: got %v, want %v", out.Data.ExecLocal[0].Command, wantCmd)
+	}
+
+	for i, want := range wantCmd {
+		if out.Data.ExecLocal[0].Command[i] != want {
+			t.Errorf("command[%d]: got %q, want %q", i, out.Data.ExecLocal[0].Command[i], want)
+		}
+	}
+
+	// Applied summary surfaces the deferred-to-CLI marker so
+	// operator can audit what got returned.
+	if len(out.Data.Applied) != 1 {
+		t.Fatalf("expected 1 applied entry, got %d", len(out.Data.Applied))
+	}
+
+	if !strings.Contains(out.Data.Applied[0], "deferred to CLI") {
+		t.Errorf("applied summary should mention deferral: %q", out.Data.Applied[0])
+	}
+}
+
+// TestPluginDispatch_ExecLocal_RejectsEmptyCommand pins the
+// validator: an exec_local action with no command vector is a
+// plugin author bug (emitted but no payload). Surface as 500.
+func TestPluginDispatch_ExecLocal_RejectsEmptyCommand(t *testing.T) {
+	root := t.TempDir()
+
+	script := `#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{
+  "status": "ok",
+  "data": {
+    "message": "buggy",
+    "actions": [
+      {"type": "exec_local", "scope": "x", "name": "y"}
+    ]
+  }
+}
+EOF
+`
+
+	writePluginYAML(t, root, "demo", "buggy", script)
+
+	srv, _ := dispatchTestServer(t, root)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/plugin/demo/buggy", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected error for empty exec_local, got 200: %s", raw)
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(raw, []byte("empty command")) {
+		t.Errorf("error should mention empty command, got: %s", raw)
 	}
 }

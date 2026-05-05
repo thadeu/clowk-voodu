@@ -56,6 +56,13 @@ type pluginDispatchRequest struct {
 //                        dispatch response (fire-and-forget by
 //                        design — plugin already exited when the
 //                        run starts).
+//   - exec_local       — passthrough: controller does NOT run
+//                        the command server-side; it adds the
+//                        command vector to a separate
+//                        `exec_local` field in the response so
+//                        the CLI can run it locally with TTY
+//                        attached. Use for interactive shells
+//                        and other TTY-dependent flows.
 //
 // Unknown action types are rejected (loud failure beats silent
 // no-op when a plugin author typos a type).
@@ -110,6 +117,35 @@ type pluginDispatchAction struct {
 	// (Scope, Name) to remove. (Scope/Name come from the
 	// top-level fields above so we don't duplicate them.)
 	Kind string `json:"kind,omitempty"`
+
+	// exec_local payload — a command vector the CLI runs LOCALLY
+	// on the operator's host with the operator's TTY attached.
+	// The controller does NOT execute this server-side; it
+	// passes the command through in the dispatch response so
+	// the CLI can invoke it.
+	//
+	// Use case: interactive shells (`vd pg:psql`, `vd redis:cli`),
+	// any command that needs a TTY. Plugin-side syscall.Exec
+	// cannot propagate TTY through HTTP dispatch — this gives
+	// the plugin a way to delegate the local exec back to the
+	// CLI while keeping authority over the command's arguments
+	// (resolves container name, user, db, etc.).
+	//
+	// Security note: any plugin emitting exec_local can run
+	// arbitrary commands on the operator's host. Plugins are
+	// trusted by install model (operator chose to install them),
+	// so this is consistent with the existing trust boundary.
+	// The CLI logs the command before executing for audit.
+	Command []string `json:"command,omitempty"`
+}
+
+// pluginDispatchExecLocal is the wire shape the controller adds
+// to the dispatch response for every exec_local action it
+// encountered. CLI iterates this list after the response arrives
+// and runs each command with the operator's TTY attached. Order
+// preserved from the plugin's emit order.
+type pluginDispatchExecLocal struct {
+	Command []string `json:"command"`
 }
 
 // pluginDispatchManifest is the wire shape the plugin emits when
@@ -225,8 +261,8 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 
 	if _, declared := plug.Commands[command]; !declared {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf(
-			"plugin %q does not have an executable named %q under bin/ (each subcommand needs a shim file in bin/<name> that re-execs the plugin binary)",
-			pluginName, command))
+			"plugin %q has no command %q (available: %s)",
+			pluginName, command, listAvailableCommands(plug)))
 		return
 	}
 
@@ -303,8 +339,25 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	applied := make([]string, 0, len(resp.Actions))
+	execLocals := make([]pluginDispatchExecLocal, 0)
 
 	for i, action := range resp.Actions {
+		// exec_local is a passthrough — controller doesn't run
+		// it server-side. We collect it for the CLI to execute
+		// locally with the operator's TTY. See
+		// pluginDispatchAction.Command for the rationale.
+		if action.Type == "exec_local" {
+			if len(action.Command) == 0 {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("apply action %d (exec_local): empty command", i))
+				return
+			}
+
+			execLocals = append(execLocals, pluginDispatchExecLocal{Command: action.Command})
+			applied = append(applied, fmt.Sprintf("exec_local %v (deferred to CLI)", action.Command))
+
+			continue
+		}
+
 		summary, err := a.applyPluginDispatchActionFromRequest(r, action)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, fmt.Errorf("apply action %d (%s): %w", i, action.Type, err))
@@ -314,12 +367,21 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 		applied = append(applied, summary)
 	}
 
+	data := map[string]any{
+		"message": resp.Message,
+		"applied": applied,
+	}
+
+	// Only include exec_local in the response when there's at
+	// least one — keeps the JSON tidy for the 99% case where no
+	// local exec is needed.
+	if len(execLocals) > 0 {
+		data["exec_local"] = execLocals
+	}
+
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data: map[string]any{
-			"message": resp.Message,
-			"applied": applied,
-		},
+		Data:   data,
 	})
 }
 
@@ -586,6 +648,28 @@ func (a *API) applyDispatchRunJob(ctx context.Context, action pluginDispatchActi
 	}()
 
 	return fmt.Sprintf("run_job %s/%s queued", scope, name), nil
+}
+
+// listAvailableCommands renders the plugin's declared command
+// names as a comma-separated, sorted list. Used in the
+// "no such command" error so operators see what they CAN type
+// without having to read plugin.yml. Capped at 20 entries with
+// an ellipsis so the error message stays reasonable for
+// large plugins.
+func listAvailableCommands(plug *plugins.LoadedPlugin) string {
+	names := make([]string, 0, len(plug.Commands))
+	for name := range plug.Commands {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	const cap = 20
+	if len(names) > cap {
+		return strings.Join(names[:cap], ", ") + ", ..."
+	}
+
+	return strings.Join(names, ", ")
 }
 
 func keysSorted(m map[string]string) []string {
