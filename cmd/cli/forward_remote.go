@@ -402,6 +402,14 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 func remoteEnv() map[string]string {
 	env := map[string]string{
 		progress.EnvProtocol: progress.ProtocolVersion,
+		// Tell the server-side voodu that the client already
+		// applied rewriteColonSyntax — re-applying on the server
+		// would mangle multi-segment plugin commands like
+		// `pg:backups:capture`. The client splits to
+		// `["pg", "backups:capture"]`; without this marker the
+		// server would re-split `backups:capture` into
+		// `["backups", "capture"]`, dropping the third segment.
+		envRewriteAlreadyApplied: "1",
 	}
 
 	if v := os.Getenv("NO_COLOR"); v != "" {

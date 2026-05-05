@@ -115,6 +115,15 @@ func runPluginDispatch(root *cobra.Command, plugin, command string, args []strin
 
 	url := strings.TrimRight(controllerURL(root), "/") + "/plugin/" + plugin + "/" + command
 
+	// VOODU_DEBUG=1 prints the dispatch URL + args to stderr.
+	// Useful for "is the multi-colon split landing right?" kind
+	// of debugging when an operator suspects a CLI staleness or
+	// routing issue. No-op without the env var so normal output
+	// stays clean.
+	if os.Getenv("VOODU_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "voodu-debug: dispatch URL=%s args=%v\n", url, args)
+	}
+
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)

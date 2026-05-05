@@ -141,6 +141,37 @@ func TestIsKnownCommand(t *testing.T) {
 	}
 }
 
+// TestRewriteColonSyntax_DoesNotDoubleSplitOnAlreadyRewritten pins
+// the bug where a forwarded SSH invocation would re-apply the colon
+// rewrite on the server side, splitting `backups:capture` (already
+// the result of one pass) into `backups` + `capture`. Resulting
+// argv had 5 tokens instead of 4, dispatch routed to the wrong
+// command (`pg backups`, with `capture` as a positional arg).
+//
+// The fix lives in main.go: skip the rewrite when env
+// VOODU_ARGV_REWRITTEN=1 is set (client toggles it before SSH).
+// This test pins what rewriteColonSyntax DOES on already-split
+// argv when accidentally invoked — to catch regressions in the
+// rewrite function itself, not the env-var gate.
+func TestRewriteColonSyntax_AlreadySplitArgvGetsManglesByDefault(t *testing.T) {
+	// Already-split argv that mimics what arrives on the server
+	// after the client splits "pg:backups:capture":
+	in := []string{"voodu", "pg", "backups:capture", "clowk-lp/db"}
+
+	got := rewriteColonSyntax(in)
+
+	// The rewrite re-splits "backups:capture" into two tokens.
+	// This is intentional — the function has no way to know the
+	// argv was pre-rewritten. The fix is the env var gate in
+	// main.go that skips this call entirely on the server side.
+	want := []string{"voodu", "pg", "backups", "capture", "clowk-lp/db"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rewriteColonSyntax (re-applied):\n  got  %v\n  want %v\n  (this confirms the bug exists; the env-var gate in main.go is what prevents the second call)",
+			got, want)
+	}
+}
+
 func TestFilterFlags(t *testing.T) {
 	in := []string{"postgres", "create", "--controller-url", "http://x:9", "main", "-a", "prod"}
 	want := []string{"--controller-url", "http://x:9", "-a", "prod"}

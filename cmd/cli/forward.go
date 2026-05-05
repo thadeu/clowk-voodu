@@ -17,6 +17,18 @@ const (
 	envControllerURL     = "VOODU_CONTROLLER_URL"
 	defaultControllerURL = "http://127.0.0.1:8686"
 	forwardTimeout       = 30 * time.Second
+
+	// envRewriteAlreadyApplied is set by the client's SSH
+	// forward when it has already run rewriteColonSyntax on
+	// argv. The server-side voodu reads it in main() and skips
+	// the rewrite to avoid double-splitting multi-segment plugin
+	// commands like `pg:backups:capture`.
+	//
+	// Without this marker, the second pass on the server would
+	// split `backups:capture` into `backups` + `capture`,
+	// dropping the third segment and routing to the wrong plugin
+	// command. See the trace in main.go for the full reasoning.
+	envRewriteAlreadyApplied = "VOODU_ARGV_REWRITTEN"
 )
 
 // controllerURL resolves the controller endpoint in priority order:

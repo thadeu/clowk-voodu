@@ -13,7 +13,16 @@ var (
 )
 
 func main() {
-	os.Args = rewriteColonSyntax(os.Args)
+	// Skip rewrite when the client has already applied it
+	// (forwarded SSH invocation). Re-rewriting would split a
+	// multi-segment plugin command like `pg:backups:capture`
+	// twice — first the client splits to `["pg", "backups:capture"]`,
+	// then the server would re-split `backups:capture` into
+	// `["backups", "capture"]`, which collapses to the wrong
+	// command (`pg:backups` with arg `capture`) at dispatch.
+	if os.Getenv(envRewriteAlreadyApplied) != "1" {
+		os.Args = rewriteColonSyntax(os.Args)
+	}
 
 	root := newRootCmd()
 

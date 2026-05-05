@@ -1,4 +1,4 @@
-.PHONY: help build build-cli build-controller build-linux build-linux-arm64 build-linux-amd64 test lint fmt vet clean install-cli tidy check
+.PHONY: help build build-cli build-controller build-linux build-linux-arm64 build-linux-amd64 test lint fmt vet clean install-cli force-install-cli tidy check
 
 BINARY_CLI        := voodu
 BINARY_CONTROLLER := voodu-controller
@@ -57,6 +57,25 @@ install-cli: build-cli ## Install voodu to /usr/local/bin (with vd symlink)
 		sudo codesign --force --sign - /usr/local/bin/$(BINARY_CLI); \
 	fi
 	sudo ln -sf /usr/local/bin/$(BINARY_CLI) /usr/local/bin/vd
+
+force-install-cli: ## Force-rebuild from scratch + reinstall (use when stale binary suspected)
+	@echo "==> Force-rebuild bin/$(BINARY_CLI)"
+	go build -a -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY_CLI) ./cmd/cli
+	@echo "==> Reinstall to /usr/local/bin/$(BINARY_CLI)"
+	sudo rm -f /usr/local/bin/vd /usr/local/bin/$(BINARY_CLI) 2>/dev/null || true
+	sudo install -m 0755 bin/$(BINARY_CLI) /usr/local/bin/$(BINARY_CLI)
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		sudo codesign --force --sign - /usr/local/bin/$(BINARY_CLI); \
+	fi
+	sudo ln -sf /usr/local/bin/$(BINARY_CLI) /usr/local/bin/vd
+	@echo ""
+	@echo "✓ Installed. Verify with:"
+	@echo "   /usr/local/bin/$(BINARY_CLI) --version"
+	@echo "   should show:  $(VERSION)"
+	@echo ""
+	@echo "⚠  If 'vd' still acts stale, your shell cached the old path."
+	@echo "   Clear it with:   hash -r       (bash/zsh)"
+	@echo "   Or open a new terminal session."
 
 install-controller: build-linux-arm64
 	scp bin/linux-arm64/voodu $(HOST):/tmp/voodu
