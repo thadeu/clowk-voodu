@@ -695,3 +695,118 @@ func (e *exitCodeContainers) Wait(name string) (int, error) {
 
 	return e.exit, nil
 }
+
+// TestJobHandler_RunOnceMergesSpecLabels pins the spec.Labels →
+// container labels merge: operator-supplied tags (voodu.role,
+// arbitrary key=value) reach the container; voodu's identity
+// labels (kind, scope, name, replica id) are preserved unchanged.
+//
+// Used by voodu-postgres' backup capture to emit
+// `voodu.role=backup` so `docker ps --filter
+// label=voodu.role=backup` filters across resources.
+func TestJobHandler_RunOnceMergesSpecLabels(t *testing.T) {
+	store := newMemStore()
+
+	spec := map[string]any{
+		"image":   "ghcr.io/acme/api:1.0.0",
+		"command": []string{"./run.sh"},
+		"labels": map[string]any{
+			"voodu.role":  "backup",
+			"team":        "platform",
+		},
+	}
+	seedManifest(t, store, KindJob, "demo", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	applyEv := putEvent(t, KindJob, "demo", spec)
+
+	if err := apply.Handle(context.Background(), applyEv); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cm := &fakeContainers{}
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "demo"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(cm.recreates) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(cm.recreates))
+	}
+
+	labels := cm.recreates[0].Labels
+
+	wantLabels := []string{"voodu.role=backup", "team=platform"}
+	for _, want := range wantLabels {
+		found := false
+		for _, l := range labels {
+			if l == want {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("missing operator label %q in container labels: %v", want, labels)
+		}
+	}
+
+	// Identity labels still present (voodu.kind etc.).
+	if !strings.Contains(strings.Join(labels, ","), "voodu.kind=job") {
+		t.Errorf("identity labels missing: %v", labels)
+	}
+}
+
+// TestJobHandler_RunOnceRejectsReservedLabelKeys pins the
+// platform-invariant guard: spec.Labels can NOT override voodu's
+// own identity keys (kind, scope, name, replica id, etc.). Without
+// this gate, a malicious or buggy plugin could re-label its
+// container as someone else's, breaking ListByIdentity.
+func TestJobHandler_RunOnceRejectsReservedLabelKeys(t *testing.T) {
+	store := newMemStore()
+
+	spec := map[string]any{
+		"image":   "ghcr.io/acme/api:1.0.0",
+		"command": []string{"./run.sh"},
+		"labels": map[string]any{
+			"voodu.scope": "evil-scope",   // reserved, must be ignored
+			"voodu.kind":  "deployment",   // reserved, must be ignored
+			"voodu.role":  "backup",       // not reserved, allowed
+		},
+	}
+	seedManifest(t, store, KindJob, "demo", spec)
+
+	apply := &JobHandler{Store: store, Log: quietLogger(), Containers: &fakeContainers{}}
+	applyEv := putEvent(t, KindJob, "demo", spec)
+	_ = apply.Handle(context.Background(), applyEv)
+
+	cm := &fakeContainers{}
+	h := &JobHandler{Store: store, Log: quietLogger(), Containers: cm}
+
+	if _, err := h.RunOnce(context.Background(), "test", "demo"); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	labels := strings.Join(cm.recreates[0].Labels, "\n")
+
+	// voodu.scope MUST be the actual scope (test), not the
+	// spec-supplied evil-scope.
+	if !strings.Contains(labels, "voodu.scope=test") {
+		t.Errorf("voodu.scope must reflect actual scope, got: %s", labels)
+	}
+
+	if strings.Contains(labels, "voodu.scope=evil-scope") {
+		t.Errorf("evil-scope override leaked into container labels: %s", labels)
+	}
+
+	// voodu.kind same — must stay job, not the spec-supplied deployment.
+	if strings.Contains(labels, "voodu.kind=deployment") {
+		t.Errorf("kind override leaked: %s", labels)
+	}
+
+	// voodu.role IS allowed (not in the reserved set).
+	if !strings.Contains(labels, "voodu.role=backup") {
+		t.Errorf("voodu.role should be merged in (not reserved): %s", labels)
+	}
+}

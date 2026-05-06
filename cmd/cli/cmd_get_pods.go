@@ -117,57 +117,179 @@ func runGetPods(cmd *cobra.Command, f getPodsFlags) error {
 	return renderPodsTable(os.Stdout, env.Data.Pods)
 }
 
-// renderPodsTable prints a tab-aligned listing. We deliberately do
-// NOT collapse-by-scope into headed groups: the table is more useful
-// when every row is greppable on its own, and `awk '$3=="softphone"'`
-// is the most common follow-up. Scope appears as its own column.
+// renderPodsTable groups pods by voodu.role label and prints each
+// group as its own section with a divider header. The intent is
+// to keep the long-running services (deployment, statefulset)
+// from being drowned out by the dozens of historical job/cronjob
+// runs that accumulate over time — operators usually scan the
+// listing for "what's running RIGHT NOW for app X" and the
+// section split makes that 3x faster.
 //
-// "Legacy" pods (no voodu.kind label) render their kind column as
-// "(legacy)" so they're visually distinct without needing a separate
-// section.
+// Within a section, pods are tab-aligned and sorted as the
+// controller delivered them (sortPods on the server side already
+// orders by scope/name/replica).
+//
+// Pods missing a role label fall into the "(legacy)" section so
+// pre-M0 containers stay visible without needing a re-apply.
 func renderPodsTable(w io.Writer, pods []controller.Pod) error {
 	if len(pods) == 0 {
 		fmt.Fprintln(w, "No voodu-managed containers found.")
 		return nil
 	}
 
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	groups := groupPodsByRole(pods)
 
-	fmt.Fprintln(tw, "NAME\tKIND\tSCOPE\tRESOURCE\tIMAGE\tSTATUS")
+	first := true
 
-	for _, p := range pods {
-		kind := p.Kind
-		if kind == "" {
-			kind = "(legacy)"
+	for _, role := range groups.order {
+		bucket := groups.byRole[role]
+
+		if !first {
+			fmt.Fprintln(w)
 		}
 
-		scope := p.Scope
-		if scope == "" {
-			scope = "-"
-		}
+		first = false
 
-		resource := p.ResourceName
-		if resource == "" {
-			// Legacy / pre-M0 containers lack voodu.name. Falling
-			// back to the docker name keeps the row identifiable
-			// without leaving an empty column the operator has to
-			// squint at.
-			resource = p.Name
-		}
+		// Section header — operator sees "=== role (count) ===".
+		// Count is useful when one section blows up (e.g. 50
+		// backup jobs accumulated) so the operator knows to prune
+		// without reading every row.
+		fmt.Fprintf(w, "=== %s (%d) ===\n", role, len(bucket))
 
-		status := p.Status
-		if status == "" {
-			if p.Running {
-				status = "running"
-			} else {
-				status = "stopped"
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+
+		fmt.Fprintln(tw, "NAME\tKIND\tSCOPE\tRESOURCE\tIMAGE\tSTATUS")
+
+		for _, p := range bucket {
+			kind := p.Kind
+			if kind == "" {
+				kind = "(legacy)"
 			}
+
+			scope := p.Scope
+			if scope == "" {
+				scope = "-"
+			}
+
+			resource := p.ResourceName
+			if resource == "" {
+				resource = p.Name
+			}
+
+			status := p.Status
+			if status == "" {
+				if p.Running {
+					status = "running"
+				} else {
+					status = "stopped"
+				}
+			}
+
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				p.Name, kind, scope, resource, p.Image, status,
+			)
 		}
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			p.Name, kind, scope, resource, p.Image, status,
-		)
+		if err := tw.Flush(); err != nil {
+			return err
+		}
 	}
 
-	return tw.Flush()
+	return nil
+}
+
+// roleGroups holds the bucketed-by-role pod listing plus a stable
+// section order so renderPodsTable produces the same output across
+// runs (rather than map-iteration random).
+type roleGroups struct {
+	byRole map[string][]controller.Pod
+	order  []string
+}
+
+// orphansBucket is the section name used for pods that lack a
+// voodu.role label entirely. Pre-M0 containers (from before
+// BuildLabels emitted role) and any hand-rolled docker container
+// without our labels end up here, regardless of their Kind.
+//
+// Rendered last so the structured-role sections stay scannable —
+// orphans are an "archaeology / things to migrate" view, not the
+// primary lens.
+const orphansBucket = "orphans"
+
+// groupPodsByRole buckets pods by voodu.role with two rules:
+//
+//  1. Pods with a non-empty Role land in `byRole[role]`.
+//  2. Pods missing the role label fall into a single
+//     `orphans` bucket regardless of Kind — visible at the
+//     bottom so the operator can spot "what still needs an
+//     apply to inherit the new labels".
+//
+// Within the structured sections, ordering is "natural priority":
+// long-running services first (deployment, statefulset), then
+// scheduled work (cronjob), then completed runs (job, release,
+// backup), then anything else alphabetically. Orphans always last.
+//
+// The priority is opinionated — operators primarily care about
+// the live services. Putting them on top keeps `vd get pd`
+// scannable even when 50 backup jobs accumulate.
+func groupPodsByRole(pods []controller.Pod) roleGroups {
+	by := map[string][]controller.Pod{}
+
+	for _, p := range pods {
+		role := p.Role
+		if role == "" {
+			role = orphansBucket
+		}
+
+		by[role] = append(by[role], p)
+	}
+
+	// Priority for known roles, lower index = printed first.
+	// orphans always last (well past anything else).
+	priority := map[string]int{
+		"deployment":   10,
+		"statefulset":  20,
+		"cronjob":      30,
+		"job":          40,
+		"release":      50,
+		"backup":       60,
+		// Everything else falls to 100 (alphabetical within).
+		orphansBucket: 999,
+	}
+
+	roles := make([]string, 0, len(by))
+	for role := range by {
+		roles = append(roles, role)
+	}
+
+	// Sort by priority, then alphabetically for ties / unknowns.
+	sortStrings(roles, func(a, b string) bool {
+		pa, ok := priority[a]
+		if !ok {
+			pa = 100
+		}
+
+		pb, ok := priority[b]
+		if !ok {
+			pb = 100
+		}
+
+		if pa != pb {
+			return pa < pb
+		}
+
+		return a < b
+	})
+
+	return roleGroups{byRole: by, order: roles}
+}
+
+// sortStrings is a tiny shim to keep the priority sort readable
+// without dragging in the standard sort import name juggling here.
+func sortStrings(s []string, less func(a, b string) bool) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && less(s[j], s[j-1]); j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
 }

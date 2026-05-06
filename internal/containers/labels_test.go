@@ -85,6 +85,10 @@ func TestBuildLabelsAllFields(t *testing.T) {
 		"voodu.replica_id=a3f9",
 		"voodu.manifest_hash=deadbeef",
 		"voodu.created_at=2026-04-24T10:00:00Z",
+		// Role defaults to Kind when Identity.Role is empty,
+		// so every voodu container ends up with a non-empty
+		// voodu.role label for `vd get pd` grouping.
+		"voodu.role=deployment",
 	}
 
 	if len(got) != len(want) {
@@ -132,6 +136,10 @@ func TestParseLabelsRoundTrip(t *testing.T) {
 		ManifestHash:   "feedface",
 		CreatedAt:      "2026-04-24T10:00:00Z",
 		ReplicaOrdinal: -1,
+		// BuildLabels defaults Role to Kind when not set, and
+		// ParseLabels recovers it. Set the expected value here
+		// so the round-trip equality holds.
+		Role: KindJob,
 	}
 
 	flags := BuildLabels(want)
@@ -172,7 +180,9 @@ func TestParseLabelsRoundTripStatefulset(t *testing.T) {
 		ReplicaID:      "2",
 		ReplicaOrdinal: 2,
 		ManifestHash:   "deadbeef",
-		CreatedAt:     "2026-04-28T12:00:00Z",
+		CreatedAt:      "2026-04-28T12:00:00Z",
+		// Default role mirrors Kind.
+		Role: KindStatefulset,
 	}
 
 	flags := BuildLabels(want)
@@ -265,5 +275,103 @@ func TestLegacyContainerName(t *testing.T) {
 		if got := LegacyContainerName(c.name, c.app); got != c.want {
 			t.Errorf("LegacyContainerName(%q, %q) = %v, want %v", c.name, c.app, got, c.want)
 		}
+	}
+}
+
+// TestBuildLabels_RoleDefaultsToKind pins the convention that
+// every voodu container ends up with a non-empty voodu.role label,
+// defaulting to Kind when the caller doesn't override. `vd get pd`
+// uses this to group output by role.
+func TestBuildLabels_RoleDefaultsToKind(t *testing.T) {
+	cases := []struct {
+		kind     string
+		wantRole string
+	}{
+		{KindDeployment, "deployment"},
+		{KindStatefulset, "statefulset"},
+		{KindJob, "job"},
+		{KindCronJob, "cronjob"},
+	}
+
+	for _, tc := range cases {
+		labels := BuildLabels(Identity{
+			Kind:  tc.kind,
+			Scope: "test",
+			Name:  "x",
+		})
+
+		want := "voodu.role=" + tc.wantRole
+
+		found := false
+		for _, l := range labels {
+			if l == want {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("kind %q: expected label %q, got: %v", tc.kind, want, labels)
+		}
+	}
+}
+
+// TestBuildLabels_RoleExplicitOverridesKind covers the override
+// path: callers (release pipeline, voodu-postgres backup capture)
+// set Identity.Role explicitly so the container groups under their
+// custom category in `vd get pd`.
+func TestBuildLabels_RoleExplicitOverridesKind(t *testing.T) {
+	labels := BuildLabels(Identity{
+		Kind:  KindJob,
+		Scope: "clowk-lp",
+		Name:  "release-abc",
+		Role:  "release",
+	})
+
+	for _, l := range labels {
+		if l == "voodu.role=release" {
+			return
+		}
+
+		if l == "voodu.role=job" {
+			t.Errorf("explicit Role=release was overridden by Kind default: %v", labels)
+		}
+	}
+
+	t.Errorf("expected voodu.role=release in labels: %v", labels)
+}
+
+// TestParseLabels_RoundtripsRole pins that ParseLabels recovers
+// the role from the docker label map. Used by the controller's
+// pods listing endpoint to surface the role to the CLI for
+// grouping.
+func TestParseLabels_RoundtripsRole(t *testing.T) {
+	id := Identity{
+		Kind:  KindJob,
+		Scope: "clowk-lp",
+		Name:  "db.bk.b001",
+		Role:  "backup",
+	}
+
+	labels := BuildLabels(id)
+
+	// Convert label slice to map (mirrors what docker hands back).
+	m := map[string]string{}
+	for _, l := range labels {
+		for i := 0; i < len(l); i++ {
+			if l[i] == '=' {
+				m[l[:i]] = l[i+1:]
+				break
+			}
+		}
+	}
+
+	parsed, ok := ParseLabels(m)
+	if !ok {
+		t.Fatal("ParseLabels failed on freshly-built label set")
+	}
+
+	if parsed.Role != "backup" {
+		t.Errorf("Role: got %q, want backup", parsed.Role)
 	}
 }

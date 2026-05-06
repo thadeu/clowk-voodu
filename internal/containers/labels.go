@@ -87,6 +87,20 @@ const (
 	// label=voodu.replica_ordinal=0` works without parsing
 	// names. Empty for non-statefulset kinds.
 	LabelReplicaOrdinal = "voodu.replica_ordinal"
+
+	// LabelRole categorises the container at a higher level than
+	// Kind — useful for grouping / filtering / display where the
+	// raw kind is too granular. Default mirrors Kind ("deployment",
+	// "statefulset", "job", "cronjob") but plugins or operators
+	// override via spec.Labels: voodu-postgres backups emit
+	// `voodu.role=backup` so `docker ps --filter
+	// label=voodu.role=backup` filters across resources without
+	// name parsing. The release pipeline emits
+	// `voodu.role=release` for the same reason.
+	//
+	// `vd get pd` groups its output by this label so backup jobs
+	// don't drown out the actual services in the listing.
+	LabelRole = "voodu.role"
 )
 
 // Kind values used in LabelKind. Mirror controller.Kind constants —
@@ -124,6 +138,13 @@ type Identity struct {
 	// between the integer and the string form stored on
 	// LabelReplicaOrdinal / reused as the ReplicaID.
 	ReplicaOrdinal int
+
+	// Role is the high-level category for grouping / display.
+	// Empty defaults to Kind in BuildLabels (so every voodu
+	// container ends up with a non-empty voodu.role label).
+	// Specific paths override: release containers carry
+	// `release`, backup capture jobs carry `backup`, etc.
+	Role string
 }
 
 // NewReplicaID returns a 4-char hex string for use as a container
@@ -244,6 +265,19 @@ func BuildLabels(id Identity) []string {
 		out = append(out, fmt.Sprintf("%s=%d", LabelReplicaOrdinal, id.ReplicaOrdinal))
 	}
 
+	// Role defaults to Kind so every voodu container gets a
+	// non-empty voodu.role label without callers having to set
+	// it explicitly. Specific paths (release, backup) override
+	// by setting Identity.Role before calling BuildLabels.
+	role := id.Role
+	if role == "" {
+		role = id.Kind
+	}
+
+	if role != "" {
+		out = append(out, fmt.Sprintf("%s=%s", LabelRole, role))
+	}
+
 	return out
 }
 
@@ -270,6 +304,7 @@ func ParseLabels(m map[string]string) (Identity, bool) {
 		CreatedAt:      m[LabelCreatedAt],
 		ReleaseID:      m[LabelReleaseID],
 		ReplicaOrdinal: -1,
+		Role:           m[LabelRole],
 	}
 
 	// Recover the ordinal only for statefulset pods. The label

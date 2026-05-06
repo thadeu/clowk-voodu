@@ -262,6 +262,10 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		return 1, fmt.Errorf("link env: %w", err)
 	}
 
+	// Role=release distinguishes this from regular job containers
+	// in `vd get pd` and `docker ps --filter label=voodu.role=release`.
+	// Kind stays "job" so the existing list/logs paths still find
+	// the container — release pods ARE jobs by lifecycle.
 	labels := containers.BuildLabels(containers.Identity{
 		Kind:         containers.KindJob,
 		Scope:        scope,
@@ -269,14 +273,8 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		ReplicaID:    suffix,
 		ManifestHash: "release",
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		Role:         "release",
 	})
-
-	// Add voodu.role=release as an extra label so operators can
-	// filter releases distinctly from regular jobs (e.g. via
-	// docker inspect --filter label=voodu.role=release). The
-	// containers.Identity-driven labels keep kind=job for the
-	// existing list/logs paths.
-	labels = append(labels, "voodu.role=release")
 
 	releaseSpec := ContainerSpec{
 		Name:        cname,

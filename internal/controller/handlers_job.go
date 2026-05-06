@@ -58,6 +58,19 @@ type jobSpec struct {
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 
+	// Labels carries operator/plugin-supplied docker labels that
+	// merge with voodu's auto-generated identity labels (kind,
+	// scope, name, replica_id, created_at). Plugins use this for
+	// category tagging — e.g. voodu-postgres emits
+	// `voodu.role=backup` so `docker ps --filter
+	// label=voodu.role=backup` filters across resources without
+	// name parsing.
+	//
+	// Voodu's identity labels (`voodu.*` keys reserved by
+	// BuildLabels) take precedence on key collision; operator
+	// can't accidentally overwrite voodu.kind etc.
+	Labels map[string]string `json:"labels,omitempty"`
+
 	// Resources mirrors manifest.ResourcesSpec — kernel-level
 	// CPU/memory caps via cgroups. For cron jobs the same shape
 	// applies to each tick's run container.
@@ -310,6 +323,19 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		ReplicaID: runID,
 		CreatedAt: startedAt.Format(time.RFC3339),
 	})
+
+	// Merge plugin/operator-supplied labels from spec.Labels.
+	// Voodu's identity labels win on key collision so an operator
+	// can't accidentally overwrite voodu.kind / voodu.scope / etc.
+	// — those are platform invariants, not user state.
+	for k, v := range spec.Labels {
+		if isVooduReservedLabel(k) {
+			h.logf("job/%s: ignoring spec label %q (voodu.* keys are reserved)", app, k)
+			continue
+		}
+
+		labels = append(labels, k+"="+v)
+	}
 
 	// Record the in-flight run BEFORE spawning so an operator hitting
 	// /status mid-execution sees the run is happening. The Wait branch
@@ -671,4 +697,33 @@ func (h *JobHandler) logf(format string, args ...any) {
 	}
 
 	h.Log.Printf(format, args...)
+}
+
+// vooduReservedLabels are the docker labels voodu owns and uses
+// internally to track containers (kind, scope, name, replica id,
+// etc.). Operator-supplied labels that match any of these keys are
+// rejected to keep platform invariants intact — without this guard,
+// a job spec setting `voodu.scope=other` could confuse
+// ListByIdentity and friends.
+//
+// The `voodu.role` key (and any other not in this list) IS allowed
+// for operator/plugin tagging — see voodu-postgres' backup capture
+// emitting `voodu.role=backup`.
+var vooduReservedLabels = map[string]bool{
+	containers.LabelCreatedBy:       true,
+	containers.LabelKind:            true,
+	containers.LabelScope:           true,
+	containers.LabelName:            true,
+	containers.LabelReplicaID:       true,
+	containers.LabelManifestHash:    true,
+	containers.LabelCreatedAt:       true,
+	containers.LabelReleaseID:       true,
+	containers.LabelReplicaOrdinal:  true,
+}
+
+// isVooduReservedLabel reports whether key collides with a label
+// voodu manages internally. Used by JobHandler to filter out
+// spec-supplied labels that would override platform invariants.
+func isVooduReservedLabel(key string) bool {
+	return vooduReservedLabels[key]
 }

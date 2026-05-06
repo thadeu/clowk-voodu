@@ -30,6 +30,12 @@ type Pod struct {
 	ResourceName string `json:"resource_name"`
 	ReplicaID    string `json:"replica_id,omitempty"`
 
+	// Role is the high-level category from voodu.role label.
+	// Defaults to Kind when set; specific paths override (e.g.
+	// "release", "backup"). `vd get pd` groups output by this
+	// value.
+	Role string `json:"role,omitempty"`
+
 	// ReleaseID correlates this pod to the deployment-release
 	// record it was spawned from. Empty when the pod was created
 	// outside a release orchestration (initial replica creation,
@@ -98,6 +104,7 @@ func (DockerPodsLister) ListPods() ([]Pod, error) {
 			ResourceName: id.Name,
 			ReplicaID:    id.ReplicaID,
 			ReleaseID:    id.ReleaseID,
+			Role:         id.Role,
 			Image:        c.Image,
 			Status:       c.Status,
 			Running:      running,
@@ -203,6 +210,7 @@ func (DockerPodsLister) GetPod(name string) (*PodDetail, error) {
 		out.Pod.ResourceName = id.Name
 		out.Pod.ReplicaID = id.ReplicaID
 		out.Pod.CreatedAt = id.CreatedAt
+		out.Pod.Role = id.Role
 	}
 
 	return out, nil
