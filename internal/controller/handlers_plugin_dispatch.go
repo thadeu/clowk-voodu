@@ -447,6 +447,17 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Plugin-supplied Summary wins for ALL action types —
+		// apply_manifest, config_set, run_job, etc. — same way it
+		// does for the passthrough actions above. Lets plugins
+		// produce a clean operator-facing checklist (`job manifest
+		// applied: clowk-lp/db.bk.b016`, `backup b016 dispatched`)
+		// instead of the controller's verbose default that names
+		// the underlying primitive.
+		if action.Summary != "" {
+			summary = action.Summary
+		}
+
 		applied = append(applied, summary)
 	}
 
