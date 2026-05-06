@@ -1362,25 +1362,62 @@ func (h *StatefulsetHandler) Volumes(scope, name string) ([]string, error) {
 // ever existed (including those scaled down out of) gets the axe.
 //
 // Returns the names of volumes actually removed for surface in
-// the CLI's confirmation log. Errors are best-effort: a volume
-// stuck in use by an external container surfaces an error but
-// the prune loop continues with the rest.
+// the CLI's confirmation log. Best-effort: errors append to the
+// returned list of skipped volumes but the loop continues with
+// the rest.
+//
+// CRITICAL: containers must be torn down BEFORE volume removal,
+// otherwise docker rejects with "volume in use by container X".
+// The handler's watch-driven remove() runs async and may not have
+// finished when this is called. We force-remove every container
+// matching the (scope, kind, name) labels first — idempotent on
+// already-gone containers — then retry volume removal with a
+// short backoff to absorb any remaining filesystem-level races
+// (mount propagation, lazy unmount).
+//
+// Without the force-removal, `vd delete --prune` was leaving
+// volumes behind silently — the operator saw "deleted" but
+// `docker volume ls` still showed `voodu-<scope>-<name>-data-N`,
+// and the next `vd apply` reused the stale data. This was the
+// root cause of the postgres standby-volume DR confusion.
 func (h *StatefulsetHandler) PruneVolumes(scope, name string) ([]string, error) {
 	if h.Containers == nil {
 		return nil, nil
 	}
 
-	filters := []string{
+	// Force-remove every container with our (kind, scope, name)
+	// labels first. `docker rm -f` is idempotent and tolerates
+	// "already gone", so this is safe even after the watch-driven
+	// teardown has already run. Without it, races between the
+	// watch handler and PruneVolumes leave the volume "in use"
+	// and docker volume rm fails.
+	pods, err := h.Containers.ListByIdentity(containers.KindStatefulset, scope, name)
+	if err != nil {
+		h.logf("statefulset/%s-%s prune: list containers failed (continuing): %v",
+			scope, name, err)
+	}
+
+	for _, p := range pods {
+		// Best-effort — Remove handles the "already gone" case
+		// silently. Errors logged so a stuck container is visible
+		// but don't abort the prune (we still try volumes).
+		if err := h.Containers.Remove(p.Name); err != nil {
+			h.logf("statefulset/%s-%s prune: remove container %s: %v",
+				scope, name, p.Name, err)
+		}
+	}
+
+	volumeFilters := []string{
 		containers.LabelCreatedBy + "=" + containers.LabelCreatedByValue,
 		containers.LabelKind + "=" + containers.KindStatefulset,
 		containers.LabelName + "=" + name,
 	}
 
 	if scope != "" {
-		filters = append(filters, containers.LabelScope+"="+scope)
+		volumeFilters = append(volumeFilters, containers.LabelScope+"="+scope)
 	}
 
-	vols, err := h.Containers.ListVolumesByLabels(filters)
+	vols, err := h.Containers.ListVolumesByLabels(volumeFilters)
 	if err != nil {
 		return nil, fmt.Errorf("list volumes: %w", err)
 	}
@@ -1388,8 +1425,30 @@ func (h *StatefulsetHandler) PruneVolumes(scope, name string) ([]string, error) 
 	removed := make([]string, 0, len(vols))
 
 	for _, v := range vols {
-		if err := h.Containers.RemoveVolume(v); err != nil {
-			h.logf("statefulset/%s-%s prune volume %s failed: %v", scope, name, v, err)
+		// Retry with exponential-ish backoff (50ms, 250ms, 1s).
+		// "in use" clears as soon as docker reaps the container's
+		// last reference; on this host that's typically <100ms
+		// after rm -f returns, but mount-propagation lag has been
+		// observed up to a couple hundred ms on busy hosts. Three
+		// retries totalling ~1.3s is enough headroom without
+		// dragging delete into multi-second territory on success.
+		var lastErr error
+		for _, wait := range []time.Duration{0, 50 * time.Millisecond, 250 * time.Millisecond, 1 * time.Second} {
+			if wait > 0 {
+				time.Sleep(wait)
+			}
+
+			if err := h.Containers.RemoveVolume(v); err == nil {
+				lastErr = nil
+				break
+			} else {
+				lastErr = err
+			}
+		}
+
+		if lastErr != nil {
+			h.logf("statefulset/%s-%s prune volume %s failed after retries: %v",
+				scope, name, v, lastErr)
 			continue
 		}
 
