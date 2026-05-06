@@ -926,16 +926,17 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 	sort.Slice(claims, func(i, j int) bool { return claims[i].Name < claims[j].Name })
 
 	input := struct {
-		Image        string            `json:"image"`
-		Command      []string          `json:"command"`
-		Ports        []string          `json:"ports"`
-		Volumes      []string          `json:"volumes"`
-		Env          map[string]string `json:"env"`
-		Networks     []string          `json:"networks"`
-		NetworkMode  string            `json:"network_mode"`
-		Restart      string            `json:"restart"`
-		VolumeClaims []volumeClaim     `json:"volume_claims"`
-		Assets       []string          `json:"assets,omitempty"`
+		Image        string             `json:"image"`
+		Command      []string           `json:"command"`
+		Ports        []string           `json:"ports"`
+		Volumes      []string           `json:"volumes"`
+		Env          map[string]string  `json:"env"`
+		Networks     []string           `json:"networks"`
+		NetworkMode  string             `json:"network_mode"`
+		Restart      string             `json:"restart"`
+		Resources    *resourcesWireSpec `json:"resources,omitempty"`
+		VolumeClaims []volumeClaim      `json:"volume_claims"`
+		Assets       []string           `json:"assets,omitempty"`
 	}{
 		Image:        spec.Image,
 		Command:      spec.Command,
@@ -945,6 +946,10 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		Networks:     nets,
 		NetworkMode:  spec.NetworkMode,
 		Restart:      spec.Restart,
+		// See deploymentSpecHash for why Resources folds in. Same
+		// rationale: editing the cgroup caps must trigger a rolling
+		// recreate, otherwise the new HCL is ignored at runtime.
+		Resources:    spec.Resources,
 		VolumeClaims: claims,
 		Assets:       flattenAssetDigests(assetDigests),
 	}

@@ -1476,15 +1476,16 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 	sort.Strings(nets)
 
 	input := struct {
-		Image       string            `json:"image"`
-		Command     []string          `json:"command"`
-		Ports       []string          `json:"ports"`
-		Volumes     []string          `json:"volumes"`
-		Env         map[string]string `json:"env"`
-		Networks    []string          `json:"networks"`
-		NetworkMode string            `json:"network_mode"`
-		Restart     string            `json:"restart"`
-		Assets      []string          `json:"assets,omitempty"`
+		Image       string             `json:"image"`
+		Command     []string           `json:"command"`
+		Ports       []string           `json:"ports"`
+		Volumes     []string           `json:"volumes"`
+		Env         map[string]string  `json:"env"`
+		Networks    []string           `json:"networks"`
+		NetworkMode string             `json:"network_mode"`
+		Restart     string             `json:"restart"`
+		Resources   *resourcesWireSpec `json:"resources,omitempty"`
+		Assets      []string           `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
 		Command:     spec.Command,
@@ -1494,7 +1495,17 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Networks:    nets,
 		NetworkMode: spec.NetworkMode,
 		Restart:     spec.Restart,
-		Assets:      flattenAssetDigests(assetDigests),
+		// Resources fold into the hash so a `resources { limits {
+		// cpu, memory } }` edit triggers a rolling restart. Without
+		// this, the operator changes a CPU cap, runs `vd apply`, the
+		// reconciler computes the same hash as before, and the
+		// container keeps running with the OLD cgroup limits — drift
+		// without any signal. omitempty keeps the empty case (no
+		// resources block declared) hashing identical to historical
+		// pre-resources deployments so this change isn't a no-op
+		// rolling restart on existing fleets.
+		Resources: spec.Resources,
+		Assets:    flattenAssetDigests(assetDigests),
 	}
 
 	// json.Marshal emits slice elements in declared order and struct
