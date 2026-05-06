@@ -102,6 +102,26 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		return code, true
 	}
 
+	// `vd pg:backups:download` (and any future plugin :download)
+	// orchestrates client-side because the file lives on the
+	// controller host and needs to land on the operator's machine.
+	// Going through the dispatch envelope is bounded by RAM and
+	// JSON budgets; scp reuses the SSH credentials we already have
+	// for the auto-forward, gets native progress for free, and
+	// streams without a size cap. See runDownloadForwarded.
+	if isPluginDownloadCommand(stream.args) {
+		code, err := runDownloadForwarded(info, identity, stream.args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+
+			if code == 0 {
+				code = 1
+			}
+		}
+
+		return code, true
+	}
+
 	// `voodu delete` is destructive — render the plan locally and
 	// prompt y/N on the user's actual terminal before any SSH. The
 	// orchestrator injects -y into the forwarded argv on approval so

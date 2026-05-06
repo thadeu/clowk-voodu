@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -186,9 +188,30 @@ func TestLooksLikePluginDispatch_DetectorRules(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:   "starts with flag — not plugin syntax",
+			name:   "leading flag with value consumes the next token (no plugin left)",
 			args:   []string{"-r", "redis"},
 			wantOK: false,
+		},
+		{
+			name:       "leading -o json passes through (orchestrator path)",
+			args:       []string{"-o", "json", "pg", "backups:download", "clowk-lp/db", "b013"},
+			wantOK:     true,
+			wantPlugin: "pg", wantCmd: "backups:download",
+			wantArgs: []string{"clowk-lp/db", "b013"},
+		},
+		{
+			name:       "leading --output=json (equals form) passes through",
+			args:       []string{"--output=json", "pg", "backups", "clowk-lp/db"},
+			wantOK:     true,
+			wantPlugin: "pg", wantCmd: "backups",
+			wantArgs: []string{"clowk-lp/db"},
+		},
+		{
+			name:       "double-dash terminator stops flag-skipping",
+			args:       []string{"--", "pg", "backups"},
+			wantOK:     true,
+			wantPlugin: "pg", wantCmd: "backups",
+			wantArgs: []string{},
 		},
 		{
 			name:   "command with non-ident chars",
@@ -398,5 +421,94 @@ func TestPluginDispatch_ServerErrorSurfaces(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "does not have an executable") {
 		t.Errorf("error mismatch: %v", err)
+	}
+}
+
+// TestRunFetchFileLocal_CopiesBytes pins the local-mode path: the
+// plugin emits fetch_file with (remote_path, dest_path), CLI
+// `cp`s remote_path → dest_path on the same machine. This handler
+// never runs in the auto-forwarded `:download` case (orchestrator
+// uses scp instead).
+func TestRunFetchFileLocal_CopiesBytes(t *testing.T) {
+	dir := t.TempDir()
+	src := dir + "/source.dump"
+	dst := dir + "/dest.dump"
+
+	body := []byte("PGDMP\x00\x01\x02\x03binary-payload")
+
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+
+	ff := pluginDispatchFetchFileCmd{
+		RemotePath: src,
+		DestPath:   dst,
+		SizeBytes:  int64(len(body)),
+	}
+
+	if err := runFetchFileLocal(ff); err != nil {
+		t.Fatalf("runFetchFileLocal: %v", err)
+	}
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+
+	if !bytes.Equal(got, body) {
+		t.Errorf("bytes mismatch: got %x, want %x", got, body)
+	}
+}
+
+// TestRunFetchFileLocal_RefusesToClobber: re-running `:download`
+// with the default dest (in-pod filename) should error rather
+// than silently overwrite a previous local copy.
+func TestRunFetchFileLocal_RefusesToClobber(t *testing.T) {
+	dir := t.TempDir()
+	src := dir + "/source.dump"
+	dst := dir + "/dest.dump"
+
+	if err := os.WriteFile(src, []byte("new"), 0o644); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+
+	if err := os.WriteFile(dst, []byte("preexisting"), 0o644); err != nil {
+		t.Fatalf("seed dst: %v", err)
+	}
+
+	err := runFetchFileLocal(pluginDispatchFetchFileCmd{
+		RemotePath: src,
+		DestPath:   dst,
+	})
+	if err == nil {
+		t.Fatal("expected error when dest exists")
+	}
+
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error should mention existing file, got: %v", err)
+	}
+
+	// Original content must survive — error path doesn't truncate.
+	got, _ := os.ReadFile(dst)
+	if string(got) != "preexisting" {
+		t.Errorf("dest was overwritten despite refusal: %q", got)
+	}
+}
+
+// TestRunFetchFileLocal_RejectsMalformedAction guards against a
+// plugin emitting an empty path. We surface a clear error before
+// hitting an obscure os.Open / os.Create failure.
+func TestRunFetchFileLocal_RejectsMalformedAction(t *testing.T) {
+	cases := []pluginDispatchFetchFileCmd{
+		{RemotePath: "", DestPath: "/tmp/x.dump"},
+		{RemotePath: "/some/path", DestPath: ""},
+		{},
+	}
+
+	for _, ff := range cases {
+		err := runFetchFileLocal(ff)
+		if err == nil {
+			t.Errorf("expected error for malformed action: %+v", ff)
+		}
 	}
 }

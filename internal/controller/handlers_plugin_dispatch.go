@@ -137,6 +137,35 @@ type pluginDispatchAction struct {
 	// so this is consistent with the existing trust boundary.
 	// The CLI logs the command before executing for audit.
 	Command []string `json:"command,omitempty"`
+
+	// fetch_file payload — instructs the operator-side CLI to
+	// transfer a file from RemotePath (on the controller host)
+	// to DestPath (on the operator's filesystem). The CLI picks
+	// the actual mechanism — scp when auto-forwarded over SSH
+	// (with native progress + no size limit), cp when running
+	// directly on the controller. Same passthrough pattern as
+	// exec_local; the controller never reads or copies the file.
+	//
+	// Why metadata-only and not bytes-in-envelope: streaming via
+	// scp reuses the SSH credentials the auto-forward already
+	// has, gets native progress for free, and isn't bound by
+	// RAM or JSON-envelope size budgets. Bytes-in-dispatch was
+	// a dead end above ~few hundred MiB.
+	//
+	// SizeBytes is informational — the CLI uses it for a "no
+	// progress because file is small" hint. Optional.
+	RemotePath string `json:"remote_path,omitempty"`
+	DestPath   string `json:"dest_path,omitempty"`
+	SizeBytes  int64  `json:"size_bytes,omitempty"`
+
+	// Summary is an optional human-readable label the plugin
+	// can attach to ANY action. When set, the controller uses
+	// it as the `applied` line the CLI prints; otherwise the
+	// controller composes a verbose default from structural
+	// fields. Lets plugins emit short, operator-friendly
+	// checklist lines (e.g. `fetch_file b013 → bkp/db2.dump`)
+	// instead of full path dumps.
+	Summary string `json:"summary,omitempty"`
 }
 
 // pluginDispatchExecLocal is the wire shape the controller adds
@@ -146,6 +175,19 @@ type pluginDispatchAction struct {
 // preserved from the plugin's emit order.
 type pluginDispatchExecLocal struct {
 	Command []string `json:"command"`
+}
+
+// pluginDispatchFetchFile mirrors pluginDispatchExecLocal but
+// carries (remote_path, dest_path, size_bytes) — pure metadata.
+// The operator-side CLI runs scp / cp from RemotePath to DestPath;
+// neither plugin nor controller ever reads or copies the file.
+//
+// Order preserved from the plugin's emit order — multi-file
+// downloads land in the same order the plugin emitted them.
+type pluginDispatchFetchFile struct {
+	RemotePath string `json:"remote_path"`
+	DestPath   string `json:"dest_path"`
+	SizeBytes  int64  `json:"size_bytes,omitempty"`
 }
 
 // pluginDispatchManifest is the wire shape the plugin emits when
@@ -340,6 +382,7 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 
 	applied := make([]string, 0, len(resp.Actions))
 	execLocals := make([]pluginDispatchExecLocal, 0)
+	fetches := make([]pluginDispatchFetchFile, 0)
 
 	for i, action := range resp.Actions {
 		// exec_local is a passthrough — controller doesn't run
@@ -353,7 +396,47 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 			}
 
 			execLocals = append(execLocals, pluginDispatchExecLocal{Command: action.Command})
-			applied = append(applied, fmt.Sprintf("exec_local %v (deferred to CLI)", action.Command))
+
+			// Same Summary precedence as fetch_file — plugin
+			// label wins, fallback shows the full command for
+			// debuggability.
+			summary := action.Summary
+			if summary == "" {
+				summary = fmt.Sprintf("exec_local %v (deferred to CLI)", action.Command)
+			}
+
+			applied = append(applied, summary)
+
+			continue
+		}
+
+		// fetch_file is also a passthrough. Pure metadata
+		// (RemotePath, DestPath); the CLI runs scp/cp from there.
+		// Controller never reads or copies the file. See
+		// pluginDispatchAction's fetch_file payload comments.
+		if action.Type == "fetch_file" {
+			if action.RemotePath == "" || action.DestPath == "" {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("apply action %d (fetch_file): remote_path and dest_path are required", i))
+				return
+			}
+
+			fetches = append(fetches, pluginDispatchFetchFile{
+				RemotePath: action.RemotePath,
+				DestPath:   action.DestPath,
+				SizeBytes:  action.SizeBytes,
+			})
+
+			// Plugin-supplied Summary wins so operators see
+			// short, scannable lines (e.g. `fetch_file b013 →
+			// bkp/db2.dump`). Default keeps the verbose form
+			// for debugging when a plugin forgets to label.
+			summary := action.Summary
+			if summary == "" {
+				summary = fmt.Sprintf("fetch_file %s → %s (deferred to CLI)",
+					action.RemotePath, action.DestPath)
+			}
+
+			applied = append(applied, summary)
 
 			continue
 		}
@@ -377,6 +460,12 @@ func (a *API) handlePluginCommand(w http.ResponseWriter, r *http.Request) {
 	// local exec is needed.
 	if len(execLocals) > 0 {
 		data["exec_local"] = execLocals
+	}
+
+	// Same lazy attachment for fetches — most dispatches don't
+	// produce one, so don't bloat the JSON when empty.
+	if len(fetches) > 0 {
+		data["fetch_file"] = fetches
 	}
 
 	writeJSON(w, http.StatusOK, envelope{

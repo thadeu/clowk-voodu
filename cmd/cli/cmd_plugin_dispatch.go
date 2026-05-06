@@ -33,16 +33,67 @@ import (
 // plugin which is responsible for its own help output.
 //
 // Returns (plugin, command, args, true) on a match.
+//
+// Leading root flags (`-o json`, `--controller-url=...`, etc.) are
+// skipped before the detection. Operators occasionally prepend
+// these (`vd -o json pg:backups`); the orchestrator path also
+// inserts `-o json` ahead of the plugin command when capturing the
+// dispatch envelope from an SSH-forwarded invocation. Without the
+// skip, leading flags push the plugin name out of position 0 and
+// dispatch falls through to the legacy /plugins/exec route → 404.
 func looksLikePluginDispatch(argv []string) (plugin, command string, args []string, ok bool) {
-	if len(argv) < 2 {
+	stripped := stripLeadingRootFlags(argv)
+	if len(stripped) < 2 {
 		return "", "", nil, false
 	}
 
-	if !isIdent(argv[0]) || !isCommandPath(argv[1]) {
+	if !isIdent(stripped[0]) || !isCommandPath(stripped[1]) {
 		return "", "", nil, false
 	}
 
-	return argv[0], argv[1], argv[2:], true
+	return stripped[0], stripped[1], stripped[2:], true
+}
+
+// stripLeadingRootFlags advances past any sequence of `-flag` /
+// `-flag value` pairs at the start of argv, returning the suffix.
+// Uses takesValue() so a flag known to take a value consumes the
+// next token; bare boolean flags (`-y`) consume only themselves.
+//
+// Stops at the first positional — by definition, the plugin name.
+// Stops on `--` (POSIX end-of-options) so anything past it is
+// preserved as positional, even if it starts with a dash.
+func stripLeadingRootFlags(argv []string) []string {
+	i := 0
+
+	for i < len(argv) {
+		tok := argv[i]
+
+		if tok == "--" {
+			return argv[i+1:]
+		}
+
+		if !strings.HasPrefix(tok, "-") {
+			return argv[i:]
+		}
+
+		// `-flag=value` carries its own value — single token.
+		if strings.Contains(tok, "=") {
+			i++
+			continue
+		}
+
+		// `-flag value` only when the flag is known to take a value.
+		// Unknown flags are treated as bare; we stop there rather
+		// than gobble the next token (which might be the plugin).
+		if takesValue(tok) && i+1 < len(argv) {
+			i += 2
+			continue
+		}
+
+		i++
+	}
+
+	return nil
 }
 
 // isCommandPath reports whether s is a colon-separated chain of
@@ -80,6 +131,7 @@ type pluginDispatchResponse struct {
 		Message   string                       `json:"message"`
 		Applied   []string                     `json:"applied"`
 		ExecLocal []pluginDispatchExecLocalCmd `json:"exec_local,omitempty"`
+		FetchFile []pluginDispatchFetchFileCmd `json:"fetch_file,omitempty"`
 	} `json:"data"`
 	Error string `json:"error,omitempty"`
 }
@@ -96,6 +148,19 @@ type pluginDispatchExecLocalCmd struct {
 	Command []string `json:"command"`
 }
 
+// pluginDispatchFetchFileCmd carries metadata for a host→operator
+// file transfer. The CLI picks the actual mechanism — scp when
+// auto-forwarded over SSH, cp when running on the controller —
+// and never reads bytes through the dispatch envelope.
+//
+// Mirrors the controller's pluginDispatchFetchFile. See
+// runFetchFile for the operator-side handling.
+type pluginDispatchFetchFileCmd struct {
+	RemotePath string `json:"remote_path"`
+	DestPath   string `json:"dest_path"`
+	SizeBytes  int64  `json:"size_bytes,omitempty"`
+}
+
 // runPluginDispatch POSTs the operator's args to the plugin
 // dispatch endpoint and renders the response. The CLI doesn't
 // inspect the args — they're whatever the operator typed after
@@ -106,6 +171,16 @@ type pluginDispatchExecLocalCmd struct {
 // stdout. Server applies any `actions` returned and surfaces
 // the `message` back here.
 func runPluginDispatch(root *cobra.Command, plugin, command string, args []string) error {
+	// Cobra never reaches Execute() on the dispatch path, so root's
+	// persistent flags ($-o, --controller-url, etc.) carry their
+	// defaults unless we parse them here. The forwardToController
+	// path does the same dance — we mirror it so `-o json` and
+	// `--controller-url=...` work uniformly across forwarder and
+	// dispatcher. Pass os.Args[1:] (filtered for flags) so leading
+	// flags ahead of the plugin name get applied; positional args
+	// stay in `args` for the plugin payload.
+	_ = root.PersistentFlags().Parse(filterFlags(os.Args[1:]))
+
 	body := pluginDispatchPayload{Args: args}
 
 	raw, err := json.Marshal(body)
@@ -146,6 +221,25 @@ func runPluginDispatch(root *cobra.Command, plugin, command string, args []strin
 		return formatControllerError(resp.StatusCode, body2)
 	}
 
+	// `-o json`: dump the server's envelope verbatim. The Mac-side
+	// orchestrator (runDownloadForwarded) relies on this to parse
+	// fetch_file / exec_local actions out of an SSH-forwarded
+	// dispatch — the pretty-text path below would lose the
+	// structured action data. Operators can also pipe to jq for
+	// programmatic access to applied summaries / messages.
+	if outputFormat(root) == "json" {
+		// We already verified the body parses (via the unmarshal
+		// below for the text path). Pass it through as-is so jq
+		// gets the canonical wire shape, not a re-marshaled copy.
+		fmt.Print(string(body2))
+
+		if !bytes.HasSuffix(body2, []byte("\n")) {
+			fmt.Println()
+		}
+
+		return nil
+	}
+
 	var out pluginDispatchResponse
 	if err := json.Unmarshal(body2, &out); err != nil {
 		// Plugin emitted plain text — print as-is.
@@ -181,6 +275,20 @@ func runPluginDispatch(root *cobra.Command, plugin, command string, args []strin
 		}
 	}
 
+	// fetch_file: plugin asked us to transfer a file from the
+	// controller host to the operator's filesystem. Local-mode
+	// only here — auto-forwarded :download is handled earlier
+	// by runDownloadForwarded, which uses scp with progress
+	// instead of cp (and never hits this dispatch path). The
+	// guard catches accidental fetch_file emissions on remote
+	// invocations (e.g. a future plugin) so we don't silently
+	// no-op or, worse, copy on the wrong machine.
+	for _, ff := range out.Data.FetchFile {
+		if err := runFetchFileLocal(ff); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -210,6 +318,52 @@ func runExecLocal(command []string) error {
 
 		return fmt.Errorf("exec_local %s: %w", command[0], err)
 	}
+
+	return nil
+}
+
+// runFetchFileLocal copies RemotePath → DestPath on the same
+// machine. Used when the plugin and the operator are on the same
+// host (no auto-forward) — `cp` is enough; no SSH needed.
+//
+// The auto-forward case takes a different code path
+// (runDownloadForwarded) which uses scp from the operator to the
+// controller machine before the dispatch ever happens, so this
+// handler never runs in that mode.
+//
+// Refuses to clobber an existing destination — operators
+// commonly re-run `:download` and the default dest is the
+// in-pod filename, so accidental overwrites from a stale local
+// copy would be easy to make.
+func runFetchFileLocal(ff pluginDispatchFetchFileCmd) error {
+	if ff.RemotePath == "" || ff.DestPath == "" {
+		return fmt.Errorf("fetch_file: remote_path and dest_path are required")
+	}
+
+	if _, err := os.Stat(ff.DestPath); err == nil {
+		return fmt.Errorf("fetch_file %s: file already exists (move/rename it, or pass --to <other>)", ff.DestPath)
+	}
+
+	src, err := os.Open(ff.RemotePath)
+	if err != nil {
+		return fmt.Errorf("fetch_file: open %s: %w", ff.RemotePath, err)
+	}
+
+	defer src.Close()
+
+	dst, err := os.Create(ff.DestPath)
+	if err != nil {
+		return fmt.Errorf("fetch_file: create %s: %w", ff.DestPath, err)
+	}
+
+	defer dst.Close()
+
+	n, err := io.Copy(dst, src)
+	if err != nil {
+		return fmt.Errorf("fetch_file: copy %s → %s: %w", ff.RemotePath, ff.DestPath, err)
+	}
+
+	fmt.Printf("  ✓ wrote %s (%d bytes)\n", ff.DestPath, n)
 
 	return nil
 }
