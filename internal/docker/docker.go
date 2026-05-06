@@ -1215,70 +1215,69 @@ func LogsStream(name string, follow bool, tail int) (io.ReadCloser, error) {
 
 	cmd := exec.Command("docker", args...)
 
-	stdout, err := cmd.StdoutPipe()
+	// Merge stdout + stderr onto a SINGLE OS pipe so the reader
+	// gets both streams interleaved in arrival order. Earlier
+	// version used StdoutPipe/StderrPipe separately and read
+	// stdout first; for daemons that log only to stderr (postgres,
+	// redis, jobs writing to stderr by convention) the reader
+	// blocked on stdout forever and `vd logs -f` showed only
+	// the initial buffered output — never streamed live. With
+	// the merged pipe, daemon stderr lines surface immediately.
+	pr, pw, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("docker logs %s: stdout pipe: %w", name, err)
+		return nil, fmt.Errorf("docker logs %s: pipe: %w", name, err)
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdout.Close()
-		return nil, fmt.Errorf("docker logs %s: stderr pipe: %w", name, err)
-	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 
 	if err := cmd.Start(); err != nil {
-		_ = stdout.Close()
-		_ = stderr.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+
 		return nil, fmt.Errorf("docker logs %s: start: %w", name, err)
 	}
 
+	// CRITICAL: close the WRITER end in the parent. The child
+	// inherited a duplicate of pw; closing in the parent doesn't
+	// affect the child's stdout/stderr but ensures `pr.Read`
+	// returns EOF when the child exits and closes its end. Without
+	// this, the parent's pw stays open and the reader blocks
+	// forever after the child exits — `vd logs` (without -f)
+	// against an exited container would never return.
+	_ = pw.Close()
+
 	return &dockerLogsReader{
 		cmd:    cmd,
-		stdout: stdout,
-		stderr: stderr,
+		merged: pr,
 	}, nil
 }
 
-// dockerLogsReader reads stdout + stderr concurrently and reaps the
-// underlying process on Close. We read both streams because docker
-// writes container stderr to the reader's stderr — losing it would
-// hide the most useful debug output (panic traces, "permission
-// denied", etc.).
+// dockerLogsReader is a thin io.ReadCloser over the merged
+// stdout+stderr pipe. The actual reading is one os.Read against
+// the pipe; the cmd-side merge happens at process start (see
+// LogsStream).
 type dockerLogsReader struct {
 	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	stderr io.ReadCloser
+	merged io.ReadCloser
 
-	once   sync.Once
-	closed chan struct{}
+	once sync.Once
 }
 
-// Read merges stdout and stderr by interleaving Reads. We don't
-// promise line-perfect ordering across the two streams — docker
-// itself doesn't either when its driver isn't json-file — but each
-// individual line stays atomic.
+// Read returns whatever the docker process has written so far
+// across BOTH stdout and stderr, interleaved in OS-write order.
+// Atomic per write call, not per line — same trade-off `docker
+// logs name 2>&1` makes on a shell.
 func (r *dockerLogsReader) Read(p []byte) (int, error) {
-	// Drain stdout first; when stdout closes (process exit), fall
-	// through to stderr. This matches how `docker logs name 2>&1` would
-	// look on a shell — stderr typically sees the last gasps when
-	// stdout has already closed.
-	n, err := r.stdout.Read(p)
-	if err == io.EOF {
-		return r.stderr.Read(p)
-	}
-
-	return n, err
+	return r.merged.Read(p)
 }
 
-// Close kills the docker process and waits for it. Idempotent — the
+// Close kills the docker process and reaps it. Idempotent — the
 // HTTP handler may call it multiple times if the client disconnects
 // mid-stream.
 func (r *dockerLogsReader) Close() error {
-	var err error
-
 	r.once.Do(func() {
-		_ = r.stdout.Close()
-		_ = r.stderr.Close()
+		_ = r.merged.Close()
 
 		if r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill()
@@ -1289,7 +1288,7 @@ func (r *dockerLogsReader) Close() error {
 		_ = r.cmd.Wait()
 	})
 
-	return err
+	return nil
 }
 
 // RemoveContainer removes a container.
