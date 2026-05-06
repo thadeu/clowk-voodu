@@ -62,6 +62,14 @@ func (f *fakeRestarter) Volumes(scope, name string) ([]string, error) {
 	return nil, nil
 }
 
+// RebootstrapPod stubs the per-ordinal teardown surface. Restart
+// tests don't drive this path, but the StatefulsetRestarter
+// interface requires it now that `vd delete <scope>/<name>.<N>`
+// flows through.
+func (f *fakeRestarter) RebootstrapPod(ctx context.Context, scope, name string, ordinal int, prune bool) (RebootstrapPodSummary, error) {
+	return RebootstrapPodSummary{}, nil
+}
+
 // TestRestart_DispatchesToDeploymentHandler confirms the happy path:
 // /restart?kind=deployment&scope=&name= reaches the DeploymentRestarter
 // with the tuple intact. Without this, the API could resolve scope

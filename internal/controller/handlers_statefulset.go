@@ -1457,3 +1457,124 @@ func (h *StatefulsetHandler) PruneVolumes(scope, name string) ([]string, error) 
 
 	return removed, nil
 }
+
+// RebootstrapPodSummary captures what happened during a per-pod
+// rebootstrap so the API can render it for the operator. Mirrors
+// pruneSummary but per-ordinal — one container, one volume set.
+type RebootstrapPodSummary struct {
+	ContainerRemoved string   `json:"container_removed,omitempty"`
+	VolumesRemoved   []string `json:"volumes_removed,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
+}
+
+// RebootstrapPod tears down a single pod's container (and
+// optionally its volumes) so the next reconcile recreates it
+// fresh. Used by `vd delete <scope>/<name>.<ordinal>` for
+// targeted DR — wipe one pod without touching the rest.
+//
+// Steps:
+//
+//  1. Force-remove the container at <scope>-<name>.<ordinal>.
+//     Idempotent on already-gone containers.
+//  2. If prune=true: remove every docker volume labelled with this
+//     ordinal. The wrapper's first-boot path then runs whatever
+//     bootstrap procedure the workload uses (pg_basebackup, etc.).
+//     Without prune, the existing volume's data is reused on the
+//     next pod boot.
+//  3. Re-fire the apply path on the live manifest so the missing
+//     ordinal is Ensured immediately. Without this, the pod
+//     recreates only on the next periodic reconcile (could be
+//     minutes), or on the next docker event the reconciler
+//     happens to see.
+//
+// Statefulset-only: the (scope, name, ordinal) tuple identifies a
+// stable pod here. Deployments don't have stable per-replica
+// identities — their pods are interchangeable, so "delete pod-N"
+// is meaningless at the deployment level.
+func (h *StatefulsetHandler) RebootstrapPod(ctx context.Context, scope, name string, ordinal int, prune bool) (RebootstrapPodSummary, error) {
+	summary := RebootstrapPodSummary{}
+
+	if h.Containers == nil {
+		return summary, fmt.Errorf("container manager not wired")
+	}
+
+	cname := containers.ContainerName(scope, name, containers.OrdinalReplicaID(ordinal))
+
+	// Idempotent force-remove. The Containers.Remove abstraction
+	// handles "no such container" silently; surface only real
+	// daemon errors.
+	if err := h.Containers.Remove(cname); err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("remove container %s: %v", cname, err))
+	} else {
+		summary.ContainerRemoved = cname
+	}
+
+	if prune {
+		// Per-ordinal volume filter: same labels as PruneVolumes
+		// but narrowed to this ordinal so we don't take out the
+		// other replicas' data.
+		filters := []string{
+			containers.LabelCreatedBy + "=" + containers.LabelCreatedByValue,
+			containers.LabelKind + "=" + containers.KindStatefulset,
+			containers.LabelName + "=" + name,
+			containers.LabelReplicaOrdinal + "=" + containers.OrdinalReplicaID(ordinal),
+		}
+
+		if scope != "" {
+			filters = append(filters, containers.LabelScope+"="+scope)
+		}
+
+		vols, err := h.Containers.ListVolumesByLabels(filters)
+		if err != nil {
+			summary.Errors = append(summary.Errors, fmt.Sprintf("list volumes: %v", err))
+		}
+
+		for _, v := range vols {
+			// Brief retry to absorb the same mount-propagation
+			// race PruneVolumes guards against.
+			var lastErr error
+			for _, wait := range []time.Duration{0, 50 * time.Millisecond, 250 * time.Millisecond, 1 * time.Second} {
+				if wait > 0 {
+					time.Sleep(wait)
+				}
+
+				if err := h.Containers.RemoveVolume(v); err == nil {
+					lastErr = nil
+					break
+				} else {
+					lastErr = err
+				}
+			}
+
+			if lastErr != nil {
+				summary.Errors = append(summary.Errors, fmt.Sprintf("remove volume %s: %v", v, lastErr))
+				continue
+			}
+
+			summary.VolumesRemoved = append(summary.VolumesRemoved, v)
+		}
+	}
+
+	// Re-fire reconcile so the ordinal comes back immediately.
+	// Synthesise a Put-style watch event from the live manifest;
+	// the apply path scans existing pods, sees the gap, Ensures
+	// the missing ordinal. With volume gone, EnsureVolume
+	// creates a fresh empty one and the wrapper bootstraps.
+	m, err := h.Store.Get(ctx, KindStatefulset, scope, name)
+	if err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("read manifest: %v", err))
+		return summary, nil
+	}
+
+	if m == nil {
+		// Manifest already gone (e.g. operator deleted the
+		// statefulset earlier). Nothing to reconcile.
+		return summary, nil
+	}
+
+	if err := h.apply(ctx, WatchEvent{Type: WatchPut, Kind: KindStatefulset, Scope: scope, Name: name, Manifest: m}); err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("trigger reconcile: %v", err))
+	}
+
+	return summary, nil
+}

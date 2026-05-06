@@ -452,6 +452,10 @@ func (f *fakeStatefulsetRestarter) Volumes(scope, name string) ([]string, error)
 	return nil, nil
 }
 
+func (f *fakeStatefulsetRestarter) RebootstrapPod(ctx context.Context, scope, name string, ordinal int, prune bool) (RebootstrapPodSummary, error) {
+	return RebootstrapPodSummary{}, nil
+}
+
 // TestPodStop_NotConfigured: API without PodLifecycle wired
 // returns 503, not a panic. Lets server bootstrap order be
 // flexible — if PodLifecycle isn't set, the endpoint just says

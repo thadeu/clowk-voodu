@@ -198,34 +198,32 @@ func deleteFlagTakesValue(flag string) bool {
 	return false
 }
 
-// runScopeWipeForwarded is the SSH path for `vd delete <scope>
-// --prune --remote X`. Renders an explicit "you are about to
-// destroy scope X" preview locally so the destructive prompt
-// happens on the operator's terminal (the SSH stdin is unused —
-// no manifests to ship — but cobra's prompt still wouldn't reach
-// the operator from the server side). On approval the argv
-// forwards verbatim and the server's runScopeWipe takes over.
-func runScopeWipeForwarded(info *remote.Info, identity string, stream streamResult, flags deleteClientFlags, scope string) (int, error) {
-	// Fail-fast before the prompt: the server's runScopeWipe also
-	// gates on --prune, but the operator should hear "you forgot
-	// --prune" before being asked to confirm — not after answering
-	// y to a wipe that the server then refuses.
-	if !flags.prune {
-		return 1, fmt.Errorf("delete <scope> requires --prune (this destroys every manifest, config, and on-disk state in the scope)")
-	}
+// runScopeWipeForwarded is the SSH path for the no-manifest delete
+// shapes. Three sub-shapes share this orchestrator because they
+// all skip the manifest-list rendering and just need a "you're
+// about to destroy X" preview before the SSH forward:
+//
+//   - bare scope:     `vd delete clowk-lp` — every manifest in scope
+//   - resource ref:   `vd delete clowk-lp/db` — kind-agnostic
+//   - per-pod ref:    `vd delete clowk-lp/db.1` — statefulset only
+//
+// The shape is decided here from the positional token (passed in
+// as `target`); the message explains what's going away. On approval
+// argv forwards verbatim and the server's handlers take over.
+func runScopeWipeForwarded(info *remote.Info, identity string, stream streamResult, flags deleteClientFlags, target string) (int, error) {
+	previewMsg, dryRunMsg := composeForwardedDeletePreview(target, flags)
 
 	if flags.dryRun {
-		fmt.Fprintf(os.Stdout, "Would wipe scope %q (every manifest, scope config, per-app dirs).\nDry-run: no DELETE issued.\n", scope)
+		fmt.Fprintln(os.Stdout, dryRunMsg)
 		return 0, nil
 	}
 
 	palette := newDiffPalette(os.Stdout)
-
-	fmt.Fprintf(os.Stdout, "Will wipe scope %s — every manifest, scope-level config, and per-app on-disk state.\n\n", palette.Del(scope))
+	fmt.Fprintln(os.Stdout, palette.Del(previewMsg)+"\n")
 
 	if !flags.autoApprove && !envAutoApprove() {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			return 1, errors.New("refusing to wipe scope in non-interactive mode without --auto-approve (or VOODU_AUTO_APPROVE=1)")
+			return 1, errors.New("refusing to delete in non-interactive mode without --auto-approve (or VOODU_AUTO_APPROVE=1)")
 		}
 
 		ok, err := promptDeleteConfirm(os.Stdin, os.Stderr)
@@ -234,7 +232,7 @@ func runScopeWipeForwarded(info *remote.Info, identity string, stream streamResu
 		}
 
 		if !ok {
-			fmt.Fprintln(os.Stderr, "Scope wipe canceled.")
+			fmt.Fprintln(os.Stderr, "Delete canceled.")
 			return 0, nil
 		}
 	}
@@ -246,5 +244,57 @@ func runScopeWipeForwarded(info *remote.Info, identity string, stream streamResu
 	})
 
 	return code, err
+}
+
+// composeForwardedDeletePreview renders the human-readable warning
+// the forwarder shows BEFORE prompting y/N. Branches by ref shape
+// so the operator sees specifically what's about to be destroyed
+// (scope-wide vs single-resource vs single-pod) rather than a
+// generic "this is destructive" line.
+func composeForwardedDeletePreview(target string, flags deleteClientFlags) (preview, dryRun string) {
+	pruneSuffix := ""
+	if flags.prune {
+		pruneSuffix = " + per-app config + volumes"
+	}
+
+	// Per-pod: <scope>/<name>.<ordinal>
+	if scope, name, ord, ok := parsePodRef(target); ok {
+		preview = fmt.Sprintf("Will wipe pod %s/%s ordinal %d (statefulset only). Container removed; reconciler will recreate it from spec%s.",
+			scope, name, ord, pruneVolumeSuffix(flags))
+
+		dryRun = fmt.Sprintf("Would wipe pod %s/%s ordinal %d.\nDry-run: no DELETE issued.", scope, name, ord)
+
+		return
+	}
+
+	// Single resource: <scope>/<name>
+	if scope, name, ok := parseResourceRef(target); ok {
+		preview = fmt.Sprintf("Will delete resource %s/%s across every kind (manifests + containers%s).",
+			scope, name, pruneSuffix)
+
+		dryRun = fmt.Sprintf("Would delete resource %s/%s.\nDry-run: no DELETE issued.", scope, name)
+
+		return
+	}
+
+	// Bare scope: <scope>
+	preview = fmt.Sprintf("Will wipe scope %s — every manifest of every kind%s, scope-level config%s.",
+		target, pruneSuffix, pruneSuffix)
+
+	dryRun = fmt.Sprintf("Would wipe scope %q (every manifest + scope config%s).\nDry-run: no DELETE issued.",
+		target, pruneSuffix)
+
+	return
+}
+
+// pruneVolumeSuffix renders the volume-destruction clause when
+// --prune is set; otherwise returns "" so the preview reads
+// cleanly without trailing punctuation in the soft-delete case.
+func pruneVolumeSuffix(flags deleteClientFlags) string {
+	if flags.prune {
+		return " (--prune: also wipes the pod's data volume → fresh bootstrap on recreate)"
+	}
+
+	return ""
 }
 

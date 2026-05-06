@@ -216,6 +216,14 @@ type StatefulsetRestarter interface {
 	Rollback(ctx context.Context, scope, name, targetID string) (newID string, err error)
 	PruneVolumes(scope, name string) ([]string, error)
 	Volumes(scope, name string) ([]string, error)
+
+	// RebootstrapPod is the per-ordinal teardown invoked by
+	// `DELETE /resource?...&ordinal=N`. Force-removes that pod's
+	// container, optionally wipes its volumes (when prune=true),
+	// and re-fires reconcile so the missing ordinal comes back
+	// from spec. Statefulset-only — deployment replicas don't
+	// have stable per-pod identities to target.
+	RebootstrapPod(ctx context.Context, scope, name string, ordinal int, prune bool) (RebootstrapPodSummary, error)
 }
 
 // ExecOptions mirrors docker.ExecOptions field-for-field but lives
@@ -265,6 +273,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /releases/run", a.handleReleaseRun)
 	mux.HandleFunc("POST /rollback", a.handleRollback)
 	mux.HandleFunc("DELETE /scope", a.handleScopeWipe)
+	mux.HandleFunc("DELETE /resource", a.handleResourceDelete)
 
 	return logRequests(mux)
 }
@@ -833,10 +842,22 @@ func (a *API) handleScopeWipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Query().Get("prune") != "true" {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope wipe requires ?prune=true (this destroys every manifest, config and on-disk state in the scope)"))
-		return
-	}
+	// Two modes:
+	//   default (no prune):  SOFT wipe — delete every manifest in scope
+	//                        + scope-level config bucket. Containers
+	//                        tear down via watch. Per-app config and
+	//                        volumes are preserved (operator can
+	//                        re-apply later and reattach to data).
+	//   prune=true:          HARD wipe — also call pruneResource per
+	//                        resource (config + filesystem) and
+	//                        PruneVolumes for statefulsets.
+	//
+	// Earlier this endpoint required prune=true because soft mode
+	// was undocumented. Operators frequently want "nuke the manifests
+	// but keep my data volumes" for dev/test reset cycles, so we
+	// promote it to the default and keep --prune as the explicit
+	// destructive opt-in.
+	prune := r.URL.Query().Get("prune") == "true"
 
 	ctx := r.Context()
 
@@ -863,14 +884,30 @@ func (a *API) handleScopeWipe(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			sum := pruneResource(ctx, a.Store, kind, scope, m.Name)
+			sum := pruneSummary{}
+
+			if prune {
+				sum = pruneResource(ctx, a.Store, kind, scope, m.Name)
+
+				if kind == KindStatefulset && a.Statefulsets != nil {
+					vols, err := a.Statefulsets.PruneVolumes(scope, m.Name)
+					if err != nil {
+						sum.Errors = append(sum.Errors, fmt.Sprintf("prune volumes: %v", err))
+					} else {
+						sum.VolumesRemoved = vols
+					}
+				}
+			}
+
 			wiped = append(wiped, wipedResource{Kind: kind, Name: m.Name, Pruned: sum})
 		}
 	}
 
-	// Scope-level config bucket (the shared `vd config <scope> set`
-	// values). Wiped last so per-app removals are done first; an
-	// early failure here would orphan apps without scope env.
+	// Scope-level config bucket: ALWAYS wiped (regardless of
+	// prune) because the config bucket IS the scope's identity in
+	// etcd; soft-keeping a scope's config without any resources
+	// would orphan it. The per-app config buckets are what the
+	// `prune` flag gates.
 	scopeConfigErr := a.Store.DeleteConfig(ctx, scope, "")
 
 	writeJSON(w, http.StatusOK, envelope{
@@ -880,6 +917,149 @@ func (a *API) handleScopeWipe(w http.ResponseWriter, r *http.Request) {
 			"resources_wiped":    wiped,
 			"scope_config_wiped": scopeConfigErr == nil,
 			"errors":             scopedErrors,
+		},
+	})
+}
+
+// handleResourceDelete is the kind-agnostic + per-pod delete
+// dispatcher. Two shapes:
+//
+//	DELETE /resource?scope=&name=                 kind-agnostic delete
+//	DELETE /resource?scope=&name=&ordinal=N       per-pod (statefulset)
+//
+// Kind-agnostic: scans every scoped kind for a (scope, name) match
+// and deletes each one. Most resources match exactly one kind; the
+// `app` authoring sugar emits both deployment + ingress so a single
+// `vd delete clowk-lp/web` cleans both halves atomically.
+//
+// Per-pod (ordinal set): the operation is "wipe this pod's container
+// (+ optionally its volumes) and let the reconciler bring it back
+// from spec." Useful for DR — `vd delete clowk-lp/db.1 --prune`
+// rebootstraps a single standby without touching the rest of the
+// cluster. Statefulset-only since deployment replicas are
+// interchangeable (no stable ordinal identity to target).
+//
+// `prune=true` opts into the destructive cleanup (config bucket +
+// filesystem state for kind-agnostic; volume removal for per-pod).
+// Default is soft: manifests + containers gone, data preserved.
+func (a *API) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	ordinalStr := strings.TrimSpace(r.URL.Query().Get("ordinal"))
+	prune := r.URL.Query().Get("prune") == "true"
+
+	if scope == "" || name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope and name are required"))
+		return
+	}
+
+	ctx := r.Context()
+
+	// Per-pod path — only valid for statefulsets, ordinal targets
+	// a single pod's container + volumes.
+	if ordinalStr != "" {
+		ordinal, err := strconv.Atoi(ordinalStr)
+		if err != nil || ordinal < 0 {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("ordinal must be a non-negative integer, got %q", ordinalStr))
+			return
+		}
+
+		m, err := a.Store.Get(ctx, KindStatefulset, scope, name)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		if m == nil {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("statefulset/%s/%s not found (per-pod delete is statefulset-only)", scope, name))
+			return
+		}
+
+		if a.Statefulsets == nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("statefulset handler not wired"))
+			return
+		}
+
+		summary, err := a.Statefulsets.RebootstrapPod(ctx, scope, name, ordinal, prune)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("rebootstrap pod: %w", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data: map[string]any{
+				"scope":   scope,
+				"name":    name,
+				"ordinal": ordinal,
+				"action":  "rebootstrap",
+				"summary": summary,
+			},
+		})
+
+		return
+	}
+
+	// Kind-agnostic scan: iterate every scoped kind and delete
+	// matches. `app` blocks emit both deployment + ingress with
+	// the same (scope, name) so we may delete two manifests in
+	// one call — that's intentional, mirrors the apply path's
+	// app→deployment+ingress 1:N expansion.
+	type wipedResource struct {
+		Kind   Kind         `json:"kind"`
+		Pruned pruneSummary `json:"pruned,omitempty"`
+	}
+
+	var wiped []wipedResource
+
+	errs := []string{}
+
+	for kind := range ScopedKinds {
+		m, err := a.Store.Get(ctx, kind, scope, name)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("get %s: %v", kind, err))
+			continue
+		}
+
+		if m == nil {
+			continue
+		}
+
+		if _, err := a.Store.Delete(ctx, kind, scope, name); err != nil {
+			errs = append(errs, fmt.Sprintf("delete %s/%s/%s: %v", kind, scope, name, err))
+			continue
+		}
+
+		sum := pruneSummary{}
+
+		if prune {
+			sum = pruneResource(ctx, a.Store, kind, scope, name)
+
+			if kind == KindStatefulset && a.Statefulsets != nil {
+				vols, err := a.Statefulsets.PruneVolumes(scope, name)
+				if err != nil {
+					sum.Errors = append(sum.Errors, fmt.Sprintf("prune volumes: %v", err))
+				} else {
+					sum.VolumesRemoved = vols
+				}
+			}
+		}
+
+		wiped = append(wiped, wipedResource{Kind: kind, Pruned: sum})
+	}
+
+	if len(wiped) == 0 && len(errs) == 0 {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no resource found at %s/%s across any kind", scope, name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data: map[string]any{
+			"scope":           scope,
+			"name":            name,
+			"resources_wiped": wiped,
+			"errors":          errs,
 		},
 	})
 }

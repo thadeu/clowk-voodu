@@ -426,3 +426,114 @@ func TestIsDeleteCommand(t *testing.T) {
 		})
 	}
 }
+
+// TestParseResourceRef pins the `<scope>/<name>` matcher that the
+// delete dispatcher uses to route to the kind-agnostic single-
+// resource endpoint. The matcher MUST reject pod refs (with an
+// `.<ord>` suffix) so the per-pod handler isn't shadowed.
+func TestParseResourceRef(t *testing.T) {
+	cases := []struct {
+		ref         string
+		wantOK      bool
+		wantScope   string
+		wantName    string
+	}{
+		// Happy path
+		{"clowk-lp/db", true, "clowk-lp", "db"},
+		{"data/main", true, "data", "main"},
+		// Multi-segment scope/name with dashes — common in practice.
+		{"my-scope/my-app", true, "my-scope", "my-app"},
+
+		// Pod refs MUST NOT match here — parsePodRef catches them.
+		{"clowk-lp/db.0", false, "", ""},
+		{"clowk-lp/db.42", false, "", ""},
+
+		// Malformed
+		{"", false, "", ""},
+		{"clowk-lp", false, "", ""},     // bare scope
+		{"clowk-lp/", false, "", ""},    // empty name
+		{"/db", false, "", ""},          // empty scope
+		{"a/b/c", true, "a", "b/c"},     // SplitN(2): rest absorbs extra slashes; that's fine
+	}
+
+	for _, tc := range cases {
+		s, n, ok := parseResourceRef(tc.ref)
+		if ok != tc.wantOK || s != tc.wantScope || n != tc.wantName {
+			t.Errorf("parseResourceRef(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.ref, s, n, ok, tc.wantScope, tc.wantName, tc.wantOK)
+		}
+	}
+}
+
+// TestParsePodRef pins the `<scope>/<name>.<ordinal>` matcher.
+// Ordinal MUST be a non-negative integer; resource refs without
+// the dot suffix and refs with non-integer suffixes both reject.
+func TestParsePodRef(t *testing.T) {
+	cases := []struct {
+		ref         string
+		wantOK      bool
+		wantScope   string
+		wantName    string
+		wantOrd     int
+	}{
+		// Happy path
+		{"clowk-lp/db.0", true, "clowk-lp", "db", 0},
+		{"clowk-lp/db.1", true, "clowk-lp", "db", 1},
+		{"clowk-lp/db.42", true, "clowk-lp", "db", 42},
+
+		// Resource refs (no dot) — reject so parseResourceRef wins.
+		{"clowk-lp/db", false, "", "", 0},
+
+		// Bare scope — reject (no slash).
+		{"clowk-lp", false, "", "", 0},
+
+		// Non-integer ordinal — reject (avoids treating
+		// `data/main.dump` as a pod).
+		{"clowk-lp/db.abc", false, "", "", 0},
+
+		// Negative ordinal — reject (no negative pod ordinals).
+		{"clowk-lp/db.-1", false, "", "", 0},
+
+		// Empty fields
+		{"", false, "", "", 0},
+		{"clowk-lp/.0", false, "", "", 0},      // empty name
+		{"/db.0", false, "", "", 0},            // empty scope
+		{"clowk-lp/db.", false, "", "", 0},     // empty ordinal
+
+		// Multi-dot in name — last dot wins (lets names with dots
+		// parse the trailing ordinal cleanly).
+		{"clowk-lp/db.bk.b001.5", true, "clowk-lp", "db.bk.b001", 5},
+	}
+
+	for _, tc := range cases {
+		s, n, ord, ok := parsePodRef(tc.ref)
+		if ok != tc.wantOK || s != tc.wantScope || n != tc.wantName || ord != tc.wantOrd {
+			t.Errorf("parsePodRef(%q) = (%q, %q, %d, %v), want (%q, %q, %d, %v)",
+				tc.ref, s, n, ord, ok, tc.wantScope, tc.wantName, tc.wantOrd, tc.wantOK)
+		}
+	}
+}
+
+// TestParseRefDispatch_Disjoint guards that resource-ref and
+// pod-ref matchers don't both succeed on the same input. The
+// dispatcher in newDeleteCmd checks pod-ref first, then resource-
+// ref, then falls through to scope. If both matched, the order
+// would silently determine semantics — defense in depth here so
+// a future tweak doesn't introduce ambiguity.
+func TestParseRefDispatch_Disjoint(t *testing.T) {
+	cases := []string{
+		"clowk-lp/db",
+		"clowk-lp/db.0",
+		"clowk-lp/db.bk.b001.5",
+		"clowk-lp",
+	}
+
+	for _, ref := range cases {
+		_, _, _, isPod := parsePodRef(ref)
+		_, _, isRes := parseResourceRef(ref)
+
+		if isPod && isRes {
+			t.Errorf("ref %q matched both pod and resource shapes (must be disjoint)", ref)
+		}
+	}
+}

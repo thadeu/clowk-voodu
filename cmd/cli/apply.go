@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,9 +159,9 @@ func newDeleteCmd() *cobra.Command {
 	var f applyFlags
 
 	cmd := &cobra.Command{
-		Use:   "delete [-f file.hcl | <scope>]",
-		Short: "Delete resources declared in the given manifests, or wipe an entire scope",
-		Long: `delete removes resources from the controller's store. Two shapes:
+		Use:   "delete [-f file.hcl | <scope> | <scope>/<name> | <scope>/<name>.<ordinal>]",
+		Short: "Delete resources declared in manifests, an entire scope, a single resource, or one pod",
+		Long: `delete removes resources from the controller's store. Five shapes:
 
   vd delete -f file.hcl            soft-delete every manifest in the file
                                    (containers + manifest + status; env vars
@@ -168,11 +169,26 @@ func newDeleteCmd() *cobra.Command {
   vd delete -f file.hcl --prune    hard-delete: above + config bucket +
                                    /opt/voodu/apps/<app> + volumes
 
-  vd delete <scope> --prune        nuke the entire scope: every manifest of
-                                   every kind, scope-level config, all per-app
-                                   filesystem state. --prune is required because
-                                   "soft scope wipe" doesn't have a useful
-                                   meaning.
+  vd delete <scope>                soft-wipe the entire scope: every manifest
+                                   of every kind, scope-level config. Volumes
+                                   and per-app config preserved (re-apply later
+                                   to reattach to data).
+  vd delete <scope> --prune        hard-wipe the scope: also nuke per-app
+                                   config + volumes + on-disk state.
+
+  vd delete <scope>/<name>         soft-delete the resource at (scope, name)
+                                   across whatever kind owns it (auto-detect).
+                                   ` + "`app`" + ` blocks delete both deployment + ingress
+                                   in one shot.
+  vd delete <scope>/<name> --prune hard-delete (also nukes config + volumes).
+
+  vd delete <scope>/<name>.<N>     statefulset only — wipe pod ordinal N's
+                                   container and let the reconciler recreate
+                                   it. Useful for DR ("rebootstrap one
+                                   replica without touching the cluster").
+  vd delete <scope>/<name>.<N> --prune
+                                   also wipes that pod's data volume so the
+                                   wrapper bootstraps from scratch.
 
 By default delete prints a plan listing every resource that will be
 removed and asks y/N before issuing any DELETE. Pass --auto-approve
@@ -184,17 +200,27 @@ controller — useful for confirming "is this the right manifest set?"
 before committing to the destructive operation.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Two dispatch shapes:
-			//  - bare positional `<scope>` → scope-wipe
-			//  - -f file(s) → manifest-list delete
-			// Mixing both would be ambiguous (which wins?), so we
-			// reject up front.
+			// Dispatch by positional shape. Mixing -f with a positional
+			// would be ambiguous (which wins?), so we reject up front.
 			if len(args) == 1 {
 				if len(f.files) > 0 {
-					return fmt.Errorf("delete: pass either -f or a positional <scope>, not both")
+					return fmt.Errorf("delete: pass either -f or a positional ref, not both")
 				}
 
-				return runScopeWipe(cmd, args[0], f)
+				ref := args[0]
+
+				// `<scope>/<name>.<ordinal>` — per-pod delete
+				if scope, name, ordinal, ok := parsePodRef(ref); ok {
+					return runPodDelete(cmd, scope, name, ordinal, f)
+				}
+
+				// `<scope>/<name>` — kind-agnostic single resource
+				if scope, name, ok := parseResourceRef(ref); ok {
+					return runResourceDelete(cmd, scope, name, f)
+				}
+
+				// Bare `<scope>` — scope-wide wipe
+				return runScopeWipe(cmd, ref, f)
 			}
 
 			return runDelete(cmd, f)
@@ -832,18 +858,24 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 	return nil
 }
 
-// runScopeWipe is the `vd delete <scope> --prune` path: wipe every
-// manifest in a scope across every kind, plus scope-level config,
-// plus per-app filesystem state. Hits DELETE /scope on the
-// controller; the server gates the destructive op on prune=true so
-// even a buggy CLI invocation can't accidentally trigger it.
+// runScopeWipe is the `vd delete <scope> [--prune]` path: wipe every
+// manifest in a scope across every kind, plus scope-level config.
+// Hits DELETE /scope on the controller. With --prune, also nukes
+// per-app config + filesystem + volumes; without it, those are
+// preserved so an operator can re-apply later and reattach to data.
+//
+// Soft-wipe is the default because "clear every manifest, keep my
+// data volumes" is the common dev/test reset cycle. Hard-wipe
+// stays opt-in via --prune.
 func runScopeWipe(cmd *cobra.Command, scope string, f applyFlags) error {
-	if !f.prune {
-		return fmt.Errorf("delete <scope> requires --prune (this destroys every manifest, config, and on-disk state in the scope)")
-	}
-
 	if f.dryRun {
-		fmt.Fprintf(os.Stdout, "Would wipe scope %q (every manifest, scope config, per-app dirs).\nDry-run: no DELETE issued.\n", scope)
+		mode := "soft-wipe"
+		if f.prune {
+			mode = "hard-wipe (--prune: also drops per-app config + volumes)"
+		}
+
+		fmt.Fprintf(os.Stdout, "Would %s scope %q (every manifest + scope config).\nDry-run: no DELETE issued.\n", mode, scope)
+
 		return nil
 	}
 
@@ -851,7 +883,10 @@ func runScopeWipe(cmd *cobra.Command, scope string, f applyFlags) error {
 
 	q := url.Values{}
 	q.Set("scope", scope)
-	q.Set("prune", "true")
+
+	if f.prune {
+		q.Set("prune", "true")
+	}
 
 	resp, err := controllerDo(root, http.MethodDelete, "/scope", q.Encode(), nil)
 	if err != nil {
@@ -909,6 +944,215 @@ func runScopeWipe(cmd *cobra.Command, scope string, f applyFlags) error {
 	if len(env.Data.ResourcesWiped) == 0 && env.Data.ScopeConfigWiped {
 		fmt.Println("(no manifests in scope; only scope-level config existed and was wiped)")
 	}
+
+	return nil
+}
+
+// parseResourceRef matches the `<scope>/<name>` shape — scope and
+// name with no further suffix. Used by `vd delete <scope>/<name>`
+// to route to the kind-agnostic single-resource delete endpoint.
+//
+// Returns ok=false for shapes the caller should NOT treat as a
+// resource ref:
+//
+//   - bare `<scope>` (no slash) — scope-wide wipe
+//   - `<scope>/<name>.<ordinal>` — per-pod (parsePodRef catches it
+//     first; this function returns false to avoid a double-match)
+//   - more than one slash, or empty segments — malformed
+func parseResourceRef(ref string) (scope, name string, ok bool) {
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+
+	scope, name = parts[0], parts[1]
+	if scope == "" || name == "" {
+		return "", "", false
+	}
+
+	// Per-pod refs end with `.<digits>`. Defer to parsePodRef so
+	// the caller doesn't have to track which match wins.
+	if _, _, _, isPod := parsePodRef(ref); isPod {
+		return "", "", false
+	}
+
+	return scope, name, true
+}
+
+// parsePodRef matches `<scope>/<name>.<ordinal>` — statefulset
+// per-pod ref. The ordinal is a non-negative integer suffix
+// separated by a literal dot from the resource name. Returns
+// ok=false for any other shape so parseResourceRef can take
+// non-pod refs.
+func parsePodRef(ref string) (scope, name string, ordinal int, ok bool) {
+	slash := strings.IndexByte(ref, '/')
+	if slash < 0 {
+		return "", "", 0, false
+	}
+
+	scope = ref[:slash]
+	rest := ref[slash+1:]
+
+	dot := strings.LastIndexByte(rest, '.')
+	if dot < 0 {
+		return "", "", 0, false
+	}
+
+	name = rest[:dot]
+	ordStr := rest[dot+1:]
+
+	if scope == "" || name == "" || ordStr == "" {
+		return "", "", 0, false
+	}
+
+	n, err := strconv.Atoi(ordStr)
+	if err != nil || n < 0 {
+		return "", "", 0, false
+	}
+
+	return scope, name, n, true
+}
+
+// runResourceDelete handles `vd delete <scope>/<name> [-y] [--prune]`.
+// Hits DELETE /resource on the controller, which scans every
+// scoped kind for a match and deletes each one (an `app` block
+// emits both deployment + ingress so a single ref deletes both).
+func runResourceDelete(cmd *cobra.Command, scope, name string, f applyFlags) error {
+	if f.dryRun {
+		mode := "soft-delete"
+		if f.prune {
+			mode = "hard-delete (--prune: also drops config + volumes)"
+		}
+
+		fmt.Fprintf(os.Stdout, "Would %s resource %s/%s.\nDry-run: no DELETE issued.\n", mode, scope, name)
+
+		return nil
+	}
+
+	root := cmd.Root()
+
+	q := url.Values{}
+	q.Set("scope", scope)
+	q.Set("name", name)
+
+	if f.prune {
+		q.Set("prune", "true")
+	}
+
+	resp, err := controllerDo(root, http.MethodDelete, "/resource", q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return formatControllerError(resp.StatusCode, raw)
+	}
+
+	var env struct {
+		Data struct {
+			ResourcesWiped []struct {
+				Kind   string `json:"kind"`
+				Pruned struct {
+					Errors []string `json:"errors"`
+				} `json:"pruned"`
+			} `json:"resources_wiped"`
+			Errors []string `json:"errors"`
+		} `json:"data"`
+	}
+
+	_ = json.Unmarshal(raw, &env)
+
+	for _, w := range env.Data.ResourcesWiped {
+		fmt.Printf("- %s/%s/%s deleted\n", w.Kind, scope, name)
+
+		for _, e := range w.Pruned.Errors {
+			fmt.Printf("  ! %s\n", e)
+		}
+	}
+
+	for _, e := range env.Data.Errors {
+		fmt.Printf("! %s\n", e)
+	}
+
+	if len(env.Data.ResourcesWiped) == 0 {
+		fmt.Printf("(no resource found at %s/%s)\n", scope, name)
+	}
+
+	return nil
+}
+
+// runPodDelete handles `vd delete <scope>/<name>.<ordinal> [-y] [--prune]`.
+// Statefulset-only — wipes one pod's container (and optionally
+// its volume), then triggers reconcile so the missing ordinal
+// comes back from spec. The wrapper's first-boot path runs if
+// --prune was passed (volume freshly empty).
+func runPodDelete(cmd *cobra.Command, scope, name string, ordinal int, f applyFlags) error {
+	if f.dryRun {
+		mode := "soft-delete"
+		if f.prune {
+			mode = "hard-delete (--prune: also wipes volume → fresh bootstrap on recreate)"
+		}
+
+		fmt.Fprintf(os.Stdout, "Would %s pod %s/%s ordinal %d (statefulset only).\nDry-run: no DELETE issued.\n",
+			mode, scope, name, ordinal)
+
+		return nil
+	}
+
+	root := cmd.Root()
+
+	q := url.Values{}
+	q.Set("scope", scope)
+	q.Set("name", name)
+	q.Set("ordinal", strconv.Itoa(ordinal))
+
+	if f.prune {
+		q.Set("prune", "true")
+	}
+
+	resp, err := controllerDo(root, http.MethodDelete, "/resource", q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return formatControllerError(resp.StatusCode, raw)
+	}
+
+	var env struct {
+		Data struct {
+			Summary struct {
+				ContainerRemoved string   `json:"container_removed"`
+				VolumesRemoved   []string `json:"volumes_removed"`
+				Errors           []string `json:"errors"`
+			} `json:"summary"`
+		} `json:"data"`
+	}
+
+	_ = json.Unmarshal(raw, &env)
+
+	if env.Data.Summary.ContainerRemoved != "" {
+		fmt.Printf("- container %s removed\n", env.Data.Summary.ContainerRemoved)
+	}
+
+	for _, v := range env.Data.Summary.VolumesRemoved {
+		fmt.Printf("- volume %s removed\n", v)
+	}
+
+	for _, e := range env.Data.Summary.Errors {
+		fmt.Printf("! %s\n", e)
+	}
+
+	fmt.Printf("- statefulset/%s/%s ordinal %d will be recreated by the reconciler\n",
+		scope, name, ordinal)
 
 	return nil
 }
