@@ -657,6 +657,62 @@ app "clowk-lp" "web" {
 	}
 }
 
+// TestParseHCLAppCarriesResourcesBlock pins that `app` exposes the
+// resources block on parity with standalone `deployment`. Without
+// this, every operator using the authoring-sugar shape silently
+// loses CPU/memory caps — the docker container boots with no
+// limits even when the HCL declared them. The kernel-cap field is
+// the same wire shape on both kinds, so dropping it on the app
+// path was a parser-only oversight.
+func TestParseHCLAppCarriesResourcesBlock(t *testing.T) {
+	src := `
+app "clowk-lp" "web" {
+  image = "clowk-lp:latest"
+  ports = ["3000"]
+  host  = "clowk.lp"
+
+  resources {
+    limits {
+      cpu    = "500m"
+      memory = "256Mi"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "app_resources.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 2 {
+		t.Fatalf("want 2 manifests (deployment+ingress), got %d", len(mans))
+	}
+
+	dep := mans[0]
+	if dep.Kind != controller.KindDeployment {
+		t.Fatalf("first manifest should be deployment, got %s", dep.Kind)
+	}
+
+	var depSpec DeploymentSpec
+	if err := json.Unmarshal(dep.Spec, &depSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	if depSpec.Resources == nil || depSpec.Resources.Limits == nil {
+		t.Fatal("resources.limits missing — app should propagate the block to deployment")
+	}
+
+	if got, want := depSpec.Resources.Limits.CPU, "500m"; got != want {
+		t.Errorf("resources.limits.cpu: got %q, want %q", got, want)
+	}
+
+	if got, want := depSpec.Resources.Limits.Memory, "256Mi"; got != want {
+		t.Errorf("resources.limits.memory: got %q, want %q", got, want)
+	}
+}
+
 // TestParseHCLAppCollidesWithStandaloneDeployment guards the most
 // common authoring mistake: writing `app "x" "y"` and then also
 // declaring `deployment "x" "y"` thinking the latter overrides the

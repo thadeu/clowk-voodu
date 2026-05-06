@@ -376,9 +376,10 @@ type hclApp struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang      *hclLangBlock    `hcl:"lang,block"`
-	Release   *hclReleaseBlock `hcl:"release,block"`
-	DependsOn *hclDependsOn    `hcl:"depends_on,block"`
+	Lang      *hclLangBlock      `hcl:"lang,block"`
+	Release   *hclReleaseBlock   `hcl:"release,block"`
+	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
+	Resources *hclResourcesBlock `hcl:"resources,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -433,6 +434,13 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 	if b.DependsOn != nil {
 		s.DependsOn = &DependsOn{Assets: b.DependsOn.Assets}
 	}
+
+	// `app` carries the same `resources { limits { ... } }` block as
+	// a standalone `deployment`, with identical kernel-cap semantics
+	// (--cpus / --memory at docker run). Operators can budget CPU
+	// and memory directly in the authoring-sugar form without
+	// dropping back to the verbose deployment+ingress pair.
+	s.Resources = resourcesBlockToSpec(b.Resources)
 
 	s.applyDefaults()
 
