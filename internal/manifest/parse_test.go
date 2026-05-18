@@ -1956,6 +1956,67 @@ app "test" "web" {
 	}
 }
 
+// TestParseHCLDeploymentEnvFrom pins env_from parsing on the
+// deployment shape — it's the same field statefulset/job/cronjob
+// already had, extended to deployment for parity. Common use case:
+// sidecar/worker pattern where two deployments share secrets.
+func TestParseHCLDeploymentEnvFrom(t *testing.T) {
+	src := `
+deployment "clowk-lp" "worker" {
+  image    = "ghcr.io/clowk/worker:1.0"
+  env_from = ["clowk-lp/web", "shared/credentials"]
+}
+`
+	tmp := writeTemp(t, "envfrom.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.EnvFrom) != 2 {
+		t.Fatalf("env_from: got %+v, want 2 entries", spec.EnvFrom)
+	}
+
+	if spec.EnvFrom[0] != "clowk-lp/web" || spec.EnvFrom[1] != "shared/credentials" {
+		t.Errorf("env_from order/values lost: %+v", spec.EnvFrom)
+	}
+}
+
+// TestParseHCLAppEnvFrom — the `app` sugar must expose env_from too,
+// otherwise it diverges from standalone deployment and ops authoring
+// in the sugar form would have to drop back to the verbose pair just
+// to inherit env. Parity is the whole point of the sugar.
+func TestParseHCLAppEnvFrom(t *testing.T) {
+	src := `
+app "scope" "web" {
+  image    = "nginx:1.27"
+  host     = "x.example.com"
+  env_from = ["shared/credentials"]
+}
+`
+	tmp := writeTemp(t, "app-envfrom.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.EnvFrom) != 1 || spec.EnvFrom[0] != "shared/credentials" {
+		t.Errorf("env_from on app sugar: %+v", spec.EnvFrom)
+	}
+}
+
 // TestParseHCLDeploymentImageBuildMutuallyExclusive pins the parse-
 // time guard: declaring both `image = "..."` AND a `build {}` block
 // on the same resource must error out, because they're two ways of

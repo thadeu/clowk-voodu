@@ -98,6 +98,30 @@ type DeploymentSpec struct {
 	// .env file also declares FOO. Same Docker semantics.
 	EnvFile []string `yaml:"env_file,omitempty" json:"env_file,omitempty"`
 
+	// EnvFrom stacks env files from OTHER resources (not local files —
+	// for those use EnvFile). Each entry is a `<scope>/<name>` ref
+	// (or bare `<name>` for the current scope) pointing at any voodu-
+	// managed resource that has a materialised env file at
+	// /var/lib/voodu/apps/<id>.env (deployment, statefulset, even a
+	// job).
+	//
+	// At reconcile, voodu emits one `--env-file` per entry BEFORE the
+	// deployment's OWN env file, so the deployment's merged env (scope
+	// config + per-app bucket + spec.Env + EnvFile) wins on conflicts.
+	// Multiple sources stack in declared order (last one in the list
+	// overrides earlier ones within the env_from stack itself).
+	//
+	// Use cases:
+	//
+	//   - Sidecar/web+worker pattern: web deployment owns the secrets,
+	//     worker inherits via `env_from = ["web"]`.
+	//   - Shared config bucket: `env_from = ["shared/credentials"]`
+	//     pulls AWS keys, monitoring URLs, etc. from a config-only
+	//     resource managed by `vd config set`.
+	//   - Multi-tier inheritance: `env_from = ["shared, paired-api"]`
+	//     base on shared secrets + paired API's env.
+	EnvFrom []string `yaml:"env_from,omitempty" json:"env_from,omitempty"`
+
 	// Release is the optional release-phase block. When present, voodu
 	// runs Command in a one-shot container BEFORE rolling restart of
 	// the replicas — kubectl-/Heroku-style "migrate, then restart".

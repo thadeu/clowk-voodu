@@ -79,6 +79,15 @@ type deploymentSpec struct {
 	HealthCheck string            `json:"health_check,omitempty"`
 	Release     *releaseSpec      `json:"release,omitempty"`
 
+	// EnvFrom mirrors statefulsetSpec.EnvFrom — each entry is a
+	// "scope/name" (or bare "name" for the current scope) ref to
+	// another resource whose env file is stacked under the
+	// deployment's own env via --env-file. Resolution + last-wins
+	// semantics are identical to the statefulset/job path. See
+	// manifest.DeploymentSpec.EnvFrom for the operator-facing
+	// contract.
+	EnvFrom []string `json:"env_from,omitempty"`
+
 	// ExtraHosts maps to docker run `--add-host name:ip`. Extra entries
 	// stack on top of the always-injected `host.docker.internal:host-
 	// gateway`. Validated server-side at apply time (`name:ip` shape).
@@ -649,6 +658,16 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 		envFile = h.EnvFilePath(app)
 	}
 
+	// Resolve env_from refs to additional --env-file paths once per
+	// reconcile (identical for every replica). Same shape + last-wins
+	// semantics as the statefulset/job path: extraEnvFiles are passed
+	// to docker BEFORE the deployment's own env file, so the
+	// deployment's merged env wins on key conflict.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return nil, fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	created := make([]string, 0, want-have)
 
 	for i := have; i < want; i++ {
@@ -690,6 +709,7 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			NetworkAliases:   BuildNetworkAliases(scope, name),
 			Restart:          spec.Restart,
 			EnvFile:          envFile,
+			ExtraEnvFiles:    extraEnvFiles,
 			Env:              podEnv,
 			Labels:           labels,
 			CPULimit:         cpu,
@@ -934,6 +954,13 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		envFile = h.EnvFilePath(app)
 	}
 
+	// Resolve env_from once per rolling restart — see ensureReplicaCount
+	// for the contract. Identical for every replacement replica.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	// Frozen replica IDs — pods the operator parked via
 	// `vd stop --freeze`. The deployment recreates pods with
 	// brand-new hex IDs on every rolling restart, but the
@@ -990,6 +1017,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			NetworkAliases:   BuildNetworkAliases(scope, name),
 			Restart:          spec.Restart,
 			EnvFile:          envFile,
+			ExtraEnvFiles:    extraEnvFiles,
 			Env:              podEnv,
 			Labels:           labels,
 			CPULimit:         cpu,
@@ -1502,12 +1530,17 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 	caps := append([]string(nil), spec.CapAdd...)
 	sort.Strings(caps)
 
+	// EnvFrom IS order-sensitive (docker layers --env-file in declared
+	// order, later wins on collision), so we preserve the operator's
+	// list exactly. Any rearrangement is a semantic change and should
+	// trigger a recreate.
 	input := struct {
 		Image       string             `json:"image"`
 		Command     []string           `json:"command"`
 		Ports       []string           `json:"ports"`
 		Volumes     []string           `json:"volumes"`
 		Env         map[string]string  `json:"env"`
+		EnvFrom     []string           `json:"env_from,omitempty"`
 		Networks    []string           `json:"networks"`
 		NetworkMode string             `json:"network_mode"`
 		Restart     string             `json:"restart"`
@@ -1522,6 +1555,7 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Ports:       spec.Ports,
 		Volumes:     spec.Volumes,
 		Env:         spec.Env,
+		EnvFrom:     spec.EnvFrom,
 		Networks:    nets,
 		NetworkMode: spec.NetworkMode,
 		Restart:     spec.Restart,

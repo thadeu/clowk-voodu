@@ -895,6 +895,52 @@ func TestSpecHash_CapAddOrderInvariant(t *testing.T) {
 	}
 }
 
+// TestSpecHash_EnvFromFlipsHash pins that adding/editing env_from on
+// a deployment triggers a rolling restart — without this, an operator
+// who changes `env_from = ["a"]` → `env_from = ["a", "b"]` would land
+// the new ref in etcd but the running containers would keep their old
+// --env-file list, silently missing the new layer.
+func TestSpecHash_EnvFromFlipsHash(t *testing.T) {
+	base := deploymentSpec{Image: "nginx:1.27"}
+	baseHash := deploymentSpecHash(base, nil)
+
+	added := base
+	added.EnvFrom = []string{"shared/credentials"}
+
+	if deploymentSpecHash(added, nil) == baseHash {
+		t.Error("adding env_from must flip hash")
+	}
+
+	// Adding another entry also flips.
+	extended := added
+	extended.EnvFrom = []string{"shared/credentials", "clowk-lp/api"}
+
+	if deploymentSpecHash(extended, nil) == deploymentSpecHash(added, nil) {
+		t.Error("extending env_from must flip hash")
+	}
+}
+
+// TestSpecHash_EnvFromOrderSensitive pins that env_from order is
+// semantic (docker layers --env-file in declared order, later wins
+// on key conflict), so reordering the slice MUST flip the hash. This
+// differs from extra_hosts / cap_add which are set-shaped (sorted
+// before hashing).
+func TestSpecHash_EnvFromOrderSensitive(t *testing.T) {
+	a := deploymentSpec{
+		Image:   "nginx",
+		EnvFrom: []string{"shared/creds", "clowk-lp/api"},
+	}
+
+	b := deploymentSpec{
+		Image:   "nginx",
+		EnvFrom: []string{"clowk-lp/api", "shared/creds"},
+	}
+
+	if deploymentSpecHash(a, nil) == deploymentSpecHash(b, nil) {
+		t.Error("env_from reorder must flip hash (declared order is semantic)")
+	}
+}
+
 // TestSpecHash_NilComposeFieldsPreservePreFeatureHash mirrors the
 // Resources rollout invariant: existing fleets that don't declare
 // ExtraHosts/CapAdd/BuildArgs must NOT see their hash flip when

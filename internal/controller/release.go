@@ -262,6 +262,16 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		return 1, fmt.Errorf("link env: %w", err)
 	}
 
+	// Release container honours env_from the same way the live
+	// replicas do — the migration sees the merged env (env_from
+	// layers + deployment's own env) the runtime will see post-
+	// release. Anything else would let the release run with stale
+	// env and surprise the operator at first replica boot.
+	extraEnvFiles, err := resolveEnvFromList(spec.EnvFrom, scope, h.logf)
+	if err != nil {
+		return 1, fmt.Errorf("resolve env_from: %w", err)
+	}
+
 	// Role=release distinguishes this from regular job containers
 	// in `vd get pd` and `docker ps --filter label=voodu.role=release`.
 	// Kind stays "job" so the existing list/logs paths still find
@@ -277,16 +287,17 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 	})
 
 	releaseSpec := ContainerSpec{
-		Name:        cname,
-		Image:       spec.Image,
-		Command:     command,
-		Volumes:     spec.Volumes,
-		Networks:    spec.Networks,
-		NetworkMode: spec.NetworkMode,
-		EnvFile:     envFile,
-		Labels:      labels,
-		ExtraHosts:  spec.ExtraHosts,
-		CapAdd:      spec.CapAdd,
+		Name:          cname,
+		Image:         spec.Image,
+		Command:       command,
+		Volumes:       spec.Volumes,
+		Networks:      spec.Networks,
+		NetworkMode:   spec.NetworkMode,
+		EnvFile:       envFile,
+		ExtraEnvFiles: extraEnvFiles,
+		Labels:        labels,
+		ExtraHosts:    spec.ExtraHosts,
+		CapAdd:        spec.CapAdd,
 		// AutoRemove is explicitly false: we need the container to
 		// stay alive long enough for Wait to return the exit code.
 		// `--rm` would race with Wait under heavy load. Equivalent

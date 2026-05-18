@@ -207,6 +207,7 @@ type hclDeployment struct {
 	ExtraHosts []string `hcl:"extra_hosts,optional"`
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
+	EnvFrom    []string `hcl:"env_from,optional"`
 
 	Build     *hclBuildBlock     `hcl:"build,block"`
 	Release   *hclReleaseBlock   `hcl:"release,block"`
@@ -347,6 +348,7 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 		ExtraHosts:   b.ExtraHosts,
 		CapAdd:       b.CapAdd,
 		EnvFile:      b.EnvFile,
+		EnvFrom:      b.EnvFrom,
 		Build:        buildBlockToSpec(b.Build),
 	}
 
@@ -434,6 +436,7 @@ type hclApp struct {
 	ExtraHosts []string `hcl:"extra_hosts,optional"`
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
+	EnvFrom    []string `hcl:"env_from,optional"`
 
 	Build     *hclBuildBlock     `hcl:"build,block"`
 	Release   *hclReleaseBlock   `hcl:"release,block"`
@@ -474,6 +477,7 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 		ExtraHosts:   b.ExtraHosts,
 		CapAdd:       b.CapAdd,
 		EnvFile:      b.EnvFile,
+		EnvFrom:      b.EnvFrom,
 		Build:        buildBlockToSpec(b.Build),
 	}
 
