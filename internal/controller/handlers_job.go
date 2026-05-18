@@ -55,6 +55,12 @@ type jobSpec struct {
 	// inherited env_from layer.
 	EnvFrom []string `json:"env_from,omitempty"`
 
+	// ExtraHosts / CapAdd / BuildArgs — same semantics as deploymentSpec.
+	// See deploymentSpec for full docs.
+	ExtraHosts []string          `json:"extra_hosts,omitempty"`
+	CapAdd     []string          `json:"cap_add,omitempty"`
+	BuildArgs  map[string]string `json:"build_args,omitempty"`
+
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 
@@ -406,6 +412,8 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		EnvFile:       envFile,
 		ExtraEnvFiles: extraEnvFiles,
 		Labels:        labels,
+		ExtraHosts:    spec.ExtraHosts,
+		CapAdd:        spec.CapAdd,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs job <name>`
 		// can read them post-exit. The runner GCs old run containers

@@ -132,12 +132,15 @@ func TestRewriteForStdinStream_BuildModeFlagsSourcePush(t *testing.T) {
 }
 
 deployment "prod" "api" {
-  workdir = "apps/api"
-  ports   = ["3000"]
+  ports = ["3000"]
 
-  lang {
-    name    = "go"
-    version = "1.25"
+  build {
+    context = "apps/api"
+
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
   }
 }
 `
@@ -160,8 +163,8 @@ deployment "prod" "api" {
 		t.Errorf("build-mode deploy ref = %s/%s, want prod/api", bm.Scope, bm.Name)
 	}
 
-	if bm.Path != "." {
-		t.Errorf("build-mode deploy path = %q, want %q (default for root-context)", bm.Path, ".")
+	if bm.Path != "apps/api" {
+		t.Errorf("build-mode deploy path = %q, want %q (mirror of build.context)", bm.Path, "apps/api")
 	}
 
 	// diff and delete must NEVER trigger a push, even if the manifest is
@@ -186,9 +189,12 @@ func TestRewriteForStdinStream_BuildModeStatefulset(t *testing.T) {
 	path := filepath.Join(dir, "stack.hcl")
 
 	stack := `statefulset "prod" "db" {
-  workdir    = "infra/postgres"
-  dockerfile = "Dockerfile.pg"
-  replicas   = 1
+  replicas = 1
+
+  build {
+    context    = "infra/postgres"
+    dockerfile = "Dockerfile.pg"
+  }
 }
 `
 
@@ -210,10 +216,8 @@ func TestRewriteForStdinStream_BuildModeStatefulset(t *testing.T) {
 		t.Errorf("ref = %s/%s, want prod/db", bm.Scope, bm.Name)
 	}
 
-	// applyDefaults should fill Path = "." for build-mode statefulset
-	// (no explicit path = root context, like deployment).
-	if bm.Path != "." {
-		t.Errorf("path = %q, want %q (applyDefaults should fill root)", bm.Path, ".")
+	if bm.Path != "infra/postgres" {
+		t.Errorf("path = %q, want %q (mirror of build.context)", bm.Path, "infra/postgres")
 	}
 }
 
@@ -253,14 +257,18 @@ func TestRewriteForStdinStream_BuildModeDeploymentAndStatefulset(t *testing.T) {
 	stack := `deployment "prod" "api" {
   ports = ["3000"]
 
-  lang {
-    name    = "go"
-    version = "1.25"
+  build {
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
   }
 }
 
 statefulset "prod" "db" {
-  dockerfile = "Dockerfile.pg"
+  build {
+    dockerfile = "Dockerfile.pg"
+  }
 }
 `
 

@@ -189,9 +189,6 @@ func formatFromExt(path string) (Format, error) {
 
 type hclDeployment struct {
 	Image        string            `hcl:"image,optional"`
-	Workdir      string            `hcl:"workdir,optional"`
-	Dockerfile   string            `hcl:"dockerfile,optional"`
-	Path         string            `hcl:"path,optional"`
 	Replicas     int               `hcl:"replicas,optional"`
 	Command      []string          `hcl:"command,optional"`
 	Env          map[string]string `hcl:"env,optional"`
@@ -205,10 +202,63 @@ type hclDeployment struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang      *hclLangBlock      `hcl:"lang,block"`
+	// docker-compose-shaped pass-through knobs. See DeploymentSpec for
+	// full docs — these surface the same fields at the HCL layer.
+	ExtraHosts []string `hcl:"extra_hosts,optional"`
+	CapAdd     []string `hcl:"cap_add,optional"`
+	EnvFile    []string `hcl:"env_file,optional"`
+
+	Build     *hclBuildBlock     `hcl:"build,block"`
 	Release   *hclReleaseBlock   `hcl:"release,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+}
+
+// hclBuildBlock is the HCL surface for the docker-compose-shaped
+// `build { ... }` block. Lives on deployment/statefulset/job/cronjob/
+// app, mutually exclusive with `image = "..."` (parse-time validated).
+// See manifest.BuildSpec for the field contract.
+//
+// Lang is nested HERE (not at the resource root) because it's
+// strictly a build-time concern — `name = "go"` picks the build
+// handler, `version` flows into the generated Dockerfile, etc.
+// Putting it inside build {} keeps each section internally coherent
+// (root = runtime, build {} = build-time).
+type hclBuildBlock struct {
+	Context    string            `hcl:"context,optional"`
+	Dockerfile string            `hcl:"dockerfile,optional"`
+	Path       string            `hcl:"path,optional"`
+	Args       map[string]string `hcl:"args,optional"`
+
+	Lang *hclLangBlock `hcl:"lang,block"`
+}
+
+// buildBlockToSpec converts the HCL surface into the wire BuildSpec.
+// nil-in / nil-out so callers don't synthesise an empty block when
+// the operator omitted `build {}` entirely. applyDefaults handles
+// the "implicit build mode at repo root" case downstream — see
+// DeploymentSpec.applyDefaults for the synthesis path.
+func buildBlockToSpec(b *hclBuildBlock) *BuildSpec {
+	if b == nil {
+		return nil
+	}
+
+	out := &BuildSpec{
+		Context:    b.Context,
+		Dockerfile: b.Dockerfile,
+		Path:       b.Path,
+		Args:       b.Args,
+	}
+
+	if b.Lang != nil {
+		out.Lang = &LangSpec{
+			Name:       b.Lang.Name,
+			Version:    b.Lang.Version,
+			Entrypoint: b.Lang.Entrypoint,
+		}
+	}
+
+	return out
 }
 
 // hclDependsOn is the HCL surface for explicit dependencies. The
@@ -253,11 +303,15 @@ func resourcesBlockToSpec(b *hclResourcesBlock) *ResourcesSpec {
 	return out
 }
 
+// hclLangBlock is the HCL surface for the nested `build { lang {...} }`
+// runtime hint. Lives inside hclBuildBlock (lang is a build-time
+// concern, not a runtime one). Fields mirror manifest.LangSpec — see
+// there for the operator-facing contract. Build args live on the
+// parent build block (`build.args = {...}`), not here.
 type hclLangBlock struct {
-	Name       string            `hcl:"name,optional"`
-	Version    string            `hcl:"version,optional"`
-	Entrypoint string            `hcl:"entrypoint,optional"`
-	BuildArgs  map[string]string `hcl:"build_args,optional"`
+	Name       string `hcl:"name,optional"`
+	Version    string `hcl:"version,optional"`
+	Entrypoint string `hcl:"entrypoint,optional"`
 }
 
 // hclReleaseBlock is the HCL surface for the release phase. Each
@@ -271,12 +325,13 @@ type hclReleaseBlock struct {
 	Timeout     string   `hcl:"timeout,optional"`
 }
 
-func (b hclDeployment) spec() DeploymentSpec {
+func (b hclDeployment) spec() (DeploymentSpec, error) {
+	if b.Image != "" && b.Build != nil {
+		return DeploymentSpec{}, errImageBuildExclusive
+	}
+
 	s := DeploymentSpec{
 		Image:        b.Image,
-		Workdir:      b.Workdir,
-		Dockerfile:   b.Dockerfile,
-		Path:         b.Path,
 		Replicas:     b.Replicas,
 		Command:      b.Command,
 		Env:          b.Env,
@@ -289,15 +344,10 @@ func (b hclDeployment) spec() DeploymentSpec {
 		HealthCheck:  b.HealthCheck,
 		PostDeploy:   b.PostDeploy,
 		KeepReleases: b.KeepReleases,
-	}
-
-	if b.Lang != nil {
-		s.Lang = &LangSpec{
-			Name:       b.Lang.Name,
-			Version:    b.Lang.Version,
-			Entrypoint: b.Lang.Entrypoint,
-			BuildArgs:  b.Lang.BuildArgs,
-		}
+		ExtraHosts:   b.ExtraHosts,
+		CapAdd:       b.CapAdd,
+		EnvFile:      b.EnvFile,
+		Build:        buildBlockToSpec(b.Build),
 	}
 
 	if b.Release != nil {
@@ -317,8 +367,14 @@ func (b hclDeployment) spec() DeploymentSpec {
 
 	s.applyDefaults()
 
-	return s
+	return s, nil
 }
+
+// errImageBuildExclusive surfaces when an operator declares both
+// `image = "..."` AND a `build {}` block on the same resource. The
+// pipeline can't honour both: image-mode pulls from registry,
+// build-mode builds from source. Operator picks one.
+var errImageBuildExclusive = fmt.Errorf("`image` and `build {}` are mutually exclusive: use `image` to pull from a registry, or `build {}` to build from source — not both")
 
 // hclApp is authoring sugar for the "deployment + ingress with the
 // same (scope, name)" pair — by far the most common shape for web
@@ -360,9 +416,6 @@ type hclApp struct {
 	// hand: HCL doesn't walk embedded structs, and a code-gen step
 	// would be heavier than the duplication.
 	Image        string            `hcl:"image,optional"`
-	Workdir      string            `hcl:"workdir,optional"`
-	Dockerfile   string            `hcl:"dockerfile,optional"`
-	Path         string            `hcl:"path,optional"`
 	Replicas     int               `hcl:"replicas,optional"`
 	Command      []string          `hcl:"command,optional"`
 	Env          map[string]string `hcl:"env,optional"`
@@ -376,7 +429,13 @@ type hclApp struct {
 	PostDeploy   []string          `hcl:"post_deploy,optional"`
 	KeepReleases int               `hcl:"keep_releases,optional"`
 
-	Lang      *hclLangBlock      `hcl:"lang,block"`
+	// docker-compose-shaped pass-through knobs. Same semantics as
+	// hclDeployment — see DeploymentSpec for full docs.
+	ExtraHosts []string `hcl:"extra_hosts,optional"`
+	CapAdd     []string `hcl:"cap_add,optional"`
+	EnvFile    []string `hcl:"env_file,optional"`
+
+	Build     *hclBuildBlock     `hcl:"build,block"`
 	Release   *hclReleaseBlock   `hcl:"release,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
@@ -393,12 +452,13 @@ type hclApp struct {
 // shape is identical to what hclDeployment.spec() produces — same
 // defaults, same lang handling — so a deployment authored as `app`
 // reconciles byte-for-byte the same as one authored as `deployment`.
-func (b hclApp) deploymentSpec() DeploymentSpec {
+func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
+	if b.Image != "" && b.Build != nil {
+		return DeploymentSpec{}, errImageBuildExclusive
+	}
+
 	s := DeploymentSpec{
 		Image:        b.Image,
-		Workdir:      b.Workdir,
-		Dockerfile:   b.Dockerfile,
-		Path:         b.Path,
 		Replicas:     b.Replicas,
 		Command:      b.Command,
 		Env:          b.Env,
@@ -411,15 +471,10 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 		HealthCheck:  b.HealthCheck,
 		PostDeploy:   b.PostDeploy,
 		KeepReleases: b.KeepReleases,
-	}
-
-	if b.Lang != nil {
-		s.Lang = &LangSpec{
-			Name:       b.Lang.Name,
-			Version:    b.Lang.Version,
-			Entrypoint: b.Lang.Entrypoint,
-			BuildArgs:  b.Lang.BuildArgs,
-		}
+		ExtraHosts:   b.ExtraHosts,
+		CapAdd:       b.CapAdd,
+		EnvFile:      b.EnvFile,
+		Build:        buildBlockToSpec(b.Build),
 	}
 
 	if b.Release != nil {
@@ -444,7 +499,7 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 
 	s.applyDefaults()
 
-	return s
+	return s, nil
 }
 
 // ingressSpec extracts the ingress half. Service is left empty so
@@ -454,15 +509,7 @@ func (b hclApp) deploymentSpec() DeploymentSpec {
 func (b hclApp) ingressSpec() IngressSpec {
 	out := IngressSpec{Host: b.Host}
 
-	if b.TLS != nil {
-		out.TLS = &IngressTLS{
-			Enabled:  b.TLS.Enabled,
-			Provider: b.TLS.Provider,
-			Email:    b.TLS.Email,
-			OnDemand: b.TLS.OnDemand,
-			Ask:      b.TLS.Ask,
-		}
-	}
+	out.TLS = tlsBlockToSpec(b.TLS)
 
 	if len(b.Locations) > 0 {
 		out.Locations = make([]IngressLocation, 0, len(b.Locations))
@@ -494,9 +541,6 @@ func (b hclApp) ingressSpec() IngressSpec {
 // VolumeClaim becomes a block list in M-S2.
 type hclStatefulset struct {
 	Image       string            `hcl:"image,optional"`
-	Workdir     string            `hcl:"workdir,optional"`
-	Dockerfile  string            `hcl:"dockerfile,optional"`
-	Path        string            `hcl:"path,optional"`
 	Replicas    int               `hcl:"replicas,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
@@ -509,7 +553,13 @@ type hclStatefulset struct {
 	Restart     string            `hcl:"restart,optional"`
 	HealthCheck string            `hcl:"health_check,optional"`
 
-	Lang         *hclLangBlock      `hcl:"lang,block"`
+	// docker-compose-shaped pass-through knobs. Same semantics as
+	// hclDeployment — see DeploymentSpec for full docs.
+	ExtraHosts []string `hcl:"extra_hosts,optional"`
+	CapAdd     []string `hcl:"cap_add,optional"`
+	EnvFile    []string `hcl:"env_file,optional"`
+
+	Build        *hclBuildBlock     `hcl:"build,block"`
 	VolumeClaims []hclVolumeClaim   `hcl:"volume_claim,block"`
 	DependsOn    *hclDependsOn      `hcl:"depends_on,block"`
 	Resources    *hclResourcesBlock `hcl:"resources,block"`
@@ -525,12 +575,13 @@ type hclVolumeClaim struct {
 	Size      string `hcl:"size,optional"`
 }
 
-func (b hclStatefulset) spec() StatefulsetSpec {
+func (b hclStatefulset) spec() (StatefulsetSpec, error) {
+	if b.Image != "" && b.Build != nil {
+		return StatefulsetSpec{}, errImageBuildExclusive
+	}
+
 	s := StatefulsetSpec{
 		Image:       b.Image,
-		Workdir:     b.Workdir,
-		Dockerfile:  b.Dockerfile,
-		Path:        b.Path,
 		Replicas:    b.Replicas,
 		Command:     b.Command,
 		Env:         b.Env,
@@ -542,15 +593,10 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 		NetworkMode: b.NetworkMode,
 		Restart:     b.Restart,
 		HealthCheck: b.HealthCheck,
-	}
-
-	if b.Lang != nil {
-		s.Lang = &LangSpec{
-			Name:       b.Lang.Name,
-			Version:    b.Lang.Version,
-			Entrypoint: b.Lang.Entrypoint,
-			BuildArgs:  b.Lang.BuildArgs,
-		}
+		ExtraHosts:  b.ExtraHosts,
+		CapAdd:      b.CapAdd,
+		EnvFile:     b.EnvFile,
+		Build:       buildBlockToSpec(b.Build),
 	}
 
 	if len(b.VolumeClaims) > 0 {
@@ -572,7 +618,7 @@ func (b hclStatefulset) spec() StatefulsetSpec {
 
 	s.applyDefaults()
 
-	return s
+	return s, nil
 }
 
 type hclIngress struct {
@@ -589,12 +635,56 @@ type hclIngressLB struct {
 	Interval string `hcl:"interval,optional"`
 }
 
+// hclIngressTLS surfaces the `tls {}` block in HCL. Enabled is a
+// *bool (not bool) so the parser can tell "operator omitted the
+// field" (nil) from "operator wrote `enabled = false`" (pointer to
+// false). Declaring `tls {}` at all is the strong signal of intent
+// — applyDefaults flips a nil Enabled to true, but an explicit
+// `enabled = false` is honoured verbatim for the rare case the
+// operator wants to keep the block around (with email / provider /
+// etc.) but temporarily disable TLS issuance.
 type hclIngressTLS struct {
-	Enabled  bool   `hcl:"enabled,optional"`
+	Enabled  *bool  `hcl:"enabled,optional"`
 	Provider string `hcl:"provider,optional"`
 	Email    string `hcl:"email,optional"`
 	OnDemand bool   `hcl:"on_demand,optional"`
 	Ask      string `hcl:"ask,optional"`
+}
+
+// tlsBlockToSpec converts the HCL surface into the wire-shape
+// IngressTLS, applying the "block-present = TLS on" defaults:
+//
+//   - Enabled: nil → true. Operator declared `tls {}`, they want
+//     TLS. An explicit `enabled = false` is honoured (escape hatch
+//     for keeping the block declared while toggling TLS off).
+//   - Provider: empty → "letsencrypt". The overwhelmingly common
+//     case; operators who want voodu-internal certs (dev/staging)
+//     or another ACME provider override explicitly.
+//
+// nil-in / nil-out so callers know whether the operator declared
+// the block at all (no block = no TLS wire spec at all).
+func tlsBlockToSpec(b *hclIngressTLS) *IngressTLS {
+	if b == nil {
+		return nil
+	}
+
+	enabled := true
+	if b.Enabled != nil {
+		enabled = *b.Enabled
+	}
+
+	provider := b.Provider
+	if provider == "" {
+		provider = "letsencrypt"
+	}
+
+	return &IngressTLS{
+		Enabled:  enabled,
+		Provider: provider,
+		Email:    b.Email,
+		OnDemand: b.OnDemand,
+		Ask:      b.Ask,
+	}
 }
 
 type hclIngressLocation struct {
@@ -605,15 +695,7 @@ type hclIngressLocation struct {
 func (b hclIngress) spec() IngressSpec {
 	out := IngressSpec{Host: b.Host, Service: b.Service, Port: b.Port}
 
-	if b.TLS != nil {
-		out.TLS = &IngressTLS{
-			Enabled:  b.TLS.Enabled,
-			Provider: b.TLS.Provider,
-			Email:    b.TLS.Email,
-			OnDemand: b.TLS.OnDemand,
-			Ask:      b.TLS.Ask,
-		}
-	}
+	out.TLS = tlsBlockToSpec(b.TLS)
 
 	if len(b.Locations) > 0 {
 		out.Locations = make([]IngressLocation, 0, len(b.Locations))
@@ -640,9 +722,6 @@ func (b hclIngress) spec() IngressSpec {
 // separate registry image.
 type hclJob struct {
 	Image       string            `hcl:"image,optional"`
-	Workdir     string            `hcl:"workdir,optional"`
-	Dockerfile  string            `hcl:"dockerfile,optional"`
-	Path        string            `hcl:"path,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
 	EnvFrom     []string          `hcl:"env_from,optional"`
@@ -652,20 +731,27 @@ type hclJob struct {
 	NetworkMode string            `hcl:"network_mode,optional"`
 	Timeout     string            `hcl:"timeout,optional"`
 
+	// docker-compose-shaped pass-through knobs. Same semantics as
+	// hclDeployment — see DeploymentSpec for full docs.
+	ExtraHosts []string `hcl:"extra_hosts,optional"`
+	CapAdd     []string `hcl:"cap_add,optional"`
+	EnvFile    []string `hcl:"env_file,optional"`
+
 	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
 	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
 
-	Lang      *hclLangBlock      `hcl:"lang,block"`
+	Build     *hclBuildBlock     `hcl:"build,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
 }
 
-func (b hclJob) spec() JobSpec {
+func (b hclJob) spec() (JobSpec, error) {
+	if b.Image != "" && b.Build != nil {
+		return JobSpec{}, errImageBuildExclusive
+	}
+
 	s := JobSpec{
 		Image:                  b.Image,
-		Workdir:                b.Workdir,
-		Dockerfile:             b.Dockerfile,
-		Path:                   b.Path,
 		Command:                b.Command,
 		Env:                    b.Env,
 		EnvFrom:                b.EnvFrom,
@@ -674,17 +760,12 @@ func (b hclJob) spec() JobSpec {
 		Networks:               b.Networks,
 		NetworkMode:            b.NetworkMode,
 		Timeout:                b.Timeout,
+		ExtraHosts:             b.ExtraHosts,
+		CapAdd:                 b.CapAdd,
+		EnvFile:                b.EnvFile,
+		Build:                  buildBlockToSpec(b.Build),
 		SuccessfulHistoryLimit: b.SuccessfulHistoryLimit,
 		FailedHistoryLimit:     b.FailedHistoryLimit,
-	}
-
-	if b.Lang != nil {
-		s.Lang = &LangSpec{
-			Name:       b.Lang.Name,
-			Version:    b.Lang.Version,
-			Entrypoint: b.Lang.Entrypoint,
-			BuildArgs:  b.Lang.BuildArgs,
-		}
 	}
 
 	if b.DependsOn != nil {
@@ -693,7 +774,7 @@ func (b hclJob) spec() JobSpec {
 
 	s.Resources = resourcesBlockToSpec(b.Resources)
 
-	return s
+	return s, nil
 }
 
 // hclCronJob is the HCL surface for a scheduled job. The shape mirrors
@@ -718,9 +799,6 @@ type hclCronJob struct {
 	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
 
 	Image       string            `hcl:"image,optional"`
-	Workdir     string            `hcl:"workdir,optional"`
-	Dockerfile  string            `hcl:"dockerfile,optional"`
-	Path        string            `hcl:"path,optional"`
 	Command     []string          `hcl:"command,optional"`
 	Env         map[string]string `hcl:"env,optional"`
 	EnvFrom     []string          `hcl:"env_from,optional"`
@@ -730,17 +808,24 @@ type hclCronJob struct {
 	NetworkMode string            `hcl:"network_mode,optional"`
 	Timeout     string            `hcl:"timeout,optional"`
 
-	Lang      *hclLangBlock      `hcl:"lang,block"`
+	// docker-compose-shaped pass-through knobs. Same semantics as
+	// hclDeployment — see DeploymentSpec for full docs.
+	ExtraHosts []string `hcl:"extra_hosts,optional"`
+	CapAdd     []string `hcl:"cap_add,optional"`
+	EnvFile    []string `hcl:"env_file,optional"`
+
+	Build     *hclBuildBlock     `hcl:"build,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
 }
 
-func (b hclCronJob) spec() CronJobSpec {
+func (b hclCronJob) spec() (CronJobSpec, error) {
+	if b.Image != "" && b.Build != nil {
+		return CronJobSpec{}, errImageBuildExclusive
+	}
+
 	job := JobSpec{
 		Image:       b.Image,
-		Workdir:     b.Workdir,
-		Dockerfile:  b.Dockerfile,
-		Path:        b.Path,
 		Command:     b.Command,
 		Env:         b.Env,
 		EnvFrom:     b.EnvFrom,
@@ -749,15 +834,10 @@ func (b hclCronJob) spec() CronJobSpec {
 		Networks:    b.Networks,
 		NetworkMode: b.NetworkMode,
 		Timeout:     b.Timeout,
-	}
-
-	if b.Lang != nil {
-		job.Lang = &LangSpec{
-			Name:       b.Lang.Name,
-			Version:    b.Lang.Version,
-			Entrypoint: b.Lang.Entrypoint,
-			BuildArgs:  b.Lang.BuildArgs,
-		}
+		ExtraHosts:  b.ExtraHosts,
+		CapAdd:      b.CapAdd,
+		EnvFile:     b.EnvFile,
+		Build:       buildBlockToSpec(b.Build),
 	}
 
 	if b.DependsOn != nil {
@@ -774,7 +854,7 @@ func (b hclCronJob) spec() CronJobSpec {
 		Suspend:                b.Suspend,
 		SuccessfulHistoryLimit: b.SuccessfulHistoryLimit,
 		FailedHistoryLimit:     b.FailedHistoryLimit,
-	}
+	}, nil
 }
 
 // parseHCL is the dynamic-block-aware HCL parser. It iterates over
@@ -853,7 +933,12 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, d2
 		}
 
-		m, err := encode(controller.KindDeployment, scope, name, d.spec())
+		spec, err := d.spec()
+		if err != nil {
+			return nil, fmt.Errorf("deployment/%s/%s: %w", scope, name, err)
+		}
+
+		m, err := encode(controller.KindDeployment, scope, name, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -871,7 +956,12 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, d
 		}
 
-		m, err := encode(controller.KindStatefulset, scope, name, s.spec())
+		spec, err := s.spec()
+		if err != nil {
+			return nil, fmt.Errorf("statefulset/%s/%s: %w", scope, name, err)
+		}
+
+		m, err := encode(controller.KindStatefulset, scope, name, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -907,7 +997,12 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, d
 		}
 
-		m, err := encode(controller.KindJob, scope, name, j.spec())
+		spec, err := j.spec()
+		if err != nil {
+			return nil, fmt.Errorf("job/%s/%s: %w", scope, name, err)
+		}
+
+		m, err := encode(controller.KindJob, scope, name, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -925,7 +1020,12 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, d
 		}
 
-		m, err := encode(controller.KindCronJob, scope, name, c.spec())
+		spec, err := c.spec()
+		if err != nil {
+			return nil, fmt.Errorf("cronjob/%s/%s: %w", scope, name, err)
+		}
+
+		m, err := encode(controller.KindCronJob, scope, name, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -1051,7 +1151,12 @@ func decodeAppBlock(blk *hclsyntax.Block) ([]controller.Manifest, error) {
 		return nil, d
 	}
 
-	dep, err := encode(controller.KindDeployment, scope, name, a.deploymentSpec())
+	depSpec, err := a.deploymentSpec()
+	if err != nil {
+		return nil, fmt.Errorf("app/%s/%s: %w", scope, name, err)
+	}
+
+	dep, err := encode(controller.KindDeployment, scope, name, depSpec)
 	if err != nil {
 		return nil, err
 	}

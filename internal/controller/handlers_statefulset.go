@@ -84,6 +84,12 @@ type statefulsetSpec struct {
 	// for the operator-facing contract.
 	EnvFrom []string `json:"env_from,omitempty"`
 
+	// ExtraHosts / CapAdd / BuildArgs — same semantics as deploymentSpec.
+	// See deploymentSpec for full docs.
+	ExtraHosts []string          `json:"extra_hosts,omitempty"`
+	CapAdd     []string          `json:"cap_add,omitempty"`
+	BuildArgs  map[string]string `json:"build_args,omitempty"`
+
 	// VolumeClaims is the per-pod volume-template list. M-S2 wires
 	// the docker volume creation; M-S1 ignores the field but keeps
 	// the JSON shape stable so plugins authored against the early
@@ -566,6 +572,8 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			Labels:           labels,
 			CPULimit:         cpu,
 			MemoryLimitBytes: memBytes,
+			ExtraHosts:       spec.ExtraHosts,
+			CapAdd:           spec.CapAdd,
 		})
 		if err != nil {
 			return fmt.Errorf("ensure ordinal %d (%s): %w", n, cname, err)
@@ -812,6 +820,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			Labels:           labels,
 			CPULimit:         cpu,
 			MemoryLimitBytes: memBytes,
+			ExtraHosts:       spec.ExtraHosts,
+			CapAdd:           spec.CapAdd,
 		}); err != nil {
 			return fmt.Errorf("respawn ordinal %d: %w", ord, err)
 		}
@@ -925,6 +935,12 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 	claims := append([]volumeClaim(nil), spec.VolumeClaims...)
 	sort.Slice(claims, func(i, j int) bool { return claims[i].Name < claims[j].Name })
 
+	hosts := append([]string(nil), spec.ExtraHosts...)
+	sort.Strings(hosts)
+
+	caps := append([]string(nil), spec.CapAdd...)
+	sort.Strings(caps)
+
 	input := struct {
 		Image        string             `json:"image"`
 		Command      []string           `json:"command"`
@@ -934,6 +950,9 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		Networks     []string           `json:"networks"`
 		NetworkMode  string             `json:"network_mode"`
 		Restart      string             `json:"restart"`
+		ExtraHosts   []string           `json:"extra_hosts,omitempty"`
+		CapAdd       []string           `json:"cap_add,omitempty"`
+		BuildArgs    map[string]string  `json:"build_args,omitempty"`
 		Resources    *resourcesWireSpec `json:"resources,omitempty"`
 		VolumeClaims []volumeClaim      `json:"volume_claims"`
 		Assets       []string           `json:"assets,omitempty"`
@@ -946,6 +965,9 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		Networks:     nets,
 		NetworkMode:  spec.NetworkMode,
 		Restart:      spec.Restart,
+		ExtraHosts:   hosts,
+		CapAdd:       caps,
+		BuildArgs:    spec.BuildArgs,
 		// See deploymentSpecHash for why Resources folds in. Same
 		// rationale: editing the cgroup caps must trigger a rolling
 		// recreate, otherwise the new HCL is ignored at runtime.

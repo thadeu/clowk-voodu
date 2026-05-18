@@ -71,10 +71,12 @@ func TestFetchSpec_DeploymentOnly(t *testing.T) {
 		Scope: "prod",
 		Name:  "api",
 		Spec: encodeSpec(t, wireDeploymentSpec{
-			Image:      "",
-			Dockerfile: "Dockerfile.api",
-			Path:       "apps/api",
-			Lang:       &wireLangSpec{Name: "go", Version: "1.25"},
+			Image: "",
+			Build: &wireBuildSpec{
+				Context:    "apps/api",
+				Dockerfile: "Dockerfile.api",
+				Lang:       &wireLangSpec{Name: "go", Version: "1.25"},
+			},
 		}),
 	}})
 	defer srv.Close()
@@ -88,12 +90,16 @@ func TestFetchSpec_DeploymentOnly(t *testing.T) {
 		t.Fatal("expected spec, got nil")
 	}
 
-	if spec.Dockerfile != "Dockerfile.api" {
-		t.Errorf("dockerfile lost in roundtrip: %q", spec.Dockerfile)
+	if spec.Build == nil {
+		t.Fatal("build lost in roundtrip")
 	}
 
-	if spec.Lang == nil || spec.Lang.Name != "go" {
-		t.Errorf("lang lost: %+v", spec.Lang)
+	if spec.Build.Dockerfile != "Dockerfile.api" {
+		t.Errorf("dockerfile lost in roundtrip: %q", spec.Build.Dockerfile)
+	}
+
+	if spec.Build.Lang == nil || spec.Build.Lang.Name != "go" {
+		t.Errorf("lang lost: %+v", spec.Build.Lang)
 	}
 }
 
@@ -103,10 +109,11 @@ func TestFetchSpec_StatefulsetOnly(t *testing.T) {
 		Scope: "data",
 		Name:  "pg",
 		Spec: encodeSpec(t, wireStatefulsetSpec{
-			Image:      "",
-			Workdir:    "infra/postgres",
-			Dockerfile: "Dockerfile.pg",
-			Path:       ".",
+			Image: "",
+			Build: &wireBuildSpec{
+				Context:    "infra/postgres",
+				Dockerfile: "Dockerfile.pg",
+			},
 		}),
 	}})
 	defer srv.Close()
@@ -120,12 +127,16 @@ func TestFetchSpec_StatefulsetOnly(t *testing.T) {
 		t.Fatal("expected spec, got nil")
 	}
 
-	if spec.Workdir != "infra/postgres" {
-		t.Errorf("workdir lost: %q", spec.Workdir)
+	if spec.Build == nil {
+		t.Fatal("build lost")
 	}
 
-	if spec.Dockerfile != "Dockerfile.pg" {
-		t.Errorf("dockerfile lost: %q", spec.Dockerfile)
+	if spec.Build.Context != "infra/postgres" {
+		t.Errorf("context lost: %q", spec.Build.Context)
+	}
+
+	if spec.Build.Dockerfile != "Dockerfile.pg" {
+		t.Errorf("dockerfile lost: %q", spec.Build.Dockerfile)
 	}
 }
 
@@ -137,13 +148,13 @@ func TestFetchSpec_AmbiguousWhenBothKindsExist(t *testing.T) {
 			Kind:  controller.KindDeployment,
 			Scope: "x",
 			Name:  "y",
-			Spec:  encodeSpec(t, wireDeploymentSpec{Path: "."}),
+			Spec:  encodeSpec(t, wireDeploymentSpec{Build: &wireBuildSpec{Context: "."}}),
 		},
 		{
 			Kind:  controller.KindStatefulset,
 			Scope: "x",
 			Name:  "y",
-			Spec:  encodeSpec(t, wireStatefulsetSpec{Path: "."}),
+			Spec:  encodeSpec(t, wireStatefulsetSpec{Build: &wireBuildSpec{Context: "."}}),
 		},
 	})
 	defer srv.Close()
@@ -189,26 +200,40 @@ func TestFetchSpec_EmptyControllerURLReturnsNil(t *testing.T) {
 
 func TestSpecFromStatefulsetWire_PreservesAllFields(t *testing.T) {
 	w := wireStatefulsetSpec{
-		Image:       "postgres:16",
-		Dockerfile:  "Dockerfile.pg",
-		Path:        "infra/postgres",
-		Workdir:     "subdir",
+		Image:       "",
 		Env:         map[string]string{"PGAPPNAME": "voodu"},
 		Ports:       []string{"5432"},
 		Volumes:     []string{"/data"},
 		NetworkMode: "bridge",
-		Lang: &wireLangSpec{
-			Name:       "generic",
-			Version:    "16",
-			Entrypoint: "docker-entrypoint.sh",
-			BuildArgs:  map[string]string{"PG_MAJOR": "16"},
+		Build: &wireBuildSpec{
+			Context:    "infra/postgres",
+			Dockerfile: "Dockerfile.pg",
+			Path:       ".",
+			Args:       map[string]string{"PG_MAJOR": "16"},
+			Lang: &wireLangSpec{
+				Name:       "generic",
+				Version:    "16",
+				Entrypoint: "docker-entrypoint.sh",
+			},
 		},
 	}
 
 	s := specFromStatefulsetWire(w)
 
-	if s.Image != w.Image || s.Dockerfile != w.Dockerfile || s.Path != w.Path || s.Workdir != w.Workdir {
-		t.Errorf("scalar fields lost: %+v", s)
+	if s.Image != w.Image {
+		t.Errorf("image lost: %q", s.Image)
+	}
+
+	if s.Build == nil {
+		t.Fatal("build lost")
+	}
+
+	if s.Build.Context != "infra/postgres" || s.Build.Dockerfile != "Dockerfile.pg" {
+		t.Errorf("build scalar fields lost: %+v", s.Build)
+	}
+
+	if s.Build.Args["PG_MAJOR"] != "16" {
+		t.Errorf("build.args lost: %+v", s.Build.Args)
 	}
 
 	if s.Env["PGAPPNAME"] != "voodu" {
@@ -219,7 +244,7 @@ func TestSpecFromStatefulsetWire_PreservesAllFields(t *testing.T) {
 		t.Errorf("ports lost: %+v", s.Ports)
 	}
 
-	if s.Lang == nil || s.Lang.Name != "generic" || s.Lang.BuildArgs["PG_MAJOR"] != "16" {
-		t.Errorf("lang lost: %+v", s.Lang)
+	if s.Build.Lang == nil || s.Build.Lang.Name != "generic" {
+		t.Errorf("lang lost: %+v", s.Build.Lang)
 	}
 }

@@ -41,7 +41,7 @@ func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return fmt.Errorf("failed to ensure Dockerfile: %v", err)
 	}
 
-	if err := runDockerBuild(appName, spec, releaseDir, l.block(spec).BuildArgs); err != nil {
+	if err := runDockerBuild(appName, spec, releaseDir, spec.BuildArgs); err != nil {
 		return err
 	}
 

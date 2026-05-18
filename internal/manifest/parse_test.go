@@ -54,15 +54,13 @@ deployment "test" "api" {
 }
 
 func TestParseHCLDeploymentBuildMode(t *testing.T) {
-	// The pipeline/container concerns stay at root (workdir, path,
-	// ports, env, post_deploy, ...) while runtime build inputs live
-	// inside the unified `lang {}` block. Go-specific cross-compile
-	// flags (GOOS/GOARCH/CGO_ENABLED) ride inside build_args.
+	// Build-mode deployment: container/runtime concerns at root (ports,
+	// env, post_deploy, ...), build-time inputs nested inside the
+	// `build {}` block (context, dockerfile, path, args, lang).
+	// docker-compose-shaped — context matches compose's `build.context`,
+	// args matches `build.args`.
 	src := `
 deployment "test" "api" {
-  workdir      = "apps/esl"
-  dockerfile   = "Dockerfile.api"
-  path         = "cmd/api"
   ports        = ["127.0.0.1:9092:9092"]
   volumes      = ["/opt/voodu/volumes/rtp:/app/recordings"]
   network      = "bridge"
@@ -71,14 +69,20 @@ deployment "test" "api" {
   post_deploy  = ["./bin/migrate"]
   health_check = "/healthz"
 
-  lang {
-    name    = "go"
-    version = "1.25"
-    build_args = {
+  build {
+    context    = "apps/esl"
+    dockerfile = "Dockerfile.api"
+    path       = "cmd/api"
+    args = {
       GOOS        = "linux"
       GOARCH      = "amd64"
       CGO_ENABLED = "0"
       GIT_SHA     = "abc123"
+    }
+
+    lang {
+      name    = "go"
+      version = "1.25"
     }
   }
 }
@@ -104,20 +108,24 @@ deployment "test" "api" {
 		t.Errorf("image should be empty in build mode, got %q", spec.Image)
 	}
 
-	if spec.Workdir != "apps/esl" || spec.Dockerfile != "Dockerfile.api" || spec.Path != "cmd/api" {
-		t.Errorf("source fields not carried: %+v", spec)
+	if spec.Build == nil {
+		t.Fatal("build block lost")
 	}
 
-	if spec.Lang == nil {
-		t.Fatal("lang block lost")
+	if spec.Build.Context != "apps/esl" || spec.Build.Dockerfile != "Dockerfile.api" || spec.Build.Path != "cmd/api" {
+		t.Errorf("build source fields not carried: %+v", spec.Build)
 	}
 
-	if spec.Lang.Name != "go" || spec.Lang.Version != "1.25" {
-		t.Errorf("lang block fields lost: %+v", spec.Lang)
+	if spec.Build.Args["GOOS"] != "linux" || spec.Build.Args["GIT_SHA"] != "abc123" {
+		t.Errorf("build.args lost: %+v", spec.Build.Args)
 	}
 
-	if spec.Lang.BuildArgs["GOOS"] != "linux" || spec.Lang.BuildArgs["GIT_SHA"] != "abc123" {
-		t.Errorf("build_args lost: %+v", spec.Lang.BuildArgs)
+	if spec.Build.Lang == nil {
+		t.Fatal("lang block lost (should be inside build {})")
+	}
+
+	if spec.Build.Lang.Name != "go" || spec.Build.Lang.Version != "1.25" {
+		t.Errorf("lang fields lost: %+v", spec.Build.Lang)
 	}
 
 	if len(spec.PostDeploy) != 1 || spec.PostDeploy[0] != "./bin/migrate" {
@@ -133,14 +141,18 @@ func TestParseHCLDeploymentLangBlockExotic(t *testing.T) {
 	// The lang block accepts any name string — platforms the handler
 	// registry doesn't know about (Elixir, Java, Haskell) still land
 	// cleanly in the spec; handler dispatch at build time falls through
-	// to the generic Dockerfile path.
+	// to the generic Dockerfile path. Build args (MIX_ENV etc.) live on
+	// the parent build block (`build.args = {...}`).
 	src := `
 deployment "test" "api" {
-  lang {
-    name    = "elixir"
-    version = "1.17"
-    build_args = {
+  build {
+    args = {
       MIX_ENV = "prod"
+    }
+
+    lang {
+      name    = "elixir"
+      version = "1.17"
     }
   }
 }
@@ -157,22 +169,24 @@ deployment "test" "api" {
 		t.Fatal(err)
 	}
 
-	if spec.Lang == nil || spec.Lang.Name != "elixir" || spec.Lang.Version != "1.17" {
-		t.Errorf("exotic lang not carried: %+v", spec.Lang)
+	if spec.Build == nil || spec.Build.Lang == nil {
+		t.Fatalf("build/lang block lost: %+v", spec.Build)
 	}
 
-	if spec.Lang.BuildArgs["MIX_ENV"] != "prod" {
-		t.Errorf("build_args lost: %+v", spec.Lang.BuildArgs)
+	if spec.Build.Lang.Name != "elixir" || spec.Build.Lang.Version != "1.17" {
+		t.Errorf("exotic lang not carried: %+v", spec.Build.Lang)
+	}
+
+	if spec.Build.Args["MIX_ENV"] != "prod" {
+		t.Errorf("build.args lost: %+v", spec.Build.Args)
 	}
 }
 
 func TestParseHCLDeploymentImageOptional(t *testing.T) {
-	// Minimal build-mode deployment: no image, no path either. Parser
-	// fills in `path="."` only — Dockerfile stays empty so lang handlers
-	// can auto-resolve (use existing ./Dockerfile, else generate). A
-	// forced default here would push the server-side pipeline down the
-	// "custom Dockerfile" error path when the file isn't present,
-	// blocking zero-config Rails/Ruby/Node builds.
+	// Minimal build-mode deployment: no image, no build {} either.
+	// applyDefaults synthesises `build = { context = "." }` so
+	// downstream consumers always see a concrete Build pointer.
+	// Dockerfile stays empty so lang handlers can auto-resolve.
 	src := `deployment "test" "api" {}`
 
 	tmp := writeTemp(t, "bare.hcl", src)
@@ -196,32 +210,34 @@ func TestParseHCLDeploymentImageOptional(t *testing.T) {
 		t.Errorf("image should stay empty: %+v", spec)
 	}
 
-	if spec.Path != "." {
-		t.Errorf("path default not applied: got %q, want %q", spec.Path, ".")
+	if spec.Build == nil {
+		t.Fatal("applyDefaults must synthesize Build when neither image nor build {} declared")
 	}
 
-	if spec.Dockerfile != "" {
-		t.Errorf("dockerfile should stay empty so handlers can auto-resolve: got %q", spec.Dockerfile)
+	if spec.Build.Context != "." {
+		t.Errorf("context default not applied: got %q, want %q", spec.Build.Context, ".")
 	}
 
-	if spec.Workdir != "" {
-		t.Errorf("workdir should stay empty (no default): %+v", spec)
+	if spec.Build.Dockerfile != "" {
+		t.Errorf("dockerfile should stay empty so handlers can auto-resolve: got %q", spec.Build.Dockerfile)
 	}
 }
 
 func TestParseHCLStatefulsetBuildMode(t *testing.T) {
-	// Statefulset with no Image + dockerfile + lang block — exercises
-	// the build-mode path. Mirror of TestParseHCLDeploymentImageOptional
-	// but for the stateful kind. Use case: postgres + pgvector built
-	// inline (FROM postgres:16, apt-get install postgresql-16-pgvector)
-	// without a separate CI to publish a custom registry image.
+	// Statefulset with build {} — exercises the build-mode path on the
+	// stateful kind. Use case: postgres + pgvector built inline (FROM
+	// postgres:16, apt-get install postgresql-16-pgvector) without a
+	// separate CI to publish a custom registry image.
 	src := `statefulset "data" "pg" {
-  workdir    = "infra/postgres"
-  dockerfile = "Dockerfile.pg"
-  replicas   = 1
+  replicas = 1
 
-  lang {
-    name = "generic"
+  build {
+    context    = "infra/postgres"
+    dockerfile = "Dockerfile.pg"
+
+    lang {
+      name = "generic"
+    }
   }
 }`
 
@@ -246,27 +262,27 @@ func TestParseHCLStatefulsetBuildMode(t *testing.T) {
 		t.Errorf("image should stay empty (build mode): %q", spec.Image)
 	}
 
-	if spec.Workdir != "infra/postgres" {
-		t.Errorf("workdir lost: %q", spec.Workdir)
+	if spec.Build == nil {
+		t.Fatal("build block lost")
 	}
 
-	if spec.Dockerfile != "Dockerfile.pg" {
-		t.Errorf("dockerfile lost: %q", spec.Dockerfile)
+	if spec.Build.Context != "infra/postgres" {
+		t.Errorf("context lost: %q", spec.Build.Context)
 	}
 
-	if spec.Path != "." {
-		t.Errorf("applyDefaults should fill Path = \".\", got %q", spec.Path)
+	if spec.Build.Dockerfile != "Dockerfile.pg" {
+		t.Errorf("dockerfile lost: %q", spec.Build.Dockerfile)
 	}
 
-	if spec.Lang == nil || spec.Lang.Name != "generic" {
-		t.Errorf("lang block lost: %+v", spec.Lang)
+	if spec.Build.Lang == nil || spec.Build.Lang.Name != "generic" {
+		t.Errorf("nested lang block lost: %+v", spec.Build.Lang)
 	}
 }
 
-func TestParseHCLStatefulsetRegistryModeKeepsPathEmpty(t *testing.T) {
-	// Image-mode: applyDefaults should NOT fill Path. Mirrors the
-	// deployment behaviour — Path/Workdir/Dockerfile are meaningless
-	// when no build runs.
+func TestParseHCLStatefulsetRegistryModeKeepsBuildNil(t *testing.T) {
+	// Image-mode: applyDefaults should NOT synthesize a Build block.
+	// Mirrors the deployment behaviour — Build is meaningless when no
+	// build runs.
 	src := `statefulset "data" "redis" {
   image    = "redis:8"
   replicas = 1
@@ -285,8 +301,8 @@ func TestParseHCLStatefulsetRegistryModeKeepsPathEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if spec.Path != "" {
-		t.Errorf("registry-mode statefulset must not get Path default, got %q", spec.Path)
+	if spec.Build != nil {
+		t.Errorf("registry-mode statefulset must not synthesize Build, got %+v", spec.Build)
 	}
 }
 
@@ -507,9 +523,11 @@ app "clowk-lp" "web" {
   replicas = 1
   ports    = ["3000"]
 
-  lang {
-    name    = "nodejs"
-    version = "22"
+  build {
+    lang {
+      name    = "nodejs"
+      version = "22"
+    }
   }
 
   host = "vd-web.lvh.me"
@@ -556,15 +574,20 @@ app "clowk-lp" "web" {
 		t.Errorf("ports not carried: %+v", depSpec.Ports)
 	}
 
-	if depSpec.Lang == nil || depSpec.Lang.Name != "nodejs" || depSpec.Lang.Version != "22" {
-		t.Errorf("lang block lost: %+v", depSpec.Lang)
+	if depSpec.Build == nil || depSpec.Build.Lang == nil {
+		t.Fatalf("build/lang block lost: %+v", depSpec.Build)
 	}
 
-	// Path defaults must run on the app-emitted deployment too — same
-	// applyDefaults() that `deployment` blocks get. Otherwise an app
-	// authored deployment would diverge from a hand-written one.
-	if depSpec.Path != "." {
-		t.Errorf("default path not applied to app deployment: %q", depSpec.Path)
+	if depSpec.Build.Lang.Name != "nodejs" || depSpec.Build.Lang.Version != "22" {
+		t.Errorf("lang block fields lost: %+v", depSpec.Build.Lang)
+	}
+
+	// applyDefaults must synthesise build mode on the app-emitted
+	// deployment too — same as a standalone `deployment` block.
+	// Otherwise an app-authored deployment would diverge from a
+	// hand-written one.
+	if depSpec.Build.Context != "." {
+		t.Errorf("default context not applied to app deployment: %q", depSpec.Build.Context)
 	}
 
 	var ingSpec IngressSpec
@@ -590,6 +613,163 @@ app "clowk-lp" "web" {
 
 	if ingSpec.TLS == nil || !ingSpec.TLS.Enabled || ingSpec.TLS.Provider != "internal" {
 		t.Errorf("tls block lost: %+v", ingSpec.TLS)
+	}
+}
+
+// TestParseHCLIngressTLSDefaults locks in the "block-present = TLS
+// on" semantics: declaring `tls {}` (even bare) flips the wire spec
+// to `enabled = true, provider = "letsencrypt"`. The whole point of
+// these defaults is so the 90% case writes nothing redundant:
+//
+//	tls {
+//	  email = "ops@example.com"
+//	}
+//
+// matches what every web app wants — TLS enabled, letsencrypt as
+// issuer.
+func TestParseHCLIngressTLSDefaults(t *testing.T) {
+	cases := []struct {
+		name        string
+		tlsBlock    string
+		wantEnabled bool
+		wantProv    string
+	}{
+		{
+			name: "empty block defaults to enabled + letsencrypt",
+			tlsBlock: `
+tls {
+}`,
+			wantEnabled: true,
+			wantProv:    "letsencrypt",
+		},
+		{
+			name: "email-only fills enabled + letsencrypt",
+			tlsBlock: `
+tls {
+  email = "ops@example.com"
+}`,
+			wantEnabled: true,
+			wantProv:    "letsencrypt",
+		},
+		{
+			name: "explicit provider keeps custom value",
+			tlsBlock: `
+tls {
+  provider = "internal"
+}`,
+			wantEnabled: true,
+			wantProv:    "internal",
+		},
+		{
+			name: "explicit enabled=true is no-op (matches default)",
+			tlsBlock: `
+tls {
+  enabled = true
+}`,
+			wantEnabled: true,
+			wantProv:    "letsencrypt",
+		},
+		{
+			name: "explicit enabled=false honoured (escape hatch)",
+			tlsBlock: `
+tls {
+  enabled = false
+  email   = "x@y.z"
+}`,
+			wantEnabled: false,
+			wantProv:    "letsencrypt",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `
+ingress "scope" "web" {
+  host = "x.example.com"
+` + tc.tlsBlock + `
+}
+`
+			tmp := writeTemp(t, "tls.hcl", src)
+
+			mans, err := ParseFile(tmp, nil)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			var spec IngressSpec
+			if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+				t.Fatal(err)
+			}
+
+			if spec.TLS == nil {
+				t.Fatal("declared tls block but wire spec has nil TLS")
+			}
+
+			if spec.TLS.Enabled != tc.wantEnabled {
+				t.Errorf("Enabled: got %v, want %v", spec.TLS.Enabled, tc.wantEnabled)
+			}
+
+			if spec.TLS.Provider != tc.wantProv {
+				t.Errorf("Provider: got %q, want %q", spec.TLS.Provider, tc.wantProv)
+			}
+		})
+	}
+}
+
+// TestParseHCLIngressNoTLSBlockMeansNoTLS pins the opposite case:
+// when the operator omits the `tls {}` block entirely, the wire spec
+// has nil TLS — no http→https redirect, no cert issuance. Defaults
+// only fire when the block is present.
+func TestParseHCLIngressNoTLSBlockMeansNoTLS(t *testing.T) {
+	src := `ingress "scope" "web" { host = "x.example.com" }`
+	tmp := writeTemp(t, "no-tls.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec IngressSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.TLS != nil {
+		t.Errorf("omitted tls block should yield nil TLS, got %+v", spec.TLS)
+	}
+}
+
+// TestParseHCLAppInheritsTLSDefaults — same defaults apply to the
+// `app` sugar block. Parity with standalone `ingress` is the whole
+// point of the sugar.
+func TestParseHCLAppInheritsTLSDefaults(t *testing.T) {
+	src := `
+app "scope" "web" {
+  image = "nginx:1.27"
+  ports = ["80"]
+  host  = "x.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+`
+	tmp := writeTemp(t, "app-tls.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// app expands to (deployment, ingress); the ingress half carries
+	// TLS.
+	var ing IngressSpec
+	if err := json.Unmarshal(mans[1].Spec, &ing); err != nil {
+		t.Fatal(err)
+	}
+
+	if ing.TLS == nil || !ing.TLS.Enabled || ing.TLS.Provider != "letsencrypt" {
+		t.Errorf("app sugar should inherit TLS defaults: %+v", ing.TLS)
 	}
 }
 
@@ -1599,6 +1779,255 @@ func TestStringifyEnvMap_PreservesNonMap(t *testing.T) {
 	got = stringifyEnvMap(nil)
 	if got != nil {
 		t.Errorf("got %v, want nil passthrough", got)
+	}
+}
+
+// TestParseHCLDeploymentComposeShapedFields pins the docker-compose-
+// shaped pass-through knobs (extra_hosts, cap_add, env_file) at the
+// parse layer + the nested `build { args = {...} }` block. We lock in
+// that the HCL surface round-trips them verbatim into the wire spec.
+func TestParseHCLDeploymentComposeShapedFields(t *testing.T) {
+	src := `
+deployment "test" "fsw" {
+  extra_hosts = [
+    "host.docker.internal:host-gateway",
+    "legacy-api:10.0.0.5",
+  ]
+
+  cap_add = ["SYS_NICE", "NET_ADMIN"]
+
+  build {
+    args = {
+      SERVICE = "api"
+      VERSION = "1.2.3"
+    }
+  }
+
+  env_file = ["./app.env", "./secrets.env"]
+}
+`
+	tmp := writeTemp(t, "dep.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	wantHosts := []string{"host.docker.internal:host-gateway", "legacy-api:10.0.0.5"}
+	if len(spec.ExtraHosts) != len(wantHosts) {
+		t.Fatalf("extra_hosts: got %+v, want %+v", spec.ExtraHosts, wantHosts)
+	}
+
+	for i, want := range wantHosts {
+		if spec.ExtraHosts[i] != want {
+			t.Errorf("extra_hosts[%d] = %q, want %q", i, spec.ExtraHosts[i], want)
+		}
+	}
+
+	wantCaps := []string{"SYS_NICE", "NET_ADMIN"}
+	if len(spec.CapAdd) != len(wantCaps) {
+		t.Fatalf("cap_add: got %+v, want %+v", spec.CapAdd, wantCaps)
+	}
+
+	for i, want := range wantCaps {
+		if spec.CapAdd[i] != want {
+			t.Errorf("cap_add[%d] = %q, want %q", i, spec.CapAdd[i], want)
+		}
+	}
+
+	if spec.Build == nil {
+		t.Fatal("build block lost")
+	}
+
+	if spec.Build.Args["SERVICE"] != "api" || spec.Build.Args["VERSION"] != "1.2.3" {
+		t.Errorf("build.args lost: %+v", spec.Build.Args)
+	}
+
+	wantEnvFiles := []string{"./app.env", "./secrets.env"}
+	if len(spec.EnvFile) != len(wantEnvFiles) {
+		t.Fatalf("env_file: got %+v, want %+v", spec.EnvFile, wantEnvFiles)
+	}
+
+	for i, want := range wantEnvFiles {
+		if spec.EnvFile[i] != want {
+			t.Errorf("env_file[%d] = %q, want %q", i, spec.EnvFile[i], want)
+		}
+	}
+}
+
+// TestParseHCLStatefulsetComposeShapedFields mirrors the deployment
+// test for statefulset — extra_hosts/cap_add/env_file live at root,
+// build args live inside the nested build block. Image-mode here
+// (no build {}) — different from the deployment test on purpose to
+// exercise the image-mode path on the stateful kind.
+func TestParseHCLStatefulsetComposeShapedFields(t *testing.T) {
+	src := `
+statefulset "test" "redis" {
+  image       = "redis:7"
+  cap_add     = ["IPC_LOCK"]
+  extra_hosts = ["sentinel-bootstrap:10.0.0.10"]
+  env_file    = ["./redis.env"]
+}
+`
+	tmp := writeTemp(t, "sts.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec StatefulsetSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.CapAdd) != 1 || spec.CapAdd[0] != "IPC_LOCK" {
+		t.Errorf("cap_add: %+v", spec.CapAdd)
+	}
+
+	if len(spec.ExtraHosts) != 1 || spec.ExtraHosts[0] != "sentinel-bootstrap:10.0.0.10" {
+		t.Errorf("extra_hosts: %+v", spec.ExtraHosts)
+	}
+
+	if len(spec.EnvFile) != 1 || spec.EnvFile[0] != "./redis.env" {
+		t.Errorf("env_file: %+v", spec.EnvFile)
+	}
+
+	// Image-mode → Build must stay nil (no auto-synthesis).
+	if spec.Build != nil {
+		t.Errorf("image-mode statefulset must keep Build nil, got %+v", spec.Build)
+	}
+}
+
+// TestParseHCLAppComposeShapedFields covers the `app` authoring sugar:
+// the deployment-half should expose the same fields as a standalone
+// deployment block (parity is the whole point of the sugar).
+func TestParseHCLAppComposeShapedFields(t *testing.T) {
+	src := `
+app "test" "web" {
+  image = "nginx:1.25"
+  host  = "web.example.com"
+
+  extra_hosts = ["api.internal:10.0.0.1"]
+  cap_add     = ["NET_ADMIN"]
+  env_file    = ["./web.env"]
+}
+`
+	tmp := writeTemp(t, "app.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 2 {
+		t.Fatalf("app should expand to (deployment, ingress) = 2 manifests, got %d", len(mans))
+	}
+
+	// First manifest should be the deployment (parser emits in that order).
+	if mans[0].Kind != controller.KindDeployment {
+		t.Fatalf("expected first manifest to be deployment, got %s", mans[0].Kind)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.ExtraHosts) != 1 || spec.ExtraHosts[0] != "api.internal:10.0.0.1" {
+		t.Errorf("extra_hosts: %+v", spec.ExtraHosts)
+	}
+
+	if len(spec.CapAdd) != 1 || spec.CapAdd[0] != "NET_ADMIN" {
+		t.Errorf("cap_add: %+v", spec.CapAdd)
+	}
+
+	if len(spec.EnvFile) != 1 || spec.EnvFile[0] != "./web.env" {
+		t.Errorf("env_file: %+v", spec.EnvFile)
+	}
+}
+
+// TestParseHCLDeploymentImageBuildMutuallyExclusive pins the parse-
+// time guard: declaring both `image = "..."` AND a `build {}` block
+// on the same resource must error out, because they're two ways of
+// spelling mutually exclusive intents. Operator picks one or the
+// other.
+func TestParseHCLDeploymentImageBuildMutuallyExclusive(t *testing.T) {
+	src := `
+deployment "test" "api" {
+  image = "ghcr.io/me/api:v1"
+
+  build {
+    context = "."
+  }
+}
+`
+	tmp := writeTemp(t, "conflict.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for image + build {} on same resource")
+	}
+
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutual-exclusivity error, got: %v", err)
+	}
+}
+
+// TestParseHCLStatefulsetImageBuildMutuallyExclusive — same guard on
+// the stateful kind.
+func TestParseHCLStatefulsetImageBuildMutuallyExclusive(t *testing.T) {
+	src := `
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  build {
+    context = "infra/postgres"
+  }
+}
+`
+	tmp := writeTemp(t, "conflict_sts.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for image + build {} on statefulset")
+	}
+}
+
+// TestParseHCLDeploymentAutoBuildDefault pins the implicit-build
+// auto-detect path: a deployment with no image and no build block
+// gets `Build = {Context: "."}` synthesised by applyDefaults — the
+// "ship me from this repo, figure the rest out" shape.
+func TestParseHCLDeploymentAutoBuildDefault(t *testing.T) {
+	src := `deployment "test" "api" {}`
+
+	tmp := writeTemp(t, "auto.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Build == nil {
+		t.Fatal("auto-detect: expected Build synthesised, got nil")
+	}
+
+	if spec.Build.Context != "." {
+		t.Errorf("auto-detect context: got %q, want %q", spec.Build.Context, ".")
 	}
 }
 

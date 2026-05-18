@@ -14,33 +14,25 @@ package manifest
 
 // DeploymentSpec is an app the controller should run as a container.
 //
-// Shape: the root holds pipeline- and container-level concerns (image,
-// networking, env, post-deploy hooks, release retention). Language-
-// specific build inputs live inside an optional `lang {}` block whose
-// `name` field names the runtime — any value is accepted, so operators
-// can target runtimes the platform doesn't know about (Elixir, Java,
-// Haskell...) as long as they provide a custom Dockerfile.
+// Shape: the root holds runtime concerns (replicas, env, networking,
+// post-deploy hooks, release retention). Source-resolution and build-
+// time concerns live inside an optional `build {}` block — see
+// BuildSpec for the field shape.
 //
-// Source resolution is implicit. The handler picks a mode from which
-// fields are set at reconcile time:
+// Source mode is mutually exclusive:
 //
-//   - Image non-empty        → pull from registry and run (no build)
-//   - Image empty + Path set → docker build using <Workdir>/<Path> as context
-//   - Image empty + no Path  → docker build at repo root
+//   - `image = "..."` set → registry mode. The image is pulled from
+//     the registry and run. Build is ignored (parse-time error if
+//     both `image` and `build {}` are declared).
+//   - `build { ... }` set OR neither set → build mode. The CLI
+//     streams the working tree to the controller, which runs the
+//     standard build pipeline. An absent `build {}` block defaults
+//     to "build at repo root with auto-detected runtime" — the
+//     terse "ship me from this repo, figure the rest out" shape.
 //
-// Workdir narrows the repo subtree (monorepo case); Dockerfile picks a
-// non-default filename. Both are ignored when Image is set.
-//
-// Language dispatch:
-//   - `lang {}` is optional. When present, `name` picks the handler
-//     (go, ruby, rails, python, nodejs, or any custom string — unknown
-//     values fall through to the generic Dockerfile path).
-//   - Zero block is fine: handlers auto-detect at build time from
-//     well-known marker files (go.mod, Gemfile, package.json, ...).
-//   - `version`, `entrypoint`, and `build_args` are forwarded to the
-//     handler. Cross-compile flags (GOOS/GOARCH/CGO_ENABLED) live inside
-//     `build_args` — the Go handler injects defaults and any explicit
-//     entry overrides them.
+// Build configuration lives in BuildSpec (Context, Dockerfile, Path,
+// Args, Lang). docker-compose-shaped: `context` matches compose's
+// `build.context`, `args` matches `build.args`.
 //
 // Networking:
 //   - `network_mode = "host" | "none"` escapes docker bridge entirely.
@@ -54,9 +46,6 @@ package manifest
 //   - All empty → `[voodu0]`.
 type DeploymentSpec struct {
 	Image        string            `yaml:"image,omitempty"         json:"image,omitempty"`
-	Workdir      string            `yaml:"workdir,omitempty"       json:"workdir,omitempty"`
-	Dockerfile   string            `yaml:"dockerfile,omitempty"    json:"dockerfile,omitempty"`
-	Path         string            `yaml:"path,omitempty"          json:"path,omitempty"`
 	Replicas     int               `yaml:"replicas,omitempty"      json:"replicas,omitempty"`
 	Command      []string          `yaml:"command,omitempty"       json:"command,omitempty"`
 	Env          map[string]string `yaml:"env,omitempty"           json:"env,omitempty"`
@@ -70,9 +59,44 @@ type DeploymentSpec struct {
 	PostDeploy   []string          `yaml:"post_deploy,omitempty"   json:"post_deploy,omitempty"`
 	KeepReleases int               `yaml:"keep_releases,omitempty" json:"keep_releases,omitempty"`
 
-	// Lang is the single, runtime-agnostic build-input block. A nil
-	// pointer means "not declared" — handlers fall back to auto-detect.
-	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
+	// Build holds the build-mode configuration when Image is empty.
+	// Mutually exclusive with Image; see BuildSpec for the field shape.
+	// nil + empty Image → implicit "build at repo root, auto-detect
+	// runtime" (the terse shape applyDefaults synthesises).
+	Build *BuildSpec `yaml:"build,omitempty" json:"build,omitempty"`
+
+	// ExtraHosts maps to docker run `--add-host host:ip` entries on top
+	// of the always-injected `host.docker.internal:host-gateway`. Each
+	// entry is "name:ip" verbatim (validated at parse time). Useful for
+	// pointing the container at internal services that don't have DNS
+	// (legacy DB on a fixed IP, internal API on a VLAN, etc.). docker-
+	// compose's `extra_hosts` field — identical semantics.
+	ExtraHosts []string `yaml:"extra_hosts,omitempty" json:"extra_hosts,omitempty"`
+
+	// CapAdd lists Linux capabilities to grant the container via docker
+	// run `--cap-add`. Values are bare capability names without the
+	// `CAP_` prefix (`SYS_NICE`, `NET_ADMIN`, `IPC_LOCK`, etc.). Mirrors
+	// docker-compose `cap_add`. Common use cases: FreeSWITCH (SYS_NICE
+	// for realtime scheduling), network tooling (NET_ADMIN), Redis with
+	// memlock (IPC_LOCK). Avoid CAP_SYS_ADMIN unless you know exactly
+	// why — it's effectively root in the container.
+	CapAdd []string `yaml:"cap_add,omitempty" json:"cap_add,omitempty"`
+
+	// EnvFile lists local file paths (relative to the operator's CWD)
+	// whose KEY=value lines are merged into the spec's `env` map at
+	// `vd apply` time. Files are read CLIENT-side; the controller sees
+	// only the merged env map on the wire. Lets the operator keep
+	// secrets out of the HCL — equivalent to docker-compose
+	// `env_file: ./apps/foo/.env`.
+	//
+	// Precedence (last write wins, then operator-inline wins):
+	//   1. env_file values (in declared order)
+	//   2. inline `env = { ... }` block values
+	//
+	// Inline-wins means an operator who declared `env_file = "..."`
+	// AND `env = { FOO = "explicit" }` gets FOO=explicit, even if the
+	// .env file also declares FOO. Same Docker semantics.
+	EnvFile []string `yaml:"env_file,omitempty" json:"env_file,omitempty"`
 
 	// Release is the optional release-phase block. When present, voodu
 	// runs Command in a one-shot container BEFORE rolling restart of
@@ -100,6 +124,60 @@ type DeploymentSpec struct {
 	// this field — the apply pipeline stamps it post plugin-expand.
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// BuildSpec is the docker-compose-shaped build-mode block. Declared
+// inside a resource (`build { ... }`) when the operator wants voodu to
+// build the image from source instead of pulling it from a registry.
+// Mutually exclusive with the resource's `image` field — parse fails
+// loudly if both are set.
+//
+//	deployment "scope" "api" {
+//	  build {
+//	    context    = "apps/api"        # directory sent as docker build context
+//	    dockerfile = "Dockerfile.api"  # custom name, relative to context
+//	    path       = "cmd/api"         # only used by auto-generated Dockerfiles
+//	    args       = { SERVICE = "api" }
+//
+//	    lang {
+//	      name    = "go"
+//	      version = "1.25"
+//	    }
+//	  }
+//	}
+//
+// Field semantics:
+//
+//   - Context: the directory whose contents are sent to `docker build`
+//     as the build context. Defaults to "." (repo root) when build {}
+//     is declared but context is omitted. Matches docker-compose's
+//     `build.context`.
+//   - Dockerfile: picks a non-default Dockerfile name relative to
+//     Context. Empty means look for "./Dockerfile" inside Context; if
+//     none exists, language handlers may auto-generate one. Matches
+//     `build.dockerfile`.
+//   - Path: voodu-specific knob, used ONLY by auto-generated
+//     Dockerfiles (Go handler emits `go build ./<path>`, etc.).
+//     Custom Dockerfiles ignore this field — they handle their own
+//     COPY/WORKDIR. No docker-compose equivalent.
+//   - Args: docker `--build-arg KEY=value` map. Matches
+//     `build.args`. Works for any Dockerfile.
+//   - Lang: optional runtime hint. nil = handlers auto-detect from
+//     marker files (go.mod, Gemfile, package.json, …) in Context.
+//
+// Auto-detect (omitting build {} entirely):
+//
+//	deployment "scope" "web" {}   # no image, no build → "build at repo
+//	                              # root, auto-detect runtime"
+//
+// applyDefaults synthesises `Build = &BuildSpec{Context: "."}` for the
+// minimal shape, so handlers downstream don't need to special-case.
+type BuildSpec struct {
+	Context    string            `yaml:"context,omitempty"    json:"context,omitempty"`
+	Dockerfile string            `yaml:"dockerfile,omitempty" json:"dockerfile,omitempty"`
+	Path       string            `yaml:"path,omitempty"       json:"path,omitempty"`
+	Args       map[string]string `yaml:"args,omitempty"       json:"args,omitempty"`
+	Lang       *LangSpec         `yaml:"lang,omitempty"       json:"lang,omitempty"`
 }
 
 // ResourcesSpec is the k8s-shape resource constraint block. Voodu
@@ -178,42 +256,42 @@ type ReleaseSpec struct {
 	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
-// LangSpec carries build-time inputs for the chosen runtime. The
-// `name` field picks the handler; `version`, `entrypoint`, and
-// `build_args` are universal — each handler reads what's meaningful to
-// it and ignores the rest. That way new runtimes slot in without
-// schema churn: the HCL shape is identical for Go, Ruby, Elixir, or a
-// bespoke custom-Dockerfile app.
+// LangSpec is the runtime-handler hint inside a `build {}` block.
+// The `name` field picks the handler (go, ruby, rails, python,
+// nodejs, or any custom string — unknown values fall through to
+// the generic Dockerfile path). `version` flows into auto-generated
+// Dockerfiles where the handler knows what to do with it (Go base
+// image tag, Ruby version pin, …). `entrypoint` lets the operator
+// override the handler's default CMD.
 //
-// build_args doubles as the escape hatch for lang-specific knobs.
-// Go users pass `{ GOOS = "linux", GOARCH = "arm64", CGO_ENABLED = "0" }`
-// here rather than getting a dedicated struct field — the Go handler
-// auto-injects defaults and user entries override them.
+// Build args live on the parent BuildSpec (`build.args = {...}`),
+// NOT here — one source of truth. The Golang handler still injects
+// platform defaults (GOOS/GOARCH/CGO_ENABLED) internally; operators
+// override via `build.args = { GOOS = "darwin" }`.
 type LangSpec struct {
-	Name       string            `yaml:"name,omitempty"       json:"name,omitempty"`
-	Version    string            `yaml:"version,omitempty"    json:"version,omitempty"`
-	Entrypoint string            `yaml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
-	BuildArgs  map[string]string `yaml:"build_args,omitempty" json:"build_args,omitempty"`
+	Name       string `yaml:"name,omitempty"       json:"name,omitempty"`
+	Version    string `yaml:"version,omitempty"    json:"version,omitempty"`
+	Entrypoint string `yaml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
 }
 
 // applyDefaults fills implicit values so the minimal HCL
 //
 //	deployment "scope" "web" {}
 //
-// means "build the repo root, health-check /". Dockerfile is left
-// empty on purpose: lang handlers auto-resolve it (use existing
-// ./Dockerfile, else generate one for the detected runtime). Setting
-// an explicit default here would make the server-side pipeline treat
-// it as a *custom* dockerfile path and error out with a misleading
-// "custom Dockerfile not found" when it's missing — blocking the
-// auto-generation fallback that handlers like Rails/Ruby/Node rely
-// on for zero-config builds.
+// means "build the repo root, health-check /". Dockerfile inside the
+// synthesised Build is left empty on purpose: lang handlers auto-
+// resolve it (use existing ./Dockerfile, else generate one for the
+// detected runtime). Setting an explicit default would make the
+// server-side pipeline treat it as a *custom* dockerfile path and
+// error out with a misleading "custom Dockerfile not found" when it's
+// missing — blocking the auto-generation fallback that handlers like
+// Rails/Ruby/Node rely on for zero-config builds.
 //
-// Path defaults to "." (build the repo root) in build mode only —
-// registry-mode deployments (Image set) skip both defaults because
-// build metadata is meaningless when no build runs. HealthCheck
-// defaults in both modes because the ingress probe needs a path
-// regardless of how the image was produced.
+// Build defaults to `{Context: "."}` only when Image is empty (build
+// mode). Registry-mode deployments (Image set) skip the synthesis
+// because build metadata is meaningless when no build runs.
+// HealthCheck defaults in both modes because the ingress probe needs
+// a path regardless of how the image was produced.
 func (s *DeploymentSpec) applyDefaults() {
 	if s.HealthCheck == "" {
 		s.HealthCheck = "/"
@@ -223,8 +301,12 @@ func (s *DeploymentSpec) applyDefaults() {
 		return
 	}
 
-	if s.Path == "" {
-		s.Path = "."
+	if s.Build == nil {
+		s.Build = &BuildSpec{}
+	}
+
+	if s.Build.Context == "" {
+		s.Build.Context = "."
 	}
 }
 
@@ -257,9 +339,6 @@ func (s *DeploymentSpec) applyDefaults() {
 // new affordance.
 type StatefulsetSpec struct {
 	Image       string            `yaml:"image,omitempty"        json:"image,omitempty"`
-	Workdir     string            `yaml:"workdir,omitempty"      json:"workdir,omitempty"`
-	Dockerfile  string            `yaml:"dockerfile,omitempty"   json:"dockerfile,omitempty"`
-	Path        string            `yaml:"path,omitempty"         json:"path,omitempty"`
 	Replicas    int               `yaml:"replicas,omitempty"     json:"replicas,omitempty"`
 	Command     []string          `yaml:"command,omitempty"      json:"command,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"          json:"env,omitempty"`
@@ -271,11 +350,19 @@ type StatefulsetSpec struct {
 	Restart     string            `yaml:"restart,omitempty"      json:"restart,omitempty"`
 	HealthCheck string            `yaml:"health_check,omitempty" json:"health_check,omitempty"`
 
-	// Lang carries build-time inputs when Image is empty — same shape
-	// and semantics as DeploymentSpec.Lang. Optional; the lang
-	// handlers auto-detect from marker files (Gemfile, package.json,
-	// go.mod, …) when omitted.
-	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
+	// Build holds the build-mode configuration when Image is empty.
+	// See DeploymentSpec.Build / BuildSpec for the full contract —
+	// shape and mutual-exclusivity are identical across kinds.
+	Build *BuildSpec `yaml:"build,omitempty" json:"build,omitempty"`
+
+	// ExtraHosts, CapAdd, EnvFile mirror the same fields on
+	// DeploymentSpec — see DeploymentSpec for full docs. Behaviour is
+	// identical; ordinal-stable pods don't change semantics for any of
+	// these knobs. env_file values merge into Env at apply time with
+	// inline-wins precedence.
+	ExtraHosts []string `yaml:"extra_hosts,omitempty" json:"extra_hosts,omitempty"`
+	CapAdd     []string `yaml:"cap_add,omitempty"     json:"cap_add,omitempty"`
+	EnvFile    []string `yaml:"env_file,omitempty"    json:"env_file,omitempty"`
 
 	// EnvFrom stacks env files from other resources, same shape +
 	// semantics as JobSpec.EnvFrom: each entry is `<scope>/<name>`
@@ -314,7 +401,7 @@ type StatefulsetSpec struct {
 
 // applyDefaults fills implicit values for the build-mode case (mirror
 // of DeploymentSpec.applyDefaults). Image-mode statefulsets skip this
-// because Path/Workdir/Dockerfile are meaningless when no build runs.
+// because Build is meaningless when no build runs.
 //
 // No HealthCheck default: statefulset workloads (postgres, redis,
 // kafka) don't have a universal HTTP probe path the way HTTP apps do —
@@ -324,8 +411,12 @@ func (s *StatefulsetSpec) applyDefaults() {
 		return
 	}
 
-	if s.Path == "" {
-		s.Path = "."
+	if s.Build == nil {
+		s.Build = &BuildSpec{}
+	}
+
+	if s.Build.Context == "" {
+		s.Build.Context = "."
 	}
 }
 
@@ -466,15 +557,27 @@ type IngressLocation struct {
 //     scheduler shares this knob.
 type JobSpec struct {
 	Image       string            `yaml:"image,omitempty"         json:"image,omitempty"`
-	Workdir     string            `yaml:"workdir,omitempty"       json:"workdir,omitempty"`
-	Dockerfile  string            `yaml:"dockerfile,omitempty"    json:"dockerfile,omitempty"`
-	Path        string            `yaml:"path,omitempty"          json:"path,omitempty"`
 	Command     []string          `yaml:"command,omitempty"       json:"command,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"           json:"env,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"       json:"volumes,omitempty"`
 	Network     string            `yaml:"network,omitempty"       json:"network,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"      json:"networks,omitempty"`
 	NetworkMode string            `yaml:"network_mode,omitempty"  json:"network_mode,omitempty"`
+
+	// Build holds the build-mode configuration when Image is empty.
+	// Jobs typically reuse a deployment's image via `image = "my-app:
+	// latest"`, so the build block is rarely needed in practice — but
+	// the surface is symmetric with deployment/statefulset for the
+	// occasional one-off job that builds its own image.
+	Build *BuildSpec `yaml:"build,omitempty" json:"build,omitempty"`
+
+	// ExtraHosts, CapAdd, EnvFile mirror the same fields on
+	// DeploymentSpec — same semantics. EnvFile is merged into Env
+	// client-side at apply time; inline `env = {...}` wins on key
+	// collisions.
+	ExtraHosts []string `yaml:"extra_hosts,omitempty" json:"extra_hosts,omitempty"`
+	CapAdd     []string `yaml:"cap_add,omitempty"     json:"cap_add,omitempty"`
+	EnvFile    []string `yaml:"env_file,omitempty"    json:"env_file,omitempty"`
 
 	// EnvFrom stacks env files from other resources at run time.
 	// Each entry is a `<scope>/<name>` ref (or bare `<name>` for
@@ -487,12 +590,6 @@ type JobSpec struct {
 	// without redeclaration. Multiple sources stack in declared
 	// order — common pattern is `[shared-secrets, paired-app]`.
 	EnvFrom []string `yaml:"env_from,omitempty" json:"env_from,omitempty"`
-
-	// Lang mirrors the deployment's lang block — same handler dispatch,
-	// same escape-hatch via build_args. Jobs typically reuse a
-	// deployment's image via `image = "my-app:latest"`, so the lang
-	// block is rarely needed in practice.
-	Lang *LangSpec `yaml:"lang,omitempty" json:"lang,omitempty"`
 
 	// Timeout is a Go duration string (`"30s"`, `"5m"`). Empty means
 	// no enforced cap. The controller kills + records a non-zero exit

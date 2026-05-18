@@ -79,6 +79,20 @@ type deploymentSpec struct {
 	HealthCheck string            `json:"health_check,omitempty"`
 	Release     *releaseSpec      `json:"release,omitempty"`
 
+	// ExtraHosts maps to docker run `--add-host name:ip`. Extra entries
+	// stack on top of the always-injected `host.docker.internal:host-
+	// gateway`. Validated server-side at apply time (`name:ip` shape).
+	ExtraHosts []string `json:"extra_hosts,omitempty"`
+
+	// CapAdd maps to docker run `--cap-add`. Bare capability names
+	// without `CAP_` prefix (SYS_NICE, NET_ADMIN, IPC_LOCK, …).
+	CapAdd []string `json:"cap_add,omitempty"`
+
+	// BuildArgs is the docker `--build-arg KEY=value` map applied at
+	// build time when Image is empty. Independent of `lang {}` — works
+	// for any Dockerfile.
+	BuildArgs map[string]string `json:"build_args,omitempty"`
+
 	// Resources mirrors manifest.ResourcesSpec — kernel-level
 	// CPU/memory caps via cgroups. nil means "no limit", which
 	// is the safe operator-default (the `vd describe` audit
@@ -680,6 +694,8 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			Labels:           labels,
 			CPULimit:         cpu,
 			MemoryLimitBytes: memBytes,
+			ExtraHosts:       spec.ExtraHosts,
+			CapAdd:           spec.CapAdd,
 		})
 		if err != nil {
 			return created, fmt.Errorf("ensure %s: %w", cname, err)
@@ -978,6 +994,8 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			Labels:           labels,
 			CPULimit:         cpu,
 			MemoryLimitBytes: memBytes,
+			ExtraHosts:       spec.ExtraHosts,
+			CapAdd:           spec.CapAdd,
 		}); err != nil {
 			return fmt.Errorf("spawn replacement %s: %w", newName, err)
 		}
@@ -1475,6 +1493,15 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 	nets := append([]string(nil), spec.Networks...)
 	sort.Strings(nets)
 
+	// ExtraHosts / CapAdd / BuildArgs are deterministic-ordered so the
+	// operator can reshuffle the HCL without triggering a rolling restart.
+	// (BuildArgs is map already-stable via json.Marshal alpha-key order.)
+	hosts := append([]string(nil), spec.ExtraHosts...)
+	sort.Strings(hosts)
+
+	caps := append([]string(nil), spec.CapAdd...)
+	sort.Strings(caps)
+
 	input := struct {
 		Image       string             `json:"image"`
 		Command     []string           `json:"command"`
@@ -1484,6 +1511,9 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Networks    []string           `json:"networks"`
 		NetworkMode string             `json:"network_mode"`
 		Restart     string             `json:"restart"`
+		ExtraHosts  []string           `json:"extra_hosts,omitempty"`
+		CapAdd      []string           `json:"cap_add,omitempty"`
+		BuildArgs   map[string]string  `json:"build_args,omitempty"`
 		Resources   *resourcesWireSpec `json:"resources,omitempty"`
 		Assets      []string           `json:"assets,omitempty"`
 	}{
@@ -1495,6 +1525,9 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Networks:    nets,
 		NetworkMode: spec.NetworkMode,
 		Restart:     spec.Restart,
+		ExtraHosts:  hosts,
+		CapAdd:      caps,
+		BuildArgs:   spec.BuildArgs,
 		// Resources fold into the hash so a `resources { limits {
 		// cpu, memory } }` edit triggers a rolling restart. Without
 		// this, the operator changes a CPU cap, runs `vd apply`, the

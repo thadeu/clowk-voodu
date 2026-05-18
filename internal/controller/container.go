@@ -311,6 +311,18 @@ type ContainerSpec struct {
 	// layer (manifest.ParseK8sMemoryBytes) — the value here is
 	// already in bytes.
 	MemoryLimitBytes int64
+
+	// ExtraHosts is the operator-declared list of `name:ip` entries
+	// that the docker daemon writes into the container's /etc/hosts,
+	// on top of the platform's always-injected
+	// `host.docker.internal:host-gateway`. See manifest.DeploymentSpec
+	// for the contract.
+	ExtraHosts []string
+
+	// CapAdd is the list of Linux capabilities (bare names, no
+	// `CAP_` prefix) the operator wants granted via docker run
+	// `--cap-add`. See manifest.DeploymentSpec for the contract.
+	CapAdd []string
 }
 
 // DockerContainerManager is the production ContainerManager backed by
@@ -382,6 +394,8 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		TTY:              spec.TTY,
 		CPULimit:         spec.CPULimit,
 		MemoryLimitBytes: spec.MemoryLimitBytes,
+		ExtraHosts:       spec.ExtraHosts,
+		CapAdd:           spec.CapAdd,
 	}
 
 	if err := docker.CreateContainer(cfg); err != nil {
@@ -721,6 +735,8 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		TTY:              spec.TTY,
 		CPULimit:         spec.CPULimit,
 		MemoryLimitBytes: spec.MemoryLimitBytes,
+		ExtraHosts:       spec.ExtraHosts,
+		CapAdd:           spec.CapAdd,
 	}
 
 	return docker.CreateContainer(cfg)

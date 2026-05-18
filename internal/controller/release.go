@@ -285,6 +285,8 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		NetworkMode: spec.NetworkMode,
 		EnvFile:     envFile,
 		Labels:      labels,
+		ExtraHosts:  spec.ExtraHosts,
+		CapAdd:      spec.CapAdd,
 		// AutoRemove is explicitly false: we need the container to
 		// stay alive long enough for Wait to return the exit code.
 		// `--rm` would race with Wait under heavy load. Equivalent

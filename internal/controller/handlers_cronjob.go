@@ -297,6 +297,8 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		EnvFile:       envFile,
 		ExtraEnvFiles: extraEnvFiles,
 		Labels:        labels,
+		ExtraHosts:    spec.Job.ExtraHosts,
+		CapAdd:        spec.Job.CapAdd,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs cronjob
 		// <name>` can read them post-tick. The runner GCs old run

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1229,7 +1230,19 @@ func loadOne(path, stdinFormat string, env map[string]string) ([]controller.Mani
 			return nil, fmt.Errorf("-f -: --format hcl|yaml is required for stdin")
 		}
 
-		return manifest.ParseReader(os.Stdin, manifest.Format(stdinFormat), env)
+		mans, err := manifest.ParseReader(os.Stdin, manifest.Format(stdinFormat), env)
+		if err != nil {
+			return nil, err
+		}
+
+		// stdin has no manifest-file path; env_file references resolve
+		// against the operator's current working directory.
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+
+		return mergeEnvFilesInManifests(mans, cwd)
 	}
 
 	resolved, info, err := resolveManifestPath(path)
@@ -1238,10 +1251,30 @@ func loadOne(path, stdinFormat string, env map[string]string) ([]controller.Mani
 	}
 
 	if info.IsDir() {
-		return manifest.ParseDir(resolved, env)
+		mans, err := manifest.ParseDir(resolved, env)
+		if err != nil {
+			return nil, err
+		}
+
+		// Directory case: env_file refs resolve against the directory
+		// the operator pointed at. (Each manifest file inside the dir
+		// shares the same env-file resolution base — alternative
+		// would be per-file dir, but ParseDir already flattens; the
+		// directory-level base matches the most common shape where
+		// `app.voodu` + `.env` live side by side.)
+		return mergeEnvFilesInManifests(mans, resolved)
 	}
 
-	return manifest.ParseFile(resolved, env)
+	mans, err := manifest.ParseFile(resolved, env)
+	if err != nil {
+		return nil, err
+	}
+
+	// docker-compose semantics: env_file paths resolve relative to the
+	// directory of the manifest file (NOT the operator's CWD). That way
+	// `voodu apply -f apps/web/web.voodu` finds `apps/web/.env` next to
+	// the manifest, regardless of where the operator ran from.
+	return mergeEnvFilesInManifests(mans, filepath.Dir(resolved))
 }
 
 // resolveManifestPath adds a manifest extension when the user omitted

@@ -20,12 +20,12 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 	if spec.Dockerfile != "" {
 		dockerfilePath = filepath.Join(releaseDir, spec.Dockerfile)
 
-		if spec.Workdir != "" {
-			workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
+		if spec.Context != "" {
+			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
-				fmt.Printf("-----> Using custom Dockerfile in workdir: %s/%s\n", spec.Workdir, spec.Dockerfile)
+				fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 			} else {
 				fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
 			}
@@ -54,6 +54,14 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 	} else {
 		cmd = exec.Command("docker", "build", "-t", latestTag, "-t", immutableTag, releaseDir)
+	}
+
+	// Build args from the manifest's `build.args = {...}` block.
+	// docker-compose's `build.args` semantics — parameterise a generic
+	// Dockerfile (SERVICE=api / VERSION=1.2.3 / etc) without committing
+	// the value to the Dockerfile itself.
+	for key, value := range spec.BuildArgs {
+		cmd.Args = append(cmd.Args, "--build-arg", fmt.Sprintf("%s=%s", key, value))
 	}
 
 	for _, label := range docker.GetVooduLabels() {

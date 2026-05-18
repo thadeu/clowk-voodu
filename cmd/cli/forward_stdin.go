@@ -129,15 +129,15 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 //
 // Statefulset is included because postgres/redis/etc. operators may
 // want to bake extensions (pgvector, RediSearch) into a custom image
-// without a separate CI — same Image/Dockerfile/Workdir/Path/Lang
-// surface as deployment, same receive-pack pipeline.
+// without a separate CI — same build {} block surface as deployment,
+// same receive-pack pipeline.
 func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 	var out []buildModeDep
 
 	for _, m := range mans {
 		var (
 			image string
-			path  string
+			build *manifest.BuildSpec
 		)
 
 		switch m.Kind {
@@ -149,7 +149,7 @@ func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 			}
 
 			image = spec.Image
-			path = spec.Path
+			build = spec.Build
 
 		case controller.KindStatefulset:
 			var spec manifest.StatefulsetSpec
@@ -159,7 +159,7 @@ func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 			}
 
 			image = spec.Image
-			path = spec.Path
+			build = spec.Build
 
 		default:
 			continue
@@ -169,8 +169,14 @@ func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 			continue
 		}
 
-		if path == "" {
-			path = "."
+		// build.context is what the CLI streams as the build tarball
+		// root. Falls back to "." when the manifest declared neither
+		// `image` nor `build {}` — applyDefaults synthesises that case
+		// already, but we belt-and-suspenders here so a malformed
+		// manifest sneaking in via stdin doesn't produce a zero-path.
+		path := "."
+		if build != nil && build.Context != "" {
+			path = build.Context
 		}
 
 		out = append(out, buildModeDep{

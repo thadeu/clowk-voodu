@@ -7,6 +7,7 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | dir | what it shows |
 |---|---|
 | [`asset/`](./asset) | Standalone `asset` blocks with `file()`, `url()`, and inline string sources; scoped (`asset "scope" "name"`) and unscoped (`asset "name"`) shapes; combination with a `deployment` mounting the materialised paths via `${asset.…}` |
+| [`build/`](./build) | `build {}` block — build images from source instead of pulling from a registry. docker-compose-shaped (`context`, `dockerfile`, `args`). Covers auto-detect, custom Dockerfile, Go monorepo, statefulset build |
 | [`statefulset/`](./statefulset) | Single-node and multi-replica statefulsets (postgres, redis) with per-pod ordinal identity and persistent volume claims |
 | [`stack/`](./stack) | Production-grade full stack: postgres + redis (macro plugins) + asset (postgresql.conf / pg_hba.conf / redis.conf / ACL) + app (deployment + ingress) with TLS |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
@@ -30,6 +31,16 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 - **`app`** — sugar for `deployment` + `ingress` with the same identity. See `multi-env/app.voodu`.
 
 - **`ingress`** — host routing, TLS, load balancing. See `ingress/`.
+
+### Registry mode vs build mode
+
+Every `deployment` / `statefulset` / `job` / `cronjob` / `app` picks one of two source modes (parse error if both):
+
+- **`image = "ghcr.io/me/api:v1.2"`** — registry mode. Voodu pulls the named image and runs it. CI builds and pushes; voodu deploys. This is what all examples in this directory use by default.
+
+- **`build { context = "apps/api", ... }`** — build mode. Voodu tarballs `context`, ships it to the controller, runs `docker build`, and tags `<scope>-<name>:latest` for the workload to pull. Use when you don't have (or want) a CI publishing images.
+
+Auto-detect: `deployment "scope" "name" {}` with neither field gets `build = { context = "." }` synthesised — the "ship me from this repo, figure the rest out" shape. See [`build/`](./build) for end-to-end examples covering custom Dockerfiles, Go monorepos, statefulset build, and the auto-detect shape.
 
 ### Asset interpolation — scoped vs unscoped
 

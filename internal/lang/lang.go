@@ -14,9 +14,10 @@ import (
 // in-process contract between the server-side build pipeline and the
 // language-specific Build/Deploy/Dockerfile generation code.
 //
-// Shape mirrors manifest.DeploymentSpec: a flat root of container-shape
-// and source-resolution fields, plus an optional `Lang` block carrying
-// build-time inputs for the chosen runtime.
+// Shape is flat (not nested like the manifest's `build {}` block) —
+// handlers don't care about the registry-vs-build distinction, they
+// only see build inputs. The flattening happens in
+// deploy.Spec.toBuildSpec.
 //
 // Populated in two places:
 //
@@ -32,24 +33,36 @@ type BuildSpec struct {
 	Image      string
 	Dockerfile string
 	Path       string
-	Workdir    string
+
+	// Context is the directory sent to `docker build` (docker-compose
+	// matches this name). Was historically called `Workdir` here —
+	// renamed for consistency with the operator-facing HCL surface
+	// (`build { context = "..." }`).
+	Context string
 
 	Env         map[string]string
 	Ports       []string
 	Volumes     []string
 	NetworkMode string
 
+	// BuildArgs is the docker `--build-arg KEY=value` map populated
+	// from the manifest's `build.args = {...}`. Handlers like Golang
+	// inject their own platform defaults (GOOS/GOARCH/CGO_ENABLED)
+	// internally and let operator-supplied entries here override on
+	// key collision.
+	BuildArgs map[string]string
+
 	Lang *LangBuildSpec
 }
 
-// LangBuildSpec is the unified runtime block. Name picks the handler;
-// Version/Entrypoint/BuildArgs are forwarded as-is. Handlers read what
-// they need and ignore the rest.
+// LangBuildSpec is the unified runtime hint. Name picks the handler;
+// Version/Entrypoint are forwarded as-is. Build args live on the
+// parent BuildSpec.BuildArgs (one source of truth — the manifest's
+// `build.args`).
 type LangBuildSpec struct {
 	Name       string
 	Version    string
 	Entrypoint string
-	BuildArgs  map[string]string
 }
 
 // LangName returns the resolved runtime name, or "" if unset.

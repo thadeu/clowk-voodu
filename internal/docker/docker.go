@@ -141,6 +141,24 @@ type ContainerConfig struct {
 	// when > 0. Pre-validated and converted from k8s suffixes
 	// (4Gi, 512Mi, 1G, etc.) by the manifest layer. 0 = no limit.
 	MemoryLimitBytes int64
+
+	// ExtraHosts emits one `--add-host name:ip` per entry, stacked
+	// on top of the always-injected `host.docker.internal:host-gateway`.
+	// Entries already match the `name:ip` shape (validated upstream
+	// by the manifest layer). Useful for pointing the container at
+	// internal services that don't have docker DNS — legacy DB on a
+	// fixed IP, internal API on a VLAN, host.docker.internal pinning
+	// to a specific interface, etc. docker-compose's `extra_hosts`.
+	//
+	// Skipped under host/none network mode: the container shares the
+	// host's resolver, so /etc/hosts edits don't apply.
+	ExtraHosts []string
+	// CapAdd emits one `--cap-add CAP_NAME` per entry. Values are
+	// bare capability names without the `CAP_` prefix (`SYS_NICE`,
+	// `NET_ADMIN`, `IPC_LOCK`, …). Matches docker-compose's
+	// `cap_add`. Pre-validated by the manifest layer so we splice
+	// as-is.
+	CapAdd []string
 }
 
 // DeploymentConfig represents deployment configuration.
@@ -193,6 +211,28 @@ func CreateContainer(cfg ContainerConfig) error {
 	// mode IS the host, no need for the alias).
 	if cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
 		args = append(args, "--add-host", "host.docker.internal:host-gateway")
+
+		// Operator-declared extra hosts ride on top of the always-injected
+		// platform alias. Each entry is already validated as "name:ip".
+		// host/none modes skip both branches — see the field comment for
+		// rationale.
+		for _, h := range cfg.ExtraHosts {
+			if h == "" {
+				continue
+			}
+
+			args = append(args, "--add-host", h)
+		}
+	}
+
+	// Capabilities are NOT gated on network mode — they're a kernel
+	// concern, independent of how the container connects.
+	for _, c := range cfg.CapAdd {
+		if c == "" {
+			continue
+		}
+
+		args = append(args, "--cap-add", c)
 	}
 
 	// NetworkMode (host/none) wins when explicitly set — it bypasses

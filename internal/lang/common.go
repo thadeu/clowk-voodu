@@ -95,7 +95,7 @@ func deployContainer(appName string, spec *BuildSpec, releaseDir string) error {
 }
 
 // runDockerBuild invokes `docker build` honouring spec.Dockerfile /
-// spec.Workdir, tagged as <appName>:latest AND
+// spec.Context, tagged as <appName>:latest AND
 // <appName>:<buildID>. buildArgs is merged into --build-arg flags.
 // Shared by Python/Ruby/Rails/Nodejs handlers which all have the
 // same shape.
@@ -127,8 +127,8 @@ func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArg
 	if spec.Dockerfile != "" {
 		dockerfilePath := filepath.Join(releaseDir, spec.Dockerfile)
 
-		if spec.Workdir != "" {
-			workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
+		if spec.Context != "" {
+			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
@@ -160,7 +160,7 @@ func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArg
 }
 
 // ensureCustomDockerfile resolves spec.Dockerfile against releaseDir and
-// spec.Workdir. Returns nil if a usable Dockerfile is found, an error if
+// spec.Context. Returns nil if a usable Dockerfile is found, an error if
 // spec.Dockerfile was set but unreachable.
 func ensureCustomDockerfile(releaseDir string, spec *BuildSpec) (found bool, err error) {
 	if spec.Dockerfile == "" {
@@ -174,17 +174,17 @@ func ensureCustomDockerfile(releaseDir string, spec *BuildSpec) (found bool, err
 		return true, nil
 	}
 
-	if spec.Workdir != "" {
-		workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
+	if spec.Context != "" {
+		workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 		if _, err := os.Stat(workdirDockerfilePath); err == nil {
-			fmt.Printf("-----> Using custom Dockerfile in workdir: %s/%s\n", spec.Workdir, spec.Dockerfile)
+			fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 			return true, nil
 		}
 	}
 
 	return false, fmt.Errorf("custom Dockerfile not found: %s or %s",
 		customDockerfilePath,
-		filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile),
+		filepath.Join(releaseDir, spec.Context, spec.Dockerfile),
 	)
 }

@@ -814,6 +814,101 @@ func TestSpecHash_NilResourcesPreservesPreResourceHash(t *testing.T) {
 	}
 }
 
+// TestSpecHash_ComposeShapedFieldsFlipHash pins that ExtraHosts,
+// CapAdd, and BuildArgs participate in the spec hash — same drift-
+// detection invariant as Resources. An operator who edits any of
+// these must see a rolling recreate on next apply; otherwise the
+// container keeps its old --add-host / --cap-add / --build-arg state.
+func TestSpecHash_ComposeShapedFieldsFlipHash(t *testing.T) {
+	base := deploymentSpec{Image: "nginx:1.25"}
+	baseHash := deploymentSpecHash(base, nil)
+
+	withHosts := base
+	withHosts.ExtraHosts = []string{"api.internal:10.0.0.1"}
+
+	if deploymentSpecHash(withHosts, nil) == baseHash {
+		t.Error("ExtraHosts change must flip hash")
+	}
+
+	withCaps := base
+	withCaps.CapAdd = []string{"SYS_NICE"}
+
+	if deploymentSpecHash(withCaps, nil) == baseHash {
+		t.Error("CapAdd change must flip hash")
+	}
+
+	withArgs := base
+	withArgs.BuildArgs = map[string]string{"SERVICE": "api"}
+
+	if deploymentSpecHash(withArgs, nil) == baseHash {
+		t.Error("BuildArgs change must flip hash")
+	}
+
+	// Same property at the statefulset layer.
+	sts := statefulsetSpec{Image: "redis:7"}
+	stsBase := statefulsetSpecHash(sts, nil)
+
+	stsHosts := sts
+	stsHosts.ExtraHosts = []string{"x:1.1.1.1"}
+
+	if statefulsetSpecHash(stsHosts, nil) == stsBase {
+		t.Error("statefulset ExtraHosts change must flip hash")
+	}
+}
+
+// TestSpecHash_ExtraHostsOrderInvariant pins that reordering
+// extra_hosts in the HCL doesn't trigger a spurious recreate. The
+// runtime contract is set membership, not list order — the hash
+// must reflect that.
+func TestSpecHash_ExtraHostsOrderInvariant(t *testing.T) {
+	a := deploymentSpec{
+		Image:      "nginx",
+		ExtraHosts: []string{"a:1.1.1.1", "b:2.2.2.2"},
+	}
+
+	b := deploymentSpec{
+		Image:      "nginx",
+		ExtraHosts: []string{"b:2.2.2.2", "a:1.1.1.1"},
+	}
+
+	if deploymentSpecHash(a, nil) != deploymentSpecHash(b, nil) {
+		t.Error("extra_hosts reorder must NOT flip hash (set semantics)")
+	}
+}
+
+// TestSpecHash_CapAddOrderInvariant — capabilities are also set-
+// shaped: declaring [SYS_NICE, NET_ADMIN] vs [NET_ADMIN, SYS_NICE]
+// yields the same kernel cap set, so the hash must agree.
+func TestSpecHash_CapAddOrderInvariant(t *testing.T) {
+	a := deploymentSpec{
+		Image:  "nginx",
+		CapAdd: []string{"SYS_NICE", "NET_ADMIN"},
+	}
+
+	b := deploymentSpec{
+		Image:  "nginx",
+		CapAdd: []string{"NET_ADMIN", "SYS_NICE"},
+	}
+
+	if deploymentSpecHash(a, nil) != deploymentSpecHash(b, nil) {
+		t.Error("cap_add reorder must NOT flip hash (set semantics)")
+	}
+}
+
+// TestSpecHash_NilComposeFieldsPreservePreFeatureHash mirrors the
+// Resources rollout invariant: existing fleets that don't declare
+// ExtraHosts/CapAdd/BuildArgs must NOT see their hash flip when
+// this code lands. omitempty + nil-slices preserves backward
+// compatibility.
+func TestSpecHash_NilComposeFieldsPreservePreFeatureHash(t *testing.T) {
+	a := deploymentSpec{Image: "nginx", Env: map[string]string{"X": "1"}}
+	b := a // both have nil ExtraHosts/CapAdd/BuildArgs
+
+	if deploymentSpecHash(a, nil) != deploymentSpecHash(b, nil) {
+		t.Error("nil compose-shaped fields must not flip hash")
+	}
+}
+
 func mapsEqual(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

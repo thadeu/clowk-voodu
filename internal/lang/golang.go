@@ -61,8 +61,8 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 	if spec.Dockerfile != "" {
 		dockerfilePath := filepath.Join(releaseDir, spec.Dockerfile)
 
-		if spec.Workdir != "" {
-			workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
+		if spec.Context != "" {
+			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
@@ -129,17 +129,17 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 			return nil
 		}
 
-		if spec.Workdir != "" {
-			workdirDockerfilePath := filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile)
+		if spec.Context != "" {
+			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
-				fmt.Printf("-----> Using custom Dockerfile in workdir: %s/%s\n", spec.Workdir, spec.Dockerfile)
+				fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 
 				return nil
 			}
 		}
 
-		return fmt.Errorf("custom Dockerfile not found: %s or %s", customDockerfilePath, filepath.Join(releaseDir, spec.Workdir, spec.Dockerfile))
+		return fmt.Errorf("custom Dockerfile not found: %s or %s", customDockerfilePath, filepath.Join(releaseDir, spec.Context, spec.Dockerfile))
 	}
 
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
@@ -154,8 +154,8 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 
 	workDir := "."
 
-	if spec.Workdir != "" {
-		workDir = spec.Workdir
+	if spec.Context != "" {
+		workDir = spec.Context
 	}
 
 	buildPath := "."
@@ -254,9 +254,17 @@ func (l *Golang) buildArgs(spec *BuildSpec) map[string]string {
 		"GO_VERSION":  goVersion,
 	}
 
-	for k, v := range block.BuildArgs {
+	// Precedence (last write wins): platform defaults → operator-
+	// supplied `build.args`. Operator entries trump platform defaults
+	// (CGO_ENABLED, GOOS, etc. can be overridden by the manifest).
+	for k, v := range spec.BuildArgs {
 		out[k] = v
 	}
+
+	// `block` is currently only consulted for `version` (drives the
+	// `GO_VERSION` default above). LangBuildSpec no longer carries
+	// BuildArgs — that map lives on the parent BuildSpec.
+	_ = block
 
 	fmt.Printf("-----> Build args: GOOS=%s GOARCH=%s CGO_ENABLED=%s GO_VERSION=%s\n", out["GOOS"], out["GOARCH"], out["CGO_ENABLED"], out["GO_VERSION"])
 
