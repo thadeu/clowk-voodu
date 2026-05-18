@@ -363,6 +363,29 @@ voodu config reload -a prod      # recreate the active container
 Env set via `config:set` always wins over `env {}` blocks in the manifest,
 so a `voodu apply` can't accidentally reset a production secret.
 
+## Live resource usage with `voodu stats`
+
+`docker stats` analog scoped to voodu-managed pods, joined with the
+manifest's `resources.limits` so you see actual usage alongside the
+configured ceiling in one shot.
+
+```sh
+voodu stats                              # every running pod
+voodu stats clowk-lp                     # one scope
+voodu stats clowk-lp/web                 # one resource (all replicas)
+voodu stats deployment                   # all deployments
+voodu stats -o json | jq '.[] | select(.usage.memory_percent > 80)'
+```
+
+Columns: KIND, REF, CPU%, MEM USED, MEM LIMIT, MEM%, CPU LIMIT. The
+two LIMIT columns echo the operator's verbatim manifest strings
+(`254Mi`, `0.4`) — `—` means no `resources {}` was declared. CPU% is
+host-relative, matching `docker stats` semantics (100% = one full
+core). Single-shot — wrap in `watch -n 2` for refresh. Pass
+`--orphans` to surface running containers without a matching manifest
+(useful for spotting leaks after a `vd delete` that didn't fully
+clean up).
+
 ## How it works
 
 ```

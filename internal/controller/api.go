@@ -108,6 +108,12 @@ type API struct {
 	// InspectLabels methods).
 	PodLifecycle PodLifecycler
 
+	// Stats powers `GET /stats` — the live CPU/memory join used by
+	// `vd stats`. Nil → 503. Production wires a StatsCollector
+	// bound to Pods + docker.DockerStatsClient + Store. Single
+	// shape across CLI + future SDK.
+	Stats *StatsCollector
+
 	// PluginBlocks resolves plugin-block kinds (`postgres { … }`,
 	// `redis { … }`) to the on-disk plugin that expands them into
 	// core kinds. Nil → no plugin support; non-core kinds 400 with
@@ -257,6 +263,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/describe", a.handleDescribe)
 	mux.HandleFunc("/pods", a.handlePods)
 	mux.HandleFunc("GET /pods/{name}", a.handlePodDescribe)
+	mux.HandleFunc("GET /stats", a.handleStats)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
@@ -1417,6 +1424,46 @@ func (a *API) handlePodDescribe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
 		Data:   map[string]any{"pod": detail},
+	})
+}
+
+// handleStats returns runtime CPU/memory usage joined with the
+// manifest's configured limits for every matching running pod.
+//
+// GET /stats?kind=&scope=&name=&orphans=
+//
+// Filter shape mirrors /pods (kind/scope/name) so the same query
+// vocabulary works across both endpoints. ?orphans=true surfaces
+// containers that can't be joined to a manifest (legacy / leaked) —
+// off by default so the steady-state response is clean.
+//
+// 503 when StatsCollector wasn't wired (test setups). Otherwise the
+// shape is `{"status":"ok","data":{"pods":[...]}}`, with each pod
+// carrying identity + usage + limits + orphan flag — see PodStats.
+func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
+	if a.Stats == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("stats collector not configured"))
+		return
+	}
+
+	q := r.URL.Query()
+
+	filter := StatsFilter{
+		Kind:    strings.TrimSpace(q.Get("kind")),
+		Scope:   strings.TrimSpace(q.Get("scope")),
+		Name:    strings.TrimSpace(q.Get("name")),
+		Orphans: q.Get("orphans") == "true" || q.Get("orphans") == "1",
+	}
+
+	pods, err := a.Stats.Collect(r.Context(), filter)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"pods": pods},
 	})
 }
 

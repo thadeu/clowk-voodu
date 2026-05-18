@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/envfile"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
@@ -127,6 +128,17 @@ func (s *Server) Start(ctx context.Context) error {
 		// satisfy the PodLifecycler seam used by `vd stop` /
 		// `vd start`.
 		PodLifecycle: DockerContainerManager{},
+
+		// Stats collector — wires the existing pods lister + a
+		// fresh DockerStatsClient + the same Store everything else
+		// uses. Single shape powers /stats today; future SDK will
+		// re-export the typed result without re-implementing the
+		// join.
+		Stats: &StatsCollector{
+			Pods:  DockerPodsLister{},
+			Stats: docker.DockerStatsClient{},
+			Store: store,
+		},
 
 		// Plugin-block expansion: discovers plugins under
 		// PluginsRoot at apply time and routes non-core kinds
