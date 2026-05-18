@@ -59,6 +59,7 @@ From your laptop — declare the app with an HCL manifest:
 ```hcl
 # voodu.hcl
 deployment "prod" "api" {
+  image    = "ghcr.io/me/api:v1.2"
   replicas = 2
   ports    = ["8080"]
 
@@ -71,9 +72,7 @@ ingress "prod" "api" {
   host = "api.example.com"
 
   tls {
-    enabled  = true
-    provider = "letsencrypt"
-    email    = "ops@example.com"
+    email = "ops@example.com"   # enabled + letsencrypt are the defaults
   }
 }
 ```
@@ -83,17 +82,51 @@ Scoped kinds (`deployment`, `ingress`) take **two labels**: `<scope>` and
 environment); it groups manifests, selects what prune touches, and is
 the uniqueness boundary for names. `service` inside `ingress` defaults
 to the ingress name, so the 1-to-1 shape (`deployment "prod" "api"` ↔
-`ingress "prod" "api"`) is declaration-only. Path, port, and
-health_check all have sensible defaults (`.`, the deployment's declared
-port, `/`) — set them only when you need to override. Dockerfile has no
-default: the lang handler picks `Dockerfile` if you ship one, else
-auto-generates one for the detected runtime (Go/Ruby/Rails/Python/Node).
+`ingress "prod" "api"`) is declaration-only. Port and health_check
+default to the deployment's declared port and `/` — set them only when
+you need to override.
 
-`path` is **CWD-relative**: the build context is whichever directory you
-invoked `voodu apply` from, same as `docker build .`. If your manifest
-lives in a subdir (`infra/dev.voodu`) and your Dockerfile is at the
-project root, run `voodu apply -f infra/dev.voodu` from the project
-root — the tarball mirrors your shell's current dir.
+The `tls {}` block follows the "block-present = on" convention: if you
+declare it (even empty), `enabled = true` and `provider = "letsencrypt"`
+are filled in. To disable TLS for an ingress, omit the entire block.
+
+### Registry mode vs build mode
+
+Every `deployment` / `statefulset` / `job` / `cronjob` picks one of two
+source modes (parse error if both are declared on the same resource):
+
+- **`image = "ghcr.io/me/api:v1.2"`** — registry mode. Voodu pulls and
+  runs. CI builds and pushes; voodu deploys. Above example uses this.
+- **`build { ... }`** — build mode. CLI streams the working tree to the
+  server as a tarball; the controller runs `docker build` and tags
+  `<scope>-<name>:latest` for the workload to pull.
+
+```hcl
+deployment "prod" "api" {
+  replicas = 2
+  ports    = ["8080"]
+
+  build {
+    context    = "."                # docker build context (default: ".")
+    dockerfile = "Dockerfile"       # default name inside context
+    args = {
+      NODE_VERSION = "24-alpine"    # docker --build-arg
+    }
+  }
+}
+```
+
+The `build {}` block matches docker-compose's shape — `context`,
+`dockerfile`, `args`. Omit the whole block (and `image`) for the terse
+"ship me from this repo, figure the rest out" form: voodu auto-detects
+the runtime from marker files in the working tree (`go.mod`, `Gemfile`,
+`package.json`, …) and generates a Dockerfile if your repo doesn't ship
+one. See [`examples/build/`](examples/build/) for monorepo, custom
+Dockerfile, and statefulset-build patterns.
+
+The tarball follows docker-build semantics: `.dockerignore` controls
+inclusion if present, otherwise `.gitignore`. Uncommitted changes ship
+— working tree, not git HEAD.
 
 Apply it:
 
@@ -128,13 +161,11 @@ editor and file tree:
 order, so editing `web.voodu` and running `voodu apply -f web` just
 works.
 
-For a deployment that already has a published image, drop `path` and set
-`image = "ghcr.io/you/api:1.2.3"` — no tarball gets streamed, the
-controller pulls from the registry.
-
 More examples live in [`examples/`](examples/):
 
 - [`fullstack/`](examples/fullstack/) — deployment + database + ingress
+- [`build/`](examples/build/) — `build {}` block patterns: auto-detect,
+  custom Dockerfile, Go monorepo, statefulset build
 - [`multi-env/app.voodu`](examples/multi-env/app.voodu) — one manifest,
   many servers (staging / prod-1 / prod-2 selected with `-r`)
 - [`shared-scope/`](examples/shared-scope/) — one scope fanned out
@@ -341,8 +372,9 @@ voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
   │                                         │
   │                                         └─ reconcile ingress/services (etcd)
   │  (build-mode only: stream tarball)
-  └─ tar -czf - <path>  ──ssh──▶  voodu receive-pack <scope>/<name>
-                                             └─ extract → build image
+  └─ tar -czf - <build.context>  ──ssh──▶  voodu receive-pack <scope>/<name>
+                                             └─ extract → docker build (with --build-arg from build.args)
+                                                → tag <scope>-<name>:latest
                                                 → swap `current` symlink
                                                 → run post_deploy hooks
                                                 → recreate container
