@@ -50,6 +50,14 @@ type Server struct {
 	cronSched   *CronScheduler
 	cancelCron  context.CancelFunc
 	cronDone    chan struct{}
+
+	// Autoscaler goroutine — M7 CPU-driven horizontal scaler for
+	// deployments with an `autoscale {}` block. On its own goroutine
+	// so a slow stats tick can't block the reconciler; shut down
+	// independently in teardown.
+	autoscaler     *Autoscaler
+	cancelScaler   context.CancelFunc
+	autoscalerDone chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -319,6 +327,28 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cronSched.Run(cronCtx)
 	}()
 
+	// Autoscaler — reuses the same StatsCollector that powers the
+	// /stats API and `vd stats`, so scaler decisions come from the
+	// exact same runtime numbers operators see. Writes back to the
+	// store via StoreReplicasApplier; the reconciler picks the spec
+	// change up through the regular watch path. No separate runtime.
+	scalerCtx, cancelScaler := context.WithCancel(context.Background())
+	s.cancelScaler = cancelScaler
+	s.autoscalerDone = make(chan struct{})
+
+	s.autoscaler = &Autoscaler{
+		Store:  store,
+		Stats:  s.api.Stats,
+		Apply:  StoreReplicasApplier{Store: store},
+		Logger: s.cfg.Logger,
+	}
+
+	go func() {
+		defer close(s.autoscalerDone)
+
+		s.autoscaler.Run(scalerCtx)
+	}()
+
 	s.http = &http.Server{
 		Addr:              s.cfg.HTTPAddr,
 		Handler:           s.api.Handler(),
@@ -381,6 +411,14 @@ func (s *Server) Stop(timeout time.Duration) error {
 }
 
 func (s *Server) teardown() {
+	if s.cancelScaler != nil {
+		s.cancelScaler()
+	}
+
+	if s.autoscalerDone != nil {
+		<-s.autoscalerDone
+	}
+
 	if s.cancelCron != nil {
 		s.cancelCron()
 	}

@@ -108,10 +108,43 @@ type deploymentSpec struct {
 	// surface still shows the field as absent when unset).
 	Resources *resourcesWireSpec `json:"resources,omitempty"`
 
+	// Autoscale mirrors manifest.AutoscaleSpec — CPU-based
+	// horizontal scaling bounds (min/max replicas, target CPU%,
+	// up/down cooldowns). nil means the deployment is statically
+	// pinned at spec.Replicas; non-nil hands replica control to the
+	// Autoscaler goroutine, which writes new counts back to
+	// spec.Replicas on each tick.
+	//
+	// The Autoscaler is the source of truth for spec.Replicas in
+	// the autoscale case: the operator declares bounds in the
+	// manifest, the autoscaler picks the count inside those bounds.
+	// effectiveReplicas() still works as-is — the autoscaler's
+	// writes go into the same Replicas field every other path reads.
+	Autoscale *autoscaleWireSpec `json:"autoscale,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
 	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
+}
+
+// autoscaleWireSpec is the controller-side mirror of
+// manifest.AutoscaleSpec. Lives in this package so the deployment
+// spec decode + hash + autoscaler can share one shape without
+// importing internal/manifest (which would be a cycle — manifest
+// already imports controller for the wire Manifest).
+//
+// Validation (min >= 1, max >= min, cpu_target in (0,100]) happens
+// client-side in the parser. The controller treats these fields as
+// validated input — out-of-band changes via the raw wire would
+// surface as autoscaler decisions that hold instead of acting, not
+// crashes.
+type autoscaleWireSpec struct {
+	Min          int    `json:"min,omitempty"`
+	Max          int    `json:"max,omitempty"`
+	CPUTarget    int    `json:"cpu_target,omitempty"`
+	CooldownUp   string `json:"cooldown_up,omitempty"`
+	CooldownDown string `json:"cooldown_down,omitempty"`
 }
 
 // releaseSpec mirrors manifest.ReleaseSpec but lives in the
@@ -129,8 +162,20 @@ type releaseSpec struct {
 // are clamped to 1 because zero-replica deployments have no meaning in
 // the current architecture (we don't pause/drain; removing the manifest
 // is how you scale to zero).
+//
+// Autoscale case: the parser's applyDefaults seeds spec.Replicas with
+// autoscale.Min when the operator declares `autoscale {}` without an
+// explicit `replicas = N`. So by the time we land here, an autoscaled
+// deployment looks like a regular one with Replicas = Min. If somehow
+// Replicas is still zero AND Autoscale is set (a raw-wire path that
+// skipped applyDefaults), we fall back to Min so the deployment boots
+// at the floor instead of an arbitrary 1.
 func effectiveReplicas(spec deploymentSpec) int {
 	if spec.Replicas < 1 {
+		if spec.Autoscale != nil && spec.Autoscale.Min > 0 {
+			return spec.Autoscale.Min
+		}
+
 		return 1
 	}
 
@@ -1548,6 +1593,7 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		CapAdd      []string           `json:"cap_add,omitempty"`
 		BuildArgs   map[string]string  `json:"build_args,omitempty"`
 		Resources   *resourcesWireSpec `json:"resources,omitempty"`
+		Autoscale   *autoscaleWireSpec `json:"autoscale,omitempty"`
 		Assets      []string           `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
@@ -1572,6 +1618,17 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		// pre-resources deployments so this change isn't a no-op
 		// rolling restart on existing fleets.
 		Resources: spec.Resources,
+		// Autoscale folds into the hash so an operator changing
+		// min/max/target/cooldowns IS treated as a config change
+		// worth a rolling restart. Without this, an `autoscale {
+		// min = 1 max = 5 ... }` -> `min = 3 max = 10` edit would
+		// be invisible to the hash and the change would only take
+		// effect on the next autoscaler tick — silent drift between
+		// declared intent and live behavior. The autoscaler's
+		// runtime adjustments to spec.Replicas do NOT change this
+		// (Replicas isn't in the hash), so scale events stay
+		// non-disruptive.
+		Autoscale: spec.Autoscale,
 		Assets:    flattenAssetDigests(assetDigests),
 	}
 

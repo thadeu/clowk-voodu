@@ -213,7 +213,76 @@ type hclDeployment struct {
 	Release   *hclReleaseBlock   `hcl:"release,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
 }
+
+// hclAutoscaleBlock is the HCL surface for the M7 CPU-based
+// horizontal autoscale block on deployments. See manifest.AutoscaleSpec
+// for the operator-facing contract and the decision-band rationale.
+//
+// All fields are HCL-optional; semantic validation (min >= 1,
+// max >= min, cpu_target in (0,100], mutex against `replicas`)
+// lands in the per-block spec() conversion below so error messages
+// can name the surrounding deployment.
+type hclAutoscaleBlock struct {
+	Min          int    `hcl:"min,optional"`
+	Max          int    `hcl:"max,optional"`
+	CPUTarget    int    `hcl:"cpu_target,optional"`
+	CooldownUp   string `hcl:"cooldown_up,optional"`
+	CooldownDown string `hcl:"cooldown_down,optional"`
+}
+
+// autoscaleBlockToSpec converts the HCL surface into the wire-shape
+// AutoscaleSpec. nil-in / nil-out so callers don't synthesise an empty
+// block when the operator omitted autoscale entirely.
+func autoscaleBlockToSpec(b *hclAutoscaleBlock) *AutoscaleSpec {
+	if b == nil {
+		return nil
+	}
+
+	return &AutoscaleSpec{
+		Min:          b.Min,
+		Max:          b.Max,
+		CPUTarget:    b.CPUTarget,
+		CooldownUp:   b.CooldownUp,
+		CooldownDown: b.CooldownDown,
+	}
+}
+
+// validateAutoscale runs the semantic checks the HCL surface can't
+// express (numeric ranges, mutual exclusivity with replicas). Called
+// from every per-kind spec() that supports autoscale so the same error
+// shape surfaces for `deployment` and `app` blocks.
+func validateAutoscale(as *AutoscaleSpec, replicas int) error {
+	if as == nil {
+		return nil
+	}
+
+	if replicas > 0 {
+		return errAutoscaleReplicasMix
+	}
+
+	if as.Min < 1 {
+		return fmt.Errorf("autoscale.min must be >= 1 (got %d)", as.Min)
+	}
+
+	if as.Max < as.Min {
+		return fmt.Errorf("autoscale.max (%d) must be >= autoscale.min (%d)", as.Max, as.Min)
+	}
+
+	if as.CPUTarget <= 0 || as.CPUTarget > 100 {
+		return fmt.Errorf("autoscale.cpu_target must be in (0, 100], got %d", as.CPUTarget)
+	}
+
+	return nil
+}
+
+// errAutoscaleReplicasMix surfaces when both `replicas = N` and an
+// `autoscale {}` block are declared on the same deployment. The two
+// are by definition exclusive: static pinning vs delegated control.
+// Allowing both would either silently override one or freeze the
+// autoscaler at the operator's count — either way a footgun.
+var errAutoscaleReplicasMix = fmt.Errorf("replicas and autoscale are mutually exclusive — use min/max instead")
 
 // hclBuildBlock is the HCL surface for the docker-compose-shaped
 // `build { ... }` block. Lives on deployment/statefulset/job/cronjob/
@@ -366,6 +435,11 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 	}
 
 	s.Resources = resourcesBlockToSpec(b.Resources)
+	s.Autoscale = autoscaleBlockToSpec(b.Autoscale)
+
+	if err := validateAutoscale(s.Autoscale, s.Replicas); err != nil {
+		return DeploymentSpec{}, err
+	}
 
 	s.applyDefaults()
 
@@ -442,6 +516,7 @@ type hclApp struct {
 	Release   *hclReleaseBlock   `hcl:"release,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -500,6 +575,11 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 	// and memory directly in the authoring-sugar form without
 	// dropping back to the verbose deployment+ingress pair.
 	s.Resources = resourcesBlockToSpec(b.Resources)
+	s.Autoscale = autoscaleBlockToSpec(b.Autoscale)
+
+	if err := validateAutoscale(s.Autoscale, s.Replicas); err != nil {
+		return DeploymentSpec{}, err
+	}
 
 	s.applyDefaults()
 
