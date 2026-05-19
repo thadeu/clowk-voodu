@@ -1738,17 +1738,23 @@ func TestDeploymentHandler_DeleteRemovesSlotsAndClearsStatus(t *testing.T) {
 }
 
 func TestIngressApplyEnv_EmitsMultiUpstreamAndLB(t *testing.T) {
+	// LBInterval now lives on upstreamResolution (the resolver
+	// picks ingress-level lb.interval first, readiness probe
+	// period as fallback). The unit test for ingressApplyEnv
+	// itself just verifies the pass-through; the resolver
+	// fallback rules have dedicated tests below.
 	env := ingressApplyEnv(
 		"api",
 		ingressSpec{
 			Host:    "api.example.com",
 			Service: "api",
 			Port:    3000,
-			LB:      &ingressLB{Policy: "least_conn", Interval: "5s"},
+			LB:      &ingressLB{Policy: "least_conn"},
 		},
 		upstreamResolution{
 			Upstreams:       []string{"api-0:3000", "api-1:3000"},
 			HealthCheckPath: "/healthz",
+			LBInterval:      "5s",
 		},
 	)
 
@@ -1766,6 +1772,129 @@ func TestIngressApplyEnv_EmitsMultiUpstreamAndLB(t *testing.T) {
 
 	if got := env[plugin.EnvIngressHealthCheckPath]; got != "/healthz" {
 		t.Errorf("HC_PATH: got %q", got)
+	}
+}
+
+// TestHealthCheckPathFor_PrefersReadinessProbe pins the M1.2
+// caddy-integration bridge: when the deployment declares an HTTP
+// readiness probe, its path overrides the legacy health_check
+// field. Caddy's active probe then hits the SAME endpoint the
+// controller's probe runner samples — one declarative source of
+// truth.
+func TestHealthCheckPathFor_PrefersReadinessProbe(t *testing.T) {
+	dep := deploymentSpec{
+		HealthCheck: "/legacy",
+		Probes: &probesWireSpec{
+			Readiness: &probeWireSpec{
+				HTTPGet: &httpGetActionWire{Path: "/ready", Port: 8080},
+			},
+		},
+	}
+
+	if got := healthCheckPathFor(dep); got != "/ready" {
+		t.Errorf("HC path = %q, want /ready (readiness probe wins)", got)
+	}
+}
+
+// TestHealthCheckPathFor_FallsBackToHealthCheck verifies the
+// backward-compat path: a deployment with no readiness probe
+// (or a TCP/exec one) keeps the legacy `health_check` field for
+// caddy active probing.
+func TestHealthCheckPathFor_FallsBackToHealthCheck(t *testing.T) {
+	cases := []struct {
+		name string
+		dep  deploymentSpec
+		want string
+	}{
+		{
+			name: "no probes block",
+			dep:  deploymentSpec{HealthCheck: "/legacy"},
+			want: "/legacy",
+		},
+		{
+			name: "probes block but no readiness",
+			dep: deploymentSpec{
+				HealthCheck: "/legacy",
+				Probes: &probesWireSpec{
+					Liveness: &probeWireSpec{
+						HTTPGet: &httpGetActionWire{Path: "/healthz"},
+					},
+				},
+			},
+			want: "/legacy",
+		},
+		{
+			name: "TCP readiness (caddy can't probe)",
+			dep: deploymentSpec{
+				HealthCheck: "/legacy",
+				Probes: &probesWireSpec{
+					Readiness: &probeWireSpec{
+						TCPSocket: &tcpSocketActionWire{Port: 6379},
+					},
+				},
+			},
+			want: "/legacy",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := healthCheckPathFor(c.dep); got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestLBIntervalFor_PrefersIngressLB pins the precedence: an
+// explicit `lb { interval = ... }` on the ingress always wins
+// over the readiness probe's period. Operators who want a
+// different ingress-probe cadence than the controller-probe
+// cadence can opt out of the default by declaring the ingress
+// interval.
+func TestLBIntervalFor_PrefersIngressLB(t *testing.T) {
+	dep := deploymentSpec{
+		Probes: &probesWireSpec{
+			Readiness: &probeWireSpec{
+				HTTPGet: &httpGetActionWire{Path: "/ready"},
+				Period:  "5s",
+			},
+		},
+	}
+
+	got := lbIntervalFor(dep, &ingressLB{Interval: "30s"})
+	if got != "30s" {
+		t.Errorf("got %q, want 30s (ingress lb.interval wins)", got)
+	}
+}
+
+// TestLBIntervalFor_FallsBackToProbePeriod is the M1.2 default-
+// derivation invariant: declaring a readiness probe alone (no
+// ingress lb block) gives caddy a sensible active-probe cadence
+// matching the controller's loop.
+func TestLBIntervalFor_FallsBackToProbePeriod(t *testing.T) {
+	dep := deploymentSpec{
+		Probes: &probesWireSpec{
+			Readiness: &probeWireSpec{
+				HTTPGet: &httpGetActionWire{Path: "/ready"},
+				Period:  "5s",
+			},
+		},
+	}
+
+	got := lbIntervalFor(dep, nil)
+	if got != "5s" {
+		t.Errorf("got %q, want 5s (readiness period fallback)", got)
+	}
+}
+
+// TestLBIntervalFor_EmptyWhenNothingDeclared pins the no-active-
+// probing default: no ingress lb block + no readiness probe →
+// empty interval, caddy stays passive (its built-in default).
+func TestLBIntervalFor_EmptyWhenNothingDeclared(t *testing.T) {
+	got := lbIntervalFor(deploymentSpec{HealthCheck: "/"}, nil)
+	if got != "" {
+		t.Errorf("got %q, want empty (no active probing)", got)
 	}
 }
 

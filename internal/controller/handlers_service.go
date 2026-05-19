@@ -242,6 +242,69 @@ func (h *IngressHandler) remove(ctx context.Context, ev WatchEvent) error {
 type upstreamResolution struct {
 	Upstreams       []string
 	HealthCheckPath string
+
+	// LBInterval is the active-probe cadence caddy will use, when
+	// non-empty. Sourced from the readiness probe's period when the
+	// operator declared a readiness probe but no explicit
+	// `lb { interval = ... }` in the ingress block. Empty falls
+	// through to whatever the operator wrote on the ingress (or no
+	// active probing).
+	LBInterval string
+}
+
+// healthCheckPathFor picks the URI caddy should hit for active
+// health checks. Order of precedence:
+//
+//  1. The deployment's HTTP readiness probe path, when declared.
+//     This is the M1.2 bridge — same endpoint the controller's
+//     probe runner polls, so caddy's view of "ready" matches the
+//     in-memory ProbeRegistry view byte-for-byte.
+//
+//  2. The legacy `health_check` field on the deployment. Empty
+//     defaults to "/" at the caddy plugin layer.
+//
+// TCP / exec readiness probes don't surface here — caddy can only
+// do HTTP active checks, and substituting "/" would mask the fact
+// that the routing gate is weaker than the controller's gate. The
+// legacy `health_check` field is the documented escape hatch in
+// those cases.
+//
+// Port mismatch caveat: if the readiness probe targets a different
+// container port than the one caddy dials, caddy will probe at the
+// caddy-dial port using the readiness PATH, which may not respond.
+// We don't try to override the dial port — operators with a
+// separate readiness port should keep the legacy `health_check`
+// field and let the controller's probe runner own readiness gating
+// alone.
+func healthCheckPathFor(dep deploymentSpec) string {
+	if dep.Probes != nil && dep.Probes.Readiness != nil && dep.Probes.Readiness.HTTPGet != nil {
+		if path := dep.Probes.Readiness.HTTPGet.Path; path != "" {
+			return path
+		}
+	}
+
+	return dep.HealthCheck
+}
+
+// lbIntervalFor picks the active-probe period caddy uses. Honours
+// an explicit ingress-level `lb { interval = ... }` first; falls
+// back to the readiness probe's period so a `probes.readiness {
+// period = "5s" }` declaration alone is enough to drive caddy
+// active checks at the same cadence — single source of truth for
+// "how often do we check this app is up?"
+//
+// Empty result means "no active probing" at the caddy layer; the
+// controller's probe runner still ticks independently.
+func lbIntervalFor(dep deploymentSpec, ingressLB *ingressLB) string {
+	if ingressLB != nil && ingressLB.Interval != "" {
+		return ingressLB.Interval
+	}
+
+	if dep.Probes != nil && dep.Probes.Readiness != nil && dep.Probes.Readiness.HTTPGet != nil {
+		return dep.Probes.Readiness.Period
+	}
+
+	return ""
 }
 
 // ingressApplyEnv packs the spec into the env the plugin receives. As
@@ -273,10 +336,14 @@ func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[s
 		if spec.LB.Policy != "" {
 			env[plugin.EnvIngressLBPolicy] = spec.LB.Policy
 		}
+	}
 
-		if spec.LB.Interval != "" {
-			env[plugin.EnvIngressLBInterval] = spec.LB.Interval
-		}
+	// LBInterval comes from the resolver (ingress.lb.interval first,
+	// readiness probe period as fallback). Setting only when non-empty
+	// lets old caddy-plugin versions skip the active-probe block
+	// entirely when no source defined a cadence.
+	if up.LBInterval != "" {
+		env[plugin.EnvIngressLBInterval] = up.LBInterval
 	}
 
 	if up.HealthCheckPath != "" {
@@ -385,7 +452,8 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 
 	return upstreamResolution{
 		Upstreams:       upstreams,
-		HealthCheckPath: dep.HealthCheck,
+		HealthCheckPath: healthCheckPathFor(*dep),
+		LBInterval:      lbIntervalFor(*dep, spec.LB),
 	}, nil
 }
 
