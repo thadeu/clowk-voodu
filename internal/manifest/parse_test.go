@@ -2792,6 +2792,191 @@ deployment "x" "api" {
 	}
 }
 
+// TestParseHCLDeploymentInitContainers pins the happy-path shape:
+// multiple init_container blocks ride the deployment manifest with
+// labels preserved, declaration order preserved, and field-by-field
+// values round-tripping through the JSON encode/decode the apply
+// pipeline uses.
+func TestParseHCLDeploymentInitContainers(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "ghcr.io/acme/api:1.4"
+
+  init_container "migrate" {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "5m"
+    retries = 2
+  }
+
+  init_container "warm-cache" {
+    image   = "ghcr.io/acme/api:1.4"
+    command = ["bin/warm-cache"]
+
+    resources {
+      limits {
+        cpu    = "1"
+        memory = "512Mi"
+      }
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_inits.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.InitContainers) != 2 {
+		t.Fatalf("want 2 init containers, got %d", len(spec.InitContainers))
+	}
+
+	if spec.InitContainers[0].Name != "migrate" {
+		t.Errorf("init[0] name: %q, want migrate (order preserved)", spec.InitContainers[0].Name)
+	}
+
+	if got := spec.InitContainers[0].Command; len(got) != 2 || got[0] != "bin/rails" || got[1] != "db:migrate" {
+		t.Errorf("init[0] command: %v", got)
+	}
+
+	if spec.InitContainers[0].Timeout != "5m" {
+		t.Errorf("init[0] timeout: %q", spec.InitContainers[0].Timeout)
+	}
+
+	if spec.InitContainers[0].Retries != 2 {
+		t.Errorf("init[0] retries: %d", spec.InitContainers[0].Retries)
+	}
+
+	if spec.InitContainers[1].Name != "warm-cache" {
+		t.Errorf("init[1] name: %q", spec.InitContainers[1].Name)
+	}
+
+	if spec.InitContainers[1].Resources == nil || spec.InitContainers[1].Resources.Limits == nil {
+		t.Fatalf("init[1] resources lost")
+	}
+
+	if spec.InitContainers[1].Resources.Limits.CPU != "1" || spec.InitContainers[1].Resources.Limits.Memory != "512Mi" {
+		t.Errorf("init[1] resources: %+v", spec.InitContainers[1].Resources.Limits)
+	}
+}
+
+// TestParseHCLDeploymentInitContainers_NoCommandFails verifies a
+// command-less init is rejected at parse time. An init with no
+// command would just re-run the image's CMD (the deployment's
+// main entrypoint), which is almost always a misconfig — fail
+// loudly instead of silently doing the wrong thing.
+func TestParseHCLDeploymentInitContainers_NoCommandFails(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  init_container "noop" {
+    timeout = "1m"
+  }
+}
+`
+	tmp := writeTemp(t, "dep_inits_nocmd.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error when init has no command")
+	}
+
+	if !strings.Contains(err.Error(), "requires command") {
+		t.Errorf("expected 'requires command' error: %v", err)
+	}
+}
+
+// TestParseHCLDeploymentInitContainers_DuplicateNameFails pins the
+// uniqueness rule. Two init blocks with the same label would map
+// to two docker containers with the same name suffix — a
+// guaranteed runtime collision during the second's Recreate.
+func TestParseHCLDeploymentInitContainers_DuplicateNameFails(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  init_container "migrate" {
+    command = ["true"]
+  }
+
+  init_container "migrate" {
+    command = ["true"]
+  }
+}
+`
+	tmp := writeTemp(t, "dep_inits_dup.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error on duplicate init container name")
+	}
+
+	if !strings.Contains(err.Error(), "duplicate init_container") {
+		t.Errorf("expected 'duplicate init_container' error: %v", err)
+	}
+}
+
+// TestParseHCLDeploymentInitContainers_BadNameFails verifies the
+// charset rule. Names flow into docker container name segments,
+// so anything outside [a-z0-9-] starting with a letter/digit is
+// rejected at parse time.
+func TestParseHCLDeploymentInitContainers_BadNameFails(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  init_container "Bad_Name" {
+    command = ["true"]
+  }
+}
+`
+	tmp := writeTemp(t, "dep_inits_badname.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error on invalid init container name")
+	}
+
+	if !strings.Contains(err.Error(), "invalid name") {
+		t.Errorf("expected 'invalid name' error: %v", err)
+	}
+}
+
+// TestParseHCLDeploymentInitContainers_RetriesCap pins the
+// retries ceiling. Retries above 5 indicate an antipattern (the
+// init is presumed to be flaky and the operator wants the
+// platform to mask it) — better surfaced loudly so they fix the
+// init.
+func TestParseHCLDeploymentInitContainers_RetriesCap(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  init_container "migrate" {
+    command = ["true"]
+    retries = 6
+  }
+}
+`
+	tmp := writeTemp(t, "dep_inits_retries.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error on retries > 5")
+	}
+
+	if !strings.Contains(err.Error(), "retries must be in [0, 5]") {
+		t.Errorf("expected retries-range error: %v", err)
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 

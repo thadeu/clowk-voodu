@@ -145,10 +145,31 @@ type deploymentSpec struct {
 	// restart so the new probe parameters take effect.
 	Probes *probesWireSpec `json:"probes,omitempty"`
 
+	// InitContainers mirrors manifest.InitContainerSpec list — ordered
+	// one-shot prep steps run before the main container of each
+	// replica. Folded into the spec hash: editing image / command /
+	// order is a runtime change that must re-run inits for every
+	// replica, which happens naturally via rolling restart.
+	InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
 	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
+}
+
+// initContainerWireSpec mirrors manifest.InitContainerSpec. Lives
+// in the controller package (not manifest) so the apply-time decode
+// path doesn't pull the controller into a cycle with manifest. JSON
+// tags match the manifest layer exactly so the spec round-trips
+// cleanly across the wire.
+type initContainerWireSpec struct {
+	Name      string             `json:"name"`
+	Image     string             `json:"image,omitempty"`
+	Command   []string           `json:"command,omitempty"`
+	Timeout   string             `json:"timeout,omitempty"`
+	Retries   int                `json:"retries,omitempty"`
+	Resources *resourcesWireSpec `json:"resources,omitempty"`
 }
 
 // autoscaleWireSpec is the controller-side mirror of
@@ -690,7 +711,7 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) (retErr er
 		applyReleaseID = newReleaseID()
 	}
 
-	createdNames, err := h.ensureReplicaCount(ev.Scope, ev.Name, app, live, replicas, spec, hash, applyReleaseID)
+	createdNames, err := h.ensureReplicaCount(ctx, ev.Scope, ev.Name, app, live, replicas, spec, hash, applyReleaseID)
 	if err != nil {
 		return err
 	}
@@ -893,7 +914,7 @@ func filterSlots(in []ContainerSlot, keep func(ContainerSlot) bool) []ContainerS
 // release-phase orchestrator replaces these replicas right after).
 // Release()/Rollback paths pass their record's ID so `vd describe`
 // can correlate pods to their release at a glance.
-func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []ContainerSlot, want int, spec deploymentSpec, hash, releaseID string) ([]string, error) {
+func (h *DeploymentHandler) ensureReplicaCount(ctx context.Context, scope, name, app string, live []ContainerSlot, want int, spec deploymentSpec, hash, releaseID string) ([]string, error) {
 	if spec.Image == "" {
 		// Build-mode without an image is the receive-pack pipeline's
 		// territory; the handler stays env-only here.
@@ -951,6 +972,40 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 		}
 
 		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
+		// Run init containers FIRST. Each must exit 0, in declared
+		// order, before the main container is allowed to spawn. A
+		// failed init aborts this replica's creation — the
+		// reconciler will retry on the next tick (init failures are
+		// idempotent: the runner Recreates a clean container per
+		// attempt). The failure is recorded on the status blob so
+		// `vd describe` surfaces "replica X blocked on init Y."
+		if len(spec.InitContainers) > 0 {
+			runner := &initContainerRunner{
+				Containers: h.Containers,
+				Status:     h,
+				logf:       h.logf,
+			}
+
+			parent := initContainerParent{
+				Image:          spec.Image,
+				Hash:           hash,
+				Volumes:        spec.Volumes,
+				Networks:       spec.Networks,
+				NetworkMode:    spec.NetworkMode,
+				NetworkAliases: BuildNetworkAliases(scope, name),
+				EnvFile:        envFile,
+				ExtraEnvFiles:  extraEnvFiles,
+				Env:            podEnv,
+				ExtraHosts:     spec.ExtraHosts,
+				CapAdd:         spec.CapAdd,
+				Logs:           spec.Logs,
+			}
+
+			if _, ierr := runner.runInitChain(ctx, app, containers.KindDeployment, scope, name, replicaID, spec.InitContainers, parent); ierr != nil {
+				return created, fmt.Errorf("deployment/%s init flow for replica %s: %w", name, cname, ierr)
+			}
+		}
 
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:             cname,
@@ -1280,6 +1335,40 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		}
 
 		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
+		// Re-run the init container chain against the replacement
+		// replica. Each rolling replica is a fresh pod from the
+		// runtime's POV — migrations / asset prep / cache warmup
+		// must re-execute so the new container starts from a known
+		// state. Failure aborts THIS replica's recreate; the
+		// remaining replicas in the loop still attempt their own
+		// rollout. The next reconcile will retry the failed slot.
+		if len(spec.InitContainers) > 0 {
+			runner := &initContainerRunner{
+				Containers: h.Containers,
+				Status:     h,
+				logf:       h.logf,
+			}
+
+			parent := initContainerParent{
+				Image:          spec.Image,
+				Hash:           hash,
+				Volumes:        spec.Volumes,
+				Networks:       spec.Networks,
+				NetworkMode:    spec.NetworkMode,
+				NetworkAliases: BuildNetworkAliases(scope, name),
+				EnvFile:        envFile,
+				ExtraEnvFiles:  extraEnvFiles,
+				Env:            podEnv,
+				ExtraHosts:     spec.ExtraHosts,
+				CapAdd:         spec.CapAdd,
+				Logs:           spec.Logs,
+			}
+
+			if _, ierr := runner.runInitChain(ctx, app, containers.KindDeployment, scope, name, newReplicaID, spec.InitContainers, parent); ierr != nil {
+				return fmt.Errorf("init flow for replacement %s: %w", newName, ierr)
+			}
+		}
 
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:             newName,
@@ -1672,7 +1761,21 @@ type DeploymentStatus struct {
 	// the spec snapshot used at release time, which is what
 	// `vd release rollback` re-applies to revert.
 	Releases []ReleaseRecord `json:"releases,omitempty"`
+
+	// InitFailures is the recent-init-container-failure ring buffer.
+	// Each entry pins one (replica, init step) failure with the exit
+	// code, error, and attempts used. Cleared on successful init flow
+	// for the same replica so the field reflects current state, not
+	// permanent history. Capped at maxInitFailures entries (LRU by
+	// RecordedAt) to keep the etcd value bounded.
+	InitFailures []InitFailure `json:"init_failures,omitempty"`
 }
+
+// maxInitFailures caps the number of init-failure records retained
+// on the status blob. 10 is plenty to surface a chronic problem in
+// `vd describe` without bloating the status — the operator only
+// needs to see "what's currently blocked", not the full history.
+const maxInitFailures = 10
 
 // ReleaseRecord is one entry in the deployment's release history.
 // Mirrors JobRun's spirit but specialised for the release-phase
@@ -1830,11 +1933,12 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		ExtraHosts  []string           `json:"extra_hosts,omitempty"`
 		CapAdd      []string           `json:"cap_add,omitempty"`
 		BuildArgs   map[string]string  `json:"build_args,omitempty"`
-		Resources   *resourcesWireSpec `json:"resources,omitempty"`
-		Autoscale   *autoscaleWireSpec `json:"autoscale,omitempty"`
-		Logs        *logsWireSpec      `json:"logs,omitempty"`
-		Probes      *probesWireSpec    `json:"probes,omitempty"`
-		Assets      []string           `json:"assets,omitempty"`
+		Resources      *resourcesWireSpec      `json:"resources,omitempty"`
+		Autoscale      *autoscaleWireSpec      `json:"autoscale,omitempty"`
+		Logs           *logsWireSpec           `json:"logs,omitempty"`
+		Probes         *probesWireSpec         `json:"probes,omitempty"`
+		InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+		Assets         []string                `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
 		Command:     spec.Command,
@@ -1890,7 +1994,16 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		// the running replicas would keep probing the old endpoint
 		// until something else forced a restart.
 		Probes: spec.Probes,
-		Assets: flattenAssetDigests(assetDigests),
+		// InitContainers fold into the hash with order preserved
+		// (init execution order is semantic). Editing an init's
+		// image, command, or shuffling order are all runtime-
+		// affecting changes — without the hash inclusion the
+		// reconciler wouldn't notice and the new inits would only
+		// take effect for scale-up events, never re-running against
+		// already-live replicas. Rolling restart on hash drift gives
+		// every replica a chance to re-run the updated init flow.
+		InitContainers: spec.InitContainers,
+		Assets:         flattenAssetDigests(assetDigests),
 	}
 
 	// json.Marshal emits slice elements in declared order and struct
@@ -1968,6 +2081,79 @@ func (h *DeploymentHandler) writeDeploymentStatus(ctx context.Context, app, imag
 	}
 
 	return h.Store.PutStatus(ctx, KindDeployment, app, blob)
+}
+
+// RecordInitFailure appends one init-container failure to the
+// status blob's InitFailures ring. Best-effort: storage hiccups
+// log but don't fail the caller — surfacing a debug breadcrumb
+// is less important than the failure path itself.
+//
+// Implements initFailureRecorder for the shared init runner.
+func (h *DeploymentHandler) RecordInitFailure(ctx context.Context, app string, failure InitFailure) {
+	prev, _ := h.loadDeploymentStatus(ctx, app)
+	prev.InitFailures = appendInitFailure(prev.InitFailures, failure)
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("deployment/%s status marshal failed (record init failure): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindDeployment, app, blob); err != nil {
+		h.logf("deployment/%s status persist failed (record init failure): %v", app, err)
+	}
+}
+
+// ClearInitFailures drops every InitFailure entry for the given
+// replicaID. Called by the init runner after a successful init
+// chain so describe doesn't show stale failures for a replica
+// that's now healthy. Other replicas' failures (e.g. a different
+// pod that's still blocked) stay put.
+//
+// Implements initFailureRecorder.
+func (h *DeploymentHandler) ClearInitFailures(ctx context.Context, app string, replicaID string) {
+	prev, _ := h.loadDeploymentStatus(ctx, app)
+
+	if len(prev.InitFailures) == 0 {
+		return
+	}
+
+	filtered := prev.InitFailures[:0]
+	for _, f := range prev.InitFailures {
+		if f.ReplicaID != replicaID {
+			filtered = append(filtered, f)
+		}
+	}
+
+	if len(filtered) == len(prev.InitFailures) {
+		return // nothing to clear
+	}
+
+	prev.InitFailures = filtered
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("deployment/%s status marshal failed (clear init failures): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindDeployment, app, blob); err != nil {
+		h.logf("deployment/%s status persist failed (clear init failures): %v", app, err)
+	}
+}
+
+// appendInitFailure appends one failure to the ring, evicting the
+// oldest entry once the cap is reached. Shared between the
+// deployment and statefulset paths so the LRU semantics are
+// identical across kinds.
+func appendInitFailure(existing []InitFailure, f InitFailure) []InitFailure {
+	out := append(existing, f)
+
+	if len(out) > maxInitFailures {
+		out = out[len(out)-maxInitFailures:]
+	}
+
+	return out
 }
 
 // normalizePorts applies voodu's "private by default" posture to

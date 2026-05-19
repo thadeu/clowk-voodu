@@ -955,6 +955,75 @@ func TestSpecHash_NilComposeFieldsPreservePreFeatureHash(t *testing.T) {
 	}
 }
 
+// TestSpecHash_InitContainersFlipHash pins the M5 invariant:
+// adding / editing / reordering init containers ALL must flip
+// the spec hash. Without this, an operator edits a migration
+// step, applies, and the running replicas would keep their
+// stale view of the init chain until something else forced a
+// recreate — silent drift.
+func TestSpecHash_InitContainersFlipHash(t *testing.T) {
+	base := deploymentSpec{Image: "nginx"}
+	baseHash := deploymentSpecHash(base, nil)
+
+	withOne := base
+	withOne.InitContainers = []initContainerWireSpec{
+		{Name: "migrate", Command: []string{"bin/migrate"}},
+	}
+
+	if deploymentSpecHash(withOne, nil) == baseHash {
+		t.Error("adding an init container must flip hash")
+	}
+
+	// Editing the command on an existing init must flip too.
+	withEdited := withOne
+	withEdited.InitContainers = []initContainerWireSpec{
+		{Name: "migrate", Command: []string{"bin/migrate", "--force"}},
+	}
+
+	if deploymentSpecHash(withEdited, nil) == deploymentSpecHash(withOne, nil) {
+		t.Error("editing init command must flip hash")
+	}
+
+	// Reordering two inits must flip hash (sequencing is semantic
+	// — k8s contract says inits run in declared order).
+	twoInOrder := base
+	twoInOrder.InitContainers = []initContainerWireSpec{
+		{Name: "a", Command: []string{"a"}},
+		{Name: "b", Command: []string{"b"}},
+	}
+
+	twoSwapped := base
+	twoSwapped.InitContainers = []initContainerWireSpec{
+		{Name: "b", Command: []string{"b"}},
+		{Name: "a", Command: []string{"a"}},
+	}
+
+	if deploymentSpecHash(twoInOrder, nil) == deploymentSpecHash(twoSwapped, nil) {
+		t.Error("init container reorder must flip hash (order is semantic)")
+	}
+}
+
+// TestSpecHash_NilInitContainersPreservesHash mirrors the
+// Resources rollout invariant for the M5 feature: existing
+// deployments without init_container blocks must NOT see their
+// hash change when M5 lands.
+func TestSpecHash_NilInitContainersPreservesHash(t *testing.T) {
+	a := deploymentSpec{Image: "nginx"}
+	b := deploymentSpec{Image: "nginx"} // no InitContainers field set on either
+
+	if deploymentSpecHash(a, nil) != deploymentSpecHash(b, nil) {
+		t.Error("nil InitContainers must not flip hash")
+	}
+
+	// Same property for statefulsets.
+	stsA := statefulsetSpec{Image: "redis"}
+	stsB := statefulsetSpec{Image: "redis"}
+
+	if statefulsetSpecHash(stsA, nil) != statefulsetSpecHash(stsB, nil) {
+		t.Error("nil statefulset InitContainers must not flip hash")
+	}
+}
+
 func mapsEqual(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

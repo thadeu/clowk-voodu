@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
@@ -209,14 +211,15 @@ type hclDeployment struct {
 	EnvFile    []string `hcl:"env_file,optional"`
 	EnvFrom    []string `hcl:"env_from,optional"`
 
-	Build     *hclBuildBlock     `hcl:"build,block"`
-	Release   *hclReleaseBlock   `hcl:"release,block"`
-	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
-	Resources *hclResourcesBlock `hcl:"resources,block"`
-	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
-	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
-	Logs      *hclLogsBlock      `hcl:"logs,block"`
-	Probes    *hclProbesBlock    `hcl:"probes,block"`
+	Build          *hclBuildBlock          `hcl:"build,block"`
+	Release        *hclReleaseBlock        `hcl:"release,block"`
+	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
+	Resources      *hclResourcesBlock      `hcl:"resources,block"`
+	Autoscale      *hclAutoscaleBlock      `hcl:"autoscale,block"`
+	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
+	Logs           *hclLogsBlock           `hcl:"logs,block"`
+	Probes         *hclProbesBlock         `hcl:"probes,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
@@ -442,6 +445,111 @@ func validateProbeShape(p *ProbeSpec, kind string) error {
 
 	return nil
 }
+
+// hclInitContainerBlock is the HCL surface for one init container.
+// Block label is the init's name (becomes part of the docker
+// container name suffix). See manifest.InitContainerSpec for the
+// inheritance rules — most fields are optional because they
+// default to the parent deployment's values.
+type hclInitContainerBlock struct {
+	Name      string             `hcl:"name,label"`
+	Image     string             `hcl:"image,optional"`
+	Command   []string           `hcl:"command,optional"`
+	Timeout   string             `hcl:"timeout,optional"`
+	Retries   int                `hcl:"retries,optional"`
+	Resources *hclResourcesBlock `hcl:"resources,block"`
+}
+
+// initContainerBlocksToSpec converts the HCL block list into the
+// wire-shape []InitContainerSpec, preserving declaration order
+// (execution order is semantic — k8s init containers run
+// sequentially top-to-bottom).
+//
+// Empty input → nil so callers can distinguish "operator declared
+// no inits" from "operator declared an empty list" in describe
+// output (the latter is impossible in HCL anyway, but the nil-vs-
+// empty-slice difference matters for json round-trips).
+func initContainerBlocksToSpec(blocks []hclInitContainerBlock) []InitContainerSpec {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	out := make([]InitContainerSpec, 0, len(blocks))
+	for _, b := range blocks {
+		out = append(out, InitContainerSpec{
+			Name:      b.Name,
+			Image:     b.Image,
+			Command:   b.Command,
+			Timeout:   b.Timeout,
+			Retries:   b.Retries,
+			Resources: resourcesBlockToSpec(b.Resources),
+		})
+	}
+
+	return out
+}
+
+// validateInitContainers enforces parse-time invariants the HCL
+// shape can't express:
+//
+//   - Name non-empty + charset [a-z0-9-] + starts with letter/digit
+//     (mirrors resource name rules; the value flows into a docker
+//     container name segment)
+//   - Names are unique within the deployment's init list
+//   - Command non-empty (an init with no command would just run
+//     the image's CMD — almost always a misconfig)
+//   - Retries in [0, 5] (5+ is a chronic-failure-loop antipattern)
+//   - Timeout parseable (empty / valid time.ParseDuration; an
+//     unparseable value would surface only at runtime when the
+//     init goroutine tried to honour it)
+//
+// `kind` is "deployment" / "statefulset" / "app" — flows into
+// the error message so the operator can find the offending block.
+func validateInitContainers(inits []InitContainerSpec, kind string) error {
+	if len(inits) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(inits))
+
+	for i, ic := range inits {
+		if ic.Name == "" {
+			return fmt.Errorf("%s: init_container[%d] missing name", kind, i)
+		}
+
+		if !initContainerNameRE.MatchString(ic.Name) {
+			return fmt.Errorf("%s: init_container %q invalid name (must match [a-z0-9][a-z0-9-]*)", kind, ic.Name)
+		}
+
+		if _, dup := seen[ic.Name]; dup {
+			return fmt.Errorf("%s: duplicate init_container name %q", kind, ic.Name)
+		}
+
+		seen[ic.Name] = struct{}{}
+
+		if len(ic.Command) == 0 {
+			return fmt.Errorf("%s: init_container %q requires command", kind, ic.Name)
+		}
+
+		if ic.Retries < 0 || ic.Retries > 5 {
+			return fmt.Errorf("%s: init_container %q retries must be in [0, 5] (got %d)", kind, ic.Name, ic.Retries)
+		}
+
+		if ic.Timeout != "" {
+			if _, err := time.ParseDuration(ic.Timeout); err != nil {
+				return fmt.Errorf("%s: init_container %q invalid timeout %q: %w", kind, ic.Name, ic.Timeout, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// initContainerNameRE matches a valid init container name. Same
+// shape as resource names — lowercase, digits, hyphens; must start
+// with a letter/digit. The value flows into a docker container
+// name segment so we mirror docker's name rules.
+var initContainerNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 // hclAutoscaleBlock is the HCL surface for the M7 CPU-based
 // horizontal autoscale block on deployments. See manifest.AutoscaleSpec
@@ -676,6 +784,12 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 		return DeploymentSpec{}, err
 	}
 
+	s.InitContainers = initContainerBlocksToSpec(b.InitContainers)
+
+	if err := validateInitContainers(s.InitContainers, "deployment"); err != nil {
+		return DeploymentSpec{}, err
+	}
+
 	s.applyDefaults()
 
 	return s, nil
@@ -747,14 +861,15 @@ type hclApp struct {
 	EnvFile    []string `hcl:"env_file,optional"`
 	EnvFrom    []string `hcl:"env_from,optional"`
 
-	Build     *hclBuildBlock     `hcl:"build,block"`
-	Release   *hclReleaseBlock   `hcl:"release,block"`
-	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
-	Resources *hclResourcesBlock `hcl:"resources,block"`
-	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
-	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
-	Logs      *hclLogsBlock      `hcl:"logs,block"`
-	Probes    *hclProbesBlock    `hcl:"probes,block"`
+	Build          *hclBuildBlock          `hcl:"build,block"`
+	Release        *hclReleaseBlock        `hcl:"release,block"`
+	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
+	Resources      *hclResourcesBlock      `hcl:"resources,block"`
+	Autoscale      *hclAutoscaleBlock      `hcl:"autoscale,block"`
+	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
+	Logs           *hclLogsBlock           `hcl:"logs,block"`
+	Probes         *hclProbesBlock         `hcl:"probes,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -827,6 +942,12 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 		return DeploymentSpec{}, err
 	}
 
+	s.InitContainers = initContainerBlocksToSpec(b.InitContainers)
+
+	if err := validateInitContainers(s.InitContainers, "app"); err != nil {
+		return DeploymentSpec{}, err
+	}
+
 	s.applyDefaults()
 
 	return s, nil
@@ -889,11 +1010,12 @@ type hclStatefulset struct {
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
 
-	Build        *hclBuildBlock     `hcl:"build,block"`
-	VolumeClaims []hclVolumeClaim   `hcl:"volume_claim,block"`
-	DependsOn    *hclDependsOn      `hcl:"depends_on,block"`
-	Resources    *hclResourcesBlock `hcl:"resources,block"`
-	Logs         *hclLogsBlock      `hcl:"logs,block"`
+	Build          *hclBuildBlock          `hcl:"build,block"`
+	VolumeClaims   []hclVolumeClaim        `hcl:"volume_claim,block"`
+	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
+	Resources      *hclResourcesBlock      `hcl:"resources,block"`
+	Logs           *hclLogsBlock           `hcl:"logs,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -947,6 +1069,12 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 
 	s.Resources = resourcesBlockToSpec(b.Resources)
 	s.Logs = logsBlockToSpec(b.Logs)
+
+	s.InitContainers = initContainerBlocksToSpec(b.InitContainers)
+
+	if err := validateInitContainers(s.InitContainers, "statefulset"); err != nil {
+		return StatefulsetSpec{}, err
+	}
 
 	s.applyDefaults()
 

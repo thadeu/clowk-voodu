@@ -104,6 +104,14 @@ type statefulsetSpec struct {
 	// falls through to the platform fallback in effectiveLogs.
 	Logs *logsWireSpec `json:"logs,omitempty"`
 
+	// InitContainers mirrors manifest.InitContainerSpec list — ordered
+	// one-shot prep steps run before each pod's main container starts.
+	// Per-ordinal: pod-N's spawn re-runs every init against pod-N's
+	// volumes / env / aliases. Folded into the spec hash so any edit
+	// triggers a top-down rolling restart and every ordinal re-runs
+	// the new init flow with its own data.
+	InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. Server-managed (StampAssetDigests
 	// writes it post plugin-expand); operators don't author this
@@ -456,7 +464,7 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 // pod-N has time to reach a serving state before pod-(N+1) tries
 // to bootstrap against it. Without health probes (M-S5), the sleep
 // is the only synchronization we have.
-func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, app string, live []ContainerSlot, want int, spec statefulsetSpec, hash, releaseID string, frozen map[string]bool) error {
+func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, app string, live []ContainerSlot, want int, spec statefulsetSpec, hash, releaseID string, frozen map[string]bool) error {
 	if spec.Image == "" {
 		return fmt.Errorf("statefulset/%s: image is required (statefulsets do not support build-mode in M-S1)", app)
 	}
@@ -561,6 +569,38 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 		}
 
 		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
+		// Run init containers FIRST for this ordinal. Per-pod
+		// scope: the inits see this ordinal's volumes / env /
+		// aliases (so a migration on pod-0 isn't accidentally
+		// applied with pod-1's identity). Failure aborts spawning
+		// this ordinal; the reconciler retries on the next tick.
+		if len(spec.InitContainers) > 0 {
+			runner := &initContainerRunner{
+				Containers: h.Containers,
+				Status:     h,
+				logf:       h.logf,
+			}
+
+			parent := initContainerParent{
+				Image:          spec.Image,
+				Hash:           hash,
+				Volumes:        mountedVolumes,
+				Networks:       spec.Networks,
+				NetworkMode:    spec.NetworkMode,
+				NetworkAliases: aliases,
+				EnvFile:        envFile,
+				ExtraEnvFiles:  extraEnvFiles,
+				Env:            podEnv,
+				ExtraHosts:     spec.ExtraHosts,
+				CapAdd:         spec.CapAdd,
+				Logs:           spec.Logs,
+			}
+
+			if _, ierr := runner.runInitChain(ctx, app, containers.KindStatefulset, scope, name, containers.OrdinalReplicaID(n), spec.InitContainers, parent); ierr != nil {
+				return fmt.Errorf("statefulset/%s init flow for ordinal %d: %w", name, n, ierr)
+			}
+		}
 
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:             cname,
@@ -711,7 +751,7 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 // two concurrent reconciles from racing on the same fleet — a
 // race would otherwise interleave Remove/Ensure calls and produce
 // stranded ordinals.
-func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string, frozen map[string]bool) error {
+func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, name, app string, spec statefulsetSpec, hash, releaseID string, frozen map[string]bool) error {
 	val, _ := h.rolloutLocks.LoadOrStore(app, &sync.Mutex{})
 
 	mu, _ := val.(*sync.Mutex)
@@ -813,6 +853,38 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 		}
 
 		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
+		// Re-run init chain for the replacement pod-N. Volumes
+		// (per-pod claims) survive across the recreate, so an
+		// init that wrote schema migrations to a mounted volume
+		// is idempotent: re-running against the same data is the
+		// k8s contract operators expect from init containers.
+		if len(spec.InitContainers) > 0 {
+			runner := &initContainerRunner{
+				Containers: h.Containers,
+				Status:     h,
+				logf:       h.logf,
+			}
+
+			parent := initContainerParent{
+				Image:          spec.Image,
+				Hash:           hash,
+				Volumes:        mountedVolumes,
+				Networks:       spec.Networks,
+				NetworkMode:    spec.NetworkMode,
+				NetworkAliases: aliases,
+				EnvFile:        envFile,
+				ExtraEnvFiles:  extraEnvFiles,
+				Env:            podEnv,
+				ExtraHosts:     spec.ExtraHosts,
+				CapAdd:         spec.CapAdd,
+				Logs:           spec.Logs,
+			}
+
+			if _, ierr := runner.runInitChain(ctx, app, containers.KindStatefulset, scope, name, containers.OrdinalReplicaID(ord), spec.InitContainers, parent); ierr != nil {
+				return fmt.Errorf("statefulset/%s init flow for ordinal %d respawn: %w", name, ord, ierr)
+			}
+		}
 
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:             newName,
@@ -954,21 +1026,22 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 	sort.Strings(caps)
 
 	input := struct {
-		Image        string             `json:"image"`
-		Command      []string           `json:"command"`
-		Ports        []string           `json:"ports"`
-		Volumes      []string           `json:"volumes"`
-		Env          map[string]string  `json:"env"`
-		Networks     []string           `json:"networks"`
-		NetworkMode  string             `json:"network_mode"`
-		Restart      string             `json:"restart"`
-		ExtraHosts   []string           `json:"extra_hosts,omitempty"`
-		CapAdd       []string           `json:"cap_add,omitempty"`
-		BuildArgs    map[string]string  `json:"build_args,omitempty"`
-		Resources    *resourcesWireSpec `json:"resources,omitempty"`
-		Logs         *logsWireSpec      `json:"logs,omitempty"`
-		VolumeClaims []volumeClaim      `json:"volume_claims"`
-		Assets       []string           `json:"assets,omitempty"`
+		Image          string                  `json:"image"`
+		Command        []string                `json:"command"`
+		Ports          []string                `json:"ports"`
+		Volumes        []string                `json:"volumes"`
+		Env            map[string]string       `json:"env"`
+		Networks       []string                `json:"networks"`
+		NetworkMode    string                  `json:"network_mode"`
+		Restart        string                  `json:"restart"`
+		ExtraHosts     []string                `json:"extra_hosts,omitempty"`
+		CapAdd         []string                `json:"cap_add,omitempty"`
+		BuildArgs      map[string]string       `json:"build_args,omitempty"`
+		Resources      *resourcesWireSpec      `json:"resources,omitempty"`
+		Logs           *logsWireSpec           `json:"logs,omitempty"`
+		VolumeClaims   []volumeClaim           `json:"volume_claims"`
+		InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+		Assets         []string                `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
 		Command:     spec.Command,
@@ -990,7 +1063,11 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		// needs recreate to take effect.
 		Logs:         spec.Logs,
 		VolumeClaims: claims,
-		Assets:       flattenAssetDigests(assetDigests),
+		// See deploymentSpecHash for the InitContainers rationale —
+		// editing image/command/order must trigger top-down rolling
+		// restart so every ordinal re-runs the new prep flow.
+		InitContainers: spec.InitContainers,
+		Assets:         flattenAssetDigests(assetDigests),
 	}
 
 	b, _ := json.Marshal(input)
@@ -1051,6 +1128,60 @@ func (h *StatefulsetHandler) writeStatus(ctx context.Context, app, image, hash s
 	}
 
 	return h.Store.PutStatus(ctx, KindStatefulset, app, blob)
+}
+
+// RecordInitFailure appends one init-container failure for this
+// statefulset. Mirror of DeploymentHandler.RecordInitFailure —
+// the shared init runner uses this seam without caring whether
+// the handler is a deployment or a statefulset. Best-effort
+// persistence (status hiccups log but don't fail).
+func (h *StatefulsetHandler) RecordInitFailure(ctx context.Context, app string, failure InitFailure) {
+	prev, _ := h.loadStatus(ctx, app)
+	prev.InitFailures = appendInitFailure(prev.InitFailures, failure)
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("statefulset/%s status marshal failed (record init failure): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
+		h.logf("statefulset/%s status persist failed (record init failure): %v", app, err)
+	}
+}
+
+// ClearInitFailures drops every InitFailure entry for the given
+// replicaID (ordinal string for statefulsets). Mirror of the
+// deployment counterpart.
+func (h *StatefulsetHandler) ClearInitFailures(ctx context.Context, app string, replicaID string) {
+	prev, _ := h.loadStatus(ctx, app)
+
+	if len(prev.InitFailures) == 0 {
+		return
+	}
+
+	filtered := prev.InitFailures[:0]
+	for _, f := range prev.InitFailures {
+		if f.ReplicaID != replicaID {
+			filtered = append(filtered, f)
+		}
+	}
+
+	if len(filtered) == len(prev.InitFailures) {
+		return
+	}
+
+	prev.InitFailures = filtered
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("statefulset/%s status marshal failed (clear init failures): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
+		h.logf("statefulset/%s status persist failed (clear init failures): %v", app, err)
+	}
 }
 
 // decodeStatefulsetSpec parses the manifest's Spec JSON. Empty spec

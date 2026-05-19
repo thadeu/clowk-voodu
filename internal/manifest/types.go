@@ -177,6 +177,18 @@ type DeploymentSpec struct {
 	// process-alive-but-deadlocked).
 	Probes *ProbesSpec `yaml:"probes,omitempty" json:"probes,omitempty"`
 
+	// InitContainers declares ordered one-shot containers that must
+	// each run to completion (exit 0) before the deployment's main
+	// container starts for a given replica. K8s-parity contract:
+	// inits run sequentially, share the deployment's env / networks /
+	// volumes / extra_hosts / cap_add (so a migration step can write
+	// the data the main process will read), and run again for every
+	// freshly spawned replica (scale-up, rolling-restart). A failing
+	// init blocks its replica from coming up; the failure surfaces
+	// in DeploymentStatus.InitFailures. See InitContainerSpec for the
+	// per-step shape.
+	InitContainers []InitContainerSpec `yaml:"init_containers,omitempty" json:"init_containers,omitempty"`
+
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
 	// asset content drift triggers rolling restart without the
@@ -184,6 +196,79 @@ type DeploymentSpec struct {
 	// this field — the apply pipeline stamps it post plugin-expand.
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// InitContainerSpec describes one ordered prep step that must run
+// to completion (exit 0) before a replica's main container starts.
+//
+//	deployment "prod" "api" {
+//	  image = "ghcr.io/acme/api:1.4"
+//
+//	  init_containers = []  # see init_container blocks in HCL
+//	}
+//
+// In HCL the operator writes one `init_container "name" { ... }`
+// block per step; the parser collects them into this slice in
+// declared order. Order matters: each init waits for the previous
+// to succeed before starting.
+//
+// Inheritance rules (deployment → init container):
+//
+//   - Image defaults to the deployment's Image when empty. The
+//     overwhelmingly common case ("run rails db:migrate with my
+//     app's image") then needs zero `image` repetition.
+//   - Command is REQUIRED — an init with no command would just
+//     run the image's CMD, which is almost always wrong (you'd
+//     be re-running the app's server entrypoint).
+//   - Env, env_file, env_from, networks, volumes, extra_hosts,
+//     cap_add: all inherited verbatim. The init sees the same
+//     environment the main pod will see — that's the whole point
+//     (writing to shared volumes, talking to the same services).
+//   - Resources: per-init override; defaults to no limits when
+//     omitted (the main pod's resources are a steady-state cap;
+//     a one-shot migration may legitimately need more headroom).
+//   - Timeout: per-attempt wall-clock cap. Defaults to "10m" when
+//     empty (matches ReleaseSpec.Timeout — same rationale: long
+//     enough for slow migrations, short enough that a stuck step
+//     can't pin the rollout forever).
+//   - Retries: number of additional attempts after the first
+//     failure. 0 = "try once". Capped at 5 by the parser to
+//     guard against chronic-failure loops.
+//
+// Init containers do NOT count as healthy replicas — they're
+// transient prep work, not part of the steady-state pod count.
+type InitContainerSpec struct {
+	// Name is the operator-supplied identifier. Becomes the HCL
+	// block label and the container's last name segment so an
+	// operator can `docker logs voodu-prod-api-init-migrate-a3f9`
+	// after a failed run. Charset: lowercase, digits, hyphens
+	// (same shape as resource names).
+	Name string `yaml:"name" json:"name"`
+
+	// Image is the registry image to spawn for this step. Empty
+	// inherits from the parent deployment — the common case for
+	// "run this command with my app's image."
+	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+
+	// Command is the entrypoint slice (`["bin/rails", "db:migrate"]`)
+	// the init runs. Required — see type doc for rationale.
+	Command []string `yaml:"command,omitempty" json:"command,omitempty"`
+
+	// Timeout caps each ATTEMPT's wall-clock duration. Format is
+	// time.ParseDuration ("30s", "5m"). Empty / unparseable falls
+	// through to the platform default ("10m").
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+
+	// Retries is the number of additional attempts after the first
+	// failure (total attempts = 1 + Retries). Capped at 5; values
+	// above 5 are rejected at parse time as antipatterns.
+	Retries int `yaml:"retries,omitempty" json:"retries,omitempty"`
+
+	// Resources caps CPU/memory for this init at the kernel level
+	// — same shape as DeploymentSpec.Resources. nil means "no
+	// limit", which is the operator-friendly default for prep
+	// steps that may legitimately exceed steady-state caps.
+	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 }
 
 // AutoscaleSpec is the M7 CPU-based horizontal autoscale block. Lives
@@ -722,6 +807,14 @@ type StatefulsetSpec struct {
 	// DeploymentSpec.Logs for the operator-facing contract. The
 	// platform's 10m / 3-files default applies when omitted.
 	Logs *LogsSpec `yaml:"logs,omitempty" json:"logs,omitempty"`
+
+	// InitContainers mirrors DeploymentSpec.InitContainers — ordered
+	// one-shot prep steps that must complete before the pod's main
+	// container starts. For statefulsets the inits run per-ORDINAL
+	// (each pod-N spawn re-runs every init against that pod's
+	// volumes / env / aliases). See InitContainerSpec for the
+	// per-step shape and inheritance rules.
+	InitContainers []InitContainerSpec `yaml:"init_containers,omitempty" json:"init_containers,omitempty"`
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`

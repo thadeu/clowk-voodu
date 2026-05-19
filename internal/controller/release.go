@@ -899,7 +899,7 @@ func (h *DeploymentHandler) rolloutRollback(ctx context.Context, scope, name, ap
 	}
 
 	if len(live) < want {
-		if _, err := h.ensureReplicaCount(scope, name, app, live, want, spec, target.SpecHash, newReleaseID); err != nil {
+		if _, err := h.ensureReplicaCount(ctx, scope, name, app, live, want, spec, target.SpecHash, newReleaseID); err != nil {
 			return fmt.Errorf("scale up for rollback: %w", err)
 		}
 	}
