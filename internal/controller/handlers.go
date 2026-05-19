@@ -195,8 +195,18 @@ type autoscaleWireSpec struct {
 // so spec decode round-trips cleanly. Controller-local because
 // internal/manifest imports controller (cycle).
 type onDeployWireSpec struct {
-	Success string `json:"success,omitempty"`
-	Failure string `json:"failure,omitempty"`
+	Success *deployWebhookWireSpec `json:"success,omitempty"`
+	Failure *deployWebhookWireSpec `json:"failure,omitempty"`
+}
+
+// deployWebhookWireSpec mirrors manifest.DeployWebhook field-for-
+// field. Controller-local; controller-side webhook poster reads
+// Method + Headers directly off this struct to build the HTTP
+// request.
+type deployWebhookWireSpec struct {
+	URL     string            `json:"url"`
+	Method  string            `json:"method,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // logsWireSpec mirrors manifest.LogsSpec. Same anti-cycle posture

@@ -358,34 +358,76 @@ type AutoscaleSpec struct {
 	CooldownDown string `yaml:"cooldown_down,omitempty" json:"cooldown_down,omitempty"`
 }
 
-// OnDeploySpec carries the operator-supplied webhook URLs invoked
-// at the END of a rolling-restart. Both fields are optional and
-// independent: an operator who only cares about failure pages can
-// declare `failure` alone and skip the chatty "everything's fine"
-// pings. Both empty means the block has no effect.
+// OnDeploySpec carries the operator-supplied webhook
+// endpoints invoked at the END of a rolling-restart. Both
+// sub-blocks are optional and independent: an operator who only
+// cares about failure pages declares `failure` alone and skips
+// the chatty "everything's fine" pings.
 //
 //	deployment "x" "api" {
 //	  on_deploy {
-//	    success = "https://hooks.slack.com/services/T../B../..."
-//	    failure = "https://hooks.slack.com/services/T../B../..."
+//	    success {
+//	      url = "https://hooks.slack.com/services/T../B../..."
+//	    }
+//
+//	    failure {
+//	      url     = "https://events.pagerduty.com/v2/enqueue"
+//	      method  = "POST"               # default
+//	      headers = {
+//	        "Authorization" = "Token token=${PD_TOKEN}"
+//	      }
+//	    }
 //	  }
 //	}
 //
-// Delivery is best-effort. The controller POSTs a small JSON
+// Delivery is best-effort. The controller sends a small JSON
 // payload (kind, scope, name, release_id, image, status, error,
-// timestamps), retries 3 times with exponential backoff (1s, 5s,
-// 30s), and then drops on the floor. A webhook failure NEVER
-// fails the deploy — the rollout already happened and there's
-// nothing useful to "fail" by then.
+// timestamps) to each endpoint, retries 3 times with exponential
+// backoff (1s, 5s, 30s), and then drops on the floor. A webhook
+// failure NEVER fails the deploy — the rollout already happened
+// and there's nothing useful to "fail" by then.
 //
-// Payload shape is Slack-incoming-webhook compatible insofar as
-// generic services that consume "any JSON" will get a well-typed
-// blob; the operator's Slack-side formatting (block kit, plain
-// text) lives in the URL transformer of their choice. Discord and
-// generic HTTP listeners get the same shape.
+// Payload shape stays fixed (see controller.WebhookPayload).
+// Header + method customisation lets the operator hit real
+// service APIs (PagerDuty Events v2, Datadog, internal
+// receivers) without a transformer in the middle.
 type OnDeploySpec struct {
-	Success string `yaml:"success,omitempty" json:"success,omitempty"`
-	Failure string `yaml:"failure,omitempty" json:"failure,omitempty"`
+	Success *DeployWebhook `yaml:"success,omitempty" json:"success,omitempty"`
+	Failure *DeployWebhook `yaml:"failure,omitempty" json:"failure,omitempty"`
+}
+
+// DeployWebhook is one configured webhook target — URL plus the
+// optional HTTP knobs the receiver may need to accept the call.
+// Used inside OnDeploySpec for both the success and failure
+// slots; future hook kinds (pre_apply, on_drift) will reuse the
+// same shape so operators learn it once.
+type DeployWebhook struct {
+	// URL is the absolute endpoint to hit. Required. Operators
+	// commonly use `${VAR}` shell-env interpolation to keep the
+	// secret-bearing part (Slack incoming-webhook tokens, signed
+	// query strings) out of the manifest text.
+	URL string `yaml:"url" json:"url"`
+
+	// Method is the HTTP verb. Defaults to "POST" when empty.
+	// Parser validates against {POST, PUT, PATCH, DELETE} — GET
+	// and HEAD don't carry request bodies, and the whole point
+	// of an on_deploy webhook is to ship the JSON payload to the
+	// receiver.
+	Method string `yaml:"method,omitempty" json:"method,omitempty"`
+
+	// Headers map sets extra request headers. Use this for
+	// `Authorization` (most non-Slack receivers), routing keys,
+	// or service-specific X-headers (X-Honeycomb-Team,
+	// DD-API-KEY, etc.). Values support `${VAR}` interpolation
+	// so secrets stay out of the manifest.
+	//
+	// Voodu always sets the User-Agent header to
+	// "voodu-deploy-webhook" — operators cannot override that
+	// (the source identifier is useful for debugging on the
+	// receiver side). Content-Type defaults to
+	// "application/json"; declaring it here overrides the
+	// default.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 }
 
 // LogsSpec caps the docker json-file log driver per container.

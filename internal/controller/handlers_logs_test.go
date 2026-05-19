@@ -55,12 +55,12 @@ func TestDeploymentSpecHash_LogsChangeFlipsHash(t *testing.T) {
 func TestDeploymentSpecHash_OnDeployDoesNotFlipHash(t *testing.T) {
 	base := deploymentSpec{
 		Image:    "nginx:1.27",
-		OnDeploy: &onDeployWireSpec{Success: "https://example/a"},
+		OnDeploy: &onDeployWireSpec{Success: &deployWebhookWireSpec{URL: "https://example/a"}},
 	}
 
 	other := deploymentSpec{
 		Image:    "nginx:1.27",
-		OnDeploy: &onDeployWireSpec{Success: "https://example/b"},
+		OnDeploy: &onDeployWireSpec{Success: &deployWebhookWireSpec{URL: "https://example/b"}},
 	}
 
 	if deploymentSpecHash(base, nil) != deploymentSpecHash(other, nil) {

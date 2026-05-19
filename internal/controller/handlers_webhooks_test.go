@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -46,15 +48,22 @@ type fakeWebhookPoster struct {
 
 type fakeWebhookCall struct {
 	URL     string
+	Method  string
+	Headers map[string]string
 	Payload WebhookPayload
 }
 
-func (f *fakeWebhookPoster) Post(ctx context.Context, url string, payload WebhookPayload) error {
+func (f *fakeWebhookPoster) Post(ctx context.Context, target WebhookTarget, payload WebhookPayload) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	idx := len(f.calls)
-	f.calls = append(f.calls, fakeWebhookCall{URL: url, Payload: payload})
+	f.calls = append(f.calls, fakeWebhookCall{
+		URL:     target.URL,
+		Method:  target.Method,
+		Headers: target.Headers,
+		Payload: payload,
+	})
 
 	if idx < len(f.failures) {
 		return f.failures[idx]
@@ -133,8 +142,8 @@ func TestWebhook_PostedOnSuccess(t *testing.T) {
 	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
 		Image: "nginx:1.28",
 		OnDeploy: &onDeployWireSpec{
-			Success: "https://hooks.example.com/success",
-			Failure: "https://hooks.example.com/failure",
+			Success: &deployWebhookWireSpec{URL: "https://hooks.example.com/success"},
+			Failure: &deployWebhookWireSpec{URL: "https://hooks.example.com/failure"},
 		},
 	})
 
@@ -190,7 +199,7 @@ func TestWebhook_PostedOnFailure(t *testing.T) {
 	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
 		Image: "nginx:1.27",
 		OnDeploy: &onDeployWireSpec{
-			Failure: "https://hooks.example.com/failure",
+			Failure: &deployWebhookWireSpec{URL: "https://hooks.example.com/failure"},
 		},
 	})
 
@@ -235,7 +244,7 @@ func TestWebhook_RetriesOnTransientFailure(t *testing.T) {
 		failures: []error{transient, transient},
 	}
 
-	err := postWithRetry(context.Background(), poster, "https://example/hook", WebhookPayload{Status: "success"}, func(time.Duration) {})
+	err := postWithRetry(context.Background(), poster, WebhookTarget{URL: "https://example/hook"}, WebhookPayload{Status: "success"}, func(time.Duration) {})
 	if err != nil {
 		t.Fatalf("postWithRetry: got %v, want nil after recovery", err)
 	}
@@ -260,7 +269,7 @@ func TestWebhook_GivesUpAfterMaxRetries(t *testing.T) {
 		failures: []error{persistent, persistent, persistent, persistent, persistent},
 	}
 
-	err := postWithRetry(context.Background(), poster, "https://example/hook", WebhookPayload{Status: "success"}, func(time.Duration) {})
+	err := postWithRetry(context.Background(), poster, WebhookTarget{URL: "https://example/hook"}, WebhookPayload{Status: "success"}, func(time.Duration) {})
 	if err == nil {
 		t.Fatal("postWithRetry: got nil, want error after all retries exhausted")
 	}
@@ -290,7 +299,7 @@ func TestWebhook_PayloadShape(t *testing.T) {
 
 	fireDeployWebhook(
 		poster, nil,
-		&onDeployWireSpec{Success: "https://example/hook"},
+		&onDeployWireSpec{Success: &deployWebhookWireSpec{URL: "https://example/hook"}},
 		"deployment", "prod", "api",
 		"rel-42",
 		"ghcr.io/me/api:v1",
@@ -338,6 +347,107 @@ func TestWebhook_PayloadShape(t *testing.T) {
 		if !strings.Contains(string(body), key) {
 			t.Errorf("JSON missing expected key fragment %q in body: %s", key, body)
 		}
+	}
+}
+
+// TestWebhook_MethodAndHeadersPropagate pins that the new
+// method + headers fields on the operator's on_deploy block
+// reach the WebhookPoster verbatim. Without this, an operator
+// declares Authorization headers for PagerDuty and silently
+// gets HTTP 401s — the regression mode is "config looks wired
+// but webhook never authenticates."
+func TestWebhook_MethodAndHeadersPropagate(t *testing.T) {
+	withZeroWebhookBackoff(t)
+
+	poster := &fakeWebhookPoster{}
+
+	started := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	completed := started.Add(45 * time.Second)
+
+	fireDeployWebhook(
+		poster, nil,
+		&onDeployWireSpec{
+			Failure: &deployWebhookWireSpec{
+				URL:    "https://events.pagerduty.com/v2/enqueue",
+				Method: "PUT",
+				Headers: map[string]string{
+					"Authorization": "Token token=secret123",
+					"X-Source":      "voodu",
+				},
+			},
+		},
+		"deployment", "prod", "api",
+		"rel-42",
+		"ghcr.io/me/api:v1",
+		"failure", "container blew up",
+		started, completed,
+	)
+
+	waitFor(t, func() bool { return poster.callCount() >= 1 })
+
+	call, _ := poster.lastCall()
+
+	if call.URL != "https://events.pagerduty.com/v2/enqueue" {
+		t.Errorf("URL: got %q", call.URL)
+	}
+
+	if call.Method != "PUT" {
+		t.Errorf("Method: got %q, want PUT", call.Method)
+	}
+
+	if call.Headers["Authorization"] != "Token token=secret123" {
+		t.Errorf("Authorization header: got %q", call.Headers["Authorization"])
+	}
+
+	if call.Headers["X-Source"] != "voodu" {
+		t.Errorf("X-Source header: got %q", call.Headers["X-Source"])
+	}
+}
+
+// TestHTTPWebhookPoster_HeadersAndMethod exercises the actual
+// HTTP client path (not the fake) to lock in (a) operator
+// method override reaches the request, (b) operator headers
+// land on the request, (c) User-Agent stays force-set to
+// "voodu-deploy-webhook" even if the operator tries to
+// override it.
+func TestHTTPWebhookPoster_HeadersAndMethod(t *testing.T) {
+	var gotMethod string
+	var gotHeaders http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	defer srv.Close()
+
+	p := HTTPWebhookPoster{}
+
+	target := WebhookTarget{
+		URL:    srv.URL,
+		Method: "PATCH",
+		Headers: map[string]string{
+			"Authorization": "Bearer abc",
+			"User-Agent":    "operator-tried-to-override", // must lose to platform default
+		},
+	}
+
+	err := p.Post(context.Background(), target, WebhookPayload{Status: "success"})
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	if gotMethod != "PATCH" {
+		t.Errorf("method: got %q, want PATCH", gotMethod)
+	}
+
+	if got := gotHeaders.Get("Authorization"); got != "Bearer abc" {
+		t.Errorf("Authorization: got %q", got)
+	}
+
+	if got := gotHeaders.Get("User-Agent"); got != "voodu-deploy-webhook" {
+		t.Errorf("User-Agent: got %q — platform default must win over operator override", got)
 	}
 }
 

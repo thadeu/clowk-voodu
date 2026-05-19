@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -79,8 +80,36 @@ type WebhookPayload struct {
 // world. Production wires HTTPWebhookPoster; tests pass a fake
 // that records calls and (optionally) returns canned errors so
 // the retry path is reachable from a unit test.
+//
+// The `target` carries URL + method + headers — anything the
+// caller wants the HTTP layer to honour beyond the standard
+// payload body.
 type WebhookPoster interface {
-	Post(ctx context.Context, url string, payload WebhookPayload) error
+	Post(ctx context.Context, target WebhookTarget, payload WebhookPayload) error
+}
+
+// WebhookTarget bundles the per-endpoint HTTP request shape.
+// Mirrors the controller-side deployWebhookWireSpec but lives
+// here so the Poster interface stays free of "wire" naming —
+// fakes and adapters reach for this type directly.
+type WebhookTarget struct {
+	// URL is the absolute endpoint to hit. Required.
+	URL string
+
+	// Method is the HTTP verb. Empty → "POST" (the default;
+	// applied at request-build time, not at parse time).
+	// Parser already validates the operator-supplied value
+	// against {POST,PUT,PATCH,DELETE} so by the time we land
+	// here it's safe to use verbatim.
+	Method string
+
+	// Headers stack on top of the platform-set defaults
+	// (Content-Type: application/json; User-Agent:
+	// voodu-deploy-webhook). Operator-set values OVERRIDE the
+	// Content-Type default; User-Agent is force-overwritten
+	// after the operator's headers apply, so source-of-call
+	// debugging on the receiver side stays reliable.
+	Headers map[string]string
 }
 
 // HTTPWebhookPoster is the production poster. Each Post is a
@@ -116,7 +145,7 @@ const webhookAttemptTimeout = 10 * time.Second
 // caller policy is "always try 3 times" for simplicity, and an
 // endpoint flapping between 4xx/2xx is rare enough not to
 // special-case.
-func (p HTTPWebhookPoster) Post(ctx context.Context, url string, payload WebhookPayload) error {
+func (p HTTPWebhookPoster) Post(ctx context.Context, target WebhookTarget, payload WebhookPayload) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal webhook payload: %w", err)
@@ -127,12 +156,31 @@ func (p HTTPWebhookPoster) Post(ctx context.Context, url string, payload Webhook
 		client = &http.Client{Timeout: webhookAttemptTimeout}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	method := strings.ToUpper(strings.TrimSpace(target.Method))
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, target.URL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
 	}
 
+	// Default headers first so operator overrides take precedence
+	// (except User-Agent — see below).
 	req.Header.Set("Content-Type", "application/json")
+
+	// Operator-supplied headers. May override Content-Type for
+	// receivers that require a specific media type (e.g. Datadog
+	// metric submission flavours).
+	for k, v := range target.Headers {
+		req.Header.Set(k, v)
+	}
+
+	// User-Agent is force-set AFTER operator headers so receivers
+	// can always trust the source-of-call debug signal. Operators
+	// who want their own UA on a particular receiver should run a
+	// transformer between voodu and that receiver.
 	req.Header.Set("User-Agent", "voodu-deploy-webhook")
 
 	resp, err := client.Do(req)
@@ -184,7 +232,7 @@ const webhookMaxAttempts = 3
 // `sleep` is the time.Sleep seam — tests pass a recorder so
 // they can assert WITHOUT actually sleeping the wall clock.
 // Production passes time.Sleep directly.
-func postWithRetry(ctx context.Context, poster WebhookPoster, url string, payload WebhookPayload, sleep func(time.Duration)) error {
+func postWithRetry(ctx context.Context, poster WebhookPoster, target WebhookTarget, payload WebhookPayload, sleep func(time.Duration)) error {
 	if sleep == nil {
 		sleep = time.Sleep
 	}
@@ -192,7 +240,7 @@ func postWithRetry(ctx context.Context, poster WebhookPoster, url string, payloa
 	var lastErr error
 
 	for i := 0; i < webhookMaxAttempts; i++ {
-		err := poster.Post(ctx, url, payload)
+		err := poster.Post(ctx, target, payload)
 		if err == nil {
 			return nil
 		}
@@ -232,15 +280,15 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		return
 	}
 
-	var url string
+	var target *deployWebhookWireSpec
 	switch status {
 	case "success":
-		url = spec.Success
+		target = spec.Success
 	case "failure":
-		url = spec.Failure
+		target = spec.Failure
 	}
 
-	if url == "" {
+	if target == nil || target.URL == "" {
 		return
 	}
 
@@ -256,6 +304,12 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		Error:       errMsg,
 	}
 
+	wt := WebhookTarget{
+		URL:     target.URL,
+		Method:  target.Method,
+		Headers: target.Headers,
+	}
+
 	go func() {
 		// Fresh context — the apply caller's ctx may already be
 		// done (HTTP response written) by the time we get here.
@@ -264,7 +318,7 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		if err := postWithRetry(ctx, poster, url, payload, nil); err != nil {
+		if err := postWithRetry(ctx, poster, wt, payload, nil); err != nil {
 			if logf != nil {
 				logf("deployment/%s/%s on_deploy webhook (%s) dropped after retries: %v", scope, name, status, err)
 			}

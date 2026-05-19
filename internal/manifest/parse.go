@@ -223,12 +223,22 @@ type hclDeployment struct {
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
-// hooks. Both fields are optional; an empty block is a no-op (no
-// posts). See manifest.OnDeploySpec for the wire shape and delivery
+// hooks. Both sub-blocks are optional; an empty block is a no-op.
+// See manifest.OnDeploySpec for the wire shape and delivery
 // contract (best-effort, 3-attempt exponential backoff).
 type hclOnDeployBlock struct {
-	Success string `hcl:"success,optional"`
-	Failure string `hcl:"failure,optional"`
+	Success *hclDeployWebhook `hcl:"success,block"`
+	Failure *hclDeployWebhook `hcl:"failure,block"`
+}
+
+// hclDeployWebhook surfaces one webhook target — url plus the
+// optional method/headers knobs. The shape mirrors
+// manifest.DeployWebhook one-for-one so spec conversion is
+// trivial.
+type hclDeployWebhook struct {
+	URL     string            `hcl:"url"`
+	Method  string            `hcl:"method,optional"`
+	Headers map[string]string `hcl:"headers,optional"`
 }
 
 // onDeployBlockToSpec converts the HCL surface into the wire
@@ -240,9 +250,67 @@ func onDeployBlockToSpec(b *hclOnDeployBlock) *OnDeploySpec {
 	}
 
 	return &OnDeploySpec{
-		Success: b.Success,
-		Failure: b.Failure,
+		Success: deployWebhookBlockToSpec(b.Success),
+		Failure: deployWebhookBlockToSpec(b.Failure),
 	}
+}
+
+func deployWebhookBlockToSpec(b *hclDeployWebhook) *DeployWebhook {
+	if b == nil {
+		return nil
+	}
+
+	return &DeployWebhook{
+		URL:     b.URL,
+		Method:  b.Method,
+		Headers: b.Headers,
+	}
+}
+
+// validateOnDeploy runs the semantic checks the HCL surface can't
+// express: method whitelist + non-empty URL. Called from every
+// per-kind spec() that accepts on_deploy.
+//
+// Restricting method to body-carrying verbs (POST/PUT/PATCH/DELETE)
+// fails loudly on typos. GET / HEAD / OPTIONS / etc. either don't
+// accept a body or wouldn't carry the JSON payload anyway —
+// silently sending an empty webhook would be worse than refusing
+// the apply.
+func validateOnDeploy(o *OnDeploySpec) error {
+	if o == nil {
+		return nil
+	}
+
+	if err := validateDeployWebhook(o.Success, "success"); err != nil {
+		return err
+	}
+
+	if err := validateDeployWebhook(o.Failure, "failure"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateDeployWebhook(w *DeployWebhook, slot string) error {
+	if w == nil {
+		return nil
+	}
+
+	if strings.TrimSpace(w.URL) == "" {
+		return fmt.Errorf("on_deploy.%s.url is required", slot)
+	}
+
+	if w.Method != "" {
+		switch strings.ToUpper(w.Method) {
+		case "POST", "PUT", "PATCH", "DELETE":
+			// ok
+		default:
+			return fmt.Errorf("on_deploy.%s.method must be one of POST/PUT/PATCH/DELETE (got %q)", slot, w.Method)
+		}
+	}
+
+	return nil
 }
 
 // hclLogsBlock is the HCL surface for the docker-log-driver cap.
@@ -777,6 +845,10 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 	}
 
 	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
+
+	if err := validateOnDeploy(s.OnDeploy); err != nil {
+		return DeploymentSpec{}, err
+	}
 	s.Logs = logsBlockToSpec(b.Logs)
 	s.Probes = probesBlockToSpec(b.Probes)
 
@@ -935,6 +1007,10 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 	}
 
 	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
+
+	if err := validateOnDeploy(s.OnDeploy); err != nil {
+		return DeploymentSpec{}, err
+	}
 	s.Logs = logsBlockToSpec(b.Logs)
 	s.Probes = probesBlockToSpec(b.Probes)
 

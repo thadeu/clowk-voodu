@@ -2526,21 +2526,32 @@ registry "ghcr" {
 	}
 }
 
-// TestParseHCLDeploymentOnDeploy pins the on_deploy webhook block:
-// both success and failure URLs round-trip through the parser and
-// land on DeploymentSpec.OnDeploy verbatim. The block has NO defaults
-// — an operator who omits either field gets the empty string, which
-// the runtime interprets as "no webhook for this outcome." Locking
-// in the verbatim shape protects against accidental URL trimming or
-// scheme rewriting at the parser layer.
+// TestParseHCLDeploymentOnDeploy pins the on_deploy webhook
+// block surface: success + failure sub-blocks, each with url +
+// optional method + optional headers. URL round-trips verbatim
+// (no trimming, no scheme rewriting). Method defaults are
+// applied at request-build time on the controller, NOT at parse
+// time — parse leaves Method "" when the operator omitted it.
+// Headers map preserves operator keys verbatim.
 func TestParseHCLDeploymentOnDeploy(t *testing.T) {
 	src := `
 deployment "prod" "api" {
   image = "nginx:1.27"
 
   on_deploy {
-    success = "https://hooks.slack.com/services/T1/B1/abc"
-    failure = "https://hooks.slack.com/services/T1/B1/xyz"
+    success {
+      url = "https://hooks.slack.com/services/T1/B1/abc"
+    }
+
+    failure {
+      url    = "https://events.pagerduty.com/v2/enqueue"
+      method = "POST"
+
+      headers = {
+        "Authorization" = "Token token=abc123"
+        "X-Source"      = "voodu"
+      }
+    }
   }
 }
 `
@@ -2561,12 +2572,84 @@ deployment "prod" "api" {
 		t.Fatal("on_deploy missing in parsed spec")
 	}
 
-	if spec.OnDeploy.Success != "https://hooks.slack.com/services/T1/B1/abc" {
-		t.Errorf("success: got %q", spec.OnDeploy.Success)
+	if spec.OnDeploy.Success == nil || spec.OnDeploy.Success.URL != "https://hooks.slack.com/services/T1/B1/abc" {
+		t.Errorf("success url lost: %+v", spec.OnDeploy.Success)
 	}
 
-	if spec.OnDeploy.Failure != "https://hooks.slack.com/services/T1/B1/xyz" {
-		t.Errorf("failure: got %q", spec.OnDeploy.Failure)
+	if spec.OnDeploy.Success != nil && spec.OnDeploy.Success.Method != "" {
+		t.Errorf("success.method should be empty when omitted (parser leaves default to runtime); got %q", spec.OnDeploy.Success.Method)
+	}
+
+	if spec.OnDeploy.Failure == nil || spec.OnDeploy.Failure.URL != "https://events.pagerduty.com/v2/enqueue" {
+		t.Errorf("failure url lost: %+v", spec.OnDeploy.Failure)
+	}
+
+	if spec.OnDeploy.Failure.Method != "POST" {
+		t.Errorf("failure.method: %q, want POST", spec.OnDeploy.Failure.Method)
+	}
+
+	if spec.OnDeploy.Failure.Headers["Authorization"] != "Token token=abc123" {
+		t.Errorf("Authorization header lost: %+v", spec.OnDeploy.Failure.Headers)
+	}
+
+	if spec.OnDeploy.Failure.Headers["X-Source"] != "voodu" {
+		t.Errorf("X-Source header lost: %+v", spec.OnDeploy.Failure.Headers)
+	}
+}
+
+// TestParseHCLDeploymentOnDeploy_InvalidMethod pins the method
+// whitelist. GET / HEAD / OPTIONS don't fit the "POST a JSON
+// body to a receiver" contract, so they fail parse rather than
+// produce a runtime webhook that the receiver silently rejects.
+func TestParseHCLDeploymentOnDeploy_InvalidMethod(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    success {
+      url    = "https://example.com/hook"
+      method = "GET"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy_get.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for GET method on on_deploy webhook")
+	}
+
+	if !strings.Contains(err.Error(), "method must be one of") {
+		t.Errorf("expected method-whitelist error, got %v", err)
+	}
+}
+
+// TestParseHCLDeploymentOnDeploy_UrlRequired pins that a sub-block
+// must carry a non-empty url. An empty url would silently no-op
+// the webhook — better to fail parse and surface the typo.
+func TestParseHCLDeploymentOnDeploy_UrlRequired(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    success {
+      url = ""
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy_emptyurl.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for empty url on on_deploy webhook")
+	}
+
+	if !strings.Contains(err.Error(), "url is required") {
+		t.Errorf("expected url-required error, got %v", err)
 	}
 }
 
