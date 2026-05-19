@@ -10,6 +10,8 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | [`build/`](./build) | `build {}` block — build images from source instead of pulling from a registry. docker-compose-shaped (`context`, `dockerfile`, `args`). Covers auto-detect, custom Dockerfile, Go monorepo, statefulset build |
 | [`statefulset/`](./statefulset) | Single-node and multi-replica statefulsets (postgres, redis) with per-pod ordinal identity and persistent volume claims |
 | [`stack/`](./stack) | Production-grade full stack: postgres + redis (macro plugins) + asset (postgresql.conf / pg_hba.conf / redis.conf / ACL) + app (deployment + ingress) with TLS |
+| [`probes/`](./probes) | Kubelet-style health probes (liveness / readiness / startup) on deployments and statefulsets. HTTP, TCP, exec selectors. Auto caddy ingress gating via the readiness probe |
+| [`init-containers/`](./init-containers) | Ordered one-shot prep steps (db:migrate, pg_basebackup, config-validate) that must complete before main container starts |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
 | [`fullstack-yaml/`](./fullstack-yaml) | Same shape as `fullstack/`, written in YAML to show the alternate format |
 | [`ingress/`](./ingress) | Path-based routing, multiple hosts, load-balancing knobs |

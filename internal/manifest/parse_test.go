@@ -3065,6 +3065,58 @@ deployment "prod" "api" {
 	}
 }
 
+// TestExampleManifestsParse walks the new examples/probes/ and
+// examples/init-containers/ directories and asserts every .hcl
+// file there parses cleanly. Protects the documentation
+// examples from silent drift when the parser changes.
+//
+// Path is resolved relative to the test binary's CWD which Go
+// sets to the package dir — examples/ lives two levels up. We
+// skip the test (not fail) when the examples dir isn't found
+// so the test stays robust to alternate checkout layouts.
+func TestExampleManifestsParse(t *testing.T) {
+	dirs := []string{
+		"../../examples/probes",
+		"../../examples/init-containers",
+	}
+
+	for _, d := range dirs {
+		t.Run(d, func(t *testing.T) {
+			info, err := os.Stat(d)
+			if os.IsNotExist(err) {
+				t.Skipf("%s not found — skipping", d)
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("stat %s: %v", d, err)
+			}
+
+			if !info.IsDir() {
+				t.Fatalf("%s is not a directory", d)
+			}
+
+			entries, err := os.ReadDir(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, e := range entries {
+				if filepath.Ext(e.Name()) != ".hcl" {
+					continue
+				}
+
+				p := filepath.Join(d, e.Name())
+				t.Run(e.Name(), func(t *testing.T) {
+					if _, err := ParseFile(p, nil); err != nil {
+						t.Errorf("parse %s: %v", p, err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 
