@@ -6,17 +6,34 @@ small JSON payload to the URL(s) the operator declared.
 
 ## What it IS
 
-A fire-and-forget notification hook. Two independent endpoints
+A fire-and-forget notification hook. Two independent sub-blocks
 (`success`, `failure`); declare either or both.
 
 ```hcl
 deployment "prod" "api" {
   on_deploy {
-    success = "https://hooks.slack.com/services/T../B../..."
-    failure = "https://events.pagerduty.com/v2/enqueue?token=..."
+    success {
+      url = "${SLACK_WEBHOOK_URL}"
+    }
+
+    failure {
+      url    = "https://events.pagerduty.com/v2/enqueue"
+      method = "POST"                     # default; explicit here
+      headers = {
+        "X-Routing-Key" = "${PD_KEY}"
+      }
+    }
   }
 }
 ```
+
+### Sub-block fields
+
+| field | required | default | notes |
+|---|---|---|---|
+| `url` | yes | — | Absolute endpoint. Supports `${VAR}` shell-env interpolation (client-side at parse time) so secret-bearing URLs and headers stay out of git. |
+| `method` | no | `POST` | Whitelist: `POST` / `PUT` / `PATCH` / `DELETE`. GET / HEAD / OPTIONS rejected at parse — webhook payload IS a body. |
+| `headers` | no | empty | Map of extra request headers. Operator overrides `Content-Type` if declared. **`User-Agent` is force-set** to `voodu-deploy-webhook` (source-of-call debug signal). |
 
 ## What it ISN'T
 
