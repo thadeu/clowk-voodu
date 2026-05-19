@@ -461,7 +461,7 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 
 			// Probe runners go first so they can't restart a
 			// container we're about to delete.
-			h.Probes.Stop(slot.Name)
+			h.Probes.Stop(app, slot.Name)
 
 			if err := h.Containers.Remove(slot.Name); err != nil {
 				return fmt.Errorf("remove %s: %w", slot.Name, err)
@@ -479,7 +479,7 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 			// Legacy containers shouldn't have probe runners
 			// (pre-M1 code never started any), but Stop is
 			// idempotent so the defensive call costs nothing.
-			h.Probes.Stop(name)
+			h.Probes.Stop(app, name)
 
 			if err := h.Containers.Remove(name); err != nil {
 				return fmt.Errorf("remove %s: %w", name, err)
@@ -1039,7 +1039,7 @@ func (h *DeploymentHandler) ensureReplicaCount(ctx context.Context, scope, name,
 		// block is hash-folded, so changes to it trigger a rolling
 		// restart that destroys the old replica + cancels its runner
 		// before this path spawns the new one.
-		h.Probes.Start(cname, spec.Probes)
+		h.Probes.Start(app, cname, spec.Probes)
 
 		created = append(created, cname)
 	}
@@ -1129,7 +1129,7 @@ func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []Containe
 
 		// Stop probes before container removal — see rolling
 		// restart for the same rationale.
-		h.Probes.Stop(s.Name)
+		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
 			return fmt.Errorf("remove %s: %w", s.Name, err)
@@ -1318,7 +1318,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// container — otherwise the runner might fire one last
 		// restart against a container that's being deleted, and
 		// docker would error noisily.
-		h.Probes.Stop(s.Name)
+		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
 			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
@@ -1398,7 +1398,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// spec is re-read from the manifest so an in-flight rolling
 		// restart triggered by a probe-spec change picks up the new
 		// config naturally.
-		h.Probes.Start(newName, spec.Probes)
+		h.Probes.Start(app, newName, spec.Probes)
 
 		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
 
@@ -1769,6 +1769,17 @@ type DeploymentStatus struct {
 	// permanent history. Capped at maxInitFailures entries (LRU by
 	// RecordedAt) to keep the etcd value bounded.
 	InitFailures []InitFailure `json:"init_failures,omitempty"`
+
+	// ReplicaReadiness is the per-container readiness snapshot
+	// updated by ProbeRegistry as readiness/startup phase
+	// transitions occur. Keyed by docker container name so caddy
+	// (or any other ingress reading this map) can correlate to
+	// upstream addresses without parsing replica IDs. Entries are
+	// removed via ClearReplicaReadiness when the runner is Stopped;
+	// the whole map is cleared when the deployment is removed.
+	// LRU-capped at maxReplicaReadiness — a chronically broken
+	// fleet shouldn't bloat etcd.
+	ReplicaReadiness map[string]ReplicaReadinessStatus `json:"replica_readiness,omitempty"`
 }
 
 // maxInitFailures caps the number of init-failure records retained
@@ -1776,6 +1787,12 @@ type DeploymentStatus struct {
 // `vd describe` without bloating the status — the operator only
 // needs to see "what's currently blocked", not the full history.
 const maxInitFailures = 10
+
+// maxReplicaReadiness caps the persisted readiness map. 64 covers
+// any realistic single-deployment fleet (deployments rarely run
+// past a few dozen pods on one host); when exceeded we evict the
+// oldest LastTransition entry so the map stays bounded.
+const maxReplicaReadiness = 64
 
 // ReleaseRecord is one entry in the deployment's release history.
 // Mirrors JobRun's spirit but specialised for the release-phase
@@ -2154,6 +2171,101 @@ func appendInitFailure(existing []InitFailure, f InitFailure) []InitFailure {
 	}
 
 	return out
+}
+
+// RecordReplicaReadiness writes the latest per-replica readiness
+// snapshot to the deployment's status blob. Implements
+// ReadinessRecorder — ProbeRegistry calls this on every
+// readiness/startup phase transition (debounced; steady-state
+// samples don't reach here).
+//
+// Load-modify-write so the Releases / InitFailures / Replicas
+// already on the blob aren't clobbered. Best-effort: storage
+// hiccups log but don't fail the caller — surfacing readiness is
+// less critical than keeping the probe loop running.
+func (h *DeploymentHandler) RecordReplicaReadiness(ctx context.Context, app string, status ReplicaReadinessStatus) {
+	prev, _ := h.loadDeploymentStatus(ctx, app)
+
+	if prev.ReplicaReadiness == nil {
+		prev.ReplicaReadiness = make(map[string]ReplicaReadinessStatus, 1)
+	}
+
+	prev.ReplicaReadiness[status.ContainerName] = status
+	prev.ReplicaReadiness = truncateReplicaReadiness(prev.ReplicaReadiness)
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("deployment/%s status marshal failed (record readiness): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindDeployment, app, blob); err != nil {
+		h.logf("deployment/%s status persist failed (record readiness): %v", app, err)
+	}
+}
+
+// ClearReplicaReadiness removes the readiness entry for one
+// container from the deployment's status blob. Called by
+// ProbeRegistry.Stop on per-replica teardown so describe doesn't
+// show ghosts for removed pods.
+//
+// Implements ReadinessRecorder. No-op when the entry isn't present.
+func (h *DeploymentHandler) ClearReplicaReadiness(ctx context.Context, app, containerName string) {
+	prev, _ := h.loadDeploymentStatus(ctx, app)
+
+	if _, ok := prev.ReplicaReadiness[containerName]; !ok {
+		return
+	}
+
+	delete(prev.ReplicaReadiness, containerName)
+
+	if len(prev.ReplicaReadiness) == 0 {
+		prev.ReplicaReadiness = nil
+	}
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("deployment/%s status marshal failed (clear readiness): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindDeployment, app, blob); err != nil {
+		h.logf("deployment/%s status persist failed (clear readiness): %v", app, err)
+	}
+}
+
+// truncateReplicaReadiness enforces the maxReplicaReadiness cap by
+// dropping the oldest LastTransition entry until the map fits.
+// Returns the map (potentially the same one, in place) so the
+// caller doesn't have to re-assign on every call.
+func truncateReplicaReadiness(m map[string]ReplicaReadinessStatus) map[string]ReplicaReadinessStatus {
+	if len(m) <= maxReplicaReadiness {
+		return m
+	}
+
+	// Build a sorted-by-LastTransition list, drop oldest until
+	// we're back under the cap. O(n log n) per eviction is fine
+	// — n is bounded at 64+1, and evictions are rare relative to
+	// reconcile traffic.
+	type kv struct {
+		name string
+		ts   time.Time
+	}
+
+	entries := make([]kv, 0, len(m))
+	for k, v := range m {
+		entries = append(entries, kv{name: k, ts: v.LastTransition})
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ts.Before(entries[j].ts) })
+
+	for len(m) > maxReplicaReadiness {
+		oldest := entries[0]
+		delete(m, oldest.name)
+		entries = entries[1:]
+	}
+
+	return m
 }
 
 // normalizePorts applies voodu's "private by default" posture to

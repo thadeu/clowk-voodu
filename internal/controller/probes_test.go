@@ -6,12 +6,15 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.voodu.clowk.in/internal/probe"
 )
 
 // fakeContainerRestarter records every container name passed to it.
@@ -94,9 +97,9 @@ func TestProbeRegistry_StartIdempotent(t *testing.T) {
 		},
 	}
 
-	r.Start("x", spec)
-	r.Start("x", spec)
-	r.Start("x", spec)
+	r.Start("app", "x", spec)
+	r.Start("app", "x", spec)
+	r.Start("app", "x", spec)
 
 	count := 0
 	r.runners.Range(func(_, _ any) bool {
@@ -108,7 +111,7 @@ func TestProbeRegistry_StartIdempotent(t *testing.T) {
 		t.Errorf("got %d runners, want 1 (Start should be idempotent)", count)
 	}
 
-	r.Stop("x")
+	r.Stop("app", "x")
 }
 
 // TestProbeRegistry_NilSpecNoOps covers the common case: most
@@ -118,8 +121,8 @@ func TestProbeRegistry_NilSpecNoOps(t *testing.T) {
 	restarter := &fakeContainerRestarter{}
 	r := &ProbeRegistry{Restart: restarter}
 
-	r.Start("x", nil)
-	r.Start("y", &probesWireSpec{}) // probes block but no liveness inside
+	r.Start("app", "x", nil)
+	r.Start("app", "y", &probesWireSpec{}) // probes block but no liveness inside
 
 	if restarter.callCount() != 0 {
 		t.Errorf("nil spec must not trigger any restart, got %d calls", restarter.callCount())
@@ -154,7 +157,7 @@ func TestProbeRegistry_StopCancelsRunner(t *testing.T) {
 		},
 	}
 
-	r.Start("x", spec)
+	r.Start("app", "x", spec)
 
 	// Give it a moment to make a few samples.
 	time.Sleep(50 * time.Millisecond)
@@ -162,7 +165,7 @@ func TestProbeRegistry_StopCancelsRunner(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		r.Stop("x")
+		r.Stop("app", "x")
 		close(done)
 	}()
 
@@ -193,8 +196,8 @@ func TestProbeRegistry_StopUnknownContainerIsNoOp(t *testing.T) {
 	r := &ProbeRegistry{}
 
 	// Just shouldn't panic.
-	r.Stop("never-started")
-	r.Stop("")
+	r.Stop("app", "never-started")
+	r.Stop("app", "")
 }
 
 // TestProbeRegistry_LivenessFailureRestartsContainer is the core
@@ -218,7 +221,7 @@ func TestProbeRegistry_LivenessFailureRestartsContainer(t *testing.T) {
 		},
 	}
 
-	r.Start("voodu-x.a1", spec)
+	r.Start("voodu-x", "voodu-x.a1", spec)
 
 	// 2 failures × 20ms = ~40ms. Give 500ms slack for CI jitter.
 	deadline := time.After(500 * time.Millisecond)
@@ -239,7 +242,7 @@ func TestProbeRegistry_LivenessFailureRestartsContainer(t *testing.T) {
 		t.Errorf("restarted wrong container: %q", restarter.calls[0])
 	}
 
-	r.Stop("voodu-x.a1")
+	r.Stop("voodu-x", "voodu-x.a1")
 }
 
 // TestWireToProbeSpec covers the wire → probe.Spec conversion —
@@ -305,6 +308,242 @@ func TestParseProbeDuration(t *testing.T) {
 		got := parseProbeDuration(c.in)
 		if got != c.want {
 			t.Errorf("parseProbeDuration(%q): got %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// fakeReadinessRecorder captures every RecordReplicaReadiness
+// and ClearReplicaReadiness call so M1.2 tests can assert the
+// debouncing (one persist per Phase transition, not per sample)
+// and the per-replica clear on Stop.
+type fakeReadinessRecorder struct {
+	mu       sync.Mutex
+	records  []ReplicaReadinessStatus
+	cleared  []string
+}
+
+func (f *fakeReadinessRecorder) RecordReplicaReadiness(_ context.Context, _ string, s ReplicaReadinessStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, s)
+}
+
+func (f *fakeReadinessRecorder) ClearReplicaReadiness(_ context.Context, _ string, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleared = append(f.cleared, name)
+}
+
+func (f *fakeReadinessRecorder) recordCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.records)
+}
+
+// TestProbeRegistry_NoProbes_NoOp pins the backward-compat
+// guarantee: a deployment with zero probes declared never
+// registers a runner, never persists state, never logs noise.
+// This is the most common shape pre-M1, and any regression here
+// would churn fleets.
+func TestProbeRegistry_NoProbes_NoOp(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	r.Start("app", "x", &probesWireSpec{}) // empty block — no sub-probes
+
+	count := 0
+
+	r.runners.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+
+	if count != 0 {
+		t.Errorf("empty probes block must not register a runner, got %d", count)
+	}
+
+	if rec.recordCount() != 0 {
+		t.Errorf("empty probes block must not record state, got %d", rec.recordCount())
+	}
+}
+
+// TestProbeRegistry_ReadinessOnlyNoLiveness pins the "removed
+// early-out" fix: in M1.1 the registry early-returned when
+// liveness was nil — readiness alone would never spawn. M1.2
+// must spawn a readiness runner even without liveness declared.
+func TestProbeRegistry_ReadinessOnlyNoLiveness(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+
+	r := &ProbeRegistry{
+		IPs:      fakeIPResolver{ips: map[string]string{"x": "127.0.0.1"}},
+		Recorder: rec,
+	}
+
+	spec := &probesWireSpec{
+		Readiness: &probeWireSpec{
+			TCPSocket: &tcpSocketActionWire{Port: 1}, // closed
+			Period:    "30ms",
+			Timeout:   "10ms",
+		},
+	}
+
+	r.Start("app", "x", spec)
+
+	// Initial state push should arrive — verify a record landed.
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		if rec.recordCount() >= 1 {
+			break
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("no readiness record after 500ms (records=%d)", rec.recordCount())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	r.Stop("app", "x")
+}
+
+// TestProbeRegistry_StartupGatesReadiness pins the gating rule:
+// while a startup probe is declared and not yet passed, the
+// replica counts as NOT ready, regardless of readiness phase.
+// Once startup hits PhaseHealthy, the gate opens and readiness
+// determines Ready.
+func TestProbeRegistry_StartupGatesReadiness(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+
+	r := &ProbeRegistry{Recorder: rec}
+
+	// Synthesise an entry with both startup + readiness declared,
+	// startup not yet passed, readiness PhaseHealthy. The
+	// aggregator must report Ready=false because the gate is
+	// closed.
+	state := &replicaReadiness{
+		hasStartup:     true,
+		hasReadiness:   true,
+		startupPassed:  false,
+		readinessPhase: probe.PhaseHealthy,
+	}
+
+	if state.ready() {
+		t.Error("startup-not-passed + readiness-healthy must NOT be Ready")
+	}
+
+	// Open the gate; same readiness → Ready=true.
+	state.startupPassed = true
+
+	if !state.ready() {
+		t.Error("startup-passed + readiness-healthy must be Ready")
+	}
+
+	// Independent: no probes at all → Ready=true (backward
+	// compat path).
+	noProbes := &replicaReadiness{}
+	if !noProbes.ready() {
+		t.Error("no probes declared must be Ready by default")
+	}
+
+	_ = r // keep r referenced — test exercises the pure aggregator
+}
+
+// TestProbeRegistry_LookupReadiness_Roundtrip verifies the
+// in-memory fast path: snapshot a state, Start it via a fake
+// minimal entry, LookupReadiness must return the same Ready
+// status. The same code path serves the high-frequency caddy
+// active health-check query.
+func TestProbeRegistry_LookupReadiness_Roundtrip(t *testing.T) {
+	r := &ProbeRegistry{}
+
+	// Inject a synthetic runnerEntry directly. We're not
+	// exercising the runner here — just the lookup surface.
+	r.runners.Store("synthetic.a1", &runnerEntry{
+		state: &replicaReadiness{
+			hasStartup:     false,
+			hasReadiness:   false,
+			startupPassed:  true,
+			readinessPhase: probe.PhaseHealthy,
+		},
+	})
+
+	status, ok := r.LookupReadiness("synthetic.a1")
+	if !ok {
+		t.Fatal("LookupReadiness should find synthetic entry")
+	}
+
+	if !status.Ready {
+		t.Error("synthetic entry with no probes must report Ready=true")
+	}
+
+	if status.ContainerName != "synthetic.a1" {
+		t.Errorf("ContainerName=%q, want synthetic.a1", status.ContainerName)
+	}
+
+	if status.ReplicaID != "a1" {
+		t.Errorf("ReplicaID=%q, want a1 (parsed from container name)", status.ReplicaID)
+	}
+
+	// Unknown name → (zero, false).
+	_, ok = r.LookupReadiness("ghost")
+	if ok {
+		t.Error("LookupReadiness should return false for unknown container")
+	}
+}
+
+// TestProbeRegistry_Stop_CallsClear verifies that Stop notifies
+// the Recorder so describe doesn't show a ghost entry for a
+// torn-down replica. Independent of probe spec — the clear
+// fires whenever a runner had been spawned.
+func TestProbeRegistry_Stop_CallsClear(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+
+	r := &ProbeRegistry{
+		Recorder: rec,
+		IPs:      fakeIPResolver{ips: map[string]string{"x": "127.0.0.1"}},
+	}
+
+	spec := &probesWireSpec{
+		Liveness: &probeWireSpec{
+			TCPSocket: &tcpSocketActionWire{Port: 1},
+			Period:    "100ms",
+			Timeout:   "10ms",
+		},
+	}
+
+	r.Start("app", "x", spec)
+	r.Stop("app", "x")
+
+	// Drain any in-flight goroutine.
+	time.Sleep(50 * time.Millisecond)
+
+	rec.mu.Lock()
+	gotCleared := len(rec.cleared) >= 1 && rec.cleared[0] == "x"
+	rec.mu.Unlock()
+
+	if !gotCleared {
+		t.Errorf("Stop should ClearReplicaReadiness(x), got cleared=%v", rec.cleared)
+	}
+}
+
+// TestReplicaIDFromContainerName pins the trailing-after-dot
+// parser shape — matches containers.ContainerName's output for
+// scoped and unscoped names.
+func TestReplicaIDFromContainerName(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"prod-api.a3f9", "a3f9"},
+		{"api.a3f9", "a3f9"},
+		{"prod-pg.0", "0"}, // statefulset ordinal shape
+		{"nodot", "nodot"},
+	}
+
+	for _, c := range cases {
+		got := replicaIDFromContainerName(c.in)
+		if got != c.want {
+			t.Errorf("replicaIDFromContainerName(%q)=%q, want %q", c.in, got, c.want)
 		}
 	}
 }

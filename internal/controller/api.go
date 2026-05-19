@@ -114,6 +114,14 @@ type API struct {
 	// shape across CLI + future SDK.
 	Stats *StatsCollector
 
+	// Readiness powers `GET /pods/{name}/ready` — the per-replica
+	// readiness gate caddy (or any ingress) reads to decide
+	// whether to route to a given upstream. Nil → 503 / 404. The
+	// in-memory ProbeRegistry implements this in production; the
+	// fast path (no etcd hop) is important because caddy active
+	// health checks fire at high frequency.
+	Readiness ReadinessLookup
+
 	// PluginBlocks resolves plugin-block kinds (`postgres { … }`,
 	// `redis { … }`) to the on-disk plugin that expands them into
 	// core kinds. Nil → no plugin support; non-core kinds 400 with
@@ -163,6 +171,19 @@ type CronJobRunner interface {
 // hijacked HTTP connection without buffering.
 type Execer interface {
 	Exec(name string, command []string, opts ExecOptions) (int, error)
+}
+
+// ReadinessLookup is the seam `GET /pods/{name}/ready` reads from
+// to answer caddy / operator queries about per-replica readiness.
+// Production wires *ProbeRegistry — the in-memory map is the
+// fast path (sub-ms per query) so a high-frequency active health
+// check from caddy doesn't hit etcd for every probe.
+//
+// Returns (zero, false) for unknown containers; the handler turns
+// "not found" into a 404 (vs. a 503 with a known-but-unready
+// status).
+type ReadinessLookup interface {
+	LookupReadiness(containerName string) (ReplicaReadinessStatus, bool)
 }
 
 // PodLifecycler is the seam `POST /pods/{name}/stop` and
@@ -263,6 +284,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/describe", a.handleDescribe)
 	mux.HandleFunc("/pods", a.handlePods)
 	mux.HandleFunc("GET /pods/{name}", a.handlePodDescribe)
+	mux.HandleFunc("GET /pods/{name}/ready", a.handlePodReady)
 	mux.HandleFunc("GET /stats", a.handleStats)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
@@ -1424,6 +1446,63 @@ func (a *API) handlePodDescribe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
 		Data:   map[string]any{"pod": detail},
+	})
+}
+
+// handlePodReady answers the per-replica readiness query.
+//
+//	GET /pods/{name}/ready
+//
+// {name} is the docker container name (matches /pods/{name}).
+// Response shapes:
+//
+//	200 OK  — the replica is ready (startup probe passed AND
+//	          readiness probe healthy, or no probes declared)
+//	  body: ReplicaReadinessStatus JSON
+//	503 Service Unavailable — replica exists but is not ready
+//	  body: ReplicaReadinessStatus JSON (Reason field carries the
+//	        last probe's failure text so caddy / operator can
+//	        surface "why")
+//	404 Not Found — no live runner for this container name
+//	  (either no probes were declared, or the replica was Stopped)
+//	400 Bad Request — hostile or empty {name}
+//	503 — no ReadinessLookup wired (test setup with no probes)
+//
+// Designed for high-frequency calls: caddy active health checks
+// can hit this 10× / second per upstream without breaking a
+// sweat. The lookup is in-memory; no etcd hop, no JSON decode of
+// the status blob, no docker daemon contact.
+func (a *API) handlePodReady(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pod name is required"))
+		return
+	}
+
+	if strings.ContainsAny(name, "/ \t\n") || strings.HasPrefix(name, ".") {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid pod name: %q", name))
+		return
+	}
+
+	if a.Readiness == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("readiness lookup not configured"))
+		return
+	}
+
+	status, ok := a.Readiness.LookupReadiness(name)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no readiness state for pod %q", name))
+		return
+	}
+
+	code := http.StatusOK
+	if !status.Ready {
+		code = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, code, envelope{
+		Status: "ok",
+		Data:   map[string]any{"readiness": status},
 	})
 }
 

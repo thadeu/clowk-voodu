@@ -194,6 +194,19 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
+	// Recorder back-reference completes the M1.2 wiring: every
+	// readiness/startup phase transition flows back into the
+	// deployment's status blob via DeploymentHandler's
+	// RecordReplicaReadiness / ClearReplicaReadiness. Self-
+	// reference is the cheap way to break the construction
+	// chicken-and-egg without inverting ownership.
+	depHandler.Probes.Recorder = depHandler
+
+	// API.Readiness is the in-memory lookup `GET /pods/{name}/ready`
+	// reads from. Same registry that owns the runners owns the
+	// state — no cross-component sync needed.
+	s.api.Readiness = depHandler.Probes
+
 	assetHandler := &AssetHandler{
 		Store: store,
 		Log:   s.cfg.Logger,
