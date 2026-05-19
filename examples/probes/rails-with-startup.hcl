@@ -49,7 +49,7 @@ deployment "prod" "rails-web" {
     # declare the pod stuck and let liveness take over.
     startup {
       http_get {
-        path = "/healthz"
+        path = "/health"
         port = 3000
       }
 

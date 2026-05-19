@@ -120,7 +120,7 @@ type statefulsetSpec struct {
 	// volumes / env / aliases. Folded into the spec hash so any edit
 	// triggers a top-down rolling restart and every ordinal re-runs
 	// the new init flow with its own data.
-	InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+	InitContainers []initContainerWireSpec `json:"inits,omitempty"`
 
 	// Probes mirrors manifest.ProbesSpec — kubelet-style health
 	// checks, applied per-ordinal. Each pod gets its own runner
@@ -1083,7 +1083,7 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		Resources      *resourcesWireSpec      `json:"resources,omitempty"`
 		Logs           *logsWireSpec           `json:"logs,omitempty"`
 		VolumeClaims   []volumeClaim           `json:"volume_claims"`
-		InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+		InitContainers []initContainerWireSpec `json:"inits,omitempty"`
 		Probes         *probesWireSpec         `json:"probes,omitempty"`
 		Assets         []string                `json:"assets,omitempty"`
 	}{

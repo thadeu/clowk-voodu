@@ -49,7 +49,7 @@ statefulset "data" "pg" {
   # setups gate this on the ordinal — voodu emits
   # VOODU_REPLICA_ORDINAL into the pod env so the script can
   # check it.
-  init_container "bootstrap" {
+  init "bootstrap" {
     image = "postgres:16"
     command = [
       "sh", "-c",

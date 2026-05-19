@@ -219,7 +219,7 @@ type hclDeployment struct {
 	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
-	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init,block"`
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
@@ -514,30 +514,30 @@ func validateInitContainers(inits []InitContainerSpec, kind string) error {
 
 	for i, ic := range inits {
 		if ic.Name == "" {
-			return fmt.Errorf("%s: init_container[%d] missing name", kind, i)
+			return fmt.Errorf("%s: init[%d] missing name", kind, i)
 		}
 
 		if !initContainerNameRE.MatchString(ic.Name) {
-			return fmt.Errorf("%s: init_container %q invalid name (must match [a-z0-9][a-z0-9-]*)", kind, ic.Name)
+			return fmt.Errorf("%s: init %q invalid name (must match [a-z0-9][a-z0-9-]*)", kind, ic.Name)
 		}
 
 		if _, dup := seen[ic.Name]; dup {
-			return fmt.Errorf("%s: duplicate init_container name %q", kind, ic.Name)
+			return fmt.Errorf("%s: duplicate init name %q", kind, ic.Name)
 		}
 
 		seen[ic.Name] = struct{}{}
 
 		if len(ic.Command) == 0 {
-			return fmt.Errorf("%s: init_container %q requires command", kind, ic.Name)
+			return fmt.Errorf("%s: init %q requires command", kind, ic.Name)
 		}
 
 		if ic.Retries < 0 || ic.Retries > 5 {
-			return fmt.Errorf("%s: init_container %q retries must be in [0, 5] (got %d)", kind, ic.Name, ic.Retries)
+			return fmt.Errorf("%s: init %q retries must be in [0, 5] (got %d)", kind, ic.Name, ic.Retries)
 		}
 
 		if ic.Timeout != "" {
 			if _, err := time.ParseDuration(ic.Timeout); err != nil {
-				return fmt.Errorf("%s: init_container %q invalid timeout %q: %w", kind, ic.Name, ic.Timeout, err)
+				return fmt.Errorf("%s: init %q invalid timeout %q: %w", kind, ic.Name, ic.Timeout, err)
 			}
 		}
 	}
@@ -869,7 +869,7 @@ type hclApp struct {
 	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
-	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -1015,7 +1015,7 @@ type hclStatefulset struct {
 	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
 	Resources      *hclResourcesBlock      `hcl:"resources,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
-	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
+	InitContainers []hclInitContainerBlock `hcl:"init,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
 }
 

@@ -1,4 +1,8 @@
-# init-containers/
+# init/
+
+K8s-style **init containers** — the operator-facing HCL keyword
+is `init` (voodu's manifest talks about pods, not containers
+everywhere else; we keep the convention).
 
 Ordered one-shot containers that must exit 0 before a replica's
 main container starts. Kubelet-style — each runs sequentially,
@@ -37,7 +41,7 @@ Three classes of problems:
 deployment "prod" "api" {
   image = "ghcr.io/acme/api:1.4"
 
-  init_container "<name>" {
+  init "<name>" {
     image   = "ghcr.io/acme/api:1.4"       # defaults to parent image when omitted
     command = ["bin/rails", "db:migrate"]   # required
     timeout = "5m"                          # per-attempt cap (default 10m)
@@ -50,7 +54,7 @@ deployment "prod" "api" {
 }
 ```
 
-Multiple `init_container "name" { … }` blocks declare a sequence.
+Multiple `init "name" { … }` blocks declare a sequence.
 Execution order matches declaration order. Names must be unique
 within the resource (used as docker container name suffix).
 

@@ -1053,7 +1053,7 @@ func TestStatefulsetSpecHash_NilProbesPreservesHash(t *testing.T) {
 
 // TestSpecHash_NilInitContainersPreservesHash mirrors the
 // Resources rollout invariant for the M5 feature: existing
-// deployments without init_container blocks must NOT see their
+// deployments without init blocks must NOT see their
 // hash change when M5 lands.
 func TestSpecHash_NilInitContainersPreservesHash(t *testing.T) {
 	a := deploymentSpec{Image: "nginx"}

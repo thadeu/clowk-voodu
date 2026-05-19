@@ -88,8 +88,6 @@ ingress "prod" "api" {
   host    = "api.example.com"
 
   tls {
-    enabled  = true
-    provider = "letsencrypt"
     email    = "ops@example.com"
   }
 }

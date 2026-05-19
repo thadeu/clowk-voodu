@@ -2881,7 +2881,7 @@ deployment "x" "api" {
 }
 
 // TestParseHCLDeploymentInitContainers pins the happy-path shape:
-// multiple init_container blocks ride the deployment manifest with
+// multiple init blocks ride the deployment manifest with
 // labels preserved, declaration order preserved, and field-by-field
 // values round-tripping through the JSON encode/decode the apply
 // pipeline uses.
@@ -2890,13 +2890,13 @@ func TestParseHCLDeploymentInitContainers(t *testing.T) {
 deployment "prod" "api" {
   image = "ghcr.io/acme/api:1.4"
 
-  init_container "migrate" {
+  init "migrate" {
     command = ["bin/rails", "db:migrate"]
     timeout = "5m"
     retries = 2
   }
 
-  init_container "warm-cache" {
+  init "warm-cache" {
     image   = "ghcr.io/acme/api:1.4"
     command = ["bin/warm-cache"]
 
@@ -2964,7 +2964,7 @@ func TestParseHCLDeploymentInitContainers_NoCommandFails(t *testing.T) {
 deployment "prod" "api" {
   image = "nginx:1.27"
 
-  init_container "noop" {
+  init "noop" {
     timeout = "1m"
   }
 }
@@ -2990,11 +2990,11 @@ func TestParseHCLDeploymentInitContainers_DuplicateNameFails(t *testing.T) {
 deployment "prod" "api" {
   image = "nginx:1.27"
 
-  init_container "migrate" {
+  init "migrate" {
     command = ["true"]
   }
 
-  init_container "migrate" {
+  init "migrate" {
     command = ["true"]
   }
 }
@@ -3006,8 +3006,8 @@ deployment "prod" "api" {
 		t.Fatal("expected error on duplicate init container name")
 	}
 
-	if !strings.Contains(err.Error(), "duplicate init_container") {
-		t.Errorf("expected 'duplicate init_container' error: %v", err)
+	if !strings.Contains(err.Error(), "duplicate init") {
+		t.Errorf("expected 'duplicate init' error: %v", err)
 	}
 }
 
@@ -3020,7 +3020,7 @@ func TestParseHCLDeploymentInitContainers_BadNameFails(t *testing.T) {
 deployment "prod" "api" {
   image = "nginx:1.27"
 
-  init_container "Bad_Name" {
+  init "Bad_Name" {
     command = ["true"]
   }
 }
@@ -3047,7 +3047,7 @@ func TestParseHCLDeploymentInitContainers_RetriesCap(t *testing.T) {
 deployment "prod" "api" {
   image = "nginx:1.27"
 
-  init_container "migrate" {
+  init "migrate" {
     command = ["true"]
     retries = 6
   }

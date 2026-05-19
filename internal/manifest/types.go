@@ -187,7 +187,12 @@ type DeploymentSpec struct {
 	// init blocks its replica from coming up; the failure surfaces
 	// in DeploymentStatus.InitFailures. See InitContainerSpec for the
 	// per-step shape.
-	InitContainers []InitContainerSpec `yaml:"init_containers,omitempty" json:"init_containers,omitempty"`
+	//
+	// HCL surface is `init "name" { ... }` (no `_container` suffix —
+	// voodu's manifest layer talks about pods, not containers). The
+	// Go type name keeps "InitContainer" since the k8s concept is
+	// the reference; the operator-facing keyword is just `init`.
+	InitContainers []InitContainerSpec `yaml:"inits,omitempty" json:"inits,omitempty"`
 
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
@@ -200,17 +205,26 @@ type DeploymentSpec struct {
 
 // InitContainerSpec describes one ordered prep step that must run
 // to completion (exit 0) before a replica's main container starts.
+// Operator-facing HCL keyword is `init` (the "container" suffix
+// is dropped at the surface — voodu's manifest layer talks about
+// pods, not containers — though the k8s "init container" concept
+// is what's being implemented).
 //
 //	deployment "prod" "api" {
 //	  image = "ghcr.io/acme/api:1.4"
 //
-//	  init_containers = []  # see init_container blocks in HCL
+//	  init "migrate" {
+//	    command = ["bin/rails", "db:migrate"]
+//	  }
+//
+//	  init "warm-cache" {
+//	    command = ["bin/warm"]
+//	  }
 //	}
 //
-// In HCL the operator writes one `init_container "name" { ... }`
-// block per step; the parser collects them into this slice in
-// declared order. Order matters: each init waits for the previous
-// to succeed before starting.
+// The parser collects the blocks into this slice in declared
+// order. Order matters: each init waits for the previous to
+// succeed before starting.
 //
 // Inheritance rules (deployment → init container):
 //
@@ -814,7 +828,7 @@ type StatefulsetSpec struct {
 	// (each pod-N spawn re-runs every init against that pod's
 	// volumes / env / aliases). See InitContainerSpec for the
 	// per-step shape and inheritance rules.
-	InitContainers []InitContainerSpec `yaml:"init_containers,omitempty" json:"init_containers,omitempty"`
+	InitContainers []InitContainerSpec `yaml:"inits,omitempty" json:"inits,omitempty"`
 
 	// Probes mirrors DeploymentSpec.Probes — kubelet-style
 	// liveness / readiness / startup health checks, applied PER

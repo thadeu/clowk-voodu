@@ -41,14 +41,14 @@ deployment "prod" "api" {
   # Step 1: cheapest possible gate. Validate env before anything
   # else runs. If DATABASE_URL is malformed we want to know in
   # 2s, not after a 5-minute migration timeout.
-  init_container "validate-config" {
+  init "validate-config" {
     command = ["bin/config-check"]
     timeout = "30s"
     retries = 0
   }
 
   # Step 2: schema migration. Idempotent, may take a while.
-  init_container "migrate" {
+  init "migrate" {
     command = ["bin/rails", "db:migrate"]
     timeout = "10m"
 
@@ -61,7 +61,7 @@ deployment "prod" "api" {
   # Step 3: cache warm-up. Memory-heavy compared to the main
   # pod (loads a large fixture set into Redis). Override
   # resources so we don't OOM under the parent's cap.
-  init_container "warm-cache" {
+  init "warm-cache" {
     command = ["bin/warm-cache"]
     timeout = "5m"
 

@@ -7,13 +7,13 @@
 #     any rolling restart. Best for things that should happen
 #     exactly once (schema migrations on the deploy boundary).
 #
-#   - `init_container "migrate" { ... }` runs PER REPLICA, every
+#   - `init "migrate" { ... }` runs PER REPLICA, every
 #     time a replica is born. Idempotent migrations are fine
 #     either way; for "migration is the deploy gate, fail the
 #     whole rollout if it can't run" use release. For "every pod
-#     re-checks the schema before serving" use init_container.
+#     re-checks the schema before serving" use an init block.
 #
-# We use init_container here because:
+# We use init here because:
 #   (a) `db:migrate` is idempotent (Rails tracks schema versions).
 #   (b) Scale-up after an out-of-band schema change (operator ran
 #       `ALTER TABLE` directly) gets caught at the next spawn.
@@ -41,7 +41,7 @@ deployment "prod" "rails-web" {
   # Bring DATABASE_URL in from a shared scope bucket.
   env_from = ["prod/db-credentials"]
 
-  init_container "migrate" {
+  init "migrate" {
     # image omitted → inherits rails-web:2025-05-19. The
     # migration runs against the same code the main pod will
     # run. No drift possible.

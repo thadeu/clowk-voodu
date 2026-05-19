@@ -150,7 +150,7 @@ type deploymentSpec struct {
 	// replica. Folded into the spec hash: editing image / command /
 	// order is a runtime change that must re-run inits for every
 	// replica, which happens naturally via rolling restart.
-	InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+	InitContainers []initContainerWireSpec `json:"inits,omitempty"`
 
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
@@ -1954,7 +1954,7 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Autoscale      *autoscaleWireSpec      `json:"autoscale,omitempty"`
 		Logs           *logsWireSpec           `json:"logs,omitempty"`
 		Probes         *probesWireSpec         `json:"probes,omitempty"`
-		InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+		InitContainers []initContainerWireSpec `json:"inits,omitempty"`
 		Assets         []string                `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
