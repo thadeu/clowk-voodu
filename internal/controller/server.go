@@ -182,6 +182,16 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 		EnvFilePath: paths.AppEnvFile,
 		Containers:  DockerContainerManager{},
+		// Probe registry — wires the kubelet-style liveness runners
+		// to docker restart + IP resolution + exec. Same docker
+		// surface the rest of the handler uses; tests substitute
+		// fakes per field.
+		Probes: &ProbeRegistry{
+			Restart: dockerRestarter{},
+			IPs:     dockerIPResolver{},
+			Exec:    DockerContainerManager{},
+			Log:     s.cfg.Logger,
+		},
 	}
 
 	assetHandler := &AssetHandler{

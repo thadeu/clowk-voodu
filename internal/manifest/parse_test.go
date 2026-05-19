@@ -2561,6 +2561,237 @@ func TestApplyDefaults_LogsDefaults(t *testing.T) {
 	}
 }
 
+// TestParseHCLDeploymentProbes pins the probes block surface — the
+// three sub-blocks (liveness/readiness/startup), each carrying one
+// action selector + threshold knobs. Values round-trip verbatim;
+// the controller-side runner parses durations later (tolerantly).
+func TestParseHCLDeploymentProbes(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+  ports = ["8080"]
+
+  probes {
+    liveness {
+      http_get {
+        path = "/healthz"
+        port = 8080
+      }
+
+      initial_delay     = "10s"
+      period            = "10s"
+      timeout           = "1s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      http_get {
+        path = "/ready"
+        port = 8080
+      }
+
+      period = "5s"
+    }
+
+    startup {
+      http_get {
+        path = "/healthz"
+        port = 8080
+      }
+
+      period            = "1s"
+      failure_threshold = 30
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_probes.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Probes == nil {
+		t.Fatal("probes block lost")
+	}
+
+	if spec.Probes.Liveness == nil || spec.Probes.Liveness.HTTPGet == nil {
+		t.Fatal("liveness http_get missing")
+	}
+
+	if spec.Probes.Liveness.HTTPGet.Path != "/healthz" || spec.Probes.Liveness.HTTPGet.Port != 8080 {
+		t.Errorf("liveness http_get fields: %+v", spec.Probes.Liveness.HTTPGet)
+	}
+
+	if spec.Probes.Liveness.InitialDelay != "10s" || spec.Probes.Liveness.Period != "10s" || spec.Probes.Liveness.Timeout != "1s" {
+		t.Errorf("liveness durations: %+v", spec.Probes.Liveness)
+	}
+
+	if spec.Probes.Liveness.FailureThreshold != 3 {
+		t.Errorf("liveness failure_threshold: %d", spec.Probes.Liveness.FailureThreshold)
+	}
+
+	if spec.Probes.Readiness == nil || spec.Probes.Readiness.HTTPGet.Path != "/ready" {
+		t.Errorf("readiness http_get: %+v", spec.Probes.Readiness)
+	}
+
+	if spec.Probes.Startup == nil || spec.Probes.Startup.FailureThreshold != 30 {
+		t.Errorf("startup: %+v", spec.Probes.Startup)
+	}
+}
+
+// TestParseHCLDeploymentProbes_TCPSocket pins the tcp_socket action
+// — common for raw-TCP daemons (postgres, redis) where opening the
+// port is the smallest reliable "alive" signal.
+func TestParseHCLDeploymentProbes_TCPSocket(t *testing.T) {
+	src := `
+deployment "data" "redis" {
+  image = "redis:7"
+
+  probes {
+    liveness {
+      tcp_socket { port = 6379 }
+      period = "5s"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_probes_tcp.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	_ = json.Unmarshal(mans[0].Spec, &spec)
+
+	if spec.Probes == nil || spec.Probes.Liveness == nil || spec.Probes.Liveness.TCPSocket == nil {
+		t.Fatal("tcp_socket missing")
+	}
+
+	if spec.Probes.Liveness.TCPSocket.Port != 6379 {
+		t.Errorf("port: %d", spec.Probes.Liveness.TCPSocket.Port)
+	}
+
+	if spec.Probes.Liveness.HTTPGet != nil {
+		t.Error("http_get should be nil when tcp_socket is declared")
+	}
+}
+
+// TestParseHCLDeploymentProbes_Exec pins the exec action — used
+// when a probe needs to query the app via an in-container CLI
+// (pg_isready, redis-cli ping). Command rides through as a slice.
+func TestParseHCLDeploymentProbes_Exec(t *testing.T) {
+	src := `
+deployment "data" "pg" {
+  image = "postgres:16"
+
+  probes {
+    liveness {
+      exec {
+        command = ["pg_isready", "-h", "localhost"]
+      }
+
+      period = "10s"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_probes_exec.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	_ = json.Unmarshal(mans[0].Spec, &spec)
+
+	if spec.Probes == nil || spec.Probes.Liveness.Exec == nil {
+		t.Fatal("exec missing")
+	}
+
+	want := []string{"pg_isready", "-h", "localhost"}
+	if len(spec.Probes.Liveness.Exec.Command) != len(want) {
+		t.Fatalf("command length: %d, want %d", len(spec.Probes.Liveness.Exec.Command), len(want))
+	}
+
+	for i, v := range want {
+		if spec.Probes.Liveness.Exec.Command[i] != v {
+			t.Errorf("command[%d]: %q, want %q", i, spec.Probes.Liveness.Exec.Command[i], v)
+		}
+	}
+}
+
+// TestParseHCLDeploymentProbes_MutuallyExclusive validates the
+// "exactly one selector" rule. Two selectors in one probe block
+// is rejected at apply time with a clear error.
+func TestParseHCLDeploymentProbes_MutuallyExclusive(t *testing.T) {
+	src := `
+deployment "x" "api" {
+  image = "nginx:1.27"
+
+  probes {
+    liveness {
+      http_get {
+        path = "/h"
+        port = 80
+      }
+
+      tcp_socket {
+        port = 80
+      }
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_probes_conflict.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error when two selectors declared on same probe")
+	}
+
+	if !strings.Contains(err.Error(), "only one of") {
+		t.Errorf("expected 'only one of' in error: %v", err)
+	}
+}
+
+// TestParseHCLDeploymentProbes_NoSelectorFails verifies that a
+// probe with no action declared (just durations / thresholds)
+// fails fast — an empty probe is always-failing and would just
+// spam restart calls.
+func TestParseHCLDeploymentProbes_NoSelectorFails(t *testing.T) {
+	src := `
+deployment "x" "api" {
+  image = "nginx:1.27"
+
+  probes {
+    liveness {
+      period = "5s"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_probes_empty.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error when no probe action selector declared")
+	}
+
+	if !strings.Contains(err.Error(), "exactly one") {
+		t.Errorf("expected 'exactly one' in error: %v", err)
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 

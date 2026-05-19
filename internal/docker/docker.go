@@ -982,6 +982,63 @@ func StopContainer(name string) error {
 	return cmd.Run()
 }
 
+// RestartContainer runs `docker restart <name>` — SIGTERM, grace,
+// SIGKILL, then start. Keeps the same container ID and labels,
+// just bounces the process inside. Used by the probe runner's
+// liveness-failure path (kubelet-style "process is alive but
+// deadlocked") where we want to bounce without losing identity.
+//
+// Distinct from RecreateActiveContainer / Recreate (which destroy
+// and rebuild the container from spec). Restart in place preserves
+// any in-container debugging state the operator might be inspecting.
+func RestartContainer(name string) error {
+	cmd := exec.Command("docker", "restart", name)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker restart %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+// ContainerIP returns the first non-empty IP address from the
+// container's network list — typically the voodu0 bridge IP. Used by
+// the probe runner to address HTTP/TCP probes directly on the
+// container's network without going through host-side port
+// publishing (which would only expose ports the operator declared,
+// and on a randomly-allocated host port that's harder to compute).
+//
+// Returns ("", nil) when the container exists but has no networks
+// attached (rare — host-network mode, transient stop/start). Returns
+// the IP+ nil on success. Errors only on inspect failure.
+func ContainerIP(name string) (string, error) {
+	det, err := InspectContainer(name)
+	if err != nil {
+		return "", err
+	}
+
+	if det == nil {
+		return "", nil
+	}
+
+	// Prefer voodu0 if present (the platform bridge); fall back to
+	// whatever's first. Order matters only when the container has
+	// multiple networks — a deployment on voodu0 + a custom bridge —
+	// and we want probes to traverse the platform bus, not the
+	// app's overlay.
+	if n, ok := det.Networks["voodu0"]; ok && n.IPAddress != "" {
+		return n.IPAddress, nil
+	}
+
+	for _, n := range det.Networks {
+		if n.IPAddress != "" {
+			return n.IPAddress, nil
+		}
+	}
+
+	return "", nil
+}
+
 // IsRunning reports whether the container is currently in the running
 // state. Distinct from ContainerExists: a stopped container exists but
 // is not running, and the reconciler treats that as "needs a start".

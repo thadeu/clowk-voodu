@@ -169,6 +169,14 @@ type DeploymentSpec struct {
 	// disk silently. See LogsSpec for the operator-facing contract.
 	Logs *LogsSpec `yaml:"logs,omitempty" json:"logs,omitempty"`
 
+	// Probes declares kubelet-style health checks voodu runs against
+	// each replica. M1.1 wires liveness only — readiness + startup
+	// land in M1.2 alongside ingress integration. See ProbesSpec for
+	// the full contract; when nil, voodu relies on docker's restart
+	// policy alone (no in-app health gating, no automatic restart on
+	// process-alive-but-deadlocked).
+	Probes *ProbesSpec `yaml:"probes,omitempty" json:"probes,omitempty"`
+
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
 	// asset content drift triggers rolling restart without the
@@ -322,6 +330,80 @@ const (
 	defaultLogsMaxSize  = "10m"
 	defaultLogsMaxFiles = 3
 )
+
+// ProbesSpec is the operator-facing surface for kubelet-style
+// health checks. Three probe kinds, exactly mirroring Kubernetes:
+//
+//	probes {
+//	  liveness  { http_get { path = "/healthz", port = 8080 } }
+//	  readiness { http_get { path = "/ready",   port = 8080 } }   # M1.2
+//	  startup   { http_get { path = "/healthz", port = 8080 }, failure_threshold = 30 }   # M1.2
+//	}
+//
+// Liveness is the M1.1 cut: when a probe fails past its
+// failure_threshold, the controller restarts the container in-place
+// (docker restart — keeps the same container ID, restarts the
+// process). Catches deadlocks / hung event loops that docker's
+// process-exit-based restart policy can't see.
+//
+// Readiness + startup wire in M1.2: readiness gates ingress
+// traffic (caddy upstream membership), startup gives slow-boot apps
+// a grace window before liveness counts failures.
+type ProbesSpec struct {
+	Liveness  *ProbeSpec `yaml:"liveness,omitempty"  json:"liveness,omitempty"`
+	Readiness *ProbeSpec `yaml:"readiness,omitempty" json:"readiness,omitempty"`
+	Startup   *ProbeSpec `yaml:"startup,omitempty"   json:"startup,omitempty"`
+}
+
+// ProbeSpec is one probe's full configuration: which action to run
+// (http_get / tcp_socket / exec — exactly one), how often, and how
+// many consecutive failures count as "down."
+//
+// Action fields are mutually exclusive — the parser enforces "exactly
+// one selector" via probe.Spec.Validate(). All thresholds default at
+// the controller side per the k8s-parity defaults (period 10s,
+// timeout 1s, failure_threshold 3, success_threshold 1).
+//
+// Duration fields (InitialDelay, Period, Timeout) accept Go's
+// time.ParseDuration format ("10s", "1m", "1m30s"). Empty strings
+// fall through to defaults.
+type ProbeSpec struct {
+	HTTPGet   *HTTPGetAction   `yaml:"http_get,omitempty"   json:"http_get,omitempty"`
+	TCPSocket *TCPSocketAction `yaml:"tcp_socket,omitempty" json:"tcp_socket,omitempty"`
+	Exec      *ExecAction      `yaml:"exec,omitempty"       json:"exec,omitempty"`
+
+	InitialDelay     string `yaml:"initial_delay,omitempty"     json:"initial_delay,omitempty"`
+	Period           string `yaml:"period,omitempty"            json:"period,omitempty"`
+	Timeout          string `yaml:"timeout,omitempty"           json:"timeout,omitempty"`
+	FailureThreshold int    `yaml:"failure_threshold,omitempty" json:"failure_threshold,omitempty"`
+	SuccessThreshold int    `yaml:"success_threshold,omitempty" json:"success_threshold,omitempty"`
+}
+
+// HTTPGetAction issues an HTTP GET against the container; 2xx/3xx
+// counts as success. Port is required; the parser doesn't auto-pick
+// from spec.ports because that coupling would break in non-trivial
+// shapes (multi-port containers, sidecars).
+type HTTPGetAction struct {
+	Path        string            `yaml:"path"                  json:"path"`
+	Port        int               `yaml:"port"                  json:"port"`
+	Scheme      string            `yaml:"scheme,omitempty"      json:"scheme,omitempty"`
+	HTTPHeaders map[string]string `yaml:"http_headers,omitempty" json:"http_headers,omitempty"`
+}
+
+// TCPSocketAction is the "can I connect?" probe — useful for raw-TCP
+// daemons (postgres, redis) where opening the port is the smallest
+// reliable "alive" signal.
+type TCPSocketAction struct {
+	Port int `yaml:"port" json:"port"`
+}
+
+// ExecAction runs a command INSIDE the container via docker exec.
+// Exit code 0 = success; anything else fails. Command is the argv;
+// shell expansion is NOT performed (use `sh -c "..."` if you need
+// pipes or redirection).
+type ExecAction struct {
+	Command []string `yaml:"command" json:"command"`
+}
 
 // BuildSpec is the docker-compose-shaped build-mode block. Declared
 // inside a resource (`build { ... }`) when the operator wants voodu to

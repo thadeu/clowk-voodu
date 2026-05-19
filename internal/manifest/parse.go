@@ -216,6 +216,7 @@ type hclDeployment struct {
 	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
 	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
 	Logs      *hclLogsBlock      `hcl:"logs,block"`
+	Probes    *hclProbesBlock    `hcl:"probes,block"`
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
@@ -264,6 +265,182 @@ func logsBlockToSpec(b *hclLogsBlock) *LogsSpec {
 		MaxSize:  b.MaxSize,
 		MaxFiles: b.MaxFiles,
 	}
+}
+
+// hclProbesBlock is the HCL surface for the kubelet-style health
+// checks. Three sub-blocks (liveness, readiness, startup), each an
+// independent `hclProbeBlock`. Operators omit the ones they don't
+// want. See manifest.ProbesSpec for the operator-facing contract.
+type hclProbesBlock struct {
+	Liveness  *hclProbeBlock `hcl:"liveness,block"`
+	Readiness *hclProbeBlock `hcl:"readiness,block"`
+	Startup   *hclProbeBlock `hcl:"startup,block"`
+}
+
+// hclProbeBlock is one probe's full HCL surface. The three action
+// sub-blocks (http_get / tcp_socket / exec) are mutually exclusive
+// — exactly one must be declared. Validation runs at conversion
+// time via probe.Spec.Validate(), so the operator gets a parse-time
+// error rather than a runtime probe-loop misbehaviour.
+type hclProbeBlock struct {
+	HTTPGet   *hclHTTPGetAction   `hcl:"http_get,block"`
+	TCPSocket *hclTCPSocketAction `hcl:"tcp_socket,block"`
+	Exec      *hclExecAction      `hcl:"exec,block"`
+
+	InitialDelay     string `hcl:"initial_delay,optional"`
+	Period           string `hcl:"period,optional"`
+	Timeout          string `hcl:"timeout,optional"`
+	FailureThreshold int    `hcl:"failure_threshold,optional"`
+	SuccessThreshold int    `hcl:"success_threshold,optional"`
+}
+
+type hclHTTPGetAction struct {
+	Path        string            `hcl:"path"`
+	Port        int               `hcl:"port"`
+	Scheme      string            `hcl:"scheme,optional"`
+	HTTPHeaders map[string]string `hcl:"http_headers,optional"`
+}
+
+type hclTCPSocketAction struct {
+	Port int `hcl:"port"`
+}
+
+type hclExecAction struct {
+	Command []string `hcl:"command"`
+}
+
+// probesBlockToSpec converts the HCL surface into the wire ProbesSpec.
+// nil-in / nil-out so callers don't synthesise an empty block when
+// the operator omitted probes entirely.
+func probesBlockToSpec(b *hclProbesBlock) *ProbesSpec {
+	if b == nil {
+		return nil
+	}
+
+	out := &ProbesSpec{}
+
+	if b.Liveness != nil {
+		out.Liveness = probeBlockToSpec(b.Liveness)
+	}
+
+	if b.Readiness != nil {
+		out.Readiness = probeBlockToSpec(b.Readiness)
+	}
+
+	if b.Startup != nil {
+		out.Startup = probeBlockToSpec(b.Startup)
+	}
+
+	return out
+}
+
+func probeBlockToSpec(b *hclProbeBlock) *ProbeSpec {
+	if b == nil {
+		return nil
+	}
+
+	out := &ProbeSpec{
+		InitialDelay:     b.InitialDelay,
+		Period:           b.Period,
+		Timeout:          b.Timeout,
+		FailureThreshold: b.FailureThreshold,
+		SuccessThreshold: b.SuccessThreshold,
+	}
+
+	if b.HTTPGet != nil {
+		out.HTTPGet = &HTTPGetAction{
+			Path:        b.HTTPGet.Path,
+			Port:        b.HTTPGet.Port,
+			Scheme:      b.HTTPGet.Scheme,
+			HTTPHeaders: b.HTTPGet.HTTPHeaders,
+		}
+	}
+
+	if b.TCPSocket != nil {
+		out.TCPSocket = &TCPSocketAction{Port: b.TCPSocket.Port}
+	}
+
+	if b.Exec != nil {
+		out.Exec = &ExecAction{Command: b.Exec.Command}
+	}
+
+	return out
+}
+
+// validateProbes runs the same "exactly one selector" rule the
+// probe package's Spec.Validate() uses. Done here so a malformed
+// manifest fails at apply time with a clear error rather than at
+// runtime when the probe runner starts. Each error names the
+// triggering probe (liveness/readiness/startup) so the operator
+// can find the bad block fast.
+func validateProbes(p *ProbesSpec) error {
+	if p == nil {
+		return nil
+	}
+
+	if err := validateProbeShape(p.Liveness, "liveness"); err != nil {
+		return err
+	}
+
+	if err := validateProbeShape(p.Readiness, "readiness"); err != nil {
+		return err
+	}
+
+	if err := validateProbeShape(p.Startup, "startup"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateProbeShape(p *ProbeSpec, kind string) error {
+	if p == nil {
+		return nil
+	}
+
+	count := 0
+	if p.HTTPGet != nil {
+		count++
+
+		if p.HTTPGet.Path == "" {
+			return fmt.Errorf("probes.%s.http_get.path is required", kind)
+		}
+
+		if !strings.HasPrefix(p.HTTPGet.Path, "/") {
+			return fmt.Errorf("probes.%s.http_get.path must start with '/'", kind)
+		}
+
+		if p.HTTPGet.Port <= 0 {
+			return fmt.Errorf("probes.%s.http_get.port is required (got %d)", kind, p.HTTPGet.Port)
+		}
+	}
+
+	if p.TCPSocket != nil {
+		count++
+
+		if p.TCPSocket.Port <= 0 {
+			return fmt.Errorf("probes.%s.tcp_socket.port is required (got %d)", kind, p.TCPSocket.Port)
+		}
+	}
+
+	if p.Exec != nil {
+		count++
+
+		if len(p.Exec.Command) == 0 {
+			return fmt.Errorf("probes.%s.exec.command must be non-empty", kind)
+		}
+	}
+
+	switch count {
+	case 0:
+		return fmt.Errorf("probes.%s requires exactly one of http_get / tcp_socket / exec", kind)
+	case 1:
+		// ok
+	default:
+		return fmt.Errorf("probes.%s: only one of http_get / tcp_socket / exec may be declared", kind)
+	}
+
+	return nil
 }
 
 // hclAutoscaleBlock is the HCL surface for the M7 CPU-based
@@ -493,6 +670,11 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 
 	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
 	s.Logs = logsBlockToSpec(b.Logs)
+	s.Probes = probesBlockToSpec(b.Probes)
+
+	if err := validateProbes(s.Probes); err != nil {
+		return DeploymentSpec{}, err
+	}
 
 	s.applyDefaults()
 
@@ -572,6 +754,7 @@ type hclApp struct {
 	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
 	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
 	Logs      *hclLogsBlock      `hcl:"logs,block"`
+	Probes    *hclProbesBlock    `hcl:"probes,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -638,6 +821,11 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 
 	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
 	s.Logs = logsBlockToSpec(b.Logs)
+	s.Probes = probesBlockToSpec(b.Probes)
+
+	if err := validateProbes(s.Probes); err != nil {
+		return DeploymentSpec{}, err
+	}
 
 	s.applyDefaults()
 

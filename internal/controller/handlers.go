@@ -137,6 +137,14 @@ type deploymentSpec struct {
 	// default in that case so an upgrade doesn't lose protection.
 	Logs *logsWireSpec `json:"logs,omitempty"`
 
+	// Probes mirrors manifest.ProbesSpec — kubelet-style liveness /
+	// readiness / startup probes. M1.1 wires liveness only; readiness
+	// + startup decode here but the controller doesn't start runners
+	// for them yet (M1.2). Folded into the spec hash: changing a
+	// probe configuration IS a runtime change worth a rolling
+	// restart so the new probe parameters take effect.
+	Probes *probesWireSpec `json:"probes,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
@@ -175,6 +183,46 @@ type onDeployWireSpec struct {
 type logsWireSpec struct {
 	MaxSize  string `json:"max_size,omitempty"`
 	MaxFiles int    `json:"max_files,omitempty"`
+}
+
+// probesWireSpec mirrors manifest.ProbesSpec — kubelet-style health
+// checks. Lives in this package (not manifest) for the same anti-
+// cycle reason logsWireSpec does. The wire JSON shape matches the
+// manifest layer's exactly so decode round-trips cleanly.
+type probesWireSpec struct {
+	Liveness  *probeWireSpec `json:"liveness,omitempty"`
+	Readiness *probeWireSpec `json:"readiness,omitempty"`
+	Startup   *probeWireSpec `json:"startup,omitempty"`
+}
+
+// probeWireSpec is the on-the-wire shape of one probe configuration.
+// All three actions are nullable; the parser enforces exactly-one at
+// apply time, so by the time we decode here we trust the shape.
+type probeWireSpec struct {
+	HTTPGet   *httpGetActionWire   `json:"http_get,omitempty"`
+	TCPSocket *tcpSocketActionWire `json:"tcp_socket,omitempty"`
+	Exec      *execActionWire      `json:"exec,omitempty"`
+
+	InitialDelay     string `json:"initial_delay,omitempty"`
+	Period           string `json:"period,omitempty"`
+	Timeout          string `json:"timeout,omitempty"`
+	FailureThreshold int    `json:"failure_threshold,omitempty"`
+	SuccessThreshold int    `json:"success_threshold,omitempty"`
+}
+
+type httpGetActionWire struct {
+	Path        string            `json:"path"`
+	Port        int               `json:"port"`
+	Scheme      string            `json:"scheme,omitempty"`
+	HTTPHeaders map[string]string `json:"http_headers,omitempty"`
+}
+
+type tcpSocketActionWire struct {
+	Port int `json:"port"`
+}
+
+type execActionWire struct {
+	Command []string `json:"command"`
 }
 
 // Hard-coded fallback for the rare legacy spec that doesn't carry a
@@ -341,6 +389,13 @@ type DeploymentHandler struct {
 	// the call entirely (no-op when the operator doesn't use
 	// the feature and the handler wasn't configured for it).
 	Webhooks WebhookPoster
+
+	// Probes is the kubelet-style liveness/readiness/startup runner
+	// registry. Optional — nil means no health probes are spawned
+	// (operator's probes block silently ignored). Production wires
+	// a ProbeRegistry bound to docker.RestartContainer / .ContainerIP
+	// / DockerContainerManager.Exec. Tests substitute fakes.
+	Probes *ProbeRegistry
 }
 
 func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
@@ -383,6 +438,10 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 		for _, slot := range slots {
 			h.logf("deployment/%s removing replica %s", ev.Name, slot.Name)
 
+			// Probe runners go first so they can't restart a
+			// container we're about to delete.
+			h.Probes.Stop(slot.Name)
+
 			if err := h.Containers.Remove(slot.Name); err != nil {
 				return fmt.Errorf("remove %s: %w", slot.Name, err)
 			}
@@ -395,6 +454,11 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 
 		for _, name := range legacy {
 			h.logf("deployment/%s removing legacy replica %s", ev.Name, name)
+
+			// Legacy containers shouldn't have probe runners
+			// (pre-M1 code never started any), but Stop is
+			// idempotent so the defensive call costs nothing.
+			h.Probes.Stop(name)
 
 			if err := h.Containers.Remove(name); err != nil {
 				return fmt.Errorf("remove %s: %w", name, err)
@@ -915,6 +979,13 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 
 		h.logf("deployment/%s replica %s created (image=%s)", name, cname, spec.Image)
 
+		// Start probe runners for the new replica. Idempotent: if a
+		// runner exists (replay scenario), Start no-ops. The probes
+		// block is hash-folded, so changes to it trigger a rolling
+		// restart that destroys the old replica + cancels its runner
+		// before this path spawns the new one.
+		h.Probes.Start(cname, spec.Probes)
+
 		created = append(created, cname)
 	}
 
@@ -1000,6 +1071,10 @@ func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []Containe
 		}
 
 		h.logf("deployment/%s scale-down: removing %s", name, s.Name)
+
+		// Stop probes before container removal — see rolling
+		// restart for the same rationale.
+		h.Probes.Stop(s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
 			return fmt.Errorf("remove %s: %w", s.Name, err)
@@ -1184,6 +1259,12 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			ReleaseID:    releaseID,
 		})
 
+		// Stop the old container's probes BEFORE removing the
+		// container — otherwise the runner might fire one last
+		// restart against a container that's being deleted, and
+		// docker would error noisily.
+		h.Probes.Stop(s.Name)
+
 		if err := h.Containers.Remove(s.Name); err != nil {
 			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
 		}
@@ -1223,6 +1304,12 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		}); err != nil {
 			return fmt.Errorf("spawn replacement %s: %w", newName, err)
 		}
+
+		// Start probe runners for the replacement replica. Probe
+		// spec is re-read from the manifest so an in-flight rolling
+		// restart triggered by a probe-spec change picks up the new
+		// config naturally.
+		h.Probes.Start(newName, spec.Probes)
 
 		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
 
@@ -1746,6 +1833,7 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		Resources   *resourcesWireSpec `json:"resources,omitempty"`
 		Autoscale   *autoscaleWireSpec `json:"autoscale,omitempty"`
 		Logs        *logsWireSpec      `json:"logs,omitempty"`
+		Probes      *probesWireSpec    `json:"probes,omitempty"`
 		Assets      []string           `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
@@ -1793,7 +1881,15 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		// is a notification-routing edit, not a runtime change.
 		// Rolling-restarting every replica because the operator
 		// edited a Slack URL would be unjustifiable churn.
-		Logs:   spec.Logs,
+		Logs: spec.Logs,
+		// Probes fold into the hash so a probe configuration change
+		// (path, port, threshold, period) triggers a rolling restart
+		// — needed because the new ProbeRunner only spawns when the
+		// replica is freshly created. Without this mix-in, an
+		// operator could edit probes.liveness.http_get.path and
+		// the running replicas would keep probing the old endpoint
+		// until something else forced a restart.
+		Probes: spec.Probes,
 		Assets: flattenAssetDigests(assetDigests),
 	}
 
