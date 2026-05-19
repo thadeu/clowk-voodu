@@ -278,6 +278,8 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		return run, fmt.Errorf("cronjob/%s: %w", app, resErr)
 	}
 
+	cronLogMaxSize, cronLogMaxFiles := effectiveLogs(spec.Job.Logs)
+
 	if err := h.Containers.Recreate(ContainerSpec{
 		Name:             cname,
 		Image:            spec.Job.Image,
@@ -299,6 +301,8 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		Labels:        labels,
 		ExtraHosts:    spec.Job.ExtraHosts,
 		CapAdd:        spec.Job.CapAdd,
+		LogMaxSize:    cronLogMaxSize,
+		LogMaxFiles:   cronLogMaxFiles,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs cronjob
 		// <name>` can read them post-tick. The runner GCs old run

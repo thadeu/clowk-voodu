@@ -214,6 +214,56 @@ type hclDeployment struct {
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
 	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
+	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
+	Logs      *hclLogsBlock      `hcl:"logs,block"`
+}
+
+// hclOnDeployBlock is the HCL surface for the on_deploy webhook
+// hooks. Both fields are optional; an empty block is a no-op (no
+// posts). See manifest.OnDeploySpec for the wire shape and delivery
+// contract (best-effort, 3-attempt exponential backoff).
+type hclOnDeployBlock struct {
+	Success string `hcl:"success,optional"`
+	Failure string `hcl:"failure,optional"`
+}
+
+// onDeployBlockToSpec converts the HCL surface into the wire
+// OnDeploySpec. nil-in / nil-out so callers don't synthesise an
+// empty block when the operator omitted on_deploy entirely.
+func onDeployBlockToSpec(b *hclOnDeployBlock) *OnDeploySpec {
+	if b == nil {
+		return nil
+	}
+
+	return &OnDeploySpec{
+		Success: b.Success,
+		Failure: b.Failure,
+	}
+}
+
+// hclLogsBlock is the HCL surface for the docker-log-driver cap.
+// Both fields are optional at the HCL level; applyDefaults fills
+// either-or-both with the platform 10m/3 default when omitted.
+// See manifest.LogsSpec for the wire-shape counterpart and the
+// rationale for always emitting a non-nil block.
+type hclLogsBlock struct {
+	MaxSize  string `hcl:"max_size,optional"`
+	MaxFiles int    `hcl:"max_files,optional"`
+}
+
+// logsBlockToSpec converts the HCL surface into the wire LogsSpec.
+// nil-in / nil-out — applyLogsDefaults synthesises a fresh LogsSpec
+// downstream when the operator omitted the block, so callers don't
+// need to fabricate one here.
+func logsBlockToSpec(b *hclLogsBlock) *LogsSpec {
+	if b == nil {
+		return nil
+	}
+
+	return &LogsSpec{
+		MaxSize:  b.MaxSize,
+		MaxFiles: b.MaxFiles,
+	}
 }
 
 // hclAutoscaleBlock is the HCL surface for the M7 CPU-based
@@ -441,6 +491,9 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 		return DeploymentSpec{}, err
 	}
 
+	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
+	s.Logs = logsBlockToSpec(b.Logs)
+
 	s.applyDefaults()
 
 	return s, nil
@@ -517,6 +570,8 @@ type hclApp struct {
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
 	Autoscale *hclAutoscaleBlock `hcl:"autoscale,block"`
+	OnDeploy  *hclOnDeployBlock  `hcl:"on_deploy,block"`
+	Logs      *hclLogsBlock      `hcl:"logs,block"`
 
 	// Ingress-side fields. Host is required (no host = no reason to
 	// be an app, write a plain deployment instead).
@@ -580,6 +635,9 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 	if err := validateAutoscale(s.Autoscale, s.Replicas); err != nil {
 		return DeploymentSpec{}, err
 	}
+
+	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
+	s.Logs = logsBlockToSpec(b.Logs)
 
 	s.applyDefaults()
 
@@ -647,6 +705,7 @@ type hclStatefulset struct {
 	VolumeClaims []hclVolumeClaim   `hcl:"volume_claim,block"`
 	DependsOn    *hclDependsOn      `hcl:"depends_on,block"`
 	Resources    *hclResourcesBlock `hcl:"resources,block"`
+	Logs         *hclLogsBlock      `hcl:"logs,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -699,6 +758,7 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 	}
 
 	s.Resources = resourcesBlockToSpec(b.Resources)
+	s.Logs = logsBlockToSpec(b.Logs)
 
 	s.applyDefaults()
 
@@ -827,6 +887,7 @@ type hclJob struct {
 	Build     *hclBuildBlock     `hcl:"build,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+	Logs      *hclLogsBlock      `hcl:"logs,block"`
 }
 
 func (b hclJob) spec() (JobSpec, error) {
@@ -857,6 +918,9 @@ func (b hclJob) spec() (JobSpec, error) {
 	}
 
 	s.Resources = resourcesBlockToSpec(b.Resources)
+	s.Logs = logsBlockToSpec(b.Logs)
+
+	s.applyDefaults()
 
 	return s, nil
 }
@@ -901,6 +965,7 @@ type hclCronJob struct {
 	Build     *hclBuildBlock     `hcl:"build,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+	Logs      *hclLogsBlock      `hcl:"logs,block"`
 }
 
 func (b hclCronJob) spec() (CronJobSpec, error) {
@@ -929,6 +994,9 @@ func (b hclCronJob) spec() (CronJobSpec, error) {
 	}
 
 	job.Resources = resourcesBlockToSpec(b.Resources)
+	job.Logs = logsBlockToSpec(b.Logs)
+
+	job.applyDefaults()
 
 	return CronJobSpec{
 		Schedule:               b.Schedule,

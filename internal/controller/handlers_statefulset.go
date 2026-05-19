@@ -100,6 +100,10 @@ type statefulsetSpec struct {
 	// CPU/memory caps via cgroups, applied to every replica pod.
 	Resources *resourcesWireSpec `json:"resources,omitempty"`
 
+	// Logs caps the docker json-file log driver per ordinal. nil
+	// falls through to the platform fallback in effectiveLogs.
+	Logs *logsWireSpec `json:"logs,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. Server-managed (StampAssetDigests
 	// writes it post plugin-expand); operators don't author this
@@ -556,6 +560,8 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			return fmt.Errorf("statefulset/%s ordinal %d: %w", name, n, err)
 		}
 
+		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:             cname,
 			Image:            spec.Image,
@@ -574,6 +580,8 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(_ context.Context, scope, name, ap
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			LogMaxSize:       logMaxSize,
+			LogMaxFiles:      logMaxFiles,
 		})
 		if err != nil {
 			return fmt.Errorf("ensure ordinal %d (%s): %w", n, cname, err)
@@ -804,6 +812,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			return fmt.Errorf("statefulset/%s respawn ordinal %d: %w", name, ord, err)
 		}
 
+		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:             newName,
 			Image:            spec.Image,
@@ -822,6 +832,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(_ context.Context, scope, nam
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			LogMaxSize:       logMaxSize,
+			LogMaxFiles:      logMaxFiles,
 		}); err != nil {
 			return fmt.Errorf("respawn ordinal %d: %w", ord, err)
 		}
@@ -954,24 +966,29 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		CapAdd       []string           `json:"cap_add,omitempty"`
 		BuildArgs    map[string]string  `json:"build_args,omitempty"`
 		Resources    *resourcesWireSpec `json:"resources,omitempty"`
+		Logs         *logsWireSpec      `json:"logs,omitempty"`
 		VolumeClaims []volumeClaim      `json:"volume_claims"`
 		Assets       []string           `json:"assets,omitempty"`
 	}{
-		Image:        spec.Image,
-		Command:      spec.Command,
-		Ports:        spec.Ports,
-		Volumes:      spec.Volumes,
-		Env:          spec.Env,
-		Networks:     nets,
-		NetworkMode:  spec.NetworkMode,
-		Restart:      spec.Restart,
-		ExtraHosts:   hosts,
-		CapAdd:       caps,
-		BuildArgs:    spec.BuildArgs,
+		Image:       spec.Image,
+		Command:     spec.Command,
+		Ports:       spec.Ports,
+		Volumes:     spec.Volumes,
+		Env:         spec.Env,
+		Networks:    nets,
+		NetworkMode: spec.NetworkMode,
+		Restart:     spec.Restart,
+		ExtraHosts:  hosts,
+		CapAdd:      caps,
+		BuildArgs:   spec.BuildArgs,
 		// See deploymentSpecHash for why Resources folds in. Same
 		// rationale: editing the cgroup caps must trigger a rolling
 		// recreate, otherwise the new HCL is ignored at runtime.
-		Resources:    spec.Resources,
+		Resources: spec.Resources,
+		// See deploymentSpecHash for the Logs rationale — docker
+		// freezes log driver options at create time so a cap edit
+		// needs recreate to take effect.
+		Logs:         spec.Logs,
 		VolumeClaims: claims,
 		Assets:       flattenAssetDigests(assetDigests),
 	}

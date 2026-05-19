@@ -323,6 +323,15 @@ type ContainerSpec struct {
 	// `CAP_` prefix) the operator wants granted via docker run
 	// `--cap-add`. See manifest.DeploymentSpec for the contract.
 	CapAdd []string
+
+	// LogMaxSize / LogMaxFiles cap the docker json-file log
+	// driver per container — see docker.ContainerConfig for the
+	// flag-level details. Handler fills both fields from the
+	// manifest's `logs {}` block (or the platform default when
+	// the operator omits it); both must be set together for
+	// docker to honour the cap.
+	LogMaxSize  string
+	LogMaxFiles int
 }
 
 // DockerContainerManager is the production ContainerManager backed by
@@ -396,6 +405,8 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		MemoryLimitBytes: spec.MemoryLimitBytes,
 		ExtraHosts:       spec.ExtraHosts,
 		CapAdd:           spec.CapAdd,
+		LogMaxSize:       spec.LogMaxSize,
+		LogMaxFiles:      spec.LogMaxFiles,
 	}
 
 	if err := docker.CreateContainer(cfg); err != nil {
@@ -737,6 +748,8 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		MemoryLimitBytes: spec.MemoryLimitBytes,
 		ExtraHosts:       spec.ExtraHosts,
 		CapAdd:           spec.CapAdd,
+		LogMaxSize:       spec.LogMaxSize,
+		LogMaxFiles:      spec.LogMaxFiles,
 	}
 
 	return docker.CreateContainer(cfg)

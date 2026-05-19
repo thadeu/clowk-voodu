@@ -286,6 +286,8 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		Role:         "release",
 	})
 
+	releaseLogMaxSize, releaseLogMaxFiles := effectiveLogs(spec.Logs)
+
 	releaseSpec := ContainerSpec{
 		Name:          cname,
 		Image:         spec.Image,
@@ -298,6 +300,8 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		Labels:        labels,
 		ExtraHosts:    spec.ExtraHosts,
 		CapAdd:        spec.CapAdd,
+		LogMaxSize:    releaseLogMaxSize,
+		LogMaxFiles:   releaseLogMaxFiles,
 		// AutoRemove is explicitly false: we need the container to
 		// stay alive long enough for Wait to return the exit code.
 		// `--rm` would race with Wait under heavy load. Equivalent
@@ -625,6 +629,8 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 	if len(live) > 0 {
 		fmt.Fprintf(output, "-----> Release %s: rolling restart of %d replica(s)\n", releaseID, len(live))
 
+		rolloutStart := record.StartedAt
+
 		if err := h.rollingReplaceReplicas(ctx, scope, name, app, live, spec, hash, releaseID); err != nil {
 			record.Status = ReleaseStatusFailed
 			record.Error = fmt.Sprintf("rolling restart: %v", err)
@@ -632,8 +638,17 @@ func (h *DeploymentHandler) Release(ctx context.Context, scope, name string, out
 
 			_ = h.appendReleaseRecord(ctx, app, record)
 
+			fireDeployWebhook(h.Webhooks, h.logf, spec.OnDeploy, "deployment", scope, name, releaseID, spec.Image, "failure", err.Error(), rolloutStart, record.EndedAt)
+
 			return err
 		}
+
+		// Rolling restart succeeded — fire success now rather than
+		// at function bottom so the operator's hook fires before
+		// any post_command runs (post_command is allowed to fail
+		// without rolling back, so we wouldn't want a post-failure
+		// to mask a successful rollout in the webhook).
+		fireDeployWebhook(h.Webhooks, h.logf, spec.OnDeploy, "deployment", scope, name, releaseID, spec.Image, "success", "", rolloutStart, time.Now().UTC())
 	}
 
 	// post_command after restart.

@@ -2438,6 +2438,129 @@ registry "ghcr" {
 	}
 }
 
+// TestParseHCLDeploymentOnDeploy pins the on_deploy webhook block:
+// both success and failure URLs round-trip through the parser and
+// land on DeploymentSpec.OnDeploy verbatim. The block has NO defaults
+// — an operator who omits either field gets the empty string, which
+// the runtime interprets as "no webhook for this outcome." Locking
+// in the verbatim shape protects against accidental URL trimming or
+// scheme rewriting at the parser layer.
+func TestParseHCLDeploymentOnDeploy(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    success = "https://hooks.slack.com/services/T1/B1/abc"
+    failure = "https://hooks.slack.com/services/T1/B1/xyz"
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.OnDeploy == nil {
+		t.Fatal("on_deploy missing in parsed spec")
+	}
+
+	if spec.OnDeploy.Success != "https://hooks.slack.com/services/T1/B1/abc" {
+		t.Errorf("success: got %q", spec.OnDeploy.Success)
+	}
+
+	if spec.OnDeploy.Failure != "https://hooks.slack.com/services/T1/B1/xyz" {
+		t.Errorf("failure: got %q", spec.OnDeploy.Failure)
+	}
+}
+
+// TestParseHCLDeploymentLogs pins the logs cap block: both fields
+// round-trip through the parser without docker-side coercion (no
+// "10m" → bytes conversion at parse time; that's the runtime
+// driver's job). Operator-declared values win over the platform
+// default — which means TWO things this test asserts: the values
+// land verbatim, AND applyLogsDefaults does NOT clobber them.
+func TestParseHCLDeploymentLogs(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  logs {
+    max_size  = "50m"
+    max_files = 5
+  }
+}
+`
+	tmp := writeTemp(t, "dep_logs.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Logs == nil {
+		t.Fatal("logs missing in parsed spec")
+	}
+
+	if spec.Logs.MaxSize != "50m" {
+		t.Errorf("max_size: got %q, want %q", spec.Logs.MaxSize, "50m")
+	}
+
+	if spec.Logs.MaxFiles != 5 {
+		t.Errorf("max_files: got %d, want 5", spec.Logs.MaxFiles)
+	}
+}
+
+// TestApplyDefaults_LogsDefaults locks in the "no logs block →
+// platform default" contract. Without this default, a deployment
+// declared with the bare minimum (image only) would inherit
+// docker's daemon default of unbounded logs — a crash-looping
+// container could fill the host disk silently in hours. The
+// default protects every deployment unless the operator opts
+// out by declaring custom values.
+func TestApplyDefaults_LogsDefaults(t *testing.T) {
+	src := `deployment "prod" "api" { image = "nginx:1.27" }`
+
+	tmp := writeTemp(t, "dep_default_logs.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Logs == nil {
+		t.Fatal("logs default missing — applyDefaults must synthesise a LogsSpec when omitted")
+	}
+
+	if spec.Logs.MaxSize != "10m" {
+		t.Errorf("default max_size: got %q, want %q", spec.Logs.MaxSize, "10m")
+	}
+
+	if spec.Logs.MaxFiles != 3 {
+		t.Errorf("default max_files: got %d, want 3", spec.Logs.MaxFiles)
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 
