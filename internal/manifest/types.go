@@ -141,6 +141,20 @@ type DeploymentSpec struct {
 	// for the field shape and value conventions.
 	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
+	// Autoscale is the optional CPU-driven horizontal autoscale block.
+	// When set, voodu's autoscaler runs a periodic decision loop —
+	// reading runtime CPU% via the same StatsCollector that powers
+	// `vd stats` — and writes the new desired replica count back to
+	// this deployment's spec. The reconciler picks the change up via
+	// the standard watch path; no separate control plane.
+	//
+	// Mutually exclusive with the top-level `replicas` field at parse
+	// time: an operator either pins a static count OR delegates to
+	// the autoscaler, never both. See AutoscaleSpec for the per-field
+	// contract (min/max bounds, target band, separate up/down
+	// cooldowns).
+	Autoscale *AutoscaleSpec `yaml:"autoscale,omitempty" json:"autoscale,omitempty"`
+
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
 	// asset content drift triggers rolling restart without the
@@ -148,6 +162,79 @@ type DeploymentSpec struct {
 	// this field — the apply pipeline stamps it post plugin-expand.
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// AutoscaleSpec is the M7 CPU-based horizontal autoscale block. Lives
+// on DeploymentSpec.Autoscale. When present, voodu's autoscaler owns
+// the deployment's effective replica count: a periodic loop (15s
+// default) reads CPU% across running replicas via the shared
+// StatsCollector and adjusts replicas up or down by one within the
+// declared bounds.
+//
+//	deployment "clowk-lp" "worker" {
+//	  image = "..."
+//
+//	  autoscale {
+//	    min           = 2
+//	    max           = 10
+//	    cpu_target    = 70
+//	    cooldown_up   = "30s"     # default 30s
+//	    cooldown_down = "5m"      # default 5m
+//	  }
+//	}
+//
+// Decision band (hysteresis to dampen thrash):
+//
+//   - mean CPU > target * 1.1 → scale up by 1 (if replicas < max
+//     AND now - lastUp >= cooldown_up)
+//   - mean CPU < target * 0.7 → scale down by 1 (if replicas > min
+//     AND now - lastDown >= cooldown_down)
+//   - otherwise: hold
+//
+// Asymmetric cooldown is deliberate: scale-up is cheap to undo, so
+// the operator wants quick response to load; scale-down is what
+// causes 503s under bursty traffic, so it's intentionally
+// conservative. Defaults (30s up, 5m down) reflect the
+// "respond fast, retreat slowly" posture most workloads want.
+//
+// Validation (parse-time):
+//   - Min >= 1 (zero-replica deployments aren't supported)
+//   - Max >= Min
+//   - CPUTarget in (0, 100]
+//   - Mutex against DeploymentSpec.Replicas (one or the other)
+//
+// CooldownUp / CooldownDown are time.ParseDuration strings. Empty
+// values default at controller-side, not parse-side — the operator
+// can write `autoscale { min = 2 max = 10 cpu_target = 70 }` and
+// get the defaults without typing them.
+type AutoscaleSpec struct {
+	// Min is the floor — the autoscaler will never scale below this.
+	// Doubles as the initial replica count when applyDefaults runs
+	// (so a deployment with autoscale but no explicit replicas boots
+	// with Min pods, not 1).
+	Min int `yaml:"min,omitempty" json:"min,omitempty"`
+
+	// Max is the ceiling. Hard-stop on scale-up — protects the host
+	// from runaway scale events under genuine traffic spikes.
+	Max int `yaml:"max,omitempty" json:"max,omitempty"`
+
+	// CPUTarget is the per-replica CPU% the autoscaler tries to
+	// keep the fleet's mean at. The hysteresis bands (target * 0.7
+	// to target * 1.1) widen the "hold" zone so noise doesn't
+	// trigger churn.
+	CPUTarget int `yaml:"cpu_target,omitempty" json:"cpu_target,omitempty"`
+
+	// CooldownUp is the minimum wall-clock duration between scale-
+	// up events. time.ParseDuration string ("30s", "1m", "2m30s").
+	// Empty → 30s default. Short by design — scale-up is the cheap
+	// direction.
+	CooldownUp string `yaml:"cooldown_up,omitempty" json:"cooldown_up,omitempty"`
+
+	// CooldownDown is the minimum wall-clock duration between
+	// scale-down events. Empty → 5m default. Long by design — a
+	// fleet that scaled up under a 30s burst shouldn't immediately
+	// scale back down only to flap up again on the next burst.
+	CooldownDown string `yaml:"cooldown_down,omitempty" json:"cooldown_down,omitempty"`
 }
 
 // BuildSpec is the docker-compose-shaped build-mode block. Declared
@@ -319,6 +406,20 @@ type LangSpec struct {
 func (s *DeploymentSpec) applyDefaults() {
 	if s.HealthCheck == "" {
 		s.HealthCheck = "/"
+	}
+
+	// When `autoscale {}` is declared and the operator hasn't pinned
+	// a starting replica count, seed Replicas with autoscale.Min so
+	// the first reconcile boots the floor (Min pods), not the
+	// effectiveReplicas() default of 1. The autoscaler then takes
+	// over and writes new counts back to spec.Replicas as load
+	// dictates — Min stays the floor, Max the ceiling.
+	//
+	// Mutex against an explicit `replicas = N` is enforced at parse
+	// time (errAutoscaleReplicasMix), so by the time we land here we
+	// know s.Replicas is zero whenever s.Autoscale is set.
+	if s.Autoscale != nil && s.Replicas == 0 && s.Autoscale.Min > 0 {
+		s.Replicas = s.Autoscale.Min
 	}
 
 	if s.Image != "" {

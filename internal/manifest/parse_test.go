@@ -486,6 +486,203 @@ job "scope" "migrate" {
 	}
 }
 
+// TestParseHCLDeploymentAutoscale pins the wire shape of the M7
+// `autoscale { ... }` block: every field round-trips into the typed
+// AutoscaleSpec, the spec.Autoscale pointer is non-nil, and the
+// rest of the deployment surface (image, image-mode-mutex with
+// build, etc.) keeps working.
+func TestParseHCLDeploymentAutoscale(t *testing.T) {
+	src := `
+deployment "prod" "worker" {
+  image = "ghcr.io/acme/worker:1.0.0"
+
+  autoscale {
+    min           = 2
+    max           = 10
+    cpu_target    = 70
+    cooldown_up   = "30s"
+    cooldown_down = "5m"
+  }
+}
+`
+	tmp := writeTemp(t, "dep_autoscale.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Autoscale == nil {
+		t.Fatal("autoscale missing in parsed spec")
+	}
+
+	if spec.Autoscale.Min != 2 {
+		t.Errorf("min: %d", spec.Autoscale.Min)
+	}
+
+	if spec.Autoscale.Max != 10 {
+		t.Errorf("max: %d", spec.Autoscale.Max)
+	}
+
+	if spec.Autoscale.CPUTarget != 70 {
+		t.Errorf("cpu_target: %d", spec.Autoscale.CPUTarget)
+	}
+
+	if spec.Autoscale.CooldownUp != "30s" {
+		t.Errorf("cooldown_up: %q", spec.Autoscale.CooldownUp)
+	}
+
+	if spec.Autoscale.CooldownDown != "5m" {
+		t.Errorf("cooldown_down: %q", spec.Autoscale.CooldownDown)
+	}
+}
+
+// TestParseHCLDeploymentAutoscale_RejectsReplicasMix pins the mutex
+// rule. An operator pinning a static replica count AND declaring an
+// autoscale block is ambiguous — one of the two takes effect, the
+// other becomes a footgun. The parser must reject up-front.
+func TestParseHCLDeploymentAutoscale_RejectsReplicasMix(t *testing.T) {
+	src := `
+deployment "prod" "worker" {
+  image    = "ghcr.io/acme/worker:1.0.0"
+  replicas = 3
+
+  autoscale {
+    min        = 2
+    max        = 10
+    cpu_target = 70
+  }
+}
+`
+	tmp := writeTemp(t, "dep_autoscale_mix.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected parse error for replicas + autoscale combo")
+	}
+
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error must mention mutual exclusivity, got: %v", err)
+	}
+}
+
+// TestApplyDefaults_AutoscaleSetsInitialReplicasToMin pins the
+// bootstrap semantics: a deployment with only an autoscale block
+// (no explicit replicas) should seed Replicas with autoscale.Min so
+// the first reconcile boots at the floor, not the legacy default
+// of 1. Without this, an autoscaled deployment with min = 5 would
+// start with 1 pod and the autoscaler would have to ramp up over
+// several ticks.
+func TestApplyDefaults_AutoscaleSetsInitialReplicasToMin(t *testing.T) {
+	src := `
+deployment "prod" "worker" {
+  image = "ghcr.io/acme/worker:1.0.0"
+
+  autoscale {
+    min        = 5
+    max        = 20
+    cpu_target = 70
+  }
+}
+`
+	tmp := writeTemp(t, "dep_autoscale_initial.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Replicas != 5 {
+		t.Errorf("expected Replicas to be seeded to Min (5), got %d", spec.Replicas)
+	}
+}
+
+// TestParseHCLDeploymentAutoscale_RejectsBadBounds pins the
+// numeric guard rails — operators should get a parse error for
+// nonsense (min < 1, max < min, target outside (0, 100]) rather
+// than a silently-broken scaler at runtime.
+func TestParseHCLDeploymentAutoscale_RejectsBadBounds(t *testing.T) {
+	tpl := func(min, max, target int) string {
+		return "deployment \"p\" \"w\" {\n" +
+			"  image = \"x\"\n" +
+			"  autoscale {\n" +
+			"    min        = " + itoa(min) + "\n" +
+			"    max        = " + itoa(max) + "\n" +
+			"    cpu_target = " + itoa(target) + "\n" +
+			"  }\n" +
+			"}\n"
+	}
+
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"min zero", tpl(0, 5, 70), "autoscale.min must be >= 1"},
+		{"max less than min", tpl(5, 2, 70), "autoscale.max"},
+		{"cpu_target zero", tpl(1, 5, 0), "autoscale.cpu_target"},
+		{"cpu_target over 100", tpl(1, 5, 150), "autoscale.cpu_target"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmp := writeTemp(t, "bad.hcl", c.src)
+
+			_, err := ParseFile(tmp, nil)
+			if err == nil {
+				t.Fatal("expected parse error")
+			}
+
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error should mention %q, got: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// itoa is a tiny local int-to-string helper so the HCL templates
+// stay readable. strconv.Itoa would work but would mean an extra
+// import for a 6-line function used only in one test.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+
+	var buf [20]byte
+
+	i := len(buf)
+
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+
+	return string(buf[i:])
+}
+
 func TestParseHCLMultiKind(t *testing.T) {
 	src := `
 deployment "test" "api" {
