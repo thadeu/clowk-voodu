@@ -861,6 +861,78 @@ func (b hclCronJob) spec() (CronJobSpec, error) {
 	}, nil
 }
 
+// hclRegistry is the HCL surface for the private-registry pull-
+// secret block. One label (the registry's name); url/username/token
+// all required — see manifest.RegistrySpec for the operator-facing
+// contract and the rationale for the singleton-per-host shape.
+//
+// `Password` is the alias path: operators reflexively write
+// `password = "..."` when copying from older docker / ECR examples,
+// and forcing them to translate it to `token` is busywork that
+// scares off the on-ramp. The spec() conversion below picks
+// whichever of the two is non-empty (with the explicit Token field
+// winning if both happen to be set — see spec()).
+//
+// All fields are HCL-optional rather than required because gohcl
+// surfaces missing-required-attribute errors with a generic
+// diagnostic that doesn't mention the kind. We declare them
+// optional here and validate explicitly in spec() so the error
+// message reads `registry/ghcr: url is required` instead of the
+// HCL parser's generic "The argument is required".
+type hclRegistry struct {
+	URL      string `hcl:"url,optional"`
+	Username string `hcl:"username,optional"`
+	Token    string `hcl:"token,optional"`
+	Password string `hcl:"password,optional"`
+}
+
+// spec validates the required field set and folds the password
+// alias into Token. Returns a typed error per missing field so
+// the operator sees exactly what to add — `registry/ghcr: url is
+// required` is a one-step fix; the gohcl-default "Missing required
+// argument" is two steps (operator has to guess which kind the
+// surface belongs to first).
+func (b hclRegistry) spec() (RegistrySpec, error) {
+	token := b.Token
+	if token == "" {
+		token = b.Password
+	}
+
+	if b.URL == "" {
+		return RegistrySpec{}, fmt.Errorf("url is required")
+	}
+
+	if b.Username == "" {
+		return RegistrySpec{}, fmt.Errorf("username is required")
+	}
+
+	if token == "" {
+		return RegistrySpec{}, fmt.Errorf("token (or password) is required")
+	}
+
+	return RegistrySpec{
+		URL:      b.URL,
+		Username: b.Username,
+		Token:    token,
+	}, nil
+}
+
+// requireSingleLabel is the unscoped, one-label counterpart of
+// requireScopedLabels. Registry blocks carry just their name as
+// the single label (`registry "ghcr"`) — there's no scope segment
+// because the underlying ~/.docker/config.json is global per host.
+func requireSingleLabel(blk *hclsyntax.Block) (name string, err error) {
+	if len(blk.Labels) != 1 {
+		return "", fmt.Errorf("%s block needs exactly one label (the registry name), got %d", blk.Type, len(blk.Labels))
+	}
+
+	if blk.Labels[0] == "" {
+		return "", fmt.Errorf("%s block: name label must be non-empty", blk.Type)
+	}
+
+	return blk.Labels[0], nil
+}
+
 // parseHCL is the dynamic-block-aware HCL parser. It iterates over
 // every top-level block in the file via hclsyntax (to keep
 // "unknown" block types around — that's what the plugin system
@@ -1039,9 +1111,41 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 	case "asset":
 		return decodeAssetBlock(blk, source)
 
+	case "registry":
+		return decodeRegistryBlock(blk)
+
 	default:
 		return decodePluginBlock(blk)
 	}
+}
+
+// decodeRegistryBlock turns `registry "ghcr" { url = ..., username
+// = ..., token = ... }` into a single Manifest with Kind=registry,
+// no scope, Name=label. See manifest.RegistrySpec for the wire-
+// shape contract; the parser only enforces label arity and
+// required-field presence (via hclRegistry.spec).
+func decodeRegistryBlock(blk *hclsyntax.Block) ([]controller.Manifest, error) {
+	name, err := requireSingleLabel(blk)
+	if err != nil {
+		return nil, err
+	}
+
+	var r hclRegistry
+	if d := gohcl.DecodeBody(blk.Body, nil, &r); d.HasErrors() {
+		return nil, d
+	}
+
+	spec, err := r.spec()
+	if err != nil {
+		return nil, fmt.Errorf("registry/%s: %w", name, err)
+	}
+
+	m, err := encode(controller.KindRegistry, "", name, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	return []controller.Manifest{m}, nil
 }
 
 // decodeAssetBlock collects every body attribute as one entry in
@@ -1553,6 +1657,10 @@ func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, err
 
 	case controller.KindAsset:
 		var s AssetSpec
+		return s, node.Decode(&s)
+
+	case controller.KindRegistry:
+		var s RegistrySpec
 		return s, node.Decode(&s)
 
 	default:

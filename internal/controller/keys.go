@@ -37,6 +37,19 @@ const (
 	KindJob         Kind = "job"
 	KindCronJob     Kind = "cronjob"
 	KindAsset       Kind = "asset"
+	// KindRegistry is the private-registry pull-secret kind. Operators
+	// declare one block per registry hostname; the controller persists
+	// each spec under /desired/registrys/<name> and (re)generates the
+	// host's `~/.docker/config.json` atomically so subsequent
+	// `docker pull` calls authenticate transparently — no manual
+	// `docker login` on the box.
+	//
+	// Unscoped: the docker config file is global to the host, so
+	// (name → url+auth) pairs are singleton per host. Two scopes
+	// declaring the same registry name would clobber each other —
+	// the unscoped contract makes the duplicate detection at
+	// /apply trivial.
+	KindRegistry Kind = "registry"
 )
 
 var validKinds = map[Kind]bool{
@@ -46,6 +59,7 @@ var validKinds = map[Kind]bool{
 	KindJob:         true,
 	KindCronJob:     true,
 	KindAsset:       true,
+	KindRegistry:    true,
 }
 
 // ParseKind returns the canonical Kind for either the singular or plural
@@ -64,7 +78,7 @@ func ParseKind(s string) (Kind, error) {
 		return trimmed, nil
 	}
 
-	return "", fmt.Errorf("unknown kind %q (valid: deployment, statefulset, ingress, job, cronjob, asset)", s)
+	return "", fmt.Errorf("unknown kind %q (valid: deployment, statefulset, ingress, job, cronjob, asset, registry)", s)
 }
 
 // DesiredPrefix returns "/desired/<kind>s/" — the prefix covering every

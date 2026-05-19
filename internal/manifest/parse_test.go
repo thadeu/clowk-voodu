@@ -2092,6 +2092,155 @@ func TestParseHCLDeploymentAutoBuildDefault(t *testing.T) {
 	}
 }
 
+// TestParseHCLRegistry pins the canonical registry block shape:
+// one label (the registry's name), `url`/`username`/`token` body
+// attributes, no scope segment in the wire manifest, and the
+// RegistrySpec carries through unchanged. The M2 contract this
+// test locks in: registry is a CORE kind (KindRegistry), not a
+// plugin block — `vd apply` must not route it through the plugin
+// expand pipeline. A regression to plugin-block status would
+// cause this test to fail at the `mans[0].Kind` assertion.
+func TestParseHCLRegistry(t *testing.T) {
+	src := `
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "thadeu"
+  token    = "ghp_secret"
+}
+`
+	tmp := writeTemp(t, "registry.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	got := mans[0]
+
+	if got.Kind != controller.KindRegistry {
+		t.Errorf("Kind: got %q, want %q (registry is a core kind, not a plugin block)", got.Kind, controller.KindRegistry)
+	}
+
+	if got.Scope != "" {
+		t.Errorf("Scope: got %q, want empty (registry is unscoped — singleton per host)", got.Scope)
+	}
+
+	if got.Name != "ghcr" {
+		t.Errorf("Name: got %q, want %q (block label)", got.Name, "ghcr")
+	}
+
+	var spec RegistrySpec
+	if err := json.Unmarshal(got.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.URL != "ghcr.io" {
+		t.Errorf("URL: got %q, want %q", spec.URL, "ghcr.io")
+	}
+
+	if spec.Username != "thadeu" {
+		t.Errorf("Username: got %q, want %q", spec.Username, "thadeu")
+	}
+
+	if spec.Token != "ghp_secret" {
+		t.Errorf("Token: got %q, want %q", spec.Token, "ghp_secret")
+	}
+}
+
+// TestParseHCLRegistry_PasswordAlias verifies the `password = "..."`
+// ergonomic alias — some operators have muscle memory from older
+// docker / ECR / Quay tutorials that spell the credential field
+// `password`, and forcing them to translate to `token` is busywork
+// that scares off the on-ramp. Both spellings must decode into the
+// same wire Token field so the controller's auth-emission path
+// stays a single shape regardless of which keyword the operator
+// wrote.
+func TestParseHCLRegistry_PasswordAlias(t *testing.T) {
+	src := `
+registry "dockerhub" {
+  url      = "registry-1.docker.io"
+  username = "robot"
+  password = "dckr_pat_xyz"
+}
+`
+	tmp := writeTemp(t, "registry_password.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	var spec RegistrySpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Token != "dckr_pat_xyz" {
+		t.Errorf("password alias: Token got %q, want %q (password should decode into Token)", spec.Token, "dckr_pat_xyz")
+	}
+}
+
+// TestParseHCLRegistry_RequiredFields pins the parse-time
+// rejection for half-configured blocks. A registry missing any
+// of url / username / token would emit an `auths` entry that
+// breaks docker's credential helper code path more often than
+// it helps, so we reject at apply time with a kind-prefixed
+// message the operator can act on directly.
+func TestParseHCLRegistry_RequiredFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		src      string
+		wantSubs string
+	}{
+		{
+			name: "missing url",
+			src: `
+registry "ghcr" {
+  username = "thadeu"
+  token    = "x"
+}`,
+			wantSubs: "url is required",
+		},
+		{
+			name: "missing username",
+			src: `
+registry "ghcr" {
+  url   = "ghcr.io"
+  token = "x"
+}`,
+			wantSubs: "username is required",
+		},
+		{
+			name: "missing token AND password",
+			src: `
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "thadeu"
+}`,
+			wantSubs: "token (or password) is required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := writeTemp(t, "registry_invalid.hcl", tc.src)
+
+			_, err := ParseFile(tmp, nil)
+			if err == nil {
+				t.Fatalf("want parse error containing %q, got nil", tc.wantSubs)
+			}
+
+			if !strings.Contains(err.Error(), tc.wantSubs) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantSubs)
+			}
+		})
+	}
+}
+
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
 

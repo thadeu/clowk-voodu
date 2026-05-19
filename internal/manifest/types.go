@@ -713,6 +713,62 @@ type CronJobSpec struct {
 	FailedHistoryLimit int `yaml:"failed_history_limit,omitempty" json:"failed_history_limit,omitempty"`
 }
 
+// RegistrySpec is the wire shape for a private-registry pull secret.
+// Each block declares one entry under `auths` in the host's docker
+// config; the controller atomically regenerates ~/.docker/config.json
+// whenever a registry manifest is created, updated, or deleted, so
+// any subsequent `docker pull` (deployment image fetch, build cache,
+// CI run) authenticates without a manual `docker login` on the box.
+//
+//	registry "ghcr" {
+//	  url      = "ghcr.io"
+//	  username = "${GHCR_USER}"
+//	  token    = "${GHCR_TOKEN}"
+//	}
+//
+// All three fields are required at parse time — a half-configured
+// registry block would emit an `auths` entry that breaks docker's
+// credential helper code path more often than it helps, so reject
+// loudly instead of silently shipping a busted config.
+//
+// `password` is accepted as an alias of `token` in the HCL surface
+// (some upstream registries — Docker Hub, generic SSO-fronted
+// instances — use one term; others — GHCR, GitLab — use the other).
+// Both decode into the same `Token` field on the wire spec; the
+// HCL surface chooses which keyword reads more naturally to the
+// operator and stays out of the way of muscle memory.
+//
+// Identity is singleton per host: the block's label IS the registry
+// name, no scope segment. Two scopes can't both declare
+// `registry "ghcr"` because `~/.docker/config.json` is global state
+// — uniqueness is enforced at /apply via the standard
+// (kind, scope, name) duplicate-detection sweep on parse output.
+type RegistrySpec struct {
+	// URL is the registry hostname as docker sees it on the wire —
+	// `ghcr.io`, `registry-1.docker.io`, `index.docker.io`,
+	// `gitlab.example.com:5050`. Whatever the operator would put
+	// after `docker login` on the CLI lands here verbatim.
+	//
+	// No scheme (`https://`) — docker config.json stores the bare
+	// host (or host:port). The controller doesn't normalise input;
+	// operators using a non-standard form get back exactly what
+	// they wrote so the resulting config.json matches the manual
+	// `docker login` shape they may already have habits around.
+	URL string `yaml:"url" json:"url"`
+
+	// Username is the registry account name. Forwarded as-is into
+	// the base64-encoded `auth` field of the docker config entry.
+	Username string `yaml:"username" json:"username"`
+
+	// Token is the secret half of the basic auth pair. Named
+	// `token` because the overwhelmingly common case in 2026 is
+	// a Personal Access Token (GHCR, GitLab, Quay) or a registry-
+	// scoped service-account credential, not a literal password.
+	// The HCL parser ALSO accepts `password = "..."` as an alias
+	// and decodes into this same field — see RegistrySpec doc.
+	Token string `yaml:"token" json:"token"`
+}
+
 type IngressTLS struct {
 	Enabled  bool   `yaml:"enabled,omitempty"  json:"enabled,omitempty"`
 	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`

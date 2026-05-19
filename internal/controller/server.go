@@ -181,6 +181,18 @@ func (s *Server) Start(ctx context.Context) error {
 		Log:   s.cfg.Logger,
 	}
 
+	// Registry handler owns ~/.docker/config.json on the host: each
+	// `registry "name" { … }` manifest becomes one entry under
+	// `auths`, regenerated atomically on every Put / Delete watch
+	// event. DockerConfigPath stays empty so the handler resolves
+	// $HOME/.docker/config.json at reconcile time — production
+	// runs the controller as the same user that shells out to
+	// `docker pull`, so one HOME == one config file.
+	registryHandler := &RegistryHandler{
+		Store: store,
+		Log:   s.cfg.Logger,
+	}
+
 	stsHandler := &StatefulsetHandler{
 		Store: store,
 		Log:   s.cfg.Logger,
@@ -286,6 +298,7 @@ func (s *Server) Start(ctx context.Context) error {
 			KindJob:         jobHandler.Handle,
 			KindCronJob:     cronJobHandler.Handle,
 			KindAsset:       assetHandler.Handle,
+			KindRegistry:    registryHandler.Handle,
 		},
 	}
 
