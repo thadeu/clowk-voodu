@@ -293,6 +293,143 @@ func TestRenderDescribeDeployment(t *testing.T) {
 	}
 }
 
+// TestRenderDescribeReadiness pins the M1.2/M1.3 surface:
+// `vd describe deployment` shows the per-replica readiness map
+// when probes are declared, including the gating fields
+// (startup=waiting when startup probe hasn't passed yet) and
+// the last probe Reason for the unhealthy case.
+func TestRenderDescribeReadiness(t *testing.T) {
+	manifest := &controller.Manifest{
+		Kind: controller.KindDeployment, Scope: "api", Name: "web",
+		Spec: json.RawMessage(`{"image":"img:1"}`),
+	}
+
+	statusBlob, _ := json.Marshal(controller.DeploymentStatus{
+		Image:    "img:1",
+		SpecHash: "abc",
+		ReplicaReadiness: map[string]controller.ReplicaReadinessStatus{
+			"api-web.a1": {
+				ContainerName: "api-web.a1", ReplicaID: "a1",
+				Ready: true, StartupPassed: true, ReadinessPhase: "healthy",
+			},
+			"api-web.b2": {
+				ContainerName: "api-web.b2", ReplicaID: "b2",
+				Ready: false, StartupPassed: false,
+				Reason: "GET /ready -> 502",
+			},
+		},
+	})
+
+	var buf bytes.Buffer
+	if err := renderDescribe(&buf, manifest, statusBlob, nil, nil, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	out := buf.String()
+
+	if !strings.Contains(out, "readiness:") {
+		t.Errorf("missing readiness section: %q", out)
+	}
+
+	if !strings.Contains(out, "ready=true") {
+		t.Errorf("missing ready=true for healthy replica: %q", out)
+	}
+
+	if !strings.Contains(out, "startup=waiting") {
+		t.Errorf("missing startup=waiting for replica with pending startup: %q", out)
+	}
+
+	if !strings.Contains(out, `reason="GET /ready -> 502"`) {
+		t.Errorf("missing reason for failing replica: %q", out)
+	}
+
+	// Healthy replica's startup state shouldn't clutter the
+	// output — startup=passed is the default, omit it.
+	if strings.Contains(out, "startup=passed") {
+		t.Errorf("redundant startup=passed should be omitted: %q", out)
+	}
+}
+
+// TestRenderDescribeInitFailures pins the M5 surface:
+// `vd describe deployment` shows init container failures as a
+// dedicated section, sorted newest-first, with exit code +
+// error message clipped at 200 chars.
+func TestRenderDescribeInitFailures(t *testing.T) {
+	manifest := &controller.Manifest{
+		Kind: controller.KindDeployment, Scope: "api", Name: "web",
+		Spec: json.RawMessage(`{"image":"img:1"}`),
+	}
+
+	statusBlob, _ := json.Marshal(controller.DeploymentStatus{
+		Image:    "img:1",
+		SpecHash: "abc",
+		InitFailures: []controller.InitFailure{
+			{
+				ReplicaID: "a1", InitName: "migrate",
+				ExitCode: 1, Attempts: 3,
+				Error:      "container exited 1: PG::Error",
+				RecordedAt: time.Now().Add(-5 * time.Minute),
+			},
+		},
+	})
+
+	var buf bytes.Buffer
+	if err := renderDescribe(&buf, manifest, statusBlob, nil, nil, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	out := buf.String()
+
+	if !strings.Contains(out, "init failures (recent):") {
+		t.Errorf("missing init failures section: %q", out)
+	}
+
+	if !strings.Contains(out, "init=migrate") {
+		t.Errorf("missing init name: %q", out)
+	}
+
+	if !strings.Contains(out, "exit=1") {
+		t.Errorf("missing exit code: %q", out)
+	}
+
+	if !strings.Contains(out, "attempts=3") {
+		t.Errorf("missing attempts: %q", out)
+	}
+
+	if !strings.Contains(out, "PG::Error") {
+		t.Errorf("missing error message: %q", out)
+	}
+}
+
+// TestRenderDescribeNoReadinessNoSection verifies the
+// backward-compat clean view: a deployment with no probes (and
+// no init failures) doesn't get spurious empty sections.
+func TestRenderDescribeNoReadinessNoSection(t *testing.T) {
+	manifest := &controller.Manifest{
+		Kind: controller.KindDeployment, Scope: "api", Name: "web",
+		Spec: json.RawMessage(`{"image":"img:1"}`),
+	}
+
+	statusBlob, _ := json.Marshal(controller.DeploymentStatus{
+		Image: "img:1", SpecHash: "abc",
+	})
+
+	var buf bytes.Buffer
+	if err := renderDescribe(&buf, manifest, statusBlob, nil, nil, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	out := buf.String()
+
+	if strings.Contains(out, "readiness:") {
+		t.Errorf("readiness section appeared with no data: %q", out)
+	}
+
+	if strings.Contains(out, "init failures") {
+		t.Errorf("init failures section appeared with no data: %q", out)
+	}
+}
+
 // TestRenderDescribeDeploymentWithSpecDump locks in the `-o spec`
 // behaviour: same view as text PLUS the raw manifest spec under a
 // "spec:" heading.

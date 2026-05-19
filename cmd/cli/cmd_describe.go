@@ -397,6 +397,106 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage, pods []controlle
 	if len(st.Releases) > 0 {
 		renderReleaseSummaryInline(w, st.Releases, pods)
 	}
+
+	if len(st.ReplicaReadiness) > 0 {
+		renderReadinessInline(w, st.ReplicaReadiness)
+	}
+
+	if len(st.InitFailures) > 0 {
+		renderInitFailuresInline(w, st.InitFailures)
+	}
+}
+
+// renderReadinessInline shows the per-replica readiness map
+// when probes are declared. The most operator-useful at-a-glance
+// signal: which replicas are routing traffic right now.
+//
+//	readiness:
+//	  <container>   ready=true    startup=passed   phase=healthy
+//	  <container>   ready=false   startup=passed   phase=unhealthy  reason="GET /ready → 502"
+//
+// Sorted by container name for stable output across reconciles.
+func renderReadinessInline(w io.Writer, m map[string]controller.ReplicaReadinessStatus) {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+
+	sort.Strings(names)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  readiness:")
+
+	for _, n := range names {
+		s := m[n]
+		fmt.Fprintf(w, "    %s   %s\n", n, formatReadinessLine(s))
+	}
+}
+
+// formatReadinessLine renders one readiness entry as a compact
+// row. ready= comes first because it's the at-a-glance signal;
+// startup= is omitted when no startup probe was declared (clutter
+// reduction for the common case); reason= surfaces only when
+// non-empty.
+func formatReadinessLine(s controller.ReplicaReadinessStatus) string {
+	parts := []string{fmt.Sprintf("ready=%t", s.Ready)}
+
+	if !s.StartupPassed {
+		parts = append(parts, "startup=waiting")
+	}
+
+	if s.ReadinessPhase != "" {
+		parts = append(parts, "phase="+s.ReadinessPhase)
+	}
+
+	if s.Reason != "" {
+		parts = append(parts, fmt.Sprintf("reason=%q", s.Reason))
+	}
+
+	return strings.Join(parts, "   ")
+}
+
+// renderInitFailuresInline surfaces the recent-init-failure ring
+// buffer. Empty when no inits are configured or all are passing —
+// only fires the section when there's something to surface.
+//
+//	init failures (recent):
+//	  <replica>   init=<name>   exit=<code>   attempts=<n>   <age>   <error>
+//
+// Sort newest first (RecordedAt desc) so the most actionable
+// entry is at the top.
+func renderInitFailuresInline(w io.Writer, fails []controller.InitFailure) {
+	// Copy + sort newest-first.
+	sorted := append([]controller.InitFailure(nil), fails...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].RecordedAt.After(sorted[j].RecordedAt)
+	})
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  init failures (recent):")
+
+	for _, f := range sorted {
+		age := "-"
+		if !f.RecordedAt.IsZero() {
+			age = humanizeAge(time.Since(f.RecordedAt))
+		}
+
+		line := fmt.Sprintf("    %s   init=%s   exit=%d   attempts=%d   %s",
+			f.ReplicaID, f.InitName, f.ExitCode, f.Attempts, age)
+
+		if f.Error != "" {
+			// Cap the error display so a multi-line stack trace
+			// doesn't blow up the describe output.
+			err := f.Error
+			if len(err) > 200 {
+				err = err[:200] + "…"
+			}
+
+			line += "   " + err
+		}
+
+		fmt.Fprintln(w, line)
+	}
 }
 
 // renderReleaseSummaryInline drops a compact release block right
