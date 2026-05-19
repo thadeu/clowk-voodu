@@ -82,6 +82,12 @@ type jobSpec struct {
 	// applies to each tick's run container.
 	Resources *resourcesWireSpec `json:"resources,omitempty"`
 
+	// Logs caps the docker json-file log driver for the run
+	// container. Each invocation (one-shot job or cron tick)
+	// honours the same cap; nil falls through to the platform
+	// fallback in effectiveLogs.
+	Logs *logsWireSpec `json:"logs,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the job touches. Job hashing folds it in the same way
 	// deployments / statefulsets do — see statefulsetSpec.AssetDigests
@@ -371,6 +377,8 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		return run, fmt.Errorf("job/%s: %w", app, resErr)
 	}
 
+	jobLogMaxSize, jobLogMaxFiles := effectiveLogs(spec.Logs)
+
 	if err := h.Containers.Recreate(ContainerSpec{
 		Name:             cname,
 		Image:            spec.Image,
@@ -414,6 +422,8 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		Labels:        labels,
 		ExtraHosts:    spec.ExtraHosts,
 		CapAdd:        spec.CapAdd,
+		LogMaxSize:    jobLogMaxSize,
+		LogMaxFiles:   jobLogMaxFiles,
 		// AutoRemove is intentionally false: docker keeps the stopped
 		// container (and its json-file logs) so `voodu logs job <name>`
 		// can read them post-exit. The runner GCs old run containers

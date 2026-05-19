@@ -141,6 +141,20 @@ type DeploymentSpec struct {
 	// for the field shape and value conventions.
 	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
+	// OnDeploy carries the optional webhook URLs invoked once a
+	// rolling-restart completes (success) or fails. Best-effort —
+	// see OnDeploySpec for the retry / drop contract. Empty / nil
+	// is the steady-state shape: no posts, no log noise. Deliberately
+	// NOT folded into the spec hash: changing a webhook URL must not
+	// churn running replicas.
+	OnDeploy *OnDeploySpec `yaml:"on_deploy,omitempty" json:"on_deploy,omitempty"`
+
+	// Logs caps the docker json-file log driver per container. nil
+	// means "platform default" — applyDefaults synthesises a
+	// 10m/3-files cap so a runaway container can't fill the host
+	// disk silently. See LogsSpec for the operator-facing contract.
+	Logs *LogsSpec `yaml:"logs,omitempty" json:"logs,omitempty"`
+
 	// AssetDigests is server-stamped at apply time: a sha256 per
 	// asset ref the consumer uses. Folded into the spec hash so
 	// asset content drift triggers rolling restart without the
@@ -149,6 +163,78 @@ type DeploymentSpec struct {
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
 }
+
+// OnDeploySpec carries the operator-supplied webhook URLs invoked
+// at the END of a rolling-restart. Both fields are optional and
+// independent: an operator who only cares about failure pages can
+// declare `failure` alone and skip the chatty "everything's fine"
+// pings. Both empty means the block has no effect.
+//
+//	deployment "x" "api" {
+//	  on_deploy {
+//	    success = "https://hooks.slack.com/services/T../B../..."
+//	    failure = "https://hooks.slack.com/services/T../B../..."
+//	  }
+//	}
+//
+// Delivery is best-effort. The controller POSTs a small JSON
+// payload (kind, scope, name, release_id, image, status, error,
+// timestamps), retries 3 times with exponential backoff (1s, 5s,
+// 30s), and then drops on the floor. A webhook failure NEVER
+// fails the deploy — the rollout already happened and there's
+// nothing useful to "fail" by then.
+//
+// Payload shape is Slack-incoming-webhook compatible insofar as
+// generic services that consume "any JSON" will get a well-typed
+// blob; the operator's Slack-side formatting (block kit, plain
+// text) lives in the URL transformer of their choice. Discord and
+// generic HTTP listeners get the same shape.
+type OnDeploySpec struct {
+	Success string `yaml:"success,omitempty" json:"success,omitempty"`
+	Failure string `yaml:"failure,omitempty" json:"failure,omitempty"`
+}
+
+// LogsSpec caps the docker json-file log driver per container.
+// Equivalent to `docker run --log-opt max-size=X --log-opt
+// max-file=Y`. Empty / nil block falls through to the platform's
+// 10m / 3-files default (applied by applyDefaults) — voodu
+// refuses to ship a container with unbounded logs because a
+// chatty crash loop will fill the host disk silently otherwise.
+//
+//	deployment "x" "api" {
+//	  logs {
+//	    max_size  = "10m"
+//	    max_files = 3
+//	  }
+//	}
+//
+// Value formats:
+//   - MaxSize: k8s/docker-style suffixed string. "10m" = 10 MB,
+//     "1g" = 1 GB, "500k" = 500 KB. Bare digits are accepted by
+//     docker (interpreted as bytes); voodu passes through the
+//     literal string after validating shape only.
+//   - MaxFiles: positive integer. Docker rotates the active log
+//     file when it hits MaxSize, keeps the most-recent MaxFiles-1
+//     historical files alongside it (so total disk = roughly
+//     MaxSize * MaxFiles).
+//
+// Folded into the spec hash: changing the cap is a runtime
+// concern that requires recreating the container (docker freezes
+// log driver options at create time, `docker update` does not
+// touch them).
+type LogsSpec struct {
+	MaxSize  string `yaml:"max_size,omitempty"  json:"max_size,omitempty"`
+	MaxFiles int    `yaml:"max_files,omitempty" json:"max_files,omitempty"`
+}
+
+// Defaults applied when the operator omits the logs block entirely.
+// 10m * 3 files = ~30MB max per container — enough headroom for
+// reasonable apps to keep recent history without risking the host's
+// rootfs.
+const (
+	defaultLogsMaxSize  = "10m"
+	defaultLogsMaxFiles = 3
+)
 
 // BuildSpec is the docker-compose-shaped build-mode block. Declared
 // inside a resource (`build { ... }`) when the operator wants voodu to
@@ -321,6 +407,8 @@ func (s *DeploymentSpec) applyDefaults() {
 		s.HealthCheck = "/"
 	}
 
+	s.Logs = applyLogsDefaults(s.Logs)
+
 	if s.Image != "" {
 		return
 	}
@@ -332,6 +420,34 @@ func (s *DeploymentSpec) applyDefaults() {
 	if s.Build.Context == "" {
 		s.Build.Context = "."
 	}
+}
+
+// applyLogsDefaults fills the platform's 10m / 3-files cap when the
+// operator omitted the `logs {}` block entirely OR declared it
+// with one field set and the other left zero. Returns a non-nil
+// LogsSpec in every case — voodu's posture is "every container
+// gets a cap, no exceptions". An operator who explicitly wants
+// unbounded logs has to fork the controller; the silent disk-fill
+// failure mode the default prevents is too easy to hit otherwise.
+func applyLogsDefaults(s *LogsSpec) *LogsSpec {
+	if s == nil {
+		return &LogsSpec{
+			MaxSize:  defaultLogsMaxSize,
+			MaxFiles: defaultLogsMaxFiles,
+		}
+	}
+
+	out := *s
+
+	if out.MaxSize == "" {
+		out.MaxSize = defaultLogsMaxSize
+	}
+
+	if out.MaxFiles <= 0 {
+		out.MaxFiles = defaultLogsMaxFiles
+	}
+
+	return &out
 }
 
 // StatefulsetSpec is a deployment shape with stable per-pod identity:
@@ -419,6 +535,11 @@ type StatefulsetSpec struct {
 	// — see DeploymentSpec.Resources for shape and value rules.
 	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
+	// Logs caps the docker json-file log driver per ordinal — see
+	// DeploymentSpec.Logs for the operator-facing contract. The
+	// platform's 10m / 3-files default applies when omitted.
+	Logs *LogsSpec `yaml:"logs,omitempty" json:"logs,omitempty"`
+
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
 }
@@ -431,6 +552,8 @@ type StatefulsetSpec struct {
 // kafka) don't have a universal HTTP probe path the way HTTP apps do —
 // the operator picks `pg_isready`, `redis-cli ping`, etc.
 func (s *StatefulsetSpec) applyDefaults() {
+	s.Logs = applyLogsDefaults(s.Logs)
+
 	if s.Image != "" {
 		return
 	}
@@ -639,8 +762,23 @@ type JobSpec struct {
 	// model as long-running deployments.
 	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
 
+	// Logs caps the docker json-file log driver for the run
+	// container — see DeploymentSpec.Logs for the operator-facing
+	// contract. Inherited by cronjob via the embedded JobSpec, so
+	// scheduled ticks get the same cap as standalone runs.
+	Logs *LogsSpec `yaml:"logs,omitempty" json:"logs,omitempty"`
+
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+}
+
+// applyDefaults fills the per-run platform defaults that aren't
+// driver-level overrides (today: the logs cap). Image/build defaults
+// are NOT synthesised here — jobs always require an explicit image
+// (or build block), and the parser enforces that contract before we
+// reach applyDefaults.
+func (s *JobSpec) applyDefaults() {
+	s.Logs = applyLogsDefaults(s.Logs)
 }
 
 // DependsOn declares explicit, non-textual dependencies on other

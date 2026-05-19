@@ -108,10 +108,74 @@ type deploymentSpec struct {
 	// surface still shows the field as absent when unset).
 	Resources *resourcesWireSpec `json:"resources,omitempty"`
 
+	// OnDeploy carries the optional webhook URLs invoked at
+	// rolling-restart end (success / failure). See
+	// manifest.OnDeploySpec for the operator contract. Deliberately
+	// NOT in the spec hash — changing the URL must not churn
+	// replicas; the hooks fire on the NEXT rolling restart whatever
+	// the cause.
+	OnDeploy *onDeployWireSpec `json:"on_deploy,omitempty"`
+
+	// Logs caps the docker json-file log driver per replica. The
+	// parser synthesises a 10m/3 default when the operator omits
+	// the block, so a nil value here means "legacy spec from before
+	// the field existed" — the handler falls back to a hard-coded
+	// default in that case so an upgrade doesn't lose protection.
+	Logs *logsWireSpec `json:"logs,omitempty"`
+
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
 	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
+}
+
+// onDeployWireSpec mirrors manifest.OnDeploySpec — JSON tags match
+// so spec decode round-trips cleanly. Controller-local because
+// internal/manifest imports controller (cycle).
+type onDeployWireSpec struct {
+	Success string `json:"success,omitempty"`
+	Failure string `json:"failure,omitempty"`
+}
+
+// logsWireSpec mirrors manifest.LogsSpec. Same anti-cycle posture
+// as onDeployWireSpec.
+type logsWireSpec struct {
+	MaxSize  string `json:"max_size,omitempty"`
+	MaxFiles int    `json:"max_files,omitempty"`
+}
+
+// Hard-coded fallback for the rare legacy spec that doesn't carry a
+// logs block at all. Matches the manifest layer's default constants;
+// duplicated rather than imported because internal/manifest depends
+// on controller. Keep in sync with manifest.defaultLogsMaxSize /
+// defaultLogsMaxFiles — a discrepancy here is a silent
+// platform-default drift bug.
+const (
+	fallbackLogsMaxSize  = "10m"
+	fallbackLogsMaxFiles = 3
+)
+
+// effectiveLogs returns the (maxSize, maxFiles) pair the handler
+// passes through to the container manager. Honours the operator's
+// declaration when present; otherwise applies the platform fallback
+// so a legacy spec (decoded from a pre-M6 etcd blob) still benefits
+// from the protection.
+func effectiveLogs(spec *logsWireSpec) (maxSize string, maxFiles int) {
+	if spec == nil {
+		return fallbackLogsMaxSize, fallbackLogsMaxFiles
+	}
+
+	maxSize = spec.MaxSize
+	if maxSize == "" {
+		maxSize = fallbackLogsMaxSize
+	}
+
+	maxFiles = spec.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = fallbackLogsMaxFiles
+	}
+
+	return maxSize, maxFiles
 }
 
 // releaseSpec mirrors manifest.ReleaseSpec but lives in the
@@ -225,6 +289,13 @@ type DeploymentHandler struct {
 	// already-running release fails fast with a clear error
 	// instead of silently queueing.
 	releaseLocks sync.Map
+
+	// Webhooks is the on_deploy delivery seam. Optional —
+	// production wires HTTPWebhookPoster, tests pass a fake.
+	// When nil, the rolling-restart success/failure paths skip
+	// the call entirely (no-op when the operator doesn't use
+	// the feature and the handler wasn't configured for it).
+	Webhooks WebhookPoster
 }
 
 func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
@@ -299,15 +370,73 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 	return nil
 }
 
-func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
+func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) (retErr error) {
 	if ev.Manifest == nil {
 		return fmt.Errorf("put event without manifest")
 	}
+
+	// Mark the rollout's wall-clock start as early as possible —
+	// before any work that can fail — so the on_deploy webhook
+	// payload's started_at reflects the true beginning of the
+	// reconcile rather than (say) the moment we'd finished the
+	// spec decode.
+	startedAt := time.Now().UTC()
+
+	// On-deploy webhook delivery rides at the END of the apply
+	// path via a named-return defer. webhookCtx is populated as
+	// the apply progresses (spec decode, release ID mint, drift
+	// detection) and the deferred closure inspects (retErr,
+	// webhookCtx) to decide whether to fire the success or
+	// failure hook.
+	//
+	// Why a defer: the apply has half a dozen early-return error
+	// paths, and re-routing each through a wrapper that fires the
+	// failure hook would scatter the logic. The defer collects
+	// the result once at the bottom.
+	//
+	// Why "rolled-out" tracking: a no-op replay (hash unchanged,
+	// replicas unchanged, env unchanged) doesn't actually roll
+	// anything. Posting "success" on every reconcile of a
+	// steady-state deployment would spam the operator's Slack.
+	// We post ONLY when the reconcile produced visible
+	// container churn (created / recreated / restarted).
+	var (
+		webhookOnDeploy *onDeployWireSpec
+		webhookRolled   bool
+		webhookRelease  string
+		webhookImage    string
+	)
+
+	defer func() {
+		if webhookOnDeploy == nil {
+			return
+		}
+
+		completedAt := time.Now().UTC()
+
+		if retErr != nil {
+			fireDeployWebhook(h.Webhooks, h.logf, webhookOnDeploy, "deployment", ev.Scope, ev.Name, webhookRelease, webhookImage, "failure", retErr.Error(), startedAt, completedAt)
+			return
+		}
+
+		if !webhookRolled {
+			return
+		}
+
+		fireDeployWebhook(h.Webhooks, h.logf, webhookOnDeploy, "deployment", ev.Scope, ev.Name, webhookRelease, webhookImage, "success", "", startedAt, completedAt)
+	}()
 
 	spec, err := decodeDeploymentSpec(ev.Manifest)
 	if err != nil {
 		return err
 	}
+
+	// Capture the operator's on_deploy URLs upfront so an
+	// error-path return (e.g. unresolved ref, container manager
+	// blow-up) can still fire the failure hook. Spec decode is
+	// the earliest point we know which URLs are configured.
+	webhookOnDeploy = spec.OnDeploy
+	webhookImage = spec.Image
 
 	// Single on-host identity for this deployment: container slots,
 	// image tag, env file, release directory — everything is keyed by
@@ -597,6 +726,20 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) error {
 		}
 	}
 
+	// Signal the deferred webhook firer that this reconcile
+	// produced visible churn. createdAny covers first-apply +
+	// scale-up; recreatedAny covers spec/image drift recreate.
+	// Env-change-only rolling restarts (no recreate, no apply
+	// release ID) also count — those are operator-visible state
+	// changes that operators want to learn about. The env-change
+	// branch above handles its own error logging; we treat any
+	// envChanged rollout that reached this point as success since
+	// it didn't bubble up an error.
+	if createdAny || recreatedAny || envChanged {
+		webhookRolled = true
+		webhookRelease = applyReleaseID
+	}
+
 	return nil
 }
 
@@ -698,6 +841,8 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			return created, fmt.Errorf("deployment/%s replica %s: %w", name, cname, err)
 		}
 
+		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:             cname,
 			Image:            spec.Image,
@@ -716,6 +861,8 @@ func (h *DeploymentHandler) ensureReplicaCount(scope, name, app string, live []C
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			LogMaxSize:       logMaxSize,
+			LogMaxFiles:      logMaxFiles,
 		})
 		if err != nil {
 			return created, fmt.Errorf("ensure %s: %w", cname, err)
@@ -1006,6 +1153,8 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			return fmt.Errorf("deployment/%s rolling restart %s: %w", name, newName, err)
 		}
 
+		logMaxSize, logMaxFiles := effectiveLogs(spec.Logs)
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:             newName,
 			Image:            spec.Image,
@@ -1024,6 +1173,8 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			LogMaxSize:       logMaxSize,
+			LogMaxFiles:      logMaxFiles,
 		}); err != nil {
 			return fmt.Errorf("spawn replacement %s: %w", newName, err)
 		}
@@ -1548,6 +1699,7 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		CapAdd      []string           `json:"cap_add,omitempty"`
 		BuildArgs   map[string]string  `json:"build_args,omitempty"`
 		Resources   *resourcesWireSpec `json:"resources,omitempty"`
+		Logs        *logsWireSpec      `json:"logs,omitempty"`
 		Assets      []string           `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
@@ -1572,7 +1724,20 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		// pre-resources deployments so this change isn't a no-op
 		// rolling restart on existing fleets.
 		Resources: spec.Resources,
-		Assets:    flattenAssetDigests(assetDigests),
+		// Logs folds into the hash: docker freezes log driver options
+		// at container-create time (`docker update` doesn't touch
+		// them), so a change to max_size/max_files is only honoured
+		// after recreate. Without this mix-in, the operator edits the
+		// cap, applies, and the container quietly keeps the old
+		// budget — exactly the silent drift pattern Resources avoids
+		// above.
+		//
+		// OnDeploy is INTENTIONALLY OMITTED: changing a webhook URL
+		// is a notification-routing edit, not a runtime change.
+		// Rolling-restarting every replica because the operator
+		// edited a Slack URL would be unjustifiable churn.
+		Logs:   spec.Logs,
+		Assets: flattenAssetDigests(assetDigests),
 	}
 
 	// json.Marshal emits slice elements in declared order and struct

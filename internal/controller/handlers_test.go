@@ -249,6 +249,13 @@ type fakeContainers struct {
 	// canned text per container name. Absent entries return an empty
 	// reader, matching the real "no logs yet" case.
 	logsByName map[string]string
+
+	// ensureErr, when non-nil, makes every Ensure call return this
+	// error before any side effects. Used by webhook tests to drive
+	// the failure path of apply() without relying on a specific
+	// container-manager bug. Tests that don't set it get the
+	// default success behaviour.
+	ensureErr error
 }
 
 // seedSlot inserts a pre-existing M0-labeled container into the fake.
@@ -416,6 +423,10 @@ func (f *fakeContainers) Recreate(spec ContainerSpec) error {
 
 func (f *fakeContainers) Ensure(spec ContainerSpec) (bool, error) {
 	f.ensures = append(f.ensures, spec)
+
+	if f.ensureErr != nil {
+		return false, f.ensureErr
+	}
 
 	// Mirror the production contract: Ensure reports true only when it
 	// actually created a container. Pre-seeded slots get a "no-op"

@@ -159,6 +159,22 @@ type ContainerConfig struct {
 	// `cap_add`. Pre-validated by the manifest layer so we splice
 	// as-is.
 	CapAdd []string
+
+	// LogMaxSize and LogMaxFiles cap the docker json-file log
+	// driver per container — equivalent to docker-compose
+	// `logging.options.max-size` / `max-file`. Both must be set
+	// for the cap to land; if either is empty/zero we skip both
+	// `--log-opt` flags and inherit the daemon default
+	// (unbounded). The controller's handler always populates
+	// both fields from the manifest's `logs {}` block (with
+	// platform 10m/3 defaults applied), so production
+	// containers never run unbounded by accident.
+	//
+	// Value format mirrors docker's own: "10m", "1g", "500k"
+	// for size; plain integer for file count. Pre-validated by
+	// the manifest layer — splice as-is.
+	LogMaxSize  string
+	LogMaxFiles int
 }
 
 // DeploymentConfig represents deployment configuration.
@@ -176,6 +192,59 @@ type DeploymentConfig struct {
 
 // CreateContainer creates a new container with the given configuration.
 func CreateContainer(cfg ContainerConfig) error {
+	args := buildRunArgs(cfg)
+
+	cmd := exec.Command("docker", args...)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return fmt.Errorf("failed to create container %s: %v, output: %s", cfg.Name, err, string(output))
+	}
+
+	// Attach any secondary networks. Docker only accepts one --network
+	// at create time, so fanning out here is the only path to multi-
+	// homed containers. If a connect fails we roll the container back —
+	// a half-joined container is worse than no container because it
+	// silently misses whichever network the operator declared.
+	//
+	// Skip entirely in host/none mode: attaching a bridge to a
+	// host-networked container is either rejected by docker or silently
+	// ignored, and either way it's operator confusion we don't want.
+	primaryNet := ""
+	if cfg.NetworkMode != "" {
+		primaryNet = cfg.NetworkMode
+	} else if len(cfg.Networks) > 0 {
+		primaryNet = cfg.Networks[0]
+	}
+
+	if cfg.NetworkMode == "" && len(cfg.Networks) > 1 {
+		for _, net := range cfg.Networks[1:] {
+			if net == "" || net == primaryNet {
+				continue
+			}
+
+			if err := ConnectNetwork(cfg.Name, net, cfg.NetworkAliases); err != nil {
+				_ = RemoveContainer(cfg.Name, true)
+				return fmt.Errorf("failed to connect container %s to network %s: %w", cfg.Name, net, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// buildRunArgs assembles the `docker run` argument list from a
+// ContainerConfig. Extracted from CreateContainer so tests can
+// inspect the exact flags the daemon would receive without
+// actually shelling out to docker. Production CreateContainer
+// calls this then exec's `docker` with the result; tests call it
+// directly and assert on the slice (e.g. that --log-opt lands
+// when LogMaxSize is set).
+//
+// Side effects: none. The function is pure — same config in,
+// same args out, every time. Argument ordering is stable so test
+// expectations against `len(args)` / `args[i]` stay reproducible.
+func buildRunArgs(cfg ContainerConfig) []string {
 	args := []string{"run", "-d", "--name", cfg.Name}
 
 	if cfg.AutoRemove {
@@ -338,6 +407,19 @@ func CreateContainer(cfg ContainerConfig) error {
 		args = append(args, "--memory", fmt.Sprintf("%d", cfg.MemoryLimitBytes))
 	}
 
+	// Log driver cap via docker's json-file `--log-opt` flags.
+	// Both fields must be populated for the cap to actually
+	// land — otherwise we'd emit a partial spec (just max-size
+	// without max-file, or vice-versa) which docker accepts but
+	// is operator-confusing. The controller's handler always
+	// fills both before calling here (with platform defaults
+	// when the operator omitted the block), so the typical
+	// production path emits both flags.
+	if cfg.LogMaxSize != "" && cfg.LogMaxFiles > 0 {
+		args = append(args, "--log-opt", "max-size="+cfg.LogMaxSize)
+		args = append(args, "--log-opt", "max-file="+strconv.Itoa(cfg.LogMaxFiles))
+	}
+
 	// TTY allocation forces line-buffered stdout in the container's
 	// process. Plumbed in for release-phase one-shots; long-running
 	// deployments leave it off (default) since they don't need a
@@ -352,36 +434,7 @@ func CreateContainer(cfg ContainerConfig) error {
 		args = append(args, cfg.Command...)
 	}
 
-	cmd := exec.Command("docker", args...)
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return fmt.Errorf("failed to create container %s: %v, output: %s", cfg.Name, err, string(output))
-	}
-
-	// Attach any secondary networks. Docker only accepts one --network
-	// at create time, so fanning out here is the only path to multi-
-	// homed containers. If a connect fails we roll the container back —
-	// a half-joined container is worse than no container because it
-	// silently misses whichever network the operator declared.
-	//
-	// Skip entirely in host/none mode: attaching a bridge to a
-	// host-networked container is either rejected by docker or silently
-	// ignored, and either way it's operator confusion we don't want.
-	if cfg.NetworkMode == "" && len(cfg.Networks) > 1 {
-		for _, net := range cfg.Networks[1:] {
-			if net == "" || net == primaryNet {
-				continue
-			}
-
-			if err := ConnectNetwork(cfg.Name, net, cfg.NetworkAliases); err != nil {
-				_ = RemoveContainer(cfg.Name, true)
-				return fmt.Errorf("failed to connect container %s to network %s: %w", cfg.Name, net, err)
-			}
-		}
-	}
-
-	return nil
+	return args
 }
 
 // ConnectNetwork attaches an existing container to an additional docker
