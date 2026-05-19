@@ -51,6 +51,16 @@ type StatefulsetHandler struct {
 	// detect and skip the callback path. Tests leave it empty.
 	ControllerURL string
 
+	// Probes is the kubelet-style runner registry for statefulset
+	// pods — same shape DeploymentHandler uses. Optional; nil means
+	// the handler silently skips probe spawning even when the
+	// manifest declares them (useful in tests that don't exercise
+	// the probe loop). Production shares a registry instance with
+	// the deployment handler so caddy's per-replica readiness
+	// lookup is global across kinds. Recorder is wired separately
+	// so writes land in the statefulset status blob.
+	Probes *ProbeRegistry
+
 	// rolloutLocks serialises rolling restart per (scope, name).
 	// Two concurrent reconciles for the same statefulset would
 	// otherwise race on container creation order — mutex granularity
@@ -111,6 +121,13 @@ type statefulsetSpec struct {
 	// triggers a top-down rolling restart and every ordinal re-runs
 	// the new init flow with its own data.
 	InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+
+	// Probes mirrors manifest.ProbesSpec — kubelet-style health
+	// checks, applied per-ordinal. Each pod gets its own runner
+	// instances (one per declared sub-probe). Folded into the
+	// spec hash so probe-spec edits trigger a top-down rolling
+	// restart, picking up the new config on every ordinal.
+	Probes *probesWireSpec `json:"probes,omitempty"`
 
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. Server-managed (StampAssetDigests
@@ -436,6 +453,10 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 		for _, s := range slots {
 			h.logf("statefulset/%s removing replica %s", ev.Name, s.Name)
 
+			// Probes first so the runner can't fire a restart
+			// against a container in mid-delete.
+			h.Probes.Stop(app, s.Name)
+
 			if err := h.Containers.Remove(s.Name); err != nil {
 				return fmt.Errorf("remove %s: %w", s.Name, err)
 			}
@@ -629,6 +650,13 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 
 		h.logf("statefulset/%s ordinal %d ready (image=%s)", name, n, spec.Image)
 
+		// Start probe runners for the new ordinal. Idempotent —
+		// reconcile replays land here and the registry no-ops if
+		// the entry already exists. Probes block is hash-folded,
+		// so any change triggers a rolling restart which Stops the
+		// old runners before spawn lands here for the replacement.
+		h.Probes.Start(app, cname, spec.Probes)
+
 		// Brief pause before spawning the next ordinal. Replaces
 		// the readiness probe we don't have yet — pod-(N+1) often
 		// connects to pod-N during init (postgres replica connects
@@ -677,6 +705,11 @@ func (h *StatefulsetHandler) pruneOrdinalsAbove(scope, name, app string, want in
 		}
 
 		h.logf("statefulset/%s scale-down: removing ordinal %d (%s)", name, ord, s.Name)
+
+		// Stop probes before container removal so the runner
+		// can't fire a restart against an ordinal we're about
+		// to delete.
+		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
 			return fmt.Errorf("remove %s: %w", s.Name, err)
@@ -815,6 +848,11 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 
 		newName := containers.ContainerName(scope, name, containers.OrdinalReplicaID(ord))
 
+		// Stop the old pod's probes BEFORE removal so the runner
+		// can't fire a restart against a container in mid-delete.
+		// Same posture as the deployment rolling-replace path.
+		h.Probes.Stop(app, s.Name)
+
 		// Same name as before — Remove + Ensure with the original
 		// ordinal-derived container name. Docker named volumes
 		// survive container removal, so the per-pod claims
@@ -909,6 +947,11 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 		}); err != nil {
 			return fmt.Errorf("respawn ordinal %d: %w", ord, err)
 		}
+
+		// Start probes for the replacement ordinal. Spec is
+		// re-read so an in-flight rolling restart triggered by
+		// a probe-spec change picks up the new config naturally.
+		h.Probes.Start(app, newName, spec.Probes)
 
 		h.logf("statefulset/%s ordinal %d replaced", name, ord)
 
@@ -1041,6 +1084,7 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		Logs           *logsWireSpec           `json:"logs,omitempty"`
 		VolumeClaims   []volumeClaim           `json:"volume_claims"`
 		InitContainers []initContainerWireSpec `json:"init_containers,omitempty"`
+		Probes         *probesWireSpec         `json:"probes,omitempty"`
 		Assets         []string                `json:"assets,omitempty"`
 	}{
 		Image:       spec.Image,
@@ -1067,7 +1111,12 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		// editing image/command/order must trigger top-down rolling
 		// restart so every ordinal re-runs the new prep flow.
 		InitContainers: spec.InitContainers,
-		Assets:         flattenAssetDigests(assetDigests),
+		// See deploymentSpecHash for the Probes rationale —
+		// probe params change → recreate every replica so the
+		// new runner picks up the new config. Same shape for
+		// statefulsets.
+		Probes: spec.Probes,
+		Assets: flattenAssetDigests(assetDigests),
 	}
 
 	b, _ := json.Marshal(input)
@@ -1147,6 +1196,62 @@ func (h *StatefulsetHandler) RecordInitFailure(ctx context.Context, app string, 
 
 	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
 		h.logf("statefulset/%s status persist failed (record init failure): %v", app, err)
+	}
+}
+
+// RecordReplicaReadiness writes the per-ordinal readiness snapshot
+// to the statefulset's status blob. Mirror of the deployment
+// counterpart, scoped to KindStatefulset so caddy's lookup +
+// describe rendering operate on the right blob.
+//
+// Implements ReadinessRecorder. Best-effort persistence: storage
+// errors log but don't fail the caller.
+func (h *StatefulsetHandler) RecordReplicaReadiness(ctx context.Context, app string, status ReplicaReadinessStatus) {
+	prev, _ := h.loadStatus(ctx, app)
+
+	if prev.ReplicaReadiness == nil {
+		prev.ReplicaReadiness = make(map[string]ReplicaReadinessStatus, 1)
+	}
+
+	prev.ReplicaReadiness[status.ContainerName] = status
+	prev.ReplicaReadiness = truncateReplicaReadiness(prev.ReplicaReadiness)
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("statefulset/%s status marshal failed (record readiness): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
+		h.logf("statefulset/%s status persist failed (record readiness): %v", app, err)
+	}
+}
+
+// ClearReplicaReadiness removes the per-ordinal readiness entry
+// for one container. Called by ProbeRegistry.Stop on per-ordinal
+// teardown so describe doesn't show ghosts. Mirror of the
+// deployment counterpart.
+func (h *StatefulsetHandler) ClearReplicaReadiness(ctx context.Context, app, containerName string) {
+	prev, _ := h.loadStatus(ctx, app)
+
+	if _, ok := prev.ReplicaReadiness[containerName]; !ok {
+		return
+	}
+
+	delete(prev.ReplicaReadiness, containerName)
+
+	if len(prev.ReplicaReadiness) == 0 {
+		prev.ReplicaReadiness = nil
+	}
+
+	blob, err := json.Marshal(prev)
+	if err != nil {
+		h.logf("statefulset/%s status marshal failed (clear readiness): %v", app, err)
+		return
+	}
+
+	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
+		h.logf("statefulset/%s status persist failed (clear readiness): %v", app, err)
 	}
 }
 
@@ -1567,7 +1672,13 @@ func (h *StatefulsetHandler) PruneVolumes(scope, name string) ([]string, error) 
 			scope, name, err)
 	}
 
+	app := AppID(scope, name)
+
 	for _, p := range pods {
+		// Probes first — runner-against-deleted-container is the
+		// same hazard as the rolling-restart path.
+		h.Probes.Stop(app, p.Name)
+
 		// Best-effort — Remove handles the "already gone" case
 		// silently. Errors logged so a stuck container is visible
 		// but don't abort the prune (we still try volumes).
@@ -1669,6 +1780,11 @@ func (h *StatefulsetHandler) RebootstrapPod(ctx context.Context, scope, name str
 	}
 
 	cname := containers.ContainerName(scope, name, containers.OrdinalReplicaID(ordinal))
+	app := AppID(scope, name)
+
+	// Probes first so the runner can't fire a restart against an
+	// ordinal we're about to wipe.
+	h.Probes.Stop(app, cname)
 
 	// Idempotent force-remove. The Containers.Remove abstraction
 	// handles "no such container" silently; surface only real

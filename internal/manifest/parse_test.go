@@ -392,6 +392,94 @@ statefulset "data" "db" {
 	}
 }
 
+// TestParseHCLStatefulsetProbes pins the M1.3 surface: a
+// statefulset can declare the same kubelet-style probes block
+// as a deployment. Useful for postgres (pg_isready), redis
+// (redis-cli ping), or HTTP-fronted databases.
+func TestParseHCLStatefulsetProbes(t *testing.T) {
+	src := `
+statefulset "data" "redis" {
+  image    = "redis:7"
+  replicas = 3
+
+  probes {
+    liveness {
+      tcp_socket { port = 6379 }
+      period            = "5s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      exec {
+        command = ["redis-cli", "ping"]
+      }
+
+      period = "5s"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "stateful_probes.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec StatefulsetSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Probes == nil {
+		t.Fatal("statefulset probes block lost")
+	}
+
+	if spec.Probes.Liveness == nil || spec.Probes.Liveness.TCPSocket == nil {
+		t.Fatal("liveness tcp_socket missing")
+	}
+
+	if spec.Probes.Liveness.TCPSocket.Port != 6379 {
+		t.Errorf("liveness port: %d", spec.Probes.Liveness.TCPSocket.Port)
+	}
+
+	if spec.Probes.Readiness == nil || spec.Probes.Readiness.Exec == nil {
+		t.Fatal("readiness exec missing")
+	}
+
+	if len(spec.Probes.Readiness.Exec.Command) != 2 || spec.Probes.Readiness.Exec.Command[0] != "redis-cli" {
+		t.Errorf("readiness command: %v", spec.Probes.Readiness.Exec.Command)
+	}
+}
+
+// TestParseHCLStatefulsetProbes_NoSelectorFails pins that the
+// same mutual-exclusion validator that runs on deployments
+// catches malformed statefulset probes too.
+func TestParseHCLStatefulsetProbes_NoSelectorFails(t *testing.T) {
+	src := `
+statefulset "data" "redis" {
+  image = "redis:7"
+
+  probes {
+    liveness {
+      period = "5s"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "stateful_probes_empty.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error when no probe action selector declared")
+	}
+
+	if !strings.Contains(err.Error(), "exactly one") {
+		t.Errorf("expected 'exactly one' in error: %v", err)
+	}
+}
+
 func TestParseHCLResourcesBlockOptional(t *testing.T) {
 	// Operator omitting `resources { }` entirely → spec.Resources
 	// is nil. No-limit container, docker daemon defaults apply.

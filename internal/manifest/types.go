@@ -816,6 +816,15 @@ type StatefulsetSpec struct {
 	// per-step shape and inheritance rules.
 	InitContainers []InitContainerSpec `yaml:"init_containers,omitempty" json:"init_containers,omitempty"`
 
+	// Probes mirrors DeploymentSpec.Probes — kubelet-style
+	// liveness / readiness / startup health checks, applied PER
+	// ORDINAL. Each pod-N gets its own runner instances; failure
+	// of pod-N's liveness restarts pod-N alone (data-preserving
+	// docker restart on the same ordinal, same volumes). Useful
+	// for stateful workloads where pg_isready / redis-cli ping
+	// are the canonical "alive" signals.
+	Probes *ProbesSpec `yaml:"probes,omitempty" json:"probes,omitempty"`
+
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
 }

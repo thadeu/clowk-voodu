@@ -1003,6 +1003,54 @@ func TestSpecHash_InitContainersFlipHash(t *testing.T) {
 	}
 }
 
+// TestStatefulsetSpecHash_ProbesFlipHash pins the M1.3
+// invariant: adding/editing probes on a statefulset must flip
+// the hash so the top-down rolling restart picks up the new
+// runner config on every ordinal. Same rationale as the
+// deployment-side test above.
+func TestStatefulsetSpecHash_ProbesFlipHash(t *testing.T) {
+	base := statefulsetSpec{Image: "postgres:16"}
+	baseHash := statefulsetSpecHash(base, nil)
+
+	withProbes := base
+	withProbes.Probes = &probesWireSpec{
+		Liveness: &probeWireSpec{
+			TCPSocket: &tcpSocketActionWire{Port: 5432},
+			Period:    "5s",
+		},
+	}
+
+	if statefulsetSpecHash(withProbes, nil) == baseHash {
+		t.Error("adding statefulset probes must flip hash")
+	}
+
+	// Editing the probe port must also flip.
+	withDifferentPort := withProbes
+	withDifferentPort.Probes = &probesWireSpec{
+		Liveness: &probeWireSpec{
+			TCPSocket: &tcpSocketActionWire{Port: 5433},
+			Period:    "5s",
+		},
+	}
+
+	if statefulsetSpecHash(withDifferentPort, nil) == statefulsetSpecHash(withProbes, nil) {
+		t.Error("editing probe params must flip hash")
+	}
+}
+
+// TestStatefulsetSpecHash_NilProbesPreservesHash mirrors the
+// "no churn for existing fleets" guarantee — existing
+// statefulsets without a probes block must NOT see their hash
+// change when M1.3 lands.
+func TestStatefulsetSpecHash_NilProbesPreservesHash(t *testing.T) {
+	a := statefulsetSpec{Image: "redis:7"}
+	b := statefulsetSpec{Image: "redis:7"}
+
+	if statefulsetSpecHash(a, nil) != statefulsetSpecHash(b, nil) {
+		t.Error("nil statefulset Probes must not flip hash")
+	}
+}
+
 // TestSpecHash_NilInitContainersPreservesHash mirrors the
 // Resources rollout invariant for the M5 feature: existing
 // deployments without init_container blocks must NOT see their

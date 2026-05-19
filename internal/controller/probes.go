@@ -530,6 +530,32 @@ func (r *ProbeRegistry) drainStartupEvents(events <-chan probe.Event, containerN
 	}
 }
 
+// compositeReadinessLookup chains multiple ReadinessLookup
+// implementations — first hit wins. Used to expose a single
+// /pods/{name}/ready endpoint that spans deployments and
+// statefulsets without having to teach the caller which kind
+// owns a given container.
+//
+// Order matters only when the SAME container name lives in
+// both registries (shouldn't happen — docker enforces uniqueness
+// host-wide), so the slice ordering is purely about lookup
+// priority.
+type compositeReadinessLookup []ReadinessLookup
+
+func (c compositeReadinessLookup) LookupReadiness(containerName string) (ReplicaReadinessStatus, bool) {
+	for _, l := range c {
+		if l == nil {
+			continue
+		}
+
+		if s, ok := l.LookupReadiness(containerName); ok {
+			return s, true
+		}
+	}
+
+	return ReplicaReadinessStatus{}, false
+}
+
 // LookupReadiness returns the in-memory ReplicaReadinessStatus for
 // a container, plus a found bool. Fast path for
 // GET /pods/{name}/ready — no etcd hop, no JSON decode, no lock

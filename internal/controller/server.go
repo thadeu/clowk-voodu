@@ -194,19 +194,6 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
-	// Recorder back-reference completes the M1.2 wiring: every
-	// readiness/startup phase transition flows back into the
-	// deployment's status blob via DeploymentHandler's
-	// RecordReplicaReadiness / ClearReplicaReadiness. Self-
-	// reference is the cheap way to break the construction
-	// chicken-and-egg without inverting ownership.
-	depHandler.Probes.Recorder = depHandler
-
-	// API.Readiness is the in-memory lookup `GET /pods/{name}/ready`
-	// reads from. Same registry that owns the runners owns the
-	// state — no cross-component sync needed.
-	s.api.Readiness = depHandler.Probes
-
 	assetHandler := &AssetHandler{
 		Store: store,
 		Log:   s.cfg.Logger,
@@ -239,14 +226,36 @@ func (s *Server) Start(ctx context.Context) error {
 
 			return !stringMapsEqual(before, after), nil
 		},
-		EnvFilePath:   paths.AppEnvFile,
-		Containers:    DockerContainerManager{},
+		EnvFilePath: paths.AppEnvFile,
+		Containers:  DockerContainerManager{},
+		Probes: &ProbeRegistry{
+			Restart: dockerRestarter{},
+			IPs:     dockerIPResolver{},
+			Exec:    DockerContainerManager{},
+			Log:     s.cfg.Logger,
+		},
 		// Container-side URL (host.docker.internal-based) — this
 		// flows into pod env via BuildPlatformEnv. Different from
 		// API.ControllerURL above (which is 127.0.0.1-based for
 		// host-process plugin callbacks).
 		ControllerURL: deriveContainerControllerURL(s.cfg.HTTPAddr),
 	}
+
+	// Recorder back-references complete the M1.2 / M1.3 wiring:
+	// every readiness/startup phase transition flows back into
+	// the resource's status blob via the handler's
+	// RecordReplicaReadiness / ClearReplicaReadiness. Self-
+	// reference breaks the construction chicken-and-egg without
+	// inverting ownership.
+	depHandler.Probes.Recorder = depHandler
+	stsHandler.Probes.Recorder = stsHandler
+
+	// API.Readiness is the in-memory lookup `GET /pods/{name}/ready`
+	// reads from. Composite over both registries so the same
+	// endpoint serves deployment AND statefulset replicas — caddy
+	// (and operators) don't have to know which kind owns a given
+	// container.
+	s.api.Readiness = compositeReadinessLookup{depHandler.Probes, stsHandler.Probes}
 
 	ingHandler := &IngressHandler{
 		Store:      store,

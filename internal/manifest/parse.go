@@ -1016,6 +1016,7 @@ type hclStatefulset struct {
 	Resources      *hclResourcesBlock      `hcl:"resources,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	InitContainers []hclInitContainerBlock `hcl:"init_container,block"`
+	Probes         *hclProbesBlock         `hcl:"probes,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -1073,6 +1074,12 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 	s.InitContainers = initContainerBlocksToSpec(b.InitContainers)
 
 	if err := validateInitContainers(s.InitContainers, "statefulset"); err != nil {
+		return StatefulsetSpec{}, err
+	}
+
+	s.Probes = probesBlockToSpec(b.Probes)
+
+	if err := validateProbes(s.Probes); err != nil {
 		return StatefulsetSpec{}, err
 	}
 
