@@ -12,6 +12,9 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | [`stack/`](./stack) | Production-grade full stack: postgres + redis (macro plugins) + asset (postgresql.conf / pg_hba.conf / redis.conf / ACL) + app (deployment + ingress) with TLS |
 | [`probes/`](./probes) | Kubelet-style health probes (liveness / readiness / startup) on deployments and statefulsets. HTTP, TCP, exec selectors. Auto caddy ingress gating via the readiness probe |
 | [`init/`](./init) | Ordered one-shot prep steps (db:migrate, pg_basebackup, config-validate) that must complete before main container starts. HCL keyword: `init`. |
+| [`autoscale/`](./autoscale) | CPU-based horizontal autoscale block on deployments. Worker (sidekiq) + HTTP-tier tunings with the asymmetric "respond fast, retreat slowly" posture |
+| [`on_deploy/`](./on_deploy) | Post-rollout webhook notifications (success / failure URLs). Slack same-channel pattern, asymmetric PagerDuty-on-failure pattern |
+| [`registry/`](./registry) | The `registry` kind — private image pulls. Atomic ~/.docker/config.json regen, host-wide auth, single + multi-registry examples |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
 | [`fullstack-yaml/`](./fullstack-yaml) | Same shape as `fullstack/`, written in YAML to show the alternate format |
 | [`ingress/`](./ingress) | Path-based routing, multiple hosts, load-balancing knobs |
