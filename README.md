@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml)
 [![docs](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml)
-[![release](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml)
+[![release](https://img.shields.io/github/v/release/thadeu/clowk-voodu?label=release&color=blue)](https://github.com/thadeu/clowk-voodu/releases)
 
 > Self-hosted, commitless-deploy PaaS with first-class stateful services.
 
