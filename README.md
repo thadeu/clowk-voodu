@@ -2,67 +2,58 @@
 
 [![ci](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml)
 [![docs](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml)
-[![release](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml)
+[![release](https://img.shields.io/github/v/release/thadeu/clowk-voodu?label=release&color=blue)](https://github.com/thadeu/clowk-voodu/releases)
 
-> Self-hosted, commitless-deploy PaaS with first-class stateful services.
+> Self-hosted, commitless-deploy PaaS. One HCL file. One `voodu apply`. No git push, no bare repo, no plugin sprawl.
 
-Voodu is the evolution of [Gokku](https://github.com/thadeu/gokku). It keeps
-what works — single `voodu apply` deploys, blue-green swaps, per-app env
-management — and invests where Gokku is weak: Postgres, Mongo, and other
-stateful services with backup, replica, and test-restore built in, without
-requiring the plugin sprawl of a full Kubernetes stack.
+Voodu is a Heroku-shaped, Kubernetes-honest deploy tool you run on your own boxes. HCL manifests describe the running system — apps, ingress with TLS, stateful services with backup. `voodu apply` builds, ships, routes, swaps. The CLI streams the build context straight to the server over SSH — no commit required, no push, no bare repo.
 
-Commitless by default: edit code, run `voodu apply`, done. The CLI
-streams the build context straight to the server over SSH — no git
-commit required, no push, no bare repo.
+**Full documentation, examples, and architecture at [voodu.clowk.in/docs](https://voodu.clowk.in/docs).**
+
+## Table of contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [What you get](#what-you-get)
+- [Plugins](#plugins)
+- [Examples](#examples)
+- [Architecture](#architecture)
+- [Development](#development)
+- [License](#license)
+
+---
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash
+curl -fsSL voodu.clowk.in/install | bash
 ```
 
-On a Linux host this is a full **server install**: drops `voodu` and
-`voodu-controller` into `/usr/local/bin`, seeds `/opt/voodu/`, installs
-the `voodu-controller.service` systemd unit, and starts the daemon on
-`127.0.0.1:8686`. On macOS the same line installs only the CLI
-(**client mode**), for laptops that deploy to remote servers.
-
-Force mode explicitly:
+Auto-detects mode by OS — **server** on Linux (CLI + `voodu-controller` + Docker + systemd unit + default plugins), **client** on macOS (CLI only, for laptops that deploy to remote servers). Force explicitly:
 
 ```sh
-curl -fsSL ...install | bash -s -- --client
-curl -fsSL ...install | bash -s -- --server
+curl -fsSL voodu.clowk.in/install | bash -s -- --client
+curl -fsSL voodu.clowk.in/install | bash -s -- --server
 ```
 
-Useful env knobs:
+Env knobs:
 
 | Var | Default | What it does |
 |---|---|---|
-| `VERSION` | latest release | pin a tag, e.g. `v0.1.0` |
+| `VERSION` | latest release | pin a tag, e.g. `v0.9.6` |
 | `VOODU_ROOT` | `/opt/voodu` | server state directory |
 | `VOODU_HTTP_ADDR` | `127.0.0.1:8686` | controller HTTP bind |
 | `VOODU_INSTALL_REPO` | `thadeu/clowk-voodu` | source repo (for forks) |
+| `SKIP_DOCKER=1` | — | skip Docker install (server mode only) |
+| `SKIP_PLUGINS=1` | — | skip default plugin install |
 
-Pre-built releases for Linux and macOS (amd64/arm64) live on the
-[releases page](https://github.com/thadeu/clowk-voodu/releases).
-Re-running the installer upgrades both binaries and restarts the
-controller — it is idempotent.
+Re-running the installer upgrades both binaries and restarts the controller — idempotent.
 
 ## Quick start
 
-After installing in server mode, `/opt/voodu/` is already seeded and the
-controller is running. Create your first app:
-
-```sh
-voodu apps create prod           # creates /opt/voodu/apps/prod + initial .env
-```
-
-From your laptop — declare the app with an HCL manifest:
-
 ```hcl
 # voodu.hcl
-deployment "prod" "api" {
+app "prod" "api" {
   image    = "ghcr.io/me/api:v1.2"
   replicas = 2
   ports    = ["8080"]
@@ -70,381 +61,104 @@ deployment "prod" "api" {
   env = {
     PORT = "8080"
   }
-}
 
-ingress "prod" "api" {
   host = "api.example.com"
 
   tls {
-    email = "ops@example.com"   # enabled + letsencrypt are the defaults
+    email = "ops@example.com"
   }
 }
 ```
-
-Scoped kinds (`deployment`, `ingress`) take **two labels**: `<scope>` and
-`<name>`. Scope is a free-form organizational tag (app, team,
-environment); it groups manifests, selects what prune touches, and is
-the uniqueness boundary for names. `service` inside `ingress` defaults
-to the ingress name, so the 1-to-1 shape (`deployment "prod" "api"` ↔
-`ingress "prod" "api"`) is declaration-only. Port and health_check
-default to the deployment's declared port and `/` — set them only when
-you need to override.
-
-The `tls {}` block follows the "block-present = on" convention: if you
-declare it (even empty), `enabled = true` and `provider = "letsencrypt"`
-are filled in. To disable TLS for an ingress, omit the entire block.
-
-### Registry mode vs build mode
-
-Every `deployment` / `statefulset` / `job` / `cronjob` picks one of two
-source modes (parse error if both are declared on the same resource):
-
-- **`image = "ghcr.io/me/api:v1.2"`** — registry mode. Voodu pulls and
-  runs. CI builds and pushes; voodu deploys. Above example uses this.
-- **`build { ... }`** — build mode. CLI streams the working tree to the
-  server as a tarball; the controller runs `docker build` and tags
-  `<scope>-<name>:latest` for the workload to pull.
-
-```hcl
-deployment "prod" "api" {
-  replicas = 2
-  ports    = ["8080"]
-
-  build {
-    context    = "."                # docker build context (default: ".")
-    dockerfile = "Dockerfile"       # default name inside context
-    args = {
-      NODE_VERSION = "24-alpine"    # docker --build-arg
-    }
-  }
-}
-```
-
-The `build {}` block matches docker-compose's shape — `context`,
-`dockerfile`, `args`. Omit the whole block (and `image`) for the terse
-"ship me from this repo, figure the rest out" form: voodu auto-detects
-the runtime from marker files in the working tree (`go.mod`, `Gemfile`,
-`package.json`, …) and generates a Dockerfile if your repo doesn't ship
-one. See [`examples/build/`](examples/build/) for monorepo, custom
-Dockerfile, and statefulset-build patterns.
-
-The tarball follows docker-build semantics: `.dockerignore` controls
-inclusion if present, otherwise `.gitignore`. Uncommitted changes ship
-— working tree, not git HEAD.
-
-Apply it:
 
 ```sh
+voodu remote add voodu ubuntu@your-host    # default remote (alias `voodu`)
 voodu apply -f voodu.hcl
 ```
 
-`voodu apply` is the single user-facing entrypoint and the source of
-truth: the invocation (one file, many `-f`, or a directory) is the
-desired state. The controller diffs against etcd and **prunes per
-(scope, kind)** automatically — no confirm, no prompt. Applying only
-`deployments.hcl` won't touch ingresses in the same scope, so you can
-decompose by kind without cross-kind deletion.
-
-Pass `--no-prune` to upsert without deletions — see
-[Shared scope across repos](#shared-scope-across-repos) for the
-intended use case.
-
-### File extensions
-
-All of these are parsed as HCL — pick whichever reads best in your
-editor and file tree:
-
-| Extension | When it's nice |
-|---|---|
-| `.hcl` | Tooling compatibility (most editors / IDEs highlight this by default) |
-| `.voodu` | Branded, reads like a first-class config (`web.voodu`, `api.voodu`) |
-| `.vdu`, `.vd` | Shorter aliases for the same |
-
-`voodu apply -f web` resolves bare names against all of the above in
-order, so editing `web.voodu` and running `voodu apply -f web` just
-works.
-
-More examples live in [`examples/`](examples/):
-
-- [`fullstack/`](examples/fullstack/) — deployment + database + ingress
-- [`build/`](examples/build/) — `build {}` block patterns: auto-detect,
-  custom Dockerfile, Go monorepo, statefulset build
-- [`multi-env/app.voodu`](examples/multi-env/app.voodu) — one manifest,
-  many servers (staging / prod-1 / prod-2 selected with `-r`)
-- [`shared-scope/`](examples/shared-scope/) — one scope fanned out
-  across independent repos with `--no-prune` upsert
-- [`ingress/profiles.hcl`](examples/ingress/profiles.hcl) — four TLS
-  profiles (HTTP, Let's Encrypt, internal CA, on-demand wildcard)
-- [`ingress/paths.hcl`](examples/ingress/paths.hcl) — path-based
-  routing with `location {}` blocks
-
-## Remotes
-
-A **remote** is just an SSH target — a `user@host` pair stored as a git
-remote so every developer clone already knows where the app ships.
-Voodu inherits the git-remote lookup so there's no extra config file.
+That's it. TLS auto-provisions via Let's Encrypt, replicas roll in behind the readiness probe, traffic reaches `api.example.com`. For staging / prod, add more remotes:
 
 ```sh
-# one-shot bootstrap of a fresh host (ssh preflight + install + server setup)
-voodu remote setup staging ubuntu@staging.example.com --binary ./bin/voodu
+voodu remote add staging ubuntu@staging.host
+voodu remote add prod    ubuntu@prod.host
 
-# or just register a remote for an already-provisioned host
-voodu remote add    prod-1 ubuntu@prod-1.example.com
-voodu remote add    prod-2 ubuntu@prod-2.example.com
-voodu remote list
+voodu apply -f voodu.hcl -r staging
+voodu apply -f voodu.hcl -r prod
 ```
 
-The HCL manifest owns the app identity (`scope` + `name`). The remote
-owns only the SSH destination. So **one server runs as many apps as the
-HCL declares**, and the same manifest ships unchanged to any server —
-only `-r` changes:
+Full first-deploy walkthrough: [voodu.clowk.in/docs/getting-started/first-deploy](https://voodu.clowk.in/docs/getting-started/first-deploy).
 
-```sh
-voodu apply -f voodu.hcl              # default: looks up the "voodu" git remote
-voodu apply -f voodu.hcl -r staging   # ship to staging
-voodu apply -f voodu.hcl -r prod-1    # ship to prod-1
-```
+## What you get
 
-`-r` is the shorthand for `--remote`. Omit both and voodu uses the git
-remote named `voodu` — handy when a repo targets a single server and
-you want `voodu apply` to "just work".
+- **Six verbs cover ~95% of day-to-day** — `apply`, `diff`, `logs`, `config`, `remote`, `plugins`.
+- **HCL manifests** — `deployment`, `app`, `statefulset`, `ingress`, `job`, `cronjob`, `asset`, `registry`, plus macros for `postgres` and `redis`.
+- **Probes drive ingress** — declare a `readiness` probe, Caddy gates upstream membership on it automatically.
+- **Per-pod volumes survive prune** — statefulset data is yours until `docker volume rm`.
+- **Autoscale** — CPU-based hysteresis with asymmetric cooldown.
+- **Multi-target `on_deploy`** — Slack + PagerDuty + Datadog in parallel goroutines, independent retry budgets.
+- **Build cache shared** — content-addressed tarball hashes; identical source skips the rebuild.
+- **`vd diff --detailed-exitcode`** — terraform-style CI exit codes (0 = no change, 2 = changes pending).
+- **Embedded etcd** — single binary, no external dependencies, no operator sprawl.
 
-Three prod hosts behind an AWS ALB? Add `prod-1`, `prod-2`, `prod-3` and
-loop: `for r in prod-1 prod-2 prod-3; do voodu apply -f voodu.hcl -r $r;
-done`. The scope+name in the manifest stays constant across rollouts.
-
-## Shared scope across repos
-
-By default every `voodu apply` is a full source-of-truth statement for
-the `(scope, kind)` pairs it touches — anything the controller knows
-about in that pair that isn't in this apply gets pruned. That's the
-right default for a single repo that owns its scope: rename a
-deployment in HCL and the old one disappears, no zombies left behind.
-
-The shape below is **different**. Four independent repos, one shared
-scope, each applying only its own slice:
-
-```hcl
-# github.com/you/clowk
-deployment "clowk" "app" { image = "ghcr.io/you/clowk:1" }
-
-# github.com/you/clowk-landingpage
-deployment "clowk" "lp"  { image = "ghcr.io/you/clowk-lp:1" }
-
-# github.com/you/clowk-api
-deployment "clowk" "api" { image = "ghcr.io/you/clowk-api:1" }
-
-# github.com/you/clowk-jobs
-deployment "clowk" "jobs" { image = "ghcr.io/you/clowk-jobs:1" }
-```
-
-With the default behavior, each `voodu apply` would delete the three
-others' deployments. Use `--no-prune` to opt into upsert-only:
-
-```sh
-voodu apply -f voodu.hcl --no-prune
-```
-
-The flag lives in every CI pipeline that shares a scope, so the choice
-is explicit and grep-able. The default elsewhere stays strict.
-
-**When to reach for this vs. distinct scopes.** The cleaner shape is
-usually one scope per repo (`clowk-app`, `clowk-lp`, `clowk-api`,
-`clowk-jobs`) — ownership is obvious, `voodu list -s clowk-api` scopes
-to one repo, and no pipeline needs a flag. Pick shared scope only when
-grouping is a first-class concern (a logical environment you want to
-query and config together) and every apply that touches the scope
-passes `--no-prune`.
-
-## Ingress routing
-
-One host, many paths, one service:
-
-```hcl
-ingress "acme" "api" {
-  host = "api.example.com"
-
-  location { path = "/api/v1" }
-  location { path = "/api/v2" }
-}
-```
-
-One host, different services per path (classic versioned API). The
-`/apply` boundary rejects two ingresses claiming the same host **unless**
-they declare distinct `location {}` blocks — one host, many paths, many
-services is legal fan-out:
-
-```hcl
-ingress "acme" "api-v1" {
-  host    = "api.example.com"
-  service = "api-v1"
-  location { path = "/api/v1" }
-}
-
-ingress "acme" "api-v2" {
-  host    = "api.example.com"
-  service = "api-v2"
-  location { path = "/api/v2" }
-}
-```
-
-`strip = true` on a location removes the prefix before forwarding — use
-it when routing a generic image (static nginx, arbitrary upstream) that
-expects root-relative URIs:
-
-```hcl
-location {
-  path  = "/docs/voodu"
-  strip = true   # backend sees /getting-started, not /docs/voodu/getting-started
-}
-```
-
-Omitting `location {}` entirely is the catch-all for a host.
-Everything inside the app itself (404 pages, rewrites, SPA fallback,
-compression) stays in your Dockerfile's web server — the platform
-terminates at `host → container:port`.
-
-## Previewing changes with `voodu diff`
-
-`voodu diff` is the "what would apply do?" button. It calls the
-controller with `?dry_run=true`, so nothing gets persisted and the
-output reflects **exactly** what the next `voodu apply` with the same
-flags would do — same prune logic, same validation, same ordering.
-
-```sh
-$ voodu diff -f voodu.hcl
-~ deployment/clowk/web
-    ~ image     "nginx:1.26"  →  "nginx:1.27"
-    ~ replicas  1  →  2
-    + lang.name  "bun"
-= ingress/clowk/web (unchanged)
-
---- Would prune (pass --no-prune to keep) ---
-- deployment/clowk/old-worker
-
-1 to modify, 1 to prune
-```
-
-Markers:
-- `~ kind/scope/name` — resource exists and its spec changed. Each
-  line underneath is one JSON field that differs, dotted for nested
-  keys (`tls.email`, `lang.name`).
-- `+ kind/scope/name (new)` — resource would be created; field lines
-  underneath are its initial spec.
-- `= kind/scope/name (unchanged)` — spec matches the controller.
-- `--- Would prune ---` — resources that would be removed by the
-  source-of-truth apply contract. Use `--no-prune` to simulate an
-  upsert-only apply (shared-scope case).
-
-### CI-friendly exit codes
-
-Pass `--detailed-exitcode` to get `terraform plan`-style exit codes:
-
-| Exit code | Meaning |
-|---|---|
-| 0 | No changes |
-| 1 | Error (couldn't reach controller, invalid manifest, …) |
-| 2 | Plan has pending changes |
-
-Lets you wire a `voodu diff --detailed-exitcode` step in CI that
-fails a branch when it drifts from the declared state, or gates a
-deploy step behind an explicit "yes there are changes" signal.
-
-## Configuration
-
-Per-app environment variables are managed out-of-band from the manifest
-so secrets don't live in your repo:
-
-```sh
-voodu config set DATABASE_URL=postgres://... SECRET_KEY=... -a prod
-voodu config list   -a prod
-voodu config get    SECRET_KEY -a prod
-voodu config unset  OLD_FLAG -a prod
-voodu config reload -a prod      # recreate the active container
-```
-
-Env set via `config:set` always wins over `env {}` blocks in the manifest,
-so a `voodu apply` can't accidentally reset a production secret.
-
-## Live resource usage with `voodu stats`
-
-`docker stats` analog scoped to voodu-managed pods, joined with the
-manifest's `resources.limits` so you see actual usage alongside the
-configured ceiling in one shot.
-
-```sh
-voodu stats                              # every running pod
-voodu stats clowk-lp                     # one scope
-voodu stats clowk-lp/web                 # one resource (all replicas)
-voodu stats deployment                   # all deployments
-voodu stats -o json | jq '.[] | select(.usage.memory_percent > 80)'
-```
-
-Columns: KIND, REF, CPU%, MEM USED, MEM LIMIT, MEM%, CPU LIMIT. The
-two LIMIT columns echo the operator's verbatim manifest strings
-(`254Mi`, `0.4`) — `—` means no `resources {}` was declared. CPU% is
-host-relative, matching `docker stats` semantics (100% = one full
-core). Single-shot — wrap in `watch -n 2` for refresh. Pass
-`--orphans` to surface running containers without a matching manifest
-(useful for spotting leaks after a `vd delete` that didn't fully
-clean up).
-
-## How it works
-
-```
-your laptop                                 server
-───────────                                 ──────
-voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
-  │                                         │
-  │                                         └─ reconcile ingress/services (etcd)
-  │  (build-mode only: stream tarball)
-  └─ tar -czf - <build.context>  ──ssh──▶  voodu receive-pack <scope>/<name>
-                                             └─ extract → docker build (with --build-arg from build.args)
-                                                → tag <scope>-<name>:latest
-                                                → swap `current` symlink
-                                                → run post_deploy hooks
-                                                → recreate container
-```
-
-Tarball transport is content-addressed: an identical tree produces the
-same build-id (sha256 of the tar bytes) and the server skips the
-rebuild, just repointing `current`. Use `VOODU_FORCE_REBUILD=1` (or
-`voodu receive-pack --force` on the server) to bypass.
-
-- **CLI (`voodu`)** — parses HCL, forwards commands over SSH or to the
-  controller's HTTP API. Installed on laptops and servers both.
-- **Controller (`voodu-controller`)** — long-running daemon backed by an
-  embedded etcd. Owns manifest state, reconciles services, routes unknown
-  commands to plugins.
-- **Plugins** — independent binaries discovered from `/opt/voodu/plugins`.
-  `voodu plugins:install <github-repo>` clones and wires them. See
-  [voodu-caddy](https://github.com/thadeu/voodu-caddy) for an example.
+Full manifest reference: [voodu.clowk.in/docs/manifests/overview](https://voodu.clowk.in/docs/manifests/overview).
 
 ## Plugins
 
 | Repo | Purpose |
 |---|---|
-| [`thadeu/voodu-caddy`](https://github.com/thadeu/voodu-caddy) | Ingress (Caddy Admin API, ACME, on-demand wildcard TLS) |
-| [`thadeu/voodu-postgres`](https://github.com/thadeu/voodu-postgres) | Postgres service with backup / replica / test-restore |
-| [`thadeu/voodu-mongo`](https://github.com/thadeu/voodu-mongo) | MongoDB service |
+| [`thadeu/voodu-caddy`](https://github.com/thadeu/voodu-caddy) | Ingress — Caddy Admin API, ACME, on-demand wildcard TLS |
+| [`thadeu/voodu-postgres`](https://github.com/thadeu/voodu-postgres) | Postgres — streaming replication, `pg_promote`, backups with retention |
+| [`thadeu/voodu-redis`](https://github.com/thadeu/voodu-redis) | Redis — single-instance or sentinel HA |
+| [`thadeu/voodu-mongo`](https://github.com/thadeu/voodu-mongo) | MongoDB |
 
-Install one with:
+Install one:
 
 ```sh
-voodu plugins:install thadeu/voodu-caddy
+voodu plugins:install thadeu/voodu-postgres
 ```
+
+Default install seeds `voodu-caddy` automatically so a fresh box can serve `app` blocks immediately.
+
+## Examples
+
+Production-grade examples in [`examples/`](examples/):
+
+- [`fsw-esl/`](examples/fsw-esl/) — full telephony stack (redis + rabbitmq + 5 Go services) translated from docker-compose. Per-service file split for independent deploys, multi-target `on_deploy`, autoscale tier.
+- [`stack/`](examples/stack/) — postgres + redis + asset + app with TLS, the canonical "real app" shape.
+- [`on_deploy/`](examples/on_deploy/) — Slack, PagerDuty, Telegram, multi-target fan-out webhooks.
+- [`probes/`](examples/probes/) — kubelet-style liveness / readiness / startup on HTTP / TCP / exec.
+- [`autoscale/`](examples/autoscale/) — worker + HTTP tier scaling profiles.
+- [`build/`](examples/build/) — `build {}` patterns: auto-detect runtime, custom Dockerfile, Go monorepo, statefulset build-mode.
+- [`statefulset/`](examples/statefulset/) — postgres cluster, redis with persistent volumes.
+- [`multi-env/`](examples/multi-env/) — one manifest, many remotes (`-r staging` / `-r prod`).
+- [`shared-scope/`](examples/shared-scope/) — multiple repos applying into the same scope with `--no-prune`.
+
+## Architecture
+
+```
+your laptop                                  server
+───────────                                  ──────
+voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
+  │                                          │
+  │ (build-mode: tarball)                    └─ reconcile → docker
+  └─ tar -czf -  ──ssh──▶  voodu receive-pack
+                              └─ extract → docker build → tag → swap → run
+```
+
+Single binary per host (`voodu-controller`), embedded etcd, in-process reconciler, plugin subprocesses for macros and CLI verbs. HTTP `:8686` on the controller; CLI talks to it via SSH-forwarded local port.
+
+Deep dive: [voodu.clowk.in/docs/architecture/overview](https://voodu.clowk.in/docs/architecture/overview).
 
 ## Development
 
 ```sh
 make tidy          # download deps
 make build         # build voodu + voodu-controller into bin/
-make check         # fmt + vet + lint + test
+make vet           # go vet
+make test          # go test -race -coverprofile=coverage.out
 ./bin/voodu --version
 ```
 
-Releases are cut by pushing a `v*` tag — GoReleaser builds cross-platform
-binaries and publishes them to the GitHub release.
+Releases are cut by pushing a `v*` tag — GoReleaser builds cross-platform binaries and publishes them to the GitHub release. The docs site rebuilds automatically on release via the [`docs` workflow](.github/workflows/docs.yml), so `voodu.clowk.in/install` and the landing-page version pill stay in sync with the latest binary.
 
 ## License
 
