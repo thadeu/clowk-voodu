@@ -626,10 +626,18 @@ func TestWebhook_InlineBodySubstitutes(t *testing.T) {
 // + payload-shape tests; this one is necessary to lock in the
 // {{token}} substitution behavior on the wire.
 func TestWebhook_InlineBodyBytesReachPoster_ViaHTTP(t *testing.T) {
-	var receivedBody []byte
+	// Channel-based capture is race-free without a mutex — Go's
+	// channel semantics establish a happens-before relationship
+	// between the send (in the HTTP handler goroutine) and the
+	// receive (in the test goroutine).
+	bodyCh := make(chan []byte, 5)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedBody, _ = io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case bodyCh <- body:
+		default: // buffer full — drop (we only need the first)
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -659,9 +667,7 @@ func TestWebhook_InlineBodyBytesReachPoster_ViaHTTP(t *testing.T) {
 		started, completed,
 	)
 
-	waitFor(t, func() bool { return receivedBody != nil })
-
-	got := string(receivedBody)
+	got := awaitBody(t, bodyCh)
 
 	// Tokens replaced
 	for _, want := range []string{`"✅ api ghcr.io/me/api:v2"`, `"rel-99"`, `"prod"`} {
@@ -698,10 +704,14 @@ func TestWebhook_FileBodyReadsFromAsset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var receivedBody []byte
+	bodyCh := make(chan []byte, 5)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedBody, _ = io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case bodyCh <- body:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -726,9 +736,7 @@ func TestWebhook_FileBodyReadsFromAsset(t *testing.T) {
 		started, completed,
 	)
 
-	waitFor(t, func() bool { return receivedBody != nil })
-
-	got := string(receivedBody)
+	got := awaitBody(t, bodyCh)
 
 	if !strings.Contains(got, "🚀 api ghcr.io/me/api:v3 deployed") {
 		t.Errorf("template tokens not substituted: %s", got)
@@ -744,10 +752,14 @@ func TestWebhook_FileBodyReadsFromAsset(t *testing.T) {
 // use handlebars-style templates; operators may legitimately
 // embed `{{room_id}}` that voodu shouldn't touch.
 func TestWebhook_UnknownTokensLeftLiteral(t *testing.T) {
-	var receivedBody []byte
+	bodyCh := make(chan []byte, 5)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedBody, _ = io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case bodyCh <- body:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -772,9 +784,7 @@ func TestWebhook_UnknownTokensLeftLiteral(t *testing.T) {
 		"deployment", "prod", "api", "", "img:v1", "success", "", now, now,
 	)
 
-	waitFor(t, func() bool { return receivedBody != nil })
-
-	got := string(receivedBody)
+	got := awaitBody(t, bodyCh)
 
 	// Known tokens replaced
 	if !strings.Contains(got, `"api - {{this_is_not_a_voodu_token}}"`) {
@@ -788,6 +798,23 @@ func TestWebhook_UnknownTokensLeftLiteral(t *testing.T) {
 
 	if !strings.Contains(got, `"success"`) {
 		t.Errorf("status token not replaced: %s", got)
+	}
+}
+
+// awaitBody blocks on bodyCh up to 2 seconds and returns the first
+// received body as a string. Race-free by Go's channel semantics:
+// the send (in the HTTP handler goroutine) establishes
+// happens-before with the receive (in the test goroutine), so the
+// returned bytes are safe to read without a mutex.
+func awaitBody(t *testing.T, ch <-chan []byte) string {
+	t.Helper()
+
+	select {
+	case body := <-ch:
+		return string(body)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("awaitBody: webhook body never received within 2s")
+		return ""
 	}
 }
 

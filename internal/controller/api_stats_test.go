@@ -172,7 +172,12 @@ func TestStats_OrphansDefaultExcludes(t *testing.T) {
 	defer ts.Close()
 
 	// Default: legacy hidden.
-	resp, _ := http.Get(ts.URL + "/stats")
+	resp, err := http.Get(ts.URL + "/stats")
+
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+
 	defer resp.Body.Close()
 
 	var env struct {
@@ -188,10 +193,15 @@ func TestStats_OrphansDefaultExcludes(t *testing.T) {
 	}
 
 	// With ?orphans=true: surfaces.
-	resp, _ = http.Get(ts.URL + "/stats?orphans=true")
-	defer resp.Body.Close()
+	resp2, err := http.Get(ts.URL + "/stats?orphans=true")
 
-	_ = json.NewDecoder(resp.Body).Decode(&env)
+	if err != nil {
+		t.Fatalf("GET /stats?orphans=true: %v", err)
+	}
+
+	defer resp2.Body.Close()
+
+	_ = json.NewDecoder(resp2.Body).Decode(&env)
 
 	if len(env.Data.Pods) != 1 || !env.Data.Pods[0].Orphan {
 		t.Errorf("orphans=true should surface legacy: %+v", env.Data.Pods)
