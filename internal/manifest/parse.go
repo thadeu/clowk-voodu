@@ -159,6 +159,14 @@ var hclExts = map[string]bool{
 	".vd":    true,
 }
 
+// FormatFromExt is the public path for callers (the CLI's
+// per-file dir walker) that need to know whether a given file
+// is a manifest voodu can parse. Returns an error when the
+// extension isn't on the supported list.
+func FormatFromExt(path string) (Format, error) {
+	return formatFromExt(path)
+}
+
 func formatFromExt(path string) (Format, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 

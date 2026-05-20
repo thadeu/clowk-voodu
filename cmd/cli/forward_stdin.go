@@ -93,7 +93,15 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 		formatSet = "hcl"
 	}
 
-	mans, err := loadManifests(applyFlags{files: paths, format: formatSet})
+	// nil cmd: the SSH-forward path runs before cobra parses args
+	// (it's the argv rewriter). env_from bucket enrichment is
+	// skipped here — operator-supplied `${VAR}` in the manifest
+	// still resolves against the LOCAL shell. For remote applies
+	// that want bucket-sourced interpolation, the operator points
+	// the controller URL at the remote and runs without -r so the
+	// local apply path (which does have cmd) is taken. SSH-forward
+	// for env_from is a deferred milestone.
+	mans, err := loadManifests(nil, applyFlags{files: paths, format: formatSet})
 	if err != nil {
 		return streamResult{}, err
 	}

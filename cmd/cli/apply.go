@@ -238,7 +238,7 @@ before committing to the destructive operation.`,
 }
 
 func runApply(cmd *cobra.Command, f applyFlags) error {
-	mans, err := loadManifests(f)
+	mans, err := loadManifests(cmd, f)
 	if err != nil {
 		return err
 	}
@@ -435,7 +435,7 @@ func splitManifestRef(ref string) (kind, scope, name string) {
 }
 
 func runDiff(cmd *cobra.Command, f applyFlags) error {
-	local, err := loadManifests(f)
+	local, err := loadManifests(cmd, f)
 	if err != nil {
 		return err
 	}
@@ -767,7 +767,7 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 	// f.autoApprove is accepted on the cobra surface so the flag can
 	// appear in argv without erroring out, but is otherwise ignored
 	// here — same dance as runApply uses for its own --auto-approve.
-	mans, err := loadManifests(f)
+	mans, err := loadManifests(cmd, f)
 	if err != nil {
 		return err
 	}
@@ -1203,17 +1203,30 @@ func promptDeleteConfirm(in io.Reader, out io.Writer) (bool, error) {
 
 // loadManifests expands every -f argument (file, dir, stdin) into a flat
 // list, applying ${VAR} interpolation from the current environment.
-func loadManifests(f applyFlags) ([]controller.Manifest, error) {
+//
+// When a manifest declares `env_from = [...]`, the referenced config
+// buckets are fetched from the controller and layered into the
+// interpolation context BEFORE `${VAR}` substitution runs. Shell env
+// wins on collision — same posture as the runtime env_from path
+// where spec.env overrides env_from layers. See apply_envfrom.go for
+// the bucket-fetch + merge mechanics.
+//
+// `cmd` is the apply cobra.Command — needed to talk to the controller
+// for bucket reads. nil-tolerant for tests that exercise pure-shell
+// interpolation; the env_from enrichment is skipped when cmd is nil
+// (no controller wired, treat as offline).
+func loadManifests(cmd *cobra.Command, f applyFlags) ([]controller.Manifest, error) {
 	if len(f.files) == 0 {
 		return nil, fmt.Errorf("at least one -f is required")
 	}
 
-	env := envAsMap()
+	shellEnv := envAsMap()
+	cache := newBucketCache()
 
 	var out []controller.Manifest
 
 	for _, path := range f.files {
-		mans, err := loadOne(path, f.format, env)
+		mans, err := loadOne(cmd, path, f.format, shellEnv, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -1224,13 +1237,23 @@ func loadManifests(f applyFlags) ([]controller.Manifest, error) {
 	return out, nil
 }
 
-func loadOne(path, stdinFormat string, env map[string]string) ([]controller.Manifest, error) {
+func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
 	if path == "-" {
 		if stdinFormat == "" {
 			return nil, fmt.Errorf("-f -: --format hcl|yaml is required for stdin")
 		}
 
-		mans, err := manifest.ParseReader(os.Stdin, manifest.Format(stdinFormat), env)
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+
+		env, err := enrichEnvFor(cmd, "<stdin>", raw, shellEnv, cache)
+		if err != nil {
+			return nil, err
+		}
+
+		mans, err := manifest.ParseReader(bytes.NewReader(raw), manifest.Format(stdinFormat), env)
 		if err != nil {
 			return nil, err
 		}
@@ -1251,18 +1274,27 @@ func loadOne(path, stdinFormat string, env map[string]string) ([]controller.Mani
 	}
 
 	if info.IsDir() {
-		mans, err := manifest.ParseDir(resolved, env)
+		// Directory case: walk files ourselves so each one gets its
+		// own env_from enrichment pass (one file might `env_from`
+		// "prod/shared", another "prod/worker-creds"; we don't want
+		// to globally union them across the whole dir). The cache
+		// dedup across files in the same apply session anyway.
+		mans, err := loadDir(cmd, resolved, shellEnv, cache)
 		if err != nil {
 			return nil, err
 		}
 
-		// Directory case: env_file refs resolve against the directory
-		// the operator pointed at. (Each manifest file inside the dir
-		// shares the same env-file resolution base — alternative
-		// would be per-file dir, but ParseDir already flattens; the
-		// directory-level base matches the most common shape where
-		// `app.voodu` + `.env` live side by side.)
 		return mergeEnvFilesInManifests(mans, resolved)
+	}
+
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", resolved, err)
+	}
+
+	env, err := enrichEnvFor(cmd, resolved, raw, shellEnv, cache)
+	if err != nil {
+		return nil, err
 	}
 
 	mans, err := manifest.ParseFile(resolved, env)
