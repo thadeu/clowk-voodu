@@ -1,0 +1,24 @@
+# Copy this file to `.envrc` in the directory where you run
+# `vd apply`. Add `.envrc` to your repo's .gitignore. Real
+# secrets go in your team password manager — this file documents
+# the SHAPE, not the values.
+#
+# direnv will auto-load these when you cd into the directory.
+# Without direnv, run `source .envrc` manually before vd apply.
+#
+# IMPORTANT: every dev on the team uses the SAME service-account
+# token. ~/.docker/config.json on the controller host is
+# singular — per-dev personal PATs trample each other. See
+# README.md "One credential per registry, per host".
+
+# GitHub Container Registry — service account / machine user.
+# Scope on the PAT: read:packages.
+export GHCR_USER="acme-deploy-bot"
+export GHCR_TOKEN="ghp_REPLACE_WITH_BOT_PAT"
+
+# Self-hosted Harbor (only needed for multi-registry.hcl).
+# Use a Harbor "robot account" rather than a real user — robot
+# accounts are scope-restricted to specific projects and easy to
+# rotate.
+export HARBOR_USER="robot\$voodu-puller"
+export HARBOR_TOKEN="REPLACE_WITH_HARBOR_CLI_SECRET"

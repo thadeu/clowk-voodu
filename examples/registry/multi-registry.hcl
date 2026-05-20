@@ -16,22 +16,29 @@
 #      host can pull from either.
 #
 #   3. Both secrets come from the operator's shell env via ${...}.
-#      Interpolation is client-side at parse time, so the plaintext
-#      never enters this file. The controller only sees the
-#      substituted values.
+#      USE SERVICE-ACCOUNT TOKENS — see ghcr-private.hcl header
+#      and examples/registry/README.md for why per-dev personal
+#      tokens don't compose on a host with ~/.docker/config.json.
+#      Distribute the shared bot tokens via a gitignored .envrc
+#      + direnv (or your team's preferred secret distribution).
 #
-# Apply:
+# Apply (after .envrc / shell vars are in place):
 #
 #   cd examples/registry
-#   export GHCR_USER=acme-deploy-bot
-#   export GHCR_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#   export HARBOR_USER=acme-ci
-#   export HARBOR_TOKEN=cli-secret-yyyyyyyyyyyyyyyyyyyyyyyy
 #   vd apply -f multi-registry.hcl
+#
+# Required env (set via .envrc or shell):
+#
+#   GHCR_USER     GitHub bot login (e.g. acme-deploy-bot)
+#   GHCR_TOKEN    PAT with read:packages on the bot account
+#   HARBOR_USER   Harbor robot account name
+#   HARBOR_TOKEN  Harbor robot CLI secret
 #
 # After apply, ~/.docker/config.json carries TWO entries under
 # `auths`: "ghcr.io" and "harbor.internal.acme.com". The next
-# `docker pull` against either host authenticates transparently.
+# `docker pull` against either host authenticates transparently
+# and the credentials persist across reboots / autoscaler events
+# until the next apply rewrites them.
 
 registry "ghcr" {
   url      = "ghcr.io"

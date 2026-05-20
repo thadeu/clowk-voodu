@@ -50,12 +50,91 @@ secret lives in the operator's shell env (sourced from `direnv`, a
 
 Two things to remember:
 
-1. `vd config set` buckets are **scoped** (`<scope>` or
-   `<scope>/<name>`). The `registry` kind is **unscoped** — its
-   secret does NOT belong in a config bucket. Use shell env.
+1. `registry` does NOT accept `env_from`. Other kinds
+   (`deployment`, `app`, `statefulset`, `job`, `cronjob`) feed
+   their `${VAR}` interpolation from `env_from`'d config buckets;
+   `registry` is the one exception. See the next section for
+   why, and the recommended team workflow.
 2. Interpolation happens client-side. The controller never sees
    `${GHCR_TOKEN}` — it sees the substituted plaintext, which is
    then base64-encoded into the auth entry.
+
+## One credential per registry, per host
+
+This is the constraint that shapes how teams should use the
+`registry` kind. Read this section before adopting a per-dev
+token workflow.
+
+`~/.docker/config.json` is **a single file** on the host. Every
+`vd apply` that includes a `registry "<name>" { ... }` block
+rewrites the `auths.<url>` entry. The credential ACTIVE on the
+host at any moment is whichever apply ran last.
+
+What this means for teams:
+
+- **Per-dev personal tokens don't compose.** If dev A has a PAT
+  with access to org X repos and dev B has a PAT scoped to org Y,
+  whichever applied last is the only credential the VM can use.
+  Subsequent `docker pull` of the other org's images will 401
+  until someone applies with a broader token.
+
+- **The credential persists across reboots and reconciles.** Once
+  written, `~/.docker/config.json` lives on disk. The autoscaler
+  scaling up at 3am uses it. A container crash + reconcile uses
+  it. No re-apply is needed for the controller to keep pulling —
+  as long as the credential itself stays valid (not revoked, not
+  expired).
+
+- **The credential expires silently.** A revoked PAT (dev leaves
+  the company, GitHub rotates the token) means the next pull
+  fails. The VM has no way to refresh — it just keeps presenting
+  the dead token until someone applies with a fresh one.
+
+### Recommended team workflow
+
+Use a **service-account / bot-account token** rather than personal
+PATs. Common shape:
+
+- GitHub: create a dedicated bot user (or a fine-grained PAT on an
+  org-owned machine user). Scope: `read:packages` for the orgs/
+  repos voodu needs to pull from. Token lifetime: as long as
+  practicable (1y typical).
+- Quay / Harbor / GitLab: equivalent service-account flow.
+
+Then standardise how every dev gets the token at apply time:
+
+- **`.envrc` in the repo** (gitignored, value distributed via
+  team password manager / shared secrets vault). Devs source it
+  via `direnv` and `vd apply` reads from `os.Environ()`.
+- **CI runner secret** (GitHub Actions secret, etc.) for automated
+  applies.
+
+Rotation: rotate the bot token centrally, update the password
+manager entry, every dev's next `direnv reload` picks it up. One
+artifact, one rotation, no per-dev drift.
+
+### What NOT to do
+
+- ❌ Per-dev personal PATs declared inline. Whoever applied last
+  wins; sometimes-failing pulls until someone re-applies.
+- ❌ Long-lived plaintext tokens checked into git.
+- ❌ Hoping `~/.docker/config.json` survives forever — it does,
+  but only as long as the credential it holds stays valid.
+
+### Why no `env_from` on `registry` today
+
+We considered it ("just put the token in a `vd config` bucket").
+But the bucket would solve only the WHERE-IS-THE-SECRET-STORED
+question, not the underlying ONE-CREDENTIAL-PER-HOST constraint.
+The right architectural answer is "use a service account so the
+one credential serves the whole team", which the `.envrc` flow
+already supports. Adding `env_from` to `RegistrySpec` would be
+mostly redundant.
+
+If your model truly needs per-dev tokens that don't trample each
+other on the host (e.g. multi-tenant voodu controller), that's a
+larger refactor than `env_from` — the `~/.docker/config.json`
+singularity would need addressing first.
 
 ## Removing a registry
 
@@ -70,5 +149,6 @@ returning 401 again.
 
 | file | what it shows |
 |---|---|
-| [`ghcr-private.hcl`](./ghcr-private.hcl) | GitHub Container Registry — one registry block + a deployment pulling from `ghcr.io/acme/private-api:1.0`. Secret comes from `${GHCR_TOKEN}` in the shell env. |
+| [`ghcr-private.hcl`](./ghcr-private.hcl) | GitHub Container Registry — one registry block + a deployment pulling from `ghcr.io/acme/private-api:1.0`. Secret comes from `${GHCR_TOKEN}` in the shell env (service-account-fed via `.envrc`). |
 | [`multi-registry.hcl`](./multi-registry.hcl) | Two registries simultaneously (ghcr.io + self-hosted Harbor). Demonstrates that registries are host-wide — deployments in different scopes pull from different registries with one set of declarations. |
+| [`.envrc.example`](./.envrc.example) | Template for the gitignored `.envrc` your team distributes via password manager. Shows the SHAPE of the env vars the examples reference; copy + edit + `direnv allow`. |
