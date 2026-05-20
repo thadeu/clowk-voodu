@@ -1,0 +1,5 @@
+{
+  "title": "Plugins",
+  "icon": "Blocks",
+  "pages": ["postgres", "redis", "caddy", "build-your-own"]
+}

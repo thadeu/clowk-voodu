@@ -1,0 +1,75 @@
+---
+title: Build your own plugin
+description: The voodu plugin protocol, in 10 minutes.
+---
+
+## What a plugin is
+
+A plugin is a **standalone executable** that:
+
+1. Speaks gRPC over a Unix socket the controller hands it on startup.
+2. Registers one or more **kinds** it can reconcile (`mongo`, `redis-ha`, `s3-asset`, ...).
+3. Receives diff events from the controller and emits reconcile actions.
+
+That's it. No Go-only requirement — anything that can serve gRPC works.
+
+## Skeleton (Go)
+
+```go
+package main
+
+import (
+  "github.com/thadeu/voodu-plugin-sdk/server"
+  "github.com/thadeu/voodu-plugin-sdk/kinds"
+)
+
+func main() {
+  srv := server.New()
+
+  srv.Register(kinds.Kind{
+    Name: "my-thing",
+    Reconcile: func(ctx server.Context, desired, current kinds.Resource) error {
+      // diff desired vs current, do the work, return error to retry
+      return nil
+    },
+  })
+
+  srv.Serve()
+}
+```
+
+Build it as `voodu-my-thing`, push a GitHub release, and:
+
+```bash
+voodu plugins:install yourname/voodu-my-thing
+```
+
+## Resource lifecycle
+
+For each `kind "scope" "name" { ... }` block:
+
+```
++  CreateAction → first time we've seen this resource
+~  UpdateAction → desired ≠ current, with a diff payload
+-  PruneAction  → resource disappeared from the manifest
+```
+
+Your `Reconcile` callback is called for all three. Use `desired.Body` and `current.Body` to inspect typed HCL values.
+
+## State
+
+The controller stores all reconciled state in embedded etcd. Your plugin should be **stateless** between calls — anything you need on the next reconcile, put it in the resource's annotations:
+
+```go
+ctx.SetAnnotation("last-applied-hash", h)
+```
+
+## Discovery
+
+Plugins live in `/opt/voodu/plugins/<binary>`. The controller scans on startup and on `SIGHUP`. There's no central registry — `voodu plugins:install` is just a sugar for "download this GitHub release binary to every remote".
+
+## Reference
+
+- [voodu-caddy](https://github.com/thadeu/voodu-caddy) — ingress plugin, ~600 LOC.
+- [voodu-postgres](https://github.com/thadeu/voodu-postgres) — stateful with WAL.
+- [voodu-plugin-sdk](https://github.com/thadeu/voodu-plugin-sdk) — Go helpers.

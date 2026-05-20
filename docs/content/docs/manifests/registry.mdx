@@ -1,0 +1,134 @@
+---
+title: registry
+description: Private image pull credentials, host-wide.
+---
+
+`registry` declares credentials for a private container registry. Voodu rewrites `~/.docker/config.json` atomically on every apply, so any subsequent `docker pull` uses them.
+
+Unlike most kinds, `registry`:
+
+- Takes **one label** — the registry shortname (`"ghcr"`, `"ecr"`, `"gitlab"`).
+- Is **host-wide and unscoped** — not scoped per app.
+- Has **no `env_from` field** — credentials must come from shell env.
+
+## Synopsis
+
+```hcl
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+```
+
+`password = "..."` is accepted as an alias for `token`.
+
+## Required fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `url` | string | Bare host (no scheme). E.g. `"ghcr.io"`, `"registry.gitlab.com"`, `"123456789012.dkr.ecr.us-east-1.amazonaws.com"`. |
+| `username` | string | Registry account. |
+| `token` or `password` | string | Token / PAT. At least one is required; `token` wins if both are set. |
+
+Each missing field is rejected with a per-field error:
+
+```
+registry/ghcr: url is required
+registry/ghcr: username is required
+registry/ghcr: token (or password) is required
+```
+
+## Validation
+
+- Exactly **one** label. `registry "x" "y" {}` is rejected — registry is host-scope, never `(scope, name)`.
+- `(kind=registry, scope="", name=<label>)` must be unique across the apply. Two `registry "ghcr"` blocks → reject.
+
+## Examples
+
+### GitHub Container Registry
+
+```hcl
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+```
+
+Then in your shell (e.g. via `direnv`):
+
+```bash
+export GHCR_USER=my-bot
+export GHCR_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+voodu apply -f voodu.hcl -r prod-1
+```
+
+### Multiple registries on one host
+
+```hcl
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+
+registry "ecr" {
+  url      = "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+  username = "AWS"
+  token    = "${ECR_TOKEN}"
+}
+
+registry "gitlab" {
+  url      = "registry.gitlab.com"
+  username = "${GITLAB_USER}"
+  password = "${GITLAB_DEPLOY_TOKEN}"
+}
+```
+
+Each block writes its own entry in `~/.docker/config.json`.
+
+### Token rotation via cronjob (ECR)
+
+ECR tokens expire every 12 hours. One pattern:
+
+```hcl
+cronjob "infra" "ecr-refresh" {
+  schedule = "0 */6 * * *"
+
+  image    = "amazon/aws-cli:latest"
+  env_from = ["aws/cli"]
+
+  command = [
+    "sh", "-c",
+    "aws ecr get-login-password --region us-east-1 | voodu config aws/ecr set ECR_TOKEN=$(cat -)"
+  ]
+}
+```
+
+Then your `registry` block reads `${ECR_TOKEN}` from shell env at next apply.
+
+## Trade-offs
+
+**One credential per registry host.** Voodu rewrites `~/.docker/config.json` atomically per apply — there's exactly one entry per registry hostname. Two operators each pushing their personal PAT will trample each other.
+
+**Use a bot / service-account token.** Distribute via:
+
+- A gitignored `.envrc` + [direnv](https://direnv.net/), or
+- A shared secret manager piping into shell env at apply time.
+
+Personal PATs in `voodu apply` flow are antipattern.
+
+**No `env_from`.** The bootstrap order is wrong — voodu needs the credential before any container (including the controller's own pull) runs. There's no way to pull registry creds from a config bucket. Use shell env via `${VAR}`.
+
+**Host-wide, not per-resource.** A `registry "ghcr" {}` block authenticates every `docker pull` on that host. There's no per-deployment override — voodu trusts docker's credential resolution.
+
+**Atomic rewrites — voodu owns `auths`, preserves everything else.** Voodu writes the new `config.json` to a tempfile, then renames. The `auths` section is owned entirely by voodu (declared registries overwrite, undeclared ones are removed). Unknown top-level keys (`credsStore`, `HTTPHeaders`, `plugins`, etc.) are preserved verbatim, so coexistence with `docker login` for non-voodu registries still works for the keys voodu doesn't touch.
+
+**Plain image pulls work without `registry {}`.** Public images (`ghcr.io/some/public:tag`, `docker.io/library/nginx:1.25`) don't need a credential block. Only declare `registry` when an image needs auth.
+
+**ECR / token-rotating registries.** Voodu doesn't refresh tokens on its own — you need a sidecar cronjob (above), an external runner, or a Docker credential helper. The `registry` block reads whatever value is in shell env at apply time.
+
+## See also
+
+- [`config & secrets`](/docs/manifests/config) — for `${VAR}` interpolation context

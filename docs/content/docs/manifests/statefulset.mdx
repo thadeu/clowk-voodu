@@ -1,0 +1,226 @@
+---
+title: statefulset
+description: Stable identity, ordered pods, per-pod volumes.
+---
+
+`statefulset` is the building block for anything that needs stable identity — postgres replicas, redis sentinels, kafka brokers, anything where pod-0 and pod-1 are not interchangeable.
+
+It shares most of [`deployment`](/docs/manifests/deployment)'s surface, plus:
+
+- Pods get stable ordinals (`name-0`, `name-1`, ...)
+- Each pod gets its own persistent volume claim (`volume_claim`)
+- Per-pod DNS aliases (`name-0.scope`, `name-1.scope`, ...)
+
+For supported macros — postgres, redis, mongo — prefer the macro. Reach for `statefulset` directly when you're running something the macros don't cover.
+
+## Synopsis
+
+```hcl
+statefulset "scope" "name" {
+  image    = "kafka:3.7"
+  replicas = 3
+  ports    = ["9092"]
+
+  env = {
+    KAFKA_NODE_ID = "${VOODU_REPLICA_ORDINAL}"
+  }
+
+  build      { ... }      # optional, mutex with image
+  depends_on { ... }
+  resources  { ... }
+  logs       { ... }
+  probes     { ... }
+  init "<name>" { ... }   # repeatable
+
+  volume_claim "data" {
+    mount_path = "/var/lib/kafka"
+    size       = "100Gi"   # optional, informational
+  }
+}
+```
+
+## Required
+
+- `host`-equivalent: none. An empty statefulset is valid in build-mode.
+- At least one `volume_claim {}` if your workload writes state. Volumes survive restart, rebuild, and image upgrade.
+
+## Optional fields (root)
+
+Same as [`deployment`](/docs/manifests/deployment) except for what's listed below.
+
+### Fields absent vs deployment
+
+- `release {}` — no rolling release hook
+- `autoscale {}` — no horizontal scaling
+- `on_deploy {}` — no webhook notifications
+- `post_deploy` — no post-rollout command
+- `keep_releases` — no release history cap
+- `health_check` — no default; `health_check = "/..."` is accepted but rarely makes sense (stateful services don't have a universal HTTP probe path)
+
+### Fields shared with deployment
+
+All of these are supported on statefulsets:
+
+- `image` / `build {}` (mutex)
+- `replicas`, `command`, `env`, `env_file`, `env_from`
+- `ports`, `volumes`, `networks`, `network`, `network_mode`
+- `restart`, `extra_hosts`, `cap_add`
+- `resources {}`, `logs {}`, `probes {}`, `depends_on {}`
+- `init "<name>" {}` (runs per-ordinal — re-runs each time pod-N is recreated)
+
+### Fields added vs deployment
+
+- `volume_claim "name" { ... }` — repeatable. Per-pod persistent volumes.
+
+## `volume_claim "name" {}`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `mount_path` | string | **required** | Interior path the volume mounts at. |
+| `size` | string | — | k8s-format informational hint (`"10Gi"`, `"500Mi"`). Not enforced. |
+
+The block label is the claim name. Docker volumes are named deterministically:
+
+```
+voodu-<scope>-<name>-<claim>-<ordinal>
+```
+
+So a statefulset `"data" "pg"` with `volume_claim "data" {}` and `replicas = 3` creates:
+
+- `voodu-data-pg-data-0`
+- `voodu-data-pg-data-1`
+- `voodu-data-pg-data-2`
+
+Volumes are **never** auto-deleted. Even `voodu apply --prune` on the resource leaves them — you have to `docker volume rm` explicitly.
+
+## Identity & DNS
+
+| Pod ordinal | Container name | DNS aliases |
+|---|---|---|
+| 0 | `<scope>-<name>.0` | `<name>-0.<scope>`, `<name>-0.<scope>.voodu`, `<name>.<scope>`, `<name>.<scope>.voodu` |
+| 1 | `<scope>-<name>.1` | `<name>-1.<scope>`, `<name>-1.<scope>.voodu`, `<name>.<scope>`, `<name>.<scope>.voodu` |
+| ... | ... | ... |
+
+Per-ordinal DNS is what makes streaming replication and quorum protocols work — clients need to talk to *that specific replica*. The shared `<name>.<scope>` alias does docker round-robin DNS across all pods. The `.voodu` FQDN form is interchangeable with the short alias; use whichever your client expects.
+
+Each pod also gets `VOODU_REPLICA_ORDINAL` injected as an env var — useful inside the container to know which one you are.
+
+## Rollout semantics
+
+- **Scale up** — pods spawn sequentially from `0 → N-1`. Each waits for the previous to be ready (probes-gated).
+- **Scale down** — pods stop sequentially from `N-1 → 0`.
+- **Rolling replace** — top-down (`N-1 → 0`), one at a time. The lower-ordinal pods (typically the primary in active/passive setups) are touched last.
+- **No autoscale** — scale is fixed via `replicas`.
+
+## Validation
+
+- Same network-mode / build / image rules as `deployment`.
+- `volume_claim` blocks must have unique labels.
+- `mount_path` is required on each claim.
+
+## Examples
+
+### Single-node postgres (raw — prefer the [`postgres`](/docs/manifests/postgres) macro)
+
+```hcl
+statefulset "data" "pg" {
+  image    = "postgres:16"
+  replicas = 1
+  ports    = ["5432"]
+
+  env = {
+    POSTGRES_DB       = "myapp"
+    POSTGRES_PASSWORD = "${PG_PASSWORD}"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+
+  probes {
+    readiness {
+      exec { command = ["pg_isready"] }
+      period = "5s"
+    }
+  }
+}
+```
+
+### Kafka with per-pod data + ordinal-driven config
+
+```hcl
+statefulset "infra" "kafka" {
+  image    = "bitnami/kafka:3.7"
+  replicas = 3
+  ports    = ["9092"]
+
+  env = {
+    KAFKA_CFG_NODE_ID                  = "${VOODU_REPLICA_ORDINAL}"
+    KAFKA_CFG_PROCESS_ROLES            = "controller,broker"
+    KAFKA_CFG_CONTROLLER_QUORUM_VOTERS = "0@kafka-0.infra:9093,1@kafka-1.infra:9093,2@kafka-2.infra:9093"
+  }
+
+  volume_claim "data" {
+    mount_path = "/bitnami/kafka"
+    size       = "50Gi"
+  }
+}
+```
+
+### Build-mode (postgres + pgvector inline)
+
+```hcl
+statefulset "data" "pg" {
+  build {
+    context    = "."
+    dockerfile = "Dockerfile.pg-pgvector"
+  }
+
+  replicas = 1
+  ports    = ["5432"]
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+}
+```
+
+Useful when you'd otherwise need a separate CI pipeline just to publish a `postgres:16-pgvector` image. The build streams via the same receive-pack as deployments.
+
+### Multi-claim (data + WAL archive on separate disks)
+
+```hcl
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+
+  volume_claim "wal-archive" {
+    mount_path = "/pg-archive"
+  }
+}
+```
+
+## Trade-offs
+
+**Volumes survive everything.** Restart, rebuild, image upgrade, image change, `voodu apply --prune` of the resource. The only thing that removes them is an explicit `docker volume rm`. That's by design — you don't accidentally wipe your data because the manifest moved.
+
+**Ordinals are forever.** Pod `pg-0` stays `pg-0` for life. If you `voodu apply --prune` the statefulset and recreate it, the new pod-0 picks up `voodu-data-pg-data-0` and inherits the old data. Same for the DNS alias `pg-0.data`.
+
+**No autoscale.** Stateful pods can't be horizontally scaled by CPU — replica count is what you wrote in the manifest. Scaling is operator-explicit (`replicas = 3 → 5`) and goes through the rollout sequence above.
+
+**`replicas = 0` clamps to 1.** Statefulsets can't scale to zero — to "stop" the workload, remove the manifest entry. Volumes remain even after removal.
+
+**No `release {}`, no `on_deploy {}`.** Statefulsets don't run release hooks; migrations are the workload's own concern (init containers, or a sibling `job`).
+
+**No `health_check =`.** Stateful services rarely have an HTTP health endpoint. Define [`probes {}`](/docs/manifests/probes) instead — TCP for liveness, `pg_isready` / `redis-cli ping` / equivalent for readiness.
+
+**Pruning leaves data.** `voodu apply --prune` removes the statefulset spec from the controller but **does not** delete volumes. Operator-deletion is irreversible enough that voodu refuses to do it automatically.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment) — the stateless counterpart
+- [`postgres`](/docs/manifests/postgres), [`redis`](/docs/manifests/redis) — macros over `statefulset`
+- [`probes`](/docs/manifests/probes), [`init`](/docs/manifests/init), [`resources`](/docs/manifests/resources), [`build`](/docs/manifests/build)

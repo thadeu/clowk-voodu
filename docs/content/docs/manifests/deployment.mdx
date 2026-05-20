@@ -1,0 +1,172 @@
+---
+title: deployment
+description: Stateless replicas. The canonical compute kind.
+---
+
+`deployment` is voodu's baseline compute kind. Every other workload shape — `app`, `job`, `cronjob` — borrows its surface. Stateless: replicas are interchangeable, no stable identity, no per-pod volume.
+
+For HTTP services with TLS + a host, use [`app`](/docs/manifests/app) — it's sugar over `deployment` + `ingress`. For stateful services with stable ordinals, use [`statefulset`](/docs/manifests/statefulset).
+
+## Synopsis
+
+```hcl
+deployment "scope" "name" {
+  # Source — pick one or omit both (auto-detect at repo root):
+  image = "ghcr.io/myorg/api:1.7"
+  # OR
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+  }
+
+  replicas     = 3
+  command      = ["bin/server"]
+  env          = { PORT = "8080" }
+  env_file     = ["./.env"]
+  env_from     = ["prod/shared"]
+  ports        = ["8080"]
+  volumes      = ["/host/path:/in/container:ro"]
+  networks     = ["voodu0"]
+  network_mode = ""               # or "host" / "none"
+  restart      = "unless-stopped"
+  health_check = "/healthz"
+  post_deploy  = ["bin/notify"]
+  keep_releases = 5
+  extra_hosts  = ["legacy.internal:10.0.0.5"]
+  cap_add      = ["NET_ADMIN"]
+
+  # Cross-cutting blocks (each documented separately):
+  release    { ... }
+  depends_on { assets = [...] }
+  resources  { ... }
+  autoscale  { ... }
+  on_deploy  { ... }
+  logs       { ... }
+  probes     { ... }
+  init "<name>" { ... }   # repeatable — see init containers
+}
+```
+
+## Required
+
+None. An empty `deployment "scope" "name" {}` is valid — it means "build at repo root, auto-detect runtime, health-check `/`".
+
+## Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `image` | string | — | Container image. Mutex with `build {}`. |
+| `build` | block | — | Build mode — Dockerfile or auto-generated. Mutex with `image`. See [build mode](/docs/manifests/build). |
+| `replicas` | int | `1` | Pod count. Mutex with `autoscale {}`. Excluded from spec hash so scaling doesn't churn the other replicas. |
+| `command` | []string | — | Argv override. Hashed into the spec. |
+| `env` | map[string]string | — | Inline env vars. Numeric/bool values are stringified automatically. |
+| `env_file` | []string | — | Paths to `.env` files. **Read client-side** at apply time. Inline `env = {...}` wins on key collision. |
+| `env_from` | []string | — | Config buckets — `"scope/name"` or `"name"` (current scope). Order is semantic and hashed. See [config & secrets](/docs/manifests/config). |
+| `ports` | []string | — | Port mappings. **Loopback-only by default** — see trade-offs. |
+| `volumes` | []string | — | Bind / named volume mounts in docker syntax. |
+| `networks` | []string | `["voodu0"]` | Docker networks. `voodu0` is **always appended** in bridge mode. |
+| `network` | string | — | Legacy singular form — folded into `networks` at handler time. Prefer `networks = [...]`. |
+| `network_mode` | string | bridge | `"host"` or `"none"`. Mutex with `networks` / `network`. |
+| `restart` | string | `"unless-stopped"` | Docker restart policy. |
+| `health_check` | string | `"/"` | Path the ingress upstream probe hits when [`lb { interval }`](/docs/manifests/ingress) is set — **not** a container liveness check. Use [`probes {}`](/docs/manifests/probes) for that. |
+| `post_deploy` | []string | — | Command run after rolling restart completes. |
+| `keep_releases` | int | `5` (when unset or `≤ 0`) | Release history cap on disk. |
+| `extra_hosts` | []string | — | Each entry `"name:ip"`. Layered atop the auto-injected `host.docker.internal:host-gateway`. |
+| `cap_add` | []string | — | Linux capabilities without the `CAP_` prefix (e.g. `"SYS_NICE"`). |
+
+## Validation
+
+The apply is rejected when:
+
+- `image` AND `build {}` are both set.
+- `network_mode = "host"` or `"none"` is set together with `networks` / `network`.
+- `network_mode` is anything other than `""`, `"host"`, or `"none"`.
+- `replicas = N` is set together with `autoscale {}`.
+- Init container, probe, or webhook validation fails (see those pages).
+
+## Examples
+
+### Minimal — auto-detect everything
+
+```hcl
+deployment "prod" "api" {}
+```
+
+Builds the repo at `.`, sniffs the runtime (Go, Ruby, Node, Python — handler picks), exposes nothing, joins `voodu0`, restarts on failure.
+
+### Image + env + ports
+
+```hcl
+deployment "prod" "api" {
+  image    = "ghcr.io/myorg/api:1.7"
+  replicas = 3
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  ports = ["8080"]
+}
+```
+
+### Build-mode with secrets from a shared bucket
+
+```hcl
+deployment "prod" "worker" {
+  build {
+    dockerfile = "Dockerfile.worker"
+    args       = { RELEASE = "v1" }
+  }
+
+  env_from = ["prod/shared"]    # DATABASE_URL, REDIS_URL, ...
+  command  = ["bin/worker"]
+}
+```
+
+### Pinned to host network for a sidecar metrics collector
+
+```hcl
+deployment "infra" "node-exporter" {
+  image        = "prom/node-exporter:latest"
+  network_mode = "host"
+  # No `ports` — host networking exposes the port directly.
+}
+```
+
+### Public exposure (explicit opt-in)
+
+```hcl
+deployment "prod" "edge" {
+  image = "ghcr.io/myorg/edge:1.0"
+  ports = ["0.0.0.0:8080:8080"]   # bind on all interfaces
+}
+```
+
+## Trade-offs
+
+**Ports default to loopback.** A bare `"8080"` normalises to `"127.0.0.1::8080"`. `"3000:8080"` normalises to `"127.0.0.1:3000:8080"`. Explicit IPs pass through unchanged — including `"0.0.0.0:..."` and `"[::1]:..."`. This is the only gate between *"I added a port mapping"* and *"my service is on the open internet"* — make the IP explicit when you mean exposure.
+
+**`voodu0` is unconditional in bridge mode.** Declaring `networks = ["my-net"]` adds `voodu0`, it does not replace it. Containers must always reach the controller and sibling services on the platform network. The only way out is `network_mode = "host"` or `"none"` — which fork their own constraints.
+
+**`replicas` is not in the spec hash.** Scale-only changes mint a release record but do not churn the rest of the replicas. That means `replicas = 5 → 10` only spawns 5 new pods; it doesn't recreate the existing 5.
+
+**`env_from` order matters.** Buckets are layered front-to-back, so later entries win on shared keys between buckets. The deployment's own `env = {...}` block still wins overall — that's how secrets-out-of-band stays consistent.
+
+**`env_file` is client-side.** The CLI reads the `.env` files at apply time and ships the merged result. The file path is relative to your shell — it does not need to exist on the target host.
+
+**No rolling-strategy knob.** There's no `swap {}` or `strategy {}` block. The rolling cadence is a fixed ~2s pause between slot recreates. To gate rollouts on actual readiness, declare a `readiness` probe — the ingress upstream will refuse traffic until it passes.
+
+**Jobs use `deployment`-like fields but are not deployments.** If you need a one-shot, use [`job`](/docs/manifests/jobs#job). If you need cron, use [`cronjob`](/docs/manifests/jobs#cronjob). `deployment` is for long-lived processes.
+
+**Spec hash excludes scaling / cosmetic fields.** `replicas`, `on_deploy`, `keep_releases`, `post_deploy`, `health_check`, and `release {}` are NOT folded into the spec hash — changing any of them won't trigger a rolling restart by itself. The fields that ARE hashed: `image`/`build`, `command`, `env`, `env_file`, `env_from`, `ports`, `volumes`, `networks`, `network_mode`, `restart`, `extra_hosts`, `cap_add`, `probes`, `init`, `autoscale`, `resources`, `logs`.
+
+**Manifest files can be `.hcl`, `.voodu`, `.vdu`, or `.vd`.** All four extensions parse as HCL.
+
+## See also
+
+- [`app`](/docs/manifests/app) — sugar over `deployment` + `ingress` for HTTP services
+- [`statefulset`](/docs/manifests/statefulset) — stable identity, per-pod volumes
+- [`probes`](/docs/manifests/probes), [`init`](/docs/manifests/init), [`autoscale`](/docs/manifests/autoscale), [`on_deploy`](/docs/manifests/on-deploy)
+- [`build`](/docs/manifests/build) — build-mode reference
+- [Interpolation reference](/docs/manifests/interpolation) — `${VAR}`, `${asset.…}`, `{{…}}`

@@ -1,0 +1,5 @@
+{
+  "title": "Reference",
+  "icon": "BookOpen",
+  "pages": ["faq", "security", "cron", "errors", "contributing"]
+}

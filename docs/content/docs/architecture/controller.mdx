@@ -1,0 +1,181 @@
+---
+title: Controller
+description: The voodu-controller process — boot, etcd, plugins, shutdown, build pipeline.
+---
+
+The controller is a single Go binary. One process per host. Runs under systemd, talks to etcd in-process, owns docker via the local socket, invokes plugins as subprocesses.
+
+## Binary + entrypoint
+
+- Path: `/usr/local/bin/voodu-controller`
+- Source: `cmd/controller/main.go`
+- Systemd unit: `deploy/systemd/voodu-controller.service` — `Restart=on-failure`, runs as root, `Environment=VOODU_ROOT=/opt/voodu`.
+
+### Default flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--http` | `:8686` | HTTP listener (all interfaces). |
+| `--etcd-client` | `http://127.0.0.1:2379` | Embedded etcd client URL. |
+| `--etcd-peer` | `http://127.0.0.1:2380` | Embedded etcd peer URL. |
+| `--data` | `$VOODU_ROOT/state` | etcd bbolt data dir. |
+| `--plugins` | `$VOODU_ROOT/plugins` | Plugin root. |
+| `--name` | `voodu-0` | Single etcd member name. |
+| `--quiet-etcd` | `true` | Suppress etcd's own log noise. |
+
+## Boot sequence
+
+`Server.Start(ctx)` runs these in order:
+
+### 1. Sanity + defaults
+
+Fill missing `DataDir`, `HTTPAddr`, `NodeName`, `ReadyTimeout=30s`. Refuse to start without `DataDir`.
+
+### 2. Embedded etcd
+
+Voodu embeds `go.etcd.io/etcd/server/v3/embed` — etcd runs **in-process**, not as a sidecar.
+
+- `DataDir` created `0700`.
+- Single-member config: `ListenClientUrls = http://127.0.0.1:2379`, `ListenPeerUrls = http://127.0.0.1:2380`, `InitialCluster = "voodu-0=http://127.0.0.1:2380"`, `ClusterState = "new"`.
+- Waits up to 30s for `ReadyNotify`.
+- Constructs an in-process `clientv3.Client`. Handlers use this client directly — no HTTP hop to talk to etcd.
+
+### 3. Store wraps the client
+
+`NewEtcdStore(etcd.Client)` exposes the `Store` interface used by every handler. Reads, writes, watches all go through this wrapper. The `Store` interface is what tests stub with `memstore_test.go` — handlers depend on the interface, not on etcd.
+
+### 4. Per-kind handlers wired
+
+Each kind (`deployment`, `statefulset`, `ingress`, `job`, `cronjob`, `asset`, `registry`) gets its own handler struct, sharing:
+
+- A `DockerContainerManager` for container operations.
+- `WriteEnv` closures for materialising env files (with `${VAR}` secret replacement + `.env` file loading).
+- A shared `ProbeRegistry` for liveness/readiness/startup runners.
+- A shared `DirInvoker` for `/exec` and reconciler-driven plugin calls.
+
+### 5. Background goroutines launched
+
+| Goroutine | What it does |
+|---|---|
+| **Reconciler** | `Watch(/desired/)`, dispatch to per-kind handler. |
+| **Cron scheduler** | Per-cronjob tickers, dispatch via the job handler. |
+| **Autoscaler** | 15s tick, evaluate every deployment with `autoscale {}`. |
+| **HTTP server** | `net.Listen("tcp", :8686)`, wrap in `logRequests`, serve `api.Handler()`. |
+
+All four are tied to a `context.Context` cancelled on shutdown.
+
+### 6. Replay
+
+The reconciler's `Run` function first **replays** every existing manifest as a synthetic `WatchPut` event. So a fresh-boot controller catches up on persisted desired state — it doesn't sit idle waiting for the next apply.
+
+## Embedded etcd — what to know
+
+- **Single member, single host.** No HA. Loss of `/opt/voodu/state/` means loss of cluster spec (backups are operator-driven — `rsync` the directory).
+- **In-process client.** Every handler uses the same `clientv3.Client`. No network hop, no DNS, no TLS within voodu.
+- **Watch is one global subscription.** `EtcdStore.Watch` opens one `Watch(/desired/, WithPrefix())` and demuxes events to the reconciler.
+- **Configuration is fixed.** Listen URLs, cluster name, member name are not currently operator-tunable beyond the flags above.
+
+### Disk footprint
+
+- `/opt/voodu/state/member/wal/` — write-ahead log (rotates).
+- `/opt/voodu/state/member/snap/` — snapshots.
+- Typical steady-state size: tens of MB. Grows with apply frequency and config bucket churn.
+
+## Plugin discovery
+
+`/opt/voodu/plugins/<name>/` with a `plugin.yml` file is recognised as a plugin. Discovery:
+
+1. **Direct name match** — `plugins.LoadByName(root, "postgres")` tries the directory `/opt/voodu/plugins/postgres` first.
+2. **Alias scan** — if the directory doesn't exist, the controller scans every loaded plugin for one whose `Manifest.Aliases` contains the requested name. This is how `vd pg:psql` resolves: `voodu-postgres`'s `plugin.yml` declares `aliases: [pg]`.
+
+Plugins are invoked as subprocesses via the shared `DirInvoker`. The invoker injects these env vars into the child process:
+
+| Env var | Value |
+|---|---|
+| `VOODU_ROOT` | The plugins root (`/opt/voodu/plugins`) — set per-invocation. Note: in the plugin's env this points at the plugins dir, not the controller's `$VOODU_ROOT`. |
+| `VOODU_NODE` | Controller name (`voodu-0`). |
+| `VOODU_ETCD_CLIENT` | etcd client URL (`http://127.0.0.1:2379`). |
+| `VOODU_PLUGIN_DIR` | The specific plugin's directory (`/opt/voodu/plugins/<name>`). Set on every invocation. |
+
+It also pipes a `pluginInvocationContext` JSON on stdin:
+
+```json
+{
+  "plugin":         "postgres",
+  "command":        "promote",
+  "controller_url": "http://127.0.0.1:8686",
+  "plugin_dir":     "/opt/voodu/plugins/postgres",
+  "node_name":      "voodu-0"
+}
+```
+
+### Two controller URLs
+
+The controller actually exposes two URLs for plugin / container callbacks:
+
+- **Loopback** (`http://127.0.0.1:8686`) — used by plugin subprocesses that run on the host, like `voodu pg:promote` dispatching from the CLI.
+- **`host.docker.internal:8686`** — injected as `VOODU_CONTROLLER_URL` into container env. Workloads reach the controller from inside docker via the host-gateway alias. Critical for plugins that emit container-side hooks (e.g. voodu-redis sentinel failover scripts).
+
+See [HTTP API → plugin dispatch](/docs/architecture/api#plugin-dispatch) for the full protocol.
+
+## Graceful shutdown
+
+On `SIGINT` or `SIGTERM`:
+
+1. `http.Shutdown(ctx)` with a 10s timeout — drains in-flight requests.
+2. Cancel autoscaler goroutine → wait for it to finish its current tick.
+3. Cancel cron scheduler → wait.
+4. Cancel reconciler → wait.
+5. Close embedded etcd (`embed.Close()`) — flushes WAL, releases bbolt locks.
+
+A `SIGKILL` skips all of this and may leave WAL in a recoverable-but-not-clean state. Embedded etcd's recovery on next boot handles partial WALs gracefully.
+
+## Build pipeline (receive-pack)
+
+Build-mode deployments don't use a registry. Instead:
+
+```
+CLI:  tar context  ──►  ssh user@host voodu receive-pack <scope>/<name> [--force]
+                                                         │ stdin: gzipped tar
+                                                         ▼
+Host: docker build  ◄──  extract release dir            ┌──────────────┐
+                                                         │ controller   │
+                                                         │  /apply was  │
+                                                         │  already in  │
+                                                         │  flight or   │
+                                                         │  done        │
+                                                         └──────────────┘
+```
+
+`voodu receive-pack` is a hidden CLI subcommand on the host — operators never invoke it directly. The flow:
+
+1. **Buffer + hash** — CLI streams gzipped tar over stdin. Host writes it to `/tmp/voodu-receive-*.tar.gz` while computing sha256. Build ID = first 12 hex chars of the hash.
+2. **Dedup** — if `/opt/voodu/apps/<scope>-<name>/releases/<buildID>/` already exists and `--force` is false, **skip the rebuild** and just repoint `current`. Identical source → identical image → no work.
+3. **Extract** — `os.MkdirAll(releaseDir, 0755)` then unpack. Extraction refuses absolute paths, `../` traversal, and symlinks that escape the release dir.
+4. **Build** — `docker build` produces `<scope>-<name>:latest` plus `<scope>-<name>:<buildID>` for rollback.
+5. **GC** — `gcReleases(app, keep)` prunes oldest beyond `keep_releases` (default 5), skipping whatever `current` points at.
+6. **Tarball is removed**; release dir is kept for rollback + future dedup.
+
+The reconciler picks up the image-id change on the next reconcile event (or notices it on the deployment's next apply) and rolling-restarts replicas pointing at `<scope>-<name>:latest`.
+
+### Cache key = tarball content hash
+
+The build ID is the sha256 of the **gzipped wire bytes**. Same source tarball → same build ID → cache hit. Editing a comment with the same number of whitespace bytes? Same tarball, same hash, no rebuild.
+
+### Tarball size cap
+
+500 MB default. Override via `VOODU_BUILD_MAX_SIZE` on the CLI side.
+
+## What's not in the controller
+
+- **Authentication / authorization.** No JWT, no API keys, no operator users. SSH is the auth boundary.
+- **External database.** No postgres, no SQLite. Everything is etcd.
+- **Service mesh.** Service-to-service traffic uses Docker DNS on `voodu0` directly.
+- **Log aggregation.** Container logs use Docker's `json-file` driver with `max_size × max_files` rotation. `voodu logs` tails from disk. No remote sink built in.
+- **Metrics.** Stats are docker-stats sampled by the autoscaler; no Prometheus surface, no time-series store.
+
+## See also
+
+- [Reconciler](/docs/architecture/reconciler) — the watch loop and rolling-restart algorithm.
+- [HTTP API](/docs/architecture/api) — full endpoint reference.
+- [`build`](/docs/manifests/build) — operator-facing build-mode reference.

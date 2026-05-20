@@ -1,0 +1,149 @@
+---
+title: autoscale
+description: CPU-based horizontal scaling with hysteresis.
+---
+
+`autoscale {}` declares dynamic replica scaling. Voodu samples per-container CPU and scales the replica count between `min` and `max` based on a target threshold.
+
+Accepted on `deployment` and `app`. **Mutually exclusive** with `replicas = N`.
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  autoscale {
+    min        = 3
+    max        = 15
+    cpu_target = 60
+
+    cooldown_up   = "30s"
+    cooldown_down = "5m"
+  }
+}
+```
+
+## Required
+
+| Field | Type | Meaning |
+|---|---|---|
+| `min` | int | Floor. Never scale below. Must be ≥ 1. |
+| `max` | int | Ceiling. Never scale above. Must be ≥ `min`. |
+| `cpu_target` | int | Target mean CPU % across replicas. Range `(0, 100]`. |
+
+## Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `cooldown_up` | duration | `"30s"` | Minimum gap between scale-up events. |
+| `cooldown_down` | duration | `"5m"` | Minimum gap between scale-down events. |
+
+## Hysteresis — the decision band
+
+To avoid flapping, scale decisions use a deadband around the target:
+
+| Observed CPU | Action |
+|---|---|
+| `> cpu_target × 1.1` AND replicas `< max` AND last scale-up was > `cooldown_up` ago | Scale up by 1 |
+| `< cpu_target × 0.7` AND replicas `> min` AND last scale-down was > `cooldown_down` ago | Scale down by 1 |
+| Anything in between | Hold |
+
+CPU is sampled every ~15s from Docker stats and averaged across replicas.
+
+## Validation
+
+The apply is rejected when:
+
+- Both `autoscale {}` AND `replicas = N` are declared.
+- `min < 1`.
+- `max < min`.
+- `cpu_target` is outside `(0, 100]`.
+
+## Examples
+
+### HTTP API — modest floor, big ceiling
+
+```hcl
+app "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+  host  = "api.example.com"
+  tls   { email = "ops@example.com" }
+
+  autoscale {
+    min           = 3
+    max           = 20
+    cpu_target    = 60
+    cooldown_up   = "30s"
+    cooldown_down = "10m"
+  }
+}
+```
+
+Floor of 3 keeps you above one-replica failure modes. `cooldown_down = 10m` prevents trip-and-fall scaling — a quiet 90 seconds doesn't shed replicas you'll need back in 2 minutes.
+
+### Batch / background worker — aggressive scaling
+
+```hcl
+deployment "prod" "worker" {
+  image   = "ghcr.io/myorg/worker:1.7"
+  command = ["bin/worker"]
+
+  autoscale {
+    min           = 0           # NOTE: rejected — see trade-offs
+    max           = 30
+    cpu_target    = 80
+    cooldown_up   = "20s"
+    cooldown_down = "1m"
+  }
+}
+```
+
+Workers tolerate rapid scale-down because they don't terminate in-flight requests on a 502. Higher `cpu_target` because batch is OK with hot replicas.
+
+> Note: `min = 0` is rejected today. Use `min = 1` for "single idle replica" — full scale-to-zero is on the roadmap.
+
+### Toggling between fixed and autoscaled
+
+Switching between the two on apply works — voodu doesn't care which form you used last time. Just don't declare both.
+
+```hcl
+# Fixed
+deployment "prod" "api" { replicas = 3 }
+```
+
+```hcl
+# Autoscaled
+deployment "prod" "api" {
+  autoscale {
+    min = 3
+    max = 15
+    cpu_target = 60
+  }
+}
+```
+
+## Initial replica count
+
+When you first declare `autoscale {}` without ever having set `replicas`, voodu seeds the initial replica count to `min`. So your first apply boots at the floor, not at 1.
+
+## Trade-offs
+
+**CPU is the only signal.** No memory pressure, no request rate, no queue depth. If you need one of those, drive scaling externally (sidecar or controller integration) and write `replicas` directly.
+
+**Mutex with `replicas`.** You can't declare both. Switching forms across applies is fine — voodu just enforces "one source of truth per apply".
+
+**Sampling is per-container, averaged.** If one of three replicas pegs at 95% and the other two idle at 5%, the mean is ~35% — voodu sees no signal to scale. CPU pressure on a hot path doesn't translate cleanly into autoscale events; for that, look at request-rate-driven approaches.
+
+**Hysteresis prevents flap, not surge.** The 1.1×/0.7× deadband stops rapid up/down cycling. It doesn't prevent rapid up-up-up when load actually grows — that's working as intended.
+
+**Cooldown matters for HTTP.** `cooldown_down = 5m` (the default) is fine for most apps. For HTTP tiers with bursty traffic, raise to `10m`+ to avoid shedding replicas you'll need shortly after.
+
+**`replicas` is not in the spec hash.** Autoscale events don't churn the other replicas — only the new ones get spawned. Spec changes (image, env, command) still trigger full rolling restarts as usual.
+
+**No scale-to-zero today.** `min = 0` is rejected. `min = 1` is the lowest steady state. Scale-to-zero for idle worker pools is a deliberate future feature, not an omission.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app) — kinds that accept autoscale
+- [`probes`](/docs/manifests/probes) — readiness probe gates new replicas before they receive traffic

@@ -1,0 +1,246 @@
+---
+title: job & cronjob
+description: One-shots and scheduled tasks.
+---
+
+`job` and `cronjob` borrow most of [`deployment`](/docs/manifests/deployment)'s field surface, minus the long-running parts (no replicas, no ports, no release hook, no autoscale).
+
+A `job` runs **when you ask it to**. A `cronjob` runs **on a schedule**.
+
+## job — manual one-shot
+
+### Synopsis
+
+```hcl
+job "scope" "name" {
+  image = "ghcr.io/myorg/api:1.7"
+  # OR build { ... }
+
+  command  = ["bin/rails", "db:migrate"]
+  env      = { ... }
+  env_from = ["prod/shared"]
+  env_file = ["./.env"]
+  volumes  = ["..."]
+  networks = ["..."]
+  network_mode = ""
+  extra_hosts = ["..."]
+  cap_add  = ["..."]
+
+  timeout = "10m"
+
+  successful_history_limit = 3
+  failed_history_limit     = 1
+
+  build      { ... }
+  depends_on { ... }
+  resources  { ... }
+  logs       { ... }
+}
+```
+
+### Required
+
+None at the root. Empty `job "scope" "name" {}` is parseable but useless without a `command` or auto-detected entrypoint.
+
+### Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `image` | string | — | Mutex with `build {}`. |
+| `build` | block | — | Build-mode. Mutex with `image`. |
+| `command` | []string | — | Argv. Inherits the image's `CMD` if omitted. |
+| `env` | map | — | Inline env vars. |
+| `env_file` | []string | — | Client-side `.env` files. |
+| `env_from` | []string | — | Config buckets. |
+| `volumes` | []string | — | Mounts. |
+| `networks` / `network` / `network_mode` | — | bridge | Same semantics as `deployment`. |
+| `extra_hosts`, `cap_add` | — | — | Same as `deployment`. |
+| `timeout` | duration | — | Hard cap. Empty = no timeout. |
+| `successful_history_limit` | int | `3` | Successful containers retained for `voodu logs`. |
+| `failed_history_limit` | int | `1` | Failed containers retained. |
+
+### Triggering
+
+`voodu apply` **only registers** the job spec — it does NOT execute it. Run it explicitly:
+
+```bash
+voodu run prod/seed
+```
+
+This spawns a fresh container from the job's image / build, runs the command, exits. Re-run to run again.
+
+### Examples
+
+#### Database seed
+
+```hcl
+job "prod" "seed" {
+  image    = "ghcr.io/myorg/api:1.7"
+  command  = ["bin/rails", "db:seed"]
+  env_from = ["prod/shared"]
+  timeout  = "5m"
+}
+```
+
+#### One-shot migration with build-mode
+
+```hcl
+job "prod" "migrate" {
+  build { dockerfile = "Dockerfile.tools" }
+  command  = ["bin/migrate"]
+  env_from = ["prod/shared"]
+}
+```
+
+```bash
+voodu run prod/migrate
+```
+
+#### Backup task that mounts a sibling statefulset's volume
+
+```hcl
+job "data" "pg-dump" {
+  image    = "postgres:16"
+  env_from = ["data/pg"]   # pulls PGUSER, PGPASSWORD, PGHOST, ...
+
+  command = ["sh", "-c", "pg_dump $PG_NAME > /backups/dump-$(date +%s).sql"]
+
+  volumes = ["voodu-data-pg-data-0:/var/lib/postgresql/data:ro"]
+}
+```
+
+## cronjob — scheduled
+
+### Synopsis
+
+```hcl
+cronjob "scope" "name" {
+  schedule = "*/15 * * * *"
+  timezone = "America/Sao_Paulo"
+  suspend  = false
+
+  concurrency_policy = "Forbid"
+
+  # All job-like fields flattened at the root:
+  image, command, env, env_from, env_file, volumes, networks, network_mode,
+  timeout, extra_hosts, cap_add
+
+  successful_history_limit = 3
+  failed_history_limit     = 5
+
+  build      { ... }
+  depends_on { ... }
+  resources  { ... }
+  logs       { ... }
+}
+```
+
+### Required
+
+- `schedule` — 5-field cron (`minute hour dom month dow`). Seconds are **not** supported.
+
+### Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `timezone` | IANA tz | `"UTC"` | Time zone for schedule evaluation. |
+| `suspend` | bool | `false` | Pause dispatch without removing the cronjob. |
+| `concurrency_policy` | enum | `"Allow"` | `"Allow"` (overlap OK) or `"Forbid"` (skip if previous run still active). |
+| `successful_history_limit` | int | `3` | History cap for successful runs. |
+| `failed_history_limit` | int | `1` | History cap for failed runs. |
+| All `job` fields | — | — | Same surface and semantics. |
+
+`"Replace"` is reserved and rejected today.
+
+### Examples
+
+#### Nightly backup at 03:00 São Paulo time
+
+```hcl
+cronjob "data" "backup" {
+  schedule = "0 3 * * *"
+  timezone = "America/Sao_Paulo"
+
+  image   = "amazon/aws-cli:latest"
+  command = ["s3", "sync", "/backups/", "s3://my-bucket/db-backups/"]
+
+  env_from = ["aws/cli"]
+  volumes  = ["/opt/voodu/backups:/backups:ro"]
+}
+```
+
+#### Every 15 min crawler with forbid-overlap
+
+```hcl
+cronjob "clowk-lp" "crawler" {
+  schedule = "*/15 * * * *"
+
+  image   = "ghcr.io/clowk/lp:latest"
+  command = ["bun", "/app/out/crawler.js"]
+
+  concurrency_policy = "Forbid"
+  timeout            = "10m"
+
+  env_from = ["clowk-lp/web"]
+}
+```
+
+#### Suspending without deletion
+
+```hcl
+cronjob "data" "expensive-report" {
+  schedule = "0 6 * * *"
+  suspend  = true            # paused; manifest stays
+
+  image   = "ghcr.io/myorg/reports:1.0"
+  command = ["bin/generate"]
+}
+```
+
+## Cron quick reference
+
+```
+*/15 * * * *     every 15 minutes
+0 6 * * *        daily at 06:00
+5-59/15 * * * *  every 15 min, offset +5 (spread load)
+0 0 * * 0        weekly Sunday midnight
+30 8 1 * *       monthly on the 1st at 08:30
+0 12 * * Mon-Fri weekdays at noon
+```
+
+Each field accepts: literal value, `*`, comma list (`1,5,9`), range (`0-30`), step (`*/15`, `5-59/15`).
+
+Day-of-week also accepts `Sun`, `Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat` aliases.
+
+### Shorthand macros
+
+```hcl
+schedule = "@hourly"     # 0 * * * *
+schedule = "@daily"      # 0 0 * * *  (also @midnight)
+schedule = "@weekly"     # 0 0 * * 0
+schedule = "@monthly"    # 0 0 1 * *
+schedule = "@yearly"     # 0 0 1 1 *  (also @annually)
+```
+
+## Trade-offs
+
+**Jobs and cronjobs deliberately do NOT register DNS aliases.** They join the `voodu0` network (so they can dial internal services) but are NOT addressable by service name. Why: a job sharing `(scope, name)` with a deployment would make Docker DNS round-robin between the long-running app container and the transient job container — ingress traffic could land on the job mid-execution.
+
+**Apply doesn't run jobs.** `voodu apply` registers the job spec. To execute, run `voodu run scope/name`. Cronjobs are different — the controller's scheduler dispatches them automatically per schedule.
+
+**`concurrency_policy = "Replace"` is reserved, not implemented.** Use `"Allow"` (default — overlap fine) or `"Forbid"` (skip if previous still running).
+
+**`env_from` runs at apply time AND runtime.** At apply, buckets are fetched to interpolate `${VAR}` in the manifest. At runtime, the keys are injected as env vars into the container. Same bucket, two phases. See [interpolation](/docs/manifests/interpolation).
+
+**No `health_check`, no `probes`, no `release`.** Jobs and cronjobs are short-lived — they exit. Use `timeout` to cap runtime; use `failed_history_limit` to retain failed containers for `voodu logs <scope/name>`.
+
+**Image build is cached.** Build-mode jobs use the same tarball-hash content-addressed cache as deployments. Re-running the job re-uses the build unless the source changed.
+
+**Cron uses controller-local time by default.** `timezone = "UTC"` is the default; set to your operations timezone if you care about business hours alignment.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment) — the long-lived counterpart
+- [`build`](/docs/manifests/build) — build-mode reference
+- [`config & secrets`](/docs/manifests/config) — how `env_from` buckets work
+- [`resources`](/docs/manifests/resources), [`logs`](/docs/manifests/logs)

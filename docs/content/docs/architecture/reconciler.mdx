@@ -1,0 +1,219 @@
+---
+title: Reconciler
+description: The watch loop, spec hash, rolling-restart algorithm, autoscaler interaction.
+---
+
+The reconciler is **one global goroutine** that watches `/desired/` in etcd and dispatches events to per-kind handlers. It's not a leader-elected controller. It's not one loop per resource. It's a single subscription and a switch statement.
+
+## The loop
+
+```
+reconciler.Run(ctx):
+   1. replay()                          ◄─ catch up on persisted state
+   2. ch := store.Watch(ctx)            ◄─ one etcd Watch on /desired/
+   3. for ev := range ch:
+          handle(ev, attempt=1)
+```
+
+### replay()
+
+On boot, the reconciler iterates `Store.ListAll()` and **emits a synthetic `WatchPut` event for every existing manifest**. So fresh-boot controllers don't sit idle — they reconcile everything that's already in etcd. After replay, the live `Watch` channel takes over.
+
+### handle()
+
+For each event:
+
+1. Look up `Handlers[ev.Kind]` (deployment, statefulset, ingress, job, cronjob, asset, registry). If missing, no-op.
+2. Call the handler.
+3. If it returns nil → done.
+4. If it returns a **transient error** (wrapped via `Transient(err)`) → schedule a retry with exponential backoff (1s → 2s → 4s → 8s → 16s → 30s, max 6 attempts). The retry re-reads the manifest from the store — a fix or delete during the wait wins.
+5. If it returns any other error → log and drop. Recovery path is "the next watch event".
+
+## Per-kind dispatch
+
+```go
+Handlers: map[Kind]HandlerFunc{
+  KindDeployment:  depHandler.Handle,
+  KindStatefulset: stsHandler.Handle,
+  KindIngress:     ingHandler.Handle,
+  KindJob:         jobHandler.Handle,
+  KindCronJob:     cronJobHandler.Handle,
+  KindAsset:       assetHandler.Handle,
+  KindRegistry:    registryHandler.Handle,
+}
+```
+
+Each handler dispatches on `ev.Type`:
+
+| Event | Effect |
+|---|---|
+| `WatchPut` | `apply(spec)` — diff vs running, act |
+| `WatchDelete` | `remove(scope, name)` — stop containers, optionally wipe state |
+
+## Deployment apply — step by step
+
+`DeploymentHandler.apply` does this on every relevant watch event:
+
+1. **Decode** the spec from the manifest blob.
+2. **Set up the on_deploy webhook firer** as a `defer` — webhooks fire on the way out, success or failure.
+3. **Apply spec defaults** — normalise image, default health-check path, etc.
+4. **Build the merged env file** — `resolveAppEnv` merges scope + app config buckets, overlays `spec.Env`, interpolates `${asset.…}` and `${ref.…}` references, writes to `/opt/voodu/apps/<scope>-<name>/shared/.env`. Returns `envChanged`.
+5. **List live replicas** — docker `ListContainers` filtered by `voodu.kind`, `voodu.scope`, `voodu.name` labels.
+6. **Compute the spec hash** — `deploymentSpecHash(spec, assetDigests)`.
+7. **Decide if a release is needed**:
+   - First apply (no prior status)?
+   - Spec hash changed?
+   - Replica count changed?
+   - Image-id drift (build-mode `:latest` rebuilt under same tag)?
+   If any are true and there's no `release {}` block, mint a fresh `applyReleaseID`.
+8. **Scale-up** — `ensureReplicaCount` spawns fresh containers for missing slots.
+9. **Scale-down** — `pruneExtraReplicas` removes excess.
+10. **Rolling restart on spec drift** — `rollingReplaceReplicas` (see below).
+11. **Env-change rolling restart** — only if `envChanged && !recreatedAny`. Docker reads `--env-file` at `docker run`, never on `docker restart`, so env changes must recreate.
+12. **Append release record** with `SpecSnapshot` for rollback.
+13. **Signal the deferred webhook firer** — success.
+
+If any step errors, the deferred webhook fires `failure`.
+
+## Rolling-restart algorithm
+
+`rollingReplaceReplicas` walks live replicas in order:
+
+```
+for each live replica s:
+   if frozenSet[s.replicaID]: skip   # operator-frozen via /pods/{name}/stop
+   newReplicaID = generate()
+   newName      = container_name(scope, name, newReplicaID)
+   probes.Stop(app, s.name)
+   containers.Remove(s.name)
+   build merged env, resolve resources/logs caps
+   re-run init containers if declared
+   containers.Ensure(ContainerSpec{...})   # creates the new replica
+   probes.Start(app, newName, spec.Probes)
+   if i < len(live) - 1:
+       time.Sleep(slotRolloutPause)        # hardcoded 2s
+```
+
+### Cadence
+
+The cadence is a **hardcoded 2-second sleep** between slot recreates (`slotRolloutPause = 2 * time.Second`). It's declared as a `var` (not `const`) so tests can stub to zero — production code never writes to it.
+
+The 2s is **the only synchronisation** between slots. There's no "wait for /healthz" gate before moving to the next replica. The code comment calls it "a blunt instrument". A `readiness` probe gates **traffic** to the replica (caddy drops not-ready ones from the upstream pool), but doesn't gate the next recreate.
+
+### Failure handling
+
+If any step in the loop returns an error, `rollingReplaceReplicas` returns it verbatim. The caller propagates it up. **There is no automatic rollback** — partially-swapped state is left in place. The next reconcile event (or operator-driven `voodu restart`) is the recovery path.
+
+To get proper rollback, use [`voodu release rollback`](/docs/cli/apply) explicitly — it re-Puts the prior `SpecSnapshot` and triggers a normal recreate flow.
+
+## Statefulset apply
+
+Same overall shape as deployment, but:
+
+- **Scale-up is bottom-up** — pod-0 first, then pod-1, then pod-2.
+- **Scale-down is top-down** — drops highest ordinal first.
+- **Rolling restart is top-down** — pod-N first, pod-0 last. The convention is "pod-0 is the primary" for postgres / redis, so it's the last to swap, which preserves write availability during the rollout.
+- **Per-pod volumes are never auto-deleted.** Even on `voodu apply --prune` of the resource, docker volumes named `voodu-<scope>-<name>-<claim>-<ordinal>` persist until explicit `docker volume rm`.
+
+## Spec hash — what's in, what's out
+
+The spec hash is a sha256 over a **specific struct** (not the raw spec) — adding an irrelevant field to the spec doesn't silently flip the hash. The hash decides "does this change require a rolling restart?".
+
+### In the hash
+
+| Field | Why |
+|---|---|
+| `image` | image change = new code |
+| `command` | argv change |
+| `ports` | semantic: order maps to ingress defaults |
+| `volumes` | mount-set change |
+| `env` (HCL `env = {…}`) | declared env value change |
+| `env_from` | bucket list (order matters — last-wins on collision) |
+| `networks` (sorted) | network membership |
+| `network_mode` | bridge / host / none switch |
+| `restart` | docker restart policy |
+| `extra_hosts` (sorted) | `/etc/hosts` injection |
+| `cap_add` (sorted) | Linux capabilities |
+| `build.args` | build-arg change → rebuild |
+| `resources.limits` | docker freezes cgroup at create-time |
+| `autoscale` | autoscale block edit |
+| `logs` | docker freezes log driver options at create-time |
+| `probes` | probe runners only spawn on fresh containers |
+| `init` (order preserved) | init step order is semantic |
+| `_asset_digests` | asset content drift → fold into hash |
+
+### Out of the hash
+
+| Field | Why |
+|---|---|
+| `replicas` | scaling shouldn't churn already-running pods |
+| `on_deploy` | rotating a Slack URL shouldn't trigger a rolling restart |
+| `keep_releases` | retention is operational, not workload-affecting |
+| `post_deploy` | runs after rollout completes; not in the spec |
+| `health_check` | path is for ingress upstream probe, not container behaviour |
+| `release {}` | hooks run on release, not on every reconcile |
+
+This is why **scaling doesn't churn existing replicas** — `replicas` isn't in the hash. `ensureReplicaCount` spawns fresh containers to reach the target; existing ones stay put.
+
+### Asset digest hashing
+
+When an asset's content changes, voodu stamps the new sha256 into `_asset_digests` on every consumer's spec. That changes the consumer's hash. Next reconcile → rolling restart. This is how config file changes propagate without operator intervention.
+
+Inline `${asset.scope.name.key}` references are picked up automatically because the digest map is the asset stamper's responsibility. For invisible references (asset path injected via env var, etc.), declare `depends_on { assets = [...] }` explicitly.
+
+## Autoscaler interaction
+
+The autoscaler is a **separate ticker** (not the reconciler loop), but it writes through the same `Store`:
+
+```
+every 15s:
+   for each deployment with spec.autoscale:
+       stats = StatsCollector.Collect(<pods>)
+       mean  = meanCPUPercent(stats)
+       if mean > target × 1.1 and replicas < max and cooldown_up elapsed:
+           SetReplicas(scope, name, replicas + 1)
+       elif mean < target × 0.7 and replicas > min and cooldown_down elapsed:
+           SetReplicas(scope, name, replicas - 1)
+```
+
+`SetReplicas` reads the manifest, mutates `spec.replicas` in the untyped map (preserving unrelated fields), and `Store.Put`s it back. The watch fires the standard reconciler path. **There's no second control plane** — the autoscaler reuses the reconciler.
+
+Because `replicas` is NOT in the spec hash, the rolling-restart path doesn't fire. `ensureReplicaCount` and `pruneExtraReplicas` are the only things that run.
+
+### Autoscaler state is in-memory
+
+`LastUp` and `LastDown` (cooldown anchors) live in the autoscaler struct, not in etcd. Controller restart resets them — after a bounce, cooldowns start fresh. The trade-off is reduced complexity vs occasional first-decision flap.
+
+## Probe interaction
+
+The probe registry runs liveness/readiness/startup goroutines per replica. The reconciler:
+
+- **Starts probes** on every `containers.Ensure` (initial spawn or rolling-restart slot).
+- **Stops probes** before every `containers.Remove`.
+
+So the probe-runner lifecycle is owned by the reconciler, not by a separate manager.
+
+Probe state (per-replica readiness) is **in-memory only**, accessible via `GET /pods/{name}/ready`. voodu-caddy hits this endpoint on every active health check (low-cost — no etcd hop).
+
+## Asset stamping
+
+Asset materialisation runs **inside `/apply`, before `/desired` is persisted**. Two phases:
+
+1. **Materialise all assets** in the batch up front — write bytes to disk, compute sha256, write `/status`. Critical for race avoidance: consumer reconciles can race ahead of asset reconciles, so the bytes MUST be on disk before any `/desired` Put fires watches.
+2. **For each consumer** (deployment / statefulset / job / cronjob), walk the spec for `${asset.…}` refs + `depends_on.assets`, resolve via batch digests then `/status` fallback, stamp under `spec._asset_digests`. Unresolved refs reject the apply.
+
+This is why the controller writes the digests synchronously into the spec — not lazily at reconcile time. The hash needs them to be deterministic.
+
+## What the reconciler does NOT do
+
+- **No leader election.** Single controller per host. No coordination across hosts.
+- **No spec-change rate limiting.** Every watch event triggers a reconcile attempt. The 2s slot pause is the only inherent throttle.
+- **No automatic rollback.** Failed rollouts leave partial state; recovery is `voodu release rollback` or `voodu restart`.
+- **No reconciliation budget.** Reconciles run sequentially per kind handler (each handler is single-threaded), but in parallel across kinds.
+- **No drift detection on the actual side.** voodu doesn't periodically compare `/actual/` to `/desired/` — it reacts to spec changes. If you `docker stop` a container manually, voodu won't notice until the next spec event (then `ensureReplicaCount` notices the missing replica and spawns a fresh one).
+
+## See also
+
+- [Controller](/docs/architecture/controller) — the process model that hosts this loop.
+- [HTTP API](/docs/architecture/api) — endpoints that write to `/desired/`.
+- [Probes](/docs/manifests/probes), [Autoscale](/docs/manifests/autoscale), [Release](/docs/manifests/release).

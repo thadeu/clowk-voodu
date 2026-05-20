@@ -1,0 +1,31 @@
+---
+title: Security model
+description: How Voodu thinks about trust, transport, and secrets.
+---
+
+## Transport
+
+- The CLI talks to the controller **only over SSH**. There is no public HTTP/gRPC daemon on the remote.
+- The controller listens on `127.0.0.1:8686` for plugins and on a Unix socket for `receive-pack`. Neither is reachable from the public internet.
+- Caddy is the only public-facing process.
+
+## Secrets
+
+- `voodu config set` stores values in the controller's encrypted bolt store.
+- The encryption key is generated on first `voodu remote setup` and stored in `/opt/voodu/keys/master.key` with `0600`.
+- Secrets are decrypted into env at container start. They never touch disk in plaintext form.
+- Manifest `env { }` blocks are **never** treated as secrets — they're committed. Use `voodu config` for credentials.
+
+## Identity
+
+- The CLI authenticates as your SSH user. Voodu does not add a separate auth layer — `ssh ubuntu@host` works = `voodu` works.
+- For team setups, use SSH cert-auth or per-user keys; the controller logs the SSH user on every apply.
+
+## TLS
+
+- Caddy handles ACME — HTTP-01 by default, DNS-01 when you configure it.
+- On-demand TLS validates against your policy before issuing. **Always set a policy** in production — without one, anyone can DDoS your ACME quota.
+
+## Reporting issues
+
+Email `security@voodu.sh` (or the maintainer directly on GitHub). Please don't file public issues for unpatched vulnerabilities.

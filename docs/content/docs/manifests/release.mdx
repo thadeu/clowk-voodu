@@ -1,0 +1,150 @@
+---
+title: release
+description: Once-per-release hooks — migrations, warmups, idempotent one-shots.
+---
+
+`release {}` declares commands that run **once per release**, in a fresh container spawned from the new image. Use it for migrations, schema changes, or any idempotent one-shot that must finish before the rolling restart.
+
+Accepted on `deployment` and `app`. (Not on statefulset / job / cronjob.)
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  release {
+    command      = ["bin/rails", "db:migrate"]
+    pre_command  = ["bin/preflight"]
+    post_command = ["bin/notify-deployed"]
+    timeout      = "10m"
+  }
+}
+```
+
+## Fields — all optional
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `command` | []string | — | Main release task. Runs BEFORE the rolling restart. |
+| `pre_command` | []string | — | Runs BEFORE `command`. |
+| `post_command` | []string | — | Runs AFTER rolling restart completes. |
+| `timeout` | duration | `10m` | Hard cap. |
+
+## Lifecycle
+
+```
+pre_command  →  command  →  rolling restart  →  post_command
+```
+
+| Phase | Failure behavior |
+|---|---|
+| `pre_command` non-zero exit | Apply aborts. Replicas stay on previous version. |
+| `command` non-zero exit | Apply aborts. Replicas stay on previous version. |
+| Rolling restart fails mid-flight | Apply aborts. Already-swapped replicas stay on the new image — no automatic rollback. Subsequent reconciles retry. |
+| `post_command` non-zero exit | Recorded as a warning; **does not roll back**. |
+
+Release commands run in a fresh container spawned from the **new image**. Env is the same as the deployment containers see — `env`, `env_from`, `env_file`, all merged.
+
+## Examples
+
+### Rails migration
+
+```hcl
+deployment "prod" "web" {
+  image = "ghcr.io/myorg/web:1.7"
+
+  release {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+  }
+}
+```
+
+The migration runs first. If it fails, the new image isn't rolled in — the previous replicas keep serving on the old schema.
+
+### Preflight + migration + cache priming
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  release {
+    pre_command  = ["bin/preflight-check"]
+    command      = ["bin/db:migrate"]
+    post_command = ["bin/cache:warm"]
+    timeout      = "15m"
+  }
+}
+```
+
+`pre_command` aborts early on environment problems (missing env vars, unreachable DB). `command` runs the migration. `post_command` warms caches after replicas are rolled — failure here is recorded but doesn't roll back.
+
+### Idempotent one-shot
+
+```hcl
+deployment "prod" "worker" {
+  image   = "ghcr.io/myorg/worker:1.7"
+  command = ["bin/worker"]
+
+  release {
+    command = ["bin/ensure-queues-exist"]
+    timeout = "2m"
+  }
+}
+```
+
+Run on every release. The command itself is responsible for idempotency.
+
+### Webhook notification post-rollout
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  release {
+    post_command = ["bin/notify-slack", "deployed"]
+  }
+}
+```
+
+For richer notifications, use [`on_deploy`](/docs/manifests/on-deploy) — it has templating + structured payloads.
+
+## Release vs init
+
+|  | `release {}` | `init "<name>" {}` |
+|---|---|---|
+| When | Once per release | Per replica (every new container) |
+| Use | Migrations, schema changes, idempotent setup | Per-replica warmup, dependency waits |
+| Failure of `command` | Apply aborts. Rolling restart never runs. | This replica fails. Others may already be running. |
+| Multiple | One block per deployment | Multiple `init` blocks per deployment, in declaration order |
+
+Schema migration → `release`. Cache warmup → `release` (cluster-wide concern) OR `init` (per-replica concern). Wait-for-dependency → `init`.
+
+## Trade-offs
+
+**Declaring `release {}` opts the deployment OUT of reconciler-driven recreates.** Once a release block is present, voodu won't auto-restart the deployment on spec drift — rollouts only fire when `voodu release run` (or the apply pipeline that orchestrates it) explicitly invokes the release. This makes sense for production workloads where you want migrations to gate every rollout, but it's non-obvious: a change to `env` or `image` won't churn replicas until you trigger a release.
+
+**No automatic rollback on rolling-restart failure.** If the rolling restart fails mid-flight (e.g. the new image crash-loops), already-swapped replicas stay on the new image. Voodu records the failure and the next reconcile retries — but it doesn't restore the previous-image replicas you already lost. Use a `readiness` probe to gate traffic; use `voodu release rollback` to revert.
+
+**Release history capped at 10.** Voodu keeps the last 10 release records (with `SpecSnapshot` for rollback). Older entries are evicted.
+
+**Runs against the new image, not the old.** The migration container is `docker run`'d from the image you're deploying. So `bin/rails db:migrate` is the new migration, against the current schema state.
+
+**Pre-command is your safety net.** Use it to fail fast on env / config problems — better to abort on a missing env var than mid-migration.
+
+**Post-command failure is non-fatal.** Recorded, but doesn't roll back. Use it for notifications, cache priming, anything you'd shrug at if it failed.
+
+**Env is the deployment env.** Same merged env that replicas see — `voodu config`, `env_from`, `env_file`, manifest `env`, in normal precedence.
+
+**No multi-step inside `command`.** It's one argv. For multi-step logic, write a script: `command = ["bin/release.sh"]`.
+
+**Default timeout is 10 minutes.** Overridable. Most migrations finish in seconds; the cap is there to catch hangs.
+
+**Not available on statefulset / job / cronjob.** Stateful workloads have their own lifecycles; one-shots are the workload itself.
+
+## See also
+
+- [`init`](/docs/manifests/init) — per-replica prep
+- [`on_deploy`](/docs/manifests/on-deploy) — post-rollout webhooks (richer than `post_command`)
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app)

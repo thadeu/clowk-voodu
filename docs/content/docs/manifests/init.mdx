@@ -1,0 +1,207 @@
+---
+title: init containers
+description: Ordered, one-shot prep steps before the main container boots.
+---
+
+`init "<name>" {}` blocks run sequentially, before the main container starts. The main container only boots after every init exits 0. Use them for migrations, asset warmups, schema seeds — anything that must finish before the app accepts traffic.
+
+Accepted on `deployment`, `app`, `statefulset`. (Not on `job` or `cronjob` — those are one-shots themselves.)
+
+The HCL keyword is **`init`** (not `init_container`).
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  init "migrate" {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+    retries = 1
+  }
+
+  init "warm-cache" {
+    command = ["bin/warm-cache"]
+    resources {
+      limits {
+        cpu    = "2"
+        memory = "1Gi"
+      }
+    }
+  }
+}
+```
+
+## Required
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` (label) | string | Lowercase alphanumeric + `-`. Must start with `[a-z0-9]`. Unique within the parent. |
+| `command` | []string | Non-empty argv. |
+
+## Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `image` | string | parent's image | Override the runtime image for this init. |
+| `timeout` | duration | `10m` | Kill the init if it runs longer. |
+| `retries` | int | `0` (range `0..5`) | Re-run on non-zero exit before giving up. |
+| `resources` | block | **no limit** | Per-init CPU / memory caps. Does NOT inherit the parent's caps — defaults to unbounded. |
+
+## Inheritance
+
+Init containers inherit from the parent kind:
+
+- `image` (override with `image = "..."` inside the init block)
+- `env`, `env_from`, `env_file`
+- `volumes`, `networks`
+- `extra_hosts`, `cap_add`
+
+So `bin/rails db:migrate` sees the same `DATABASE_URL` your replicas see — no duplication.
+
+**`resources` does NOT inherit.** Init containers default to no CPU / memory limit, even if the parent declares `resources { limits { ... } }`. Prep steps (migrations, warmups) often need more headroom than steady-state, and the inheritance-by-default footgun would silently throttle them. Declare `resources {}` inside the init block when you want explicit caps.
+
+## Ordering
+
+Init blocks run in **manifest declaration order**, top to bottom. They are NOT parallelised. If you need parallel prep, do it inside one init script.
+
+For statefulsets, init runs **per ordinal** — each new pod runs its own init sequence.
+
+## Validation
+
+The apply is rejected when:
+
+- `command` is empty.
+- `name` (label) contains characters other than `[a-z0-9-]` or doesn't start with `[a-z0-9]`.
+- Two init blocks share the same name within one parent.
+- `retries > 5` (chronic-failure-loop antipattern).
+- `timeout` is set but not parseable as a Go duration.
+
+## Failure handling
+
+If an init exits non-zero past `retries`, the apply fails and the **container is left behind** (stopped). You can inspect it with:
+
+```bash
+docker logs <container-id>
+voodu describe <scope/name>
+```
+
+The main container never starts. On the next successful reconcile, voodu cleans up the failed init container.
+
+Init containers do NOT count as healthy replicas — they're prep work, not the workload.
+
+## Examples
+
+### Rails migration before web boots
+
+```hcl
+deployment "prod" "web" {
+  image = "ghcr.io/myorg/web:1.7"
+
+  init "migrate" {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+  }
+}
+```
+
+`bin/rails db:migrate` runs in a fresh container from the same image, with the same env. Once it exits 0, the web container starts.
+
+### Multi-step boot — schema + seed + warmup
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  init "schema" {
+    command = ["bin/db:create-extensions"]
+    timeout = "2m"
+  }
+
+  init "migrate" {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+    retries = 1
+  }
+
+  init "warmup" {
+    command = ["bin/warmup-cache"]
+    timeout = "5m"
+
+    resources {
+      limits {
+        cpu    = "2"
+        memory = "1Gi"
+      }
+    }
+  }
+}
+```
+
+Runs sequentially: `schema` → `migrate` → `warmup` → main container. Any failure (past retries) aborts the deploy.
+
+### Statefulset: per-pod prep
+
+```hcl
+statefulset "data" "pg" {
+  image    = "postgres:16"
+  replicas = 3
+
+  init "wait-primary" {
+    image   = "alpine:latest"
+    command = ["sh", "-c", "until nc -z pg-0.data 5432; do sleep 1; done"]
+    timeout = "5m"
+  }
+
+  volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+}
+```
+
+Each standby (`pg-1`, `pg-2`) waits for the primary (`pg-0`) to accept connections before booting postgres.
+
+### Custom image for the init step
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  init "wait-for-deps" {
+    image   = "ghcr.io/myorg/dep-checker:1.0"
+    command = ["check", "--service", "postgres", "--service", "redis"]
+    timeout = "3m"
+  }
+}
+```
+
+When the parent's image doesn't contain the tool you need.
+
+## init vs release hook
+
+|  | `init {}` | `release {}` (deployment / app only) |
+|---|---|---|
+| When | Per replica, before each main container boots | Once per release, before the rolling restart |
+| Use | Per-replica warmup, sidecar dependency waits | Migrations, idempotent one-shots |
+| Failure | This replica fails to start | Rolling restart aborts; old replicas keep serving |
+
+A schema migration belongs in [`release {}`](/docs/manifests/release) — it should run once, not per replica. A cache warmup or dependency wait belongs in `init {}`.
+
+## Trade-offs
+
+**Sequential, not parallel.** If you have three independent prep steps, init runs them one at a time. To parallelise, put them in one script: `init "prep" { command = ["sh", "-c", "step1 & step2 & step3 & wait"] }`.
+
+**Retries with fixed 2s backoff.** Not exponential — voodu waits 2s between attempts. Use it for races (sibling service not quite ready) rather than fundamentally broken jobs.
+
+**Inheritance covers env + volumes + networks.** You don't redeclare `env_from`, `volumes`, etc. inside each init — they come from the parent.
+
+**`retries = 5` is the ceiling.** Higher values are rejected as "chronic-failure-loop antipattern". If you need more, the underlying problem is somewhere else.
+
+**Failed init leaves the container behind.** Inspect via `docker logs`. Next successful reconcile cleans it up. This is intentional — you want to see *why* the migration failed, not have it silently restart.
+
+**Statefulsets run init per ordinal.** Different from deployment (every replica is interchangeable, every replica runs the same init). Statefulset pod-0 runs init when pod-0 is (re)created; pod-1 runs its own init when pod-1 is (re)created.
+
+## See also
+
+- [`release`](/docs/manifests/release) — once-per-release hooks
+- [`resources`](/docs/manifests/resources) — per-init CPU / memory caps
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app), [`statefulset`](/docs/manifests/statefulset)

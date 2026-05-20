@@ -1,0 +1,27 @@
+{
+  "title": "Manifests",
+  "icon": "FileCode2",
+  "pages": [
+    "overview",
+    "interpolation",
+    "deployment",
+    "app",
+    "statefulset",
+    "ingress",
+    "jobs",
+    "asset",
+    "registry",
+    "postgres",
+    "redis",
+    "probes",
+    "init",
+    "autoscale",
+    "on-deploy",
+    "release",
+    "resources",
+    "logs",
+    "build",
+    "depends-on",
+    "config"
+  ]
+}

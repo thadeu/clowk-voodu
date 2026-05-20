@@ -1,0 +1,394 @@
+---
+title: HTTP API
+description: Endpoints, query parameters, payloads.
+---
+
+The controller listens on TCP `:8686`. One `http.ServeMux`, wrapped in a request-logging middleware. Bodies cap at **1 MiB**. Responses use a consistent envelope:
+
+```json
+{
+  "status": "ok" | "error",
+  "data":   { ... },
+  "error":  "..."
+}
+```
+
+The CLI is just a thin client over this surface — every `voodu` command resolves to one or more HTTP calls.
+
+## Health
+
+| Method | Path | Response |
+|---|---|---|
+| `GET` | `/health` | `{status:"ok", version:"<version> (commit: <hash>)"}` (composite string set at build time) |
+
+## Apply / diff / list / delete
+
+`/apply` is multi-method:
+
+### POST /apply
+
+```
+POST /apply?dry_run=true|false&prune=true|false
+Body: Manifest OR [Manifest, ...]
+```
+
+Request body is one manifest object or an array. Each manifest:
+
+```json
+{
+  "kind":     "deployment",
+  "scope":    "prod",
+  "name":     "api",
+  "spec":     { ... },
+  "metadata": { "revision": 123 }
+}
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "applied":           [Manifest, ...],
+    "pruned":            ["deployment/prod/old-api", ...],
+    "plugin_installs":   [{ "plugin": "postgres", "version": "0.13.1", "source": "github.com/thadeu/voodu-postgres" }],
+    "plugin_expansions": [{ "from": "postgres/data/main", "to": ["statefulset/data/main", "asset/data/main"] }],
+    "current":           [Manifest, ...],
+    "dry_run":           true
+  }
+}
+```
+
+Field presence:
+
+- `applied`, `pruned` — always present (may be empty arrays).
+- `plugin_installs`, `plugin_expansions` — **omitted** when empty.
+- `current`, `dry_run` — **only present** when `dry_run=true`.
+
+What happens:
+
+1. Decode body. Validate each manifest.
+2. JIT-install any plugin referenced by an unknown block type (`postgres {}`, `redis {}`, etc.).
+3. **Expand plugin macros** — call `<plugin> expand` per macro block; receive core-kind manifests + optional dispatch actions.
+4. **Materialise inline assets** to disk; stamp asset digests onto consumer specs.
+5. Validate cross-resource constraints (ingress host collisions, etc.).
+6. If `dry_run=true`, return the plan without writing.
+7. Otherwise `Store.Put` each manifest into `/desired/...`. Watch fires; reconciler picks up.
+8. If `prune=true`, also delete siblings in the same `(scope, kind)` that aren't in the apply.
+
+### GET /apply
+
+```
+GET /apply?kind=deployment
+```
+
+Lists manifests. Omit `kind` for all kinds.
+
+### DELETE /apply
+
+```
+DELETE /apply?kind=<k>&name=<n>&scope=<s>&prune=true|false
+```
+
+Soft delete by default — removes the manifest from `/desired/...`. With `prune=true`, also wipes:
+
+- Config bucket (`/config/<scope>/<name>/`).
+- App dir (`/opt/voodu/apps/<scope>-<name>/`).
+- Per-pod docker volumes (statefulset only).
+
+Response wraps the prune summary under the `pruned` key:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "pruned": {
+      "config_wiped":     true,
+      "app_dir_removed":  true,
+      "volume_removed":   false,
+      "volumes_removed":  ["voodu-data-pg-data-0"],
+      "errors":           []
+    }
+  }
+}
+```
+
+## Resource delete (kind-agnostic)
+
+```
+DELETE /resource?scope=<s>&name=<n>&ordinal=<N>&prune=true|false
+```
+
+Useful for `app` blocks (which expand into `deployment` + `ingress` sharing identity) — `/resource` scans every scoped kind for `(scope, name)` matches and deletes each.
+
+With `ordinal=N`, scoped to statefulset per-pod rebootstrap.
+
+## Scope wipe
+
+```
+DELETE /scope?scope=<s>&prune=true|false
+```
+
+Wipes every resource in a scope. `prune=true` also wipes filesystem state and statefulset volumes.
+
+## Describe / status
+
+```
+GET /describe?kind=<k>&name=<n>&scope=<s>
+```
+
+Returns:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "manifest": { ... },
+    "status":   { ... },
+    "pods":     [ { name, replica_id, state, started_at, image, ... } ],
+    "volumes":  ["voodu-data-pg-data-0", ...]
+  }
+}
+```
+
+`status` is the raw `/status/...` blob (DeploymentStatus, etc.). Pod/volume failures are non-fatal — manifest+status still returned. `volumes` only for statefulsets.
+
+## Pods
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/pods?kind=&scope=&name=` | List all voodu-labeled containers with structured identity. |
+| `GET` | `/pods/{name}` | `docker inspect`-style detail. 404 if missing. |
+| `GET` | `/pods/{name}/ready` | 200 ready, 503 not-ready (with status body), 404 unknown. Used by caddy active health checks — high-frequency, in-memory lookup, no etcd hop. |
+| `GET` | `/pods/{name}/logs?follow=true&tail=<n>` | Chunked text/plain stream. CLI fans out client-side over multiple containers. |
+| `POST` | `/pods/{name}/exec` | Hijacks the TCP connection after `HTTP/1.1 200 OK`. Body: `{command:[...], env:["KEY=VAL",...]}`. Query: `tty=&interactive=&workdir=&user=&cols=&rows=`. |
+| `POST` | `/pods/{name}/stop?freeze=true` | Stops the container. With `freeze=true` (default), adds replica_id to `/frozen/...` so future reconciles skip the slot. Response: `{status, data:{name, freeze}}`. |
+| `POST` | `/pods/{name}/start` | Recreate-via-reconcile: removes the stale container, clears freeze, re-Puts the manifest so the watch fires. Reads fresh env from `--env-file`. Response: `{status, data:{name, recreated:bool, unfroze:bool}}`. |
+
+## Stats
+
+```
+GET /stats?kind=&scope=&name=&orphans=true|false
+```
+
+Joins live docker stats with manifest limits. Same collector the autoscaler uses. Returns `503` if the stats collector isn't wired.
+
+Per-pod shape:
+
+```json
+{
+  "identity": {
+    "kind":       "deployment",
+    "scope":      "prod",
+    "name":       "api",
+    "replica_id": "..."
+  },
+  "container_name": "prod-api.<replica_id>",
+  "usage": {
+    "cpu_percent":         42.5,
+    "memory_usage_bytes":  104857600,
+    "memory_limit_bytes":  4294967296,
+    "memory_percent":      2.44,
+    "pids":                12
+  },
+  "limits": {
+    "cpu":          "0.5",
+    "memory":       "4Gi",
+    "memory_bytes": 4294967296
+  },
+  "orphan": false
+}
+```
+
+No network IO fields are exposed today. The autoscaler only consumes `usage.cpu_percent` and `limits.cpu` for its hysteresis math.
+
+## Config bucket
+
+`/config` is multi-method:
+
+### GET /config
+
+```
+GET /config?scope=<s>&name=<n>&key=<k>&merge=true
+```
+
+| Args | Returns |
+|---|---|
+| `scope` only | scope-level bucket |
+| `scope` + `name`, `merge=true` (default) | merged view (scope + app, app wins) |
+| `scope` + `name`, `merge=false` | app-level only |
+| `+ key` | single value |
+
+Response: `{status, data:{vars:{KEY:VAL,…}}}` or `{status, data:{KEY:VAL}}` for single key.
+
+### POST /config
+
+```
+POST /config?scope=<s>&name=<n>&restart=true|false
+Body: { "KEY": "VAL", ... }
+```
+
+`PatchConfig` — empty value unsets. With `restart=true` (default), triggers fan-out restart of every container-producing manifest in scope (or just `name` if specified).
+
+### DELETE /config
+
+```
+DELETE /config?scope=<s>&name=<n>&key=<k>&restart=true|false
+```
+
+Unsets a single key.
+
+## Restart / release / rollback
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/restart?kind=&scope=&name=` | Imperative rolling restart. Auto-detects kind across deployment/statefulset (ambiguous → 400). Clears frozen replicas first; response includes `unfroze: ["replica_id", ...]`. |
+| `POST` | `/releases/run?scope=&name=` | Deployment-only. Streams release-phase output verbatim (text/plain). Failure is signalled by a trailing `failed` marker line. |
+| `POST` | `/rollback?kind=&scope=&name=&release_id=` | Re-Puts the past `SpecSnapshot`. Defaults to the previous release if `release_id` omitted. |
+
+## Jobs / cronjobs
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/jobs/run?scope=&name=` | Synchronous — connection stays open until exit. Returns a `JobRun` with exit code. |
+| `POST` | `/cronjobs/run?scope=&name=` | Forces an immediate tick; scheduler cadence unaffected. |
+
+## Plugins
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/plugins` | List installed plugins with their `plugin.yml` manifests. |
+| `POST` | `/plugins/install` | Body: `{source:"owner/repo" \| "/path", version?:""}`. Installs from GitHub release or local path. |
+| `DELETE` | `/plugins/{name}` | Idempotent removal. |
+| `POST` | `/plugins/exec` | Legacy "send unknown CLI command to a plugin" path. Body: `{args:[<plugin>,<cmd>,…], env?:{}}`. |
+| `POST` | `/plugin/{name}/{command}` | Plugin dispatch surface (see below). |
+
+## Plugin dispatch
+
+```
+POST /plugin/<name>/<command>
+Body: { "args": ["arg1", "arg2", ...] }
+```
+
+The controller verifies the command is declared in `plugin.yml` (unknown commands → 400 with the list of available ones), then invokes the plugin binary as a subprocess.
+
+### Plugin output (stdout)
+
+The plugin writes a JSON envelope to stdout:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "message": "Promoted replica 1 to primary",
+    "actions": [
+      {
+        "type":         "config_set",
+        "scope":        "clowk-lp",
+        "name":         "db",
+        "kv":           { "PG_PRIMARY_ORDINAL": "1" },
+        "skip_restart": true
+      },
+      {
+        "type":     "apply_manifest",
+        "manifest": { "kind": "statefulset", "scope": "...", "name": "...", "spec": {...} }
+      },
+      {
+        "type":    "exec_local",
+        "command": ["psql", "-h", "..."]
+      }
+    ]
+  }
+}
+```
+
+### Controller's HTTP response
+
+After processing the plugin's actions, the controller responds with:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "message":   "Promoted replica 1 to primary",
+    "applied":   ["config_set clowk-lp/db", "apply_manifest statefulset/clowk-lp/db"],
+    "exec_local": [{ "command": ["psql", "-h", "..."] }],
+    "fetch_file": [{ "remote_path": "...", "dest_path": "...", "size_bytes": 1234 }]
+  }
+}
+```
+
+`exec_local` and `fetch_file` are surfaced to the **CLI** for client-side execution — the controller doesn't run them itself.
+
+### Recognised action types
+
+| Type | Server effect | CLI effect |
+|---|---|---|
+| `config_set` | `PatchConfig(scope, name, kv)` | — |
+| `config_unset` | `PatchConfig` with empty values | — |
+| `apply_manifest` | `Store.Put(manifest)` | — |
+| `delete_manifest` | `Store.Delete(kind, scope, name)` — idempotent (no-op when missing, not an error) | — |
+| `run_job` | Fire-and-forget `Jobs.RunOnce(scope, name)` | — |
+| `exec_local` | NOT run server-side. Surfaced in `data.exec_local[]` | CLI runs locally with operator's TTY (interactive shells: `vd pg:psql`) |
+| `fetch_file` | NOT run server-side. Surfaced in `data.fetch_file[]` with `{remote_path, dest_path, size_bytes}` | CLI runs `scp` / `cp` (`vd pg:backups:download`) |
+
+Unknown action types are rejected.
+
+### SkipRestart suppression
+
+After each successful action, the controller fans out a restart to affected manifests (same as `voodu config set`). Plugins can suppress this with `skip_restart: true` per action — used during `voodu pg:promote` where the bucket flip happens BEFORE the rejoin, and a fan-out restart in the middle would cascade.
+
+`apply_manifest`, `delete_manifest`, and `run_job` actions never trigger the fan-out — they have their own reconcile path.
+
+## Plugin expansion (no HTTP surface — internal to `/apply`)
+
+When `/apply` sees an unknown block kind (`postgres {}`, `redis {}`), it calls the plugin's `expand` command with:
+
+```json
+{
+  "kind":   "postgres",
+  "scope":  "data",
+  "name":   "main",
+  "spec":   { ... HCL attrs ... },
+  "config": { ... merged scope+app bucket ... }
+}
+```
+
+Plugin returns one of:
+
+1. `[Manifest, ...]` — array of core-kind manifests.
+2. `{ ... single Manifest ... }` — single-resource (caddy ingress).
+3. `{ "manifests": [...], "actions": [...] }` — manifests + dispatch actions (used by voodu-redis to emit `config_set` for first-apply `REDIS_PASSWORD`).
+
+Actions run BEFORE the manifests are spliced into the apply.
+
+Returned manifests **must be core kinds** — recursive expansion is forbidden.
+
+## CORS / auth
+
+No CORS headers, no auth headers. Trust model is "you got here via SSH, you're the operator". For browser-side dashboards, terminate auth at a reverse proxy upstream of the controller.
+
+## Reading flow — what each CLI command hits
+
+| CLI | Endpoint |
+|---|---|
+| `voodu apply -f voodu.hcl` | `POST /apply` |
+| `voodu diff -f voodu.hcl` | `POST /apply?dry_run=true` |
+| `voodu describe` | `GET /describe` |
+| `voodu logs <ref>` | `GET /pods/{name}/logs?follow=...` |
+| `voodu config <ref> set K=V` | `POST /config` |
+| `voodu config <ref> get K` | `GET /config?key=K` |
+| `voodu restart <ref>` | `POST /restart` |
+| `voodu rollback <ref> [release_id]` | `POST /rollback` |
+| `voodu run <ref>` | `POST /jobs/run` |
+| `voodu release run <ref>` | `POST /releases/run` (streamed) |
+| `voodu pg:promote ...` | `POST /plugin/postgres/promote` |
+| `voodu plugins:install <src>` | `POST /plugins/install` |
+| `voodu plugins:list` | `GET /plugins` |
+
+## See also
+
+- [Controller](/docs/architecture/controller) — the process model.
+- [Reconciler](/docs/architecture/reconciler) — the loop that picks up `/desired/` changes.
+- [CLI reference](/docs/cli/apply) — operator-facing command docs.

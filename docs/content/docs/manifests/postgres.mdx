@@ -1,0 +1,285 @@
+---
+title: postgres
+description: Postgres macro — statefulset + streaming replication + backups.
+---
+
+`postgres "scope" "name" {}` is a server-side macro that expands into a `statefulset` plus init scripts, config templates, and an entrypoint wrapper. Provided by the [voodu-postgres plugin](/docs/plugins/postgres).
+
+For raw `statefulset` shapes (kafka, mongo, your own postgres setup), see [`statefulset`](/docs/manifests/statefulset).
+
+## Synopsis
+
+```hcl
+postgres "scope" "name" {
+  image    = "postgres:16"
+  replicas = 3                    # 1 primary + (N-1) standbys
+  database = "myapp"
+  user     = "myapp"
+  password = "${PG_PASSWORD}"     # optional — auto-generated if omitted
+
+  port             = 5432
+  initdb_locale    = "C.UTF-8"
+  initdb_encoding  = "UTF8"
+  replication_user = "replicator"
+
+  pg_config = {
+    max_connections      = 200
+    shared_buffers       = "1GB"
+    effective_cache_size = "3GB"
+    work_mem             = "16MB"
+  }
+
+  extensions = ["pgvector"]       # parsed but NOT auto-installed (see trade-offs)
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+
+  # Statefulset passthrough — anything else accepted by statefulset is forwarded:
+  env_from = ["aws/cli"]
+  probes   { ... }                # totally replaces plugin defaults
+  workdir, dockerfile, path, lang { ... }   # for inline build (e.g. + pgvector)
+}
+```
+
+## Required
+
+None. `postgres "data" "pg" {}` is parseable — it boots a single-replica `postgres:latest` instance with database `postgres`, user `postgres`, auto-generated password.
+
+## Optional fields (plugin-owned)
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `image` | string | `"postgres:latest"` | Must work as both primary AND standby (standbys clone via `pg_basebackup`). |
+| `replicas` | int | `1` | `1` = single primary. `≥2` = 1 primary + (N-1) streaming standbys. |
+| `database` | string | `"postgres"` | initdb argument. Validated as a postgres identifier (`^[a-zA-Z_][a-zA-Z0-9_]*$`, 1–63 chars). |
+| `user` | string | `"postgres"` | Superuser name. Validated as identifier. Must differ from `replication_user`. |
+| `password` | string | auto-gen | Empty → auto-generated 256-bit hex on first apply, persisted in `POSTGRES_PASSWORD` bucket key. Operator-set value lives plaintext in HCL. |
+| `port` | int | `5432` | Listen port. 1..65535. |
+| `initdb_locale` | string | `"C.UTF-8"` | initdb `--locale`. Honored only on first primary boot. |
+| `initdb_encoding` | string | `"UTF8"` | initdb `--encoding`. First boot only. |
+| `pg_config` | map | `{}` | `postgresql.conf` overrides. Keys: `^[a-z][a-z0-9_]*$`. Values: int / float / bool / string (auto-quoted). Rendered into `voodu-99-overrides.conf`. |
+| `extensions` | []string | `[]` | Validated as identifiers. **NOT auto-installed.** Use app migrations or `voodu pg:psql -c "CREATE EXTENSION ..."`. |
+| `replication_user` | string | `"replicator"` | Streaming replication role. Must differ from `user`. Password is auto-gen only; lives in bucket as `POSTGRES_REPLICATION_PASSWORD`. |
+
+## Passthrough — statefulset fields
+
+Anything the statefulset accepts flows through unchanged:
+
+- `env = {}` — deep-merged with plugin env; operator wins per-key.
+- `env_from = [...]`
+- `volumes` — additive merge by destination path; operator-declared dst replaces plugin entry for that dst.
+- `health_check = "..."` — operator wins outright.
+- `probes {}` — **totally replaces** the plugin defaults (no field-level merge — see below).
+- `resources { limits { cpu, memory } }` — CPU + memory caps.
+- `workdir` / `dockerfile` / `path` / `lang { ... }` — statefulset build-mode (e.g. inline `postgres + pgvector` image).
+- `ports`, `labels`, additional `volume_claim` blocks — full statefulset surface.
+
+## Default probes (v0.13+)
+
+```hcl
+probes {
+  liveness {
+    tcp_socket { port = <spec.port> }
+    initial_delay     = "20s"
+    period            = "10s"
+    failure_threshold = 3
+  }
+
+  readiness {
+    exec { command = ["pg_isready", "-U", "<spec.user>", "-d", "<spec.database>", "-p", "<spec.port>"] }
+    period            = "5s"
+    failure_threshold = 1
+    success_threshold = 2
+  }
+}
+```
+
+No `startup` probe by default — postgres boot is fast enough that the liveness `initial_delay = 20s` covers it.
+
+**Override semantics:** any operator-declared `probes {}` block **totally replaces** the defaults. No sub-block merging. To override one and keep the other, redeclare both.
+
+To disable entirely: declare `probes {}` empty.
+
+## DNS & per-pod addressing
+
+Voodu's statefulset DNS scheme applies:
+
+| Pod | FQDN |
+|---|---|
+| Pod 0 | `pg-0.data.voodu` (primary by default) |
+| Pod 1 | `pg-1.data.voodu` (standby) |
+| Pod 2 | `pg-2.data.voodu` (standby) |
+| Round-robin | `pg.data.voodu` |
+
+The plugin tracks the current primary via `PG_PRIMARY_ORDINAL` in the resource's config bucket — `voodu pg:promote` flips it without re-applying HCL.
+
+## Validation
+
+The apply is rejected when:
+
+- `replicas < 1`.
+- `user == replication_user`.
+- `database`, `user`, `replication_user` fail the postgres identifier rule.
+- `port` is outside `[1, 65535]`.
+- `pg_config` keys fail the `^[a-z][a-z0-9_]*$` rule.
+- `extensions` entries fail the identifier rule.
+
+## Examples
+
+### Minimal — single primary, auto password
+
+```hcl
+postgres "clowk-lp" "db" {
+  image = "postgres:16"
+}
+```
+
+Defaults: 1 replica, database `postgres`, user `postgres`, auto-generated password persisted in the `clowk-lp/db` bucket.
+
+### Rails app with linked database
+
+```hcl
+postgres "clowk-lp" "db" {
+  image    = "postgres:16"
+  database = "appdata"
+  user     = "appuser"
+}
+
+deployment "clowk-lp" "web" {
+  image = "ghcr.io/clowk/web:latest"
+  ports = ["3000"]
+  env   = { RAILS_ENV = "production" }
+}
+```
+
+```bash
+voodu apply -f voodu.hcl -r prod-1
+voodu pg:link clowk-lp/db clowk-lp/web
+# clowk-lp/web bucket now has DATABASE_URL pointing at the primary
+```
+
+### HA cluster with read pool
+
+```hcl
+postgres "clowk-lp" "db" {
+  image    = "postgres:16"
+  database = "appdata"
+  user     = "appuser"
+  replicas = 3                       # 1 primary + 2 standbys
+}
+
+deployment "clowk-lp" "web" {
+  image = "ghcr.io/clowk/web:latest"
+  ports = ["3000"]
+}
+```
+
+```bash
+voodu pg:link clowk-lp/db clowk-lp/web --reads
+# web bucket now has:
+#   DATABASE_URL      = postgres://...@db-0.clowk-lp.voodu:5432/appdata        (primary)
+#   DATABASE_READ_URL = postgres://...@db-1.clowk-lp.voodu:5432,db-2.clowk-lp.voodu:5432/appdata?target_session_attrs=any&load_balance_hosts=random
+```
+
+### Custom pg_config + resource caps
+
+```hcl
+postgres "clowk-lp" "db" {
+  image    = "postgres:16"
+  replicas = 3
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+
+  pg_config = {
+    max_connections      = 200
+    shared_buffers       = "1GB"      # ~25% of memory limit
+    effective_cache_size = "3GB"      # ~75%
+    work_mem             = "16MB"
+    log_connections      = true
+    log_min_messages     = "warning"
+  }
+}
+```
+
+### Inline build with pgvector
+
+```hcl
+postgres "clowk-lp" "db" {
+  workdir    = "infra/postgres"
+  dockerfile = "Dockerfile.pg"
+  replicas   = 3
+
+  lang { name = "generic" }
+}
+```
+
+`infra/postgres/Dockerfile.pg`:
+
+```dockerfile
+FROM postgres:16
+RUN apt-get update \
+ && apt-get install -y postgresql-16-pgvector \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+```bash
+voodu apply -f voodu.hcl
+voodu pg:psql clowk-lp/db -c "CREATE EXTENSION IF NOT EXISTS vector"
+```
+
+### Backup automation via cronjob + S3 sync
+
+```hcl
+postgres "clowk-lp" "db" {
+  image    = "postgres:16"
+  replicas = 3
+}
+
+cronjob "clowk-lp" "db-backup-s3" {
+  schedule = "*/30 * * * *"
+  image    = "amazon/aws-cli:latest"
+
+  command = ["s3", "sync", "/backups/", "s3://my-bucket/postgres/clowk-lp/"]
+
+  volumes  = ["/opt/voodu/backups/clowk-lp/db:/backups:ro"]
+  env_from = ["aws/cli"]
+}
+```
+
+Backups are captured by `voodu pg:backups:capture` (CLI verb) or by manual `pg_dump`, then synced off-host on a schedule.
+
+## Trade-offs
+
+**`extensions` is validated, not installed.** voodu-postgres records the list and validates names, but doesn't run `CREATE EXTENSION` for you. Use app migrations or `voodu pg:psql -c "CREATE EXTENSION ..."` — that's the authoritative path (matches Rails/Django migration flow).
+
+**`pg_config` takes effect on the second boot.** First boot runs initdb BEFORE the include-dir is processed, so the overrides aren't applied until the next restart. You'll see one cosmetic re-apply. Subsequent applies pick up changes via include-dir reload.
+
+**Operator-declared `probes {}` totally replaces defaults.** No field-level merge. Copy what you need before overriding.
+
+**Auto-generated passwords live in the bucket.** First apply seeds `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` in the resource's config bucket. Operator-supplied `password = "..."` is plaintext in HCL — use it for dev only.
+
+**`voodu pg:expose` refuses with replicas > 1.** Statefulset reconciler applies `ports` uniformly to every pod; binding `0.0.0.0:5432` on multiple pods would host-port-conflict. Use pgbouncer / HAProxy in front, an SSH tunnel to the primary, or temporarily scale to `replicas = 1`.
+
+**Promote is plugin-owned.** Operator never types SQL to flip primary — `voodu pg:promote -r N` runs `pg_promote()` internally, polls `pg_is_in_recovery()`, flips the bucket, refreshes consumers, auto-rejoins the old primary as standby. With lag check via `pg_stat_replication`; `--force` skips it.
+
+**No PITR built-in.** WAL archive is operator-declared (cronjob that mounts `/opt/voodu/backups/<scope>/<name>:/backups:ro`). The plugin handles logical dumps (`pg_dump -F c -Z 6`); time-travel restore is on your shoulders.
+
+**Replication is no-slot.** voodu-postgres uses `wal_keep_size = '1GB'` instead of replication slots. Trade-off: a standby that falls too far behind re-bootstraps via `pg_basebackup`; no risk of abandoned slots growing WAL forever on the primary.
+
+**One credential per cluster.** The `password` and `replication_user` password live in the bucket. To rotate, `voodu config <scope/name> unset POSTGRES_PASSWORD` + apply triggers regen.
+
+## See also
+
+- [voodu-postgres plugin](/docs/plugins/postgres) — full CLI reference, internals, backup/restore details
+- [`statefulset`](/docs/manifests/statefulset) — the kind this macro expands into
+- [`probes`](/docs/manifests/probes) — override semantics
+- [`config & secrets`](/docs/manifests/config) — how `POSTGRES_PASSWORD` is persisted

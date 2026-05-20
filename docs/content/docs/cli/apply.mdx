@@ -1,0 +1,87 @@
+---
+title: voodu apply
+description: Stream context, plan, reconcile.
+---
+
+## Synopsis
+
+```bash
+voodu apply -f voodu.hcl -r prod-1 [flags]
+```
+
+## What it does
+
+1. Tar the working directory (build mode) or skip (image mode).
+2. Stream the tarball over SSH to `voodu receive-pack` on the remote.
+3. Controller diffs the manifest against embedded etcd.
+4. Builds the image (or skips — tarball hash is content-addressed).
+5. Swaps `current` symlink, runs `release` hooks, recreates containers.
+6. Reconciles ingress and Caddy routes.
+
+## Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-f`, `--file` | — | Manifest file or directory. Repeat for multiple. |
+| `-r`, `--remote` | — | SSH alias from `voodu remote list`. |
+| `--prune` | `false` | **Opt-in.** Delete resources in the same `(scope, kind)` that aren't declared in this apply. Default is upsert-only — siblings stay put. |
+| `-y`, `--auto-approve` | `false` | Skip the interactive confirmation prompt (also `VOODU_AUTO_APPROVE=1`). |
+| `--force` | `false` | Rebuild build-mode deployments even when the tarball hash matches an existing release (also `VOODU_FORCE_REBUILD=1`). |
+| `-v`, `--verbose` | `false` | Show raw docker build output instead of collapsing to a spinner. |
+
+## Examples
+
+```bash
+# Standard apply
+voodu apply -f voodu.hcl -r prod-1
+
+# Multi-file
+voodu apply -f infra/web.voodu -f infra/redis.voodu -r prod-1
+
+# Multi-remote loop
+for r in prod-1 prod-2 prod-3; do
+  voodu apply -f voodu.hcl -r $r
+done
+
+# CI gate
+voodu diff -f voodu.hcl --detailed-exitcode -r prod-1
+# exit 2 = changes pending, exit 0 = no-op
+
+# Opt-in cleanup of stale siblings (full source-of-truth apply)
+voodu apply -f voodu.hcl --prune -r prod-1
+```
+
+## Variable interpolation
+
+`${VAR}` and `${VAR:-default}` resolve on **your machine** before the tarball ships. Two sources:
+
+1. Your shell env (`os.Environ()`).
+2. **`env_from`'d config buckets** — when a resource declares `env_from = ["scope/name"]`, the CLI fetches that bucket from the controller before parsing. So `${SLACK_WEBHOOK_URL}` in `on_deploy.success.url` can come from `voodu config set -s prod -n shared SLACK_WEBHOOK_URL=...`. No per-dev `export` needed.
+
+Shell wins over bucket on collision — ad-hoc override works for testing without touching the bucket.
+
+```hcl
+deployment "prod" "api" {
+  env_from = ["prod/shared"]
+
+  on_deploy {
+    success { url = "${SLACK_WEBHOOK_URL}" }   # resolved from prod/shared
+  }
+}
+```
+
+Caveat: bucket-fed interpolation is **local-apply only**. With `-r <remote>` the SSH-forward path keeps shell-only.
+
+## Output
+
+```
+→ packing context (1.4 MB)
+→ streaming over ssh ubuntu@prod-1
+→ controller: planning ...
++ app/prod/api               replicas=3 image=ghcr.io/myorg/api:1.7
+~ ingress/prod/api           tls.email=ops@example.com
+- cronjob/prod/old-cleanup
+→ build → swap current → reconcile caddy
+✓ apply complete in 11.8s
+✓ https://api.example.com  ·  3/3 healthy
+```

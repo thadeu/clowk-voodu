@@ -1,0 +1,9 @@
+.git
+.claude
+.next
+.source
+.wrangler
+node_modules
+.env*
+out
+README.md

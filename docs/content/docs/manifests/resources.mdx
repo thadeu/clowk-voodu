@@ -1,0 +1,190 @@
+---
+title: resources
+description: CPU + memory limits — k8s-style.
+---
+
+`resources { limits { cpu memory } }` declares container resource caps. Voodu translates them into docker `--cpus` and `--memory` flags at create time.
+
+Accepted on `deployment`, `app`, `statefulset`, `job`, `cronjob`, and inside `init "<name>" {}` blocks.
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+}
+```
+
+## `limits {}`
+
+Only `limits` is honored today. `requests` is reserved for a future multi-host scheduler.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `cpu` | string | — | CPU cap. Omit for no cap. |
+| `memory` | string | — | Memory cap. Omit for no cap. |
+
+## CPU value formats
+
+| Value | Means |
+|---|---|
+| `"2"` | 2 cpus |
+| `"1.5"` | 1.5 cpus |
+| `"500m"` | 0.5 cpus (millicores) |
+
+Decimal fractions work directly; the `m` (milli) suffix is the k8s shorthand for `value / 1000`.
+
+## Memory value formats
+
+| Value | Means | Notes |
+|---|---|---|
+| `"4Gi"` | 4 × 1024³ bytes | binary, IEC suffix |
+| `"512Mi"` | 512 × 1024² bytes | binary |
+| `"1G"` | 1 × 1000³ bytes | decimal, SI suffix |
+| `"1024"` | 1024 bytes | no suffix = bytes |
+
+Use binary suffixes (`Gi`, `Mi`) when you want predictable RAM accounting; SI suffixes are accepted but rarely what you mean.
+
+## Validation
+
+CPU and memory values are parsed at reconcile time when voodu translates them into docker flags. Unparseable values (`"two cpus"`, `"4 gigs"`) surface as an apply error from the controller — not from the manifest parser, but the user-visible effect is the same: a failing apply with the offending value and a format hint.
+
+## Examples
+
+### Standard web app
+
+```hcl
+app "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+  host  = "api.example.com"
+  tls   { email = "ops@example.com" }
+
+  resources {
+    limits {
+      cpu    = "1"
+      memory = "1Gi"
+    }
+  }
+}
+```
+
+### Heavy worker
+
+```hcl
+deployment "prod" "worker" {
+  image   = "ghcr.io/myorg/worker:1.7"
+  command = ["bin/worker"]
+
+  resources {
+    limits {
+      cpu    = "4"
+      memory = "8Gi"
+    }
+  }
+}
+```
+
+### Stateful service with reservation
+
+```hcl
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+
+  volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+}
+```
+
+Postgres tuning conventions: set `shared_buffers ≈ 25%` and `effective_cache_size ≈ 75%` of the memory limit.
+
+### Per-init caps
+
+Init blocks default to **no limit**. Declare `resources {}` explicitly when you want caps on the prep step:
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  resources {
+    limits { cpu = "1" memory = "512Mi" }   # parent
+  }
+
+  init "warmup" {
+    command = ["bin/warmup"]
+
+    resources {
+      limits { cpu = "2" memory = "2Gi" }   # explicit caps for the one-shot
+    }
+  }
+}
+```
+
+The parent's caps don't carry over — init steps that need to be capped have to say so.
+
+### Job with caps
+
+```hcl
+job "prod" "backup" {
+  image = "postgres:16"
+
+  resources {
+    limits {
+      cpu    = "1"
+      memory = "2Gi"
+    }
+  }
+
+  command = ["sh", "-c", "pg_dump $DATABASE_URL > /backups/dump.sql"]
+}
+```
+
+### Cronjob memory ceiling
+
+```hcl
+cronjob "data" "reindex" {
+  schedule = "0 3 * * *"
+  image    = "ghcr.io/myorg/api:1.7"
+  command  = ["bin/reindex"]
+
+  resources {
+    limits {
+      cpu    = "2"
+      memory = "4Gi"
+    }
+  }
+}
+```
+
+## Trade-offs
+
+**Only `limits` today.** No `requests`. Voodu is single-host per remote; there's no scheduler picking nodes by available capacity. When multi-host lands, `requests` will become meaningful.
+
+**Caps are enforced by docker.** voodu translates `cpu = "2"` to `--cpus="2"` and `memory = "4Gi"` to `--memory="4Gi"` at container create. Container hitting the memory cap gets OOM-killed (and the [`probes.liveness`](/docs/manifests/probes) signals will see it shortly after).
+
+**Empty = no limit.** Omitting `resources {}` entirely means no caps — the container can use whatever the host has. Useful for trusted workloads; risky in shared hosts.
+
+**Init containers do NOT inherit the parent's caps.** An init block without `resources {}` runs **unbounded**, even if the parent declares limits. Prep steps (migrations, warmups) often need more headroom than steady-state — inheritance-by-default would silently throttle them. Declare `resources {}` inside the init block when you want explicit caps.
+
+**Hashed into the spec.** Changing a limit triggers a rolling restart — docker freezes resource args at create time; `docker update` is not used.
+
+**Memory units are exact.** `"1Gi"` is exactly 1073741824 bytes. `"1G"` is exactly 1000000000 bytes. They are different. Pick one convention and stick with it.
+
+**CPU `"500m"` is fractional, not throttled.** A 500m limit means the container can use up to 0.5 CPU on average. It can burst above briefly; docker's CFS quota enforces the time-window average.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app), [`statefulset`](/docs/manifests/statefulset), [`job`](/docs/manifests/jobs#job), [`cronjob`](/docs/manifests/jobs#cronjob)
+- [`init`](/docs/manifests/init) — per-init `resources` overrides

@@ -1,0 +1,60 @@
+---
+title: voodu config
+description: Out-of-band env vars per app. See manifests/config for semantics.
+---
+
+See [manifests / config & secrets](/docs/manifests/config) for the precedence rules.
+
+## Set
+
+```bash
+voodu config set DATABASE_URL=postgres://... -a prod
+voodu config set SECRET_KEY_BASE=$(openssl rand -hex 32) -a prod
+```
+
+Multiple keys at once:
+
+```bash
+voodu config set NODE_ENV=production PORT=8080 -a prod
+```
+
+## Get / list
+
+```bash
+voodu config get DATABASE_URL -a prod
+voodu config list -a prod
+```
+
+## Unset
+
+```bash
+voodu config unset OLD_FLAG -a prod
+```
+
+## Reload
+
+```bash
+voodu config reload -a prod
+```
+
+Re-renders env into running containers and bounces replicas one at a time. Use after a `config set` if your app doesn't watch env at runtime.
+
+## Virtual buckets
+
+Group config that belongs to a tool, not an app:
+
+```bash
+voodu config aws/cli set AWS_ACCESS_KEY_ID=AKIA...
+voodu config aws/cli list
+voodu config aws/cli unset AWS_DEFAULT_REGION
+```
+
+Reference from manifests with `env_from = ["aws/cli"]`. The same bucket also feeds parse-time `${VAR}` interpolation — see [config & secrets](/docs/manifests/config#env_from-feeds-parse-time-var).
+
+## Bulk import from .env
+
+```bash
+voodu config import .env.production -a prod
+```
+
+Skips comments and blank lines. Fails on syntax errors before writing anything.

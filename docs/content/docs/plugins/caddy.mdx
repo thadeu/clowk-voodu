@@ -1,0 +1,161 @@
+---
+title: voodu-caddy
+description: Ingress plugin — Caddy on voodu0, ACME, on-demand wildcards.
+---
+
+`voodu-caddy` is the ingress backend. It runs Caddy as a docker container on the `voodu0` network, posts to the Caddy Admin API on every change, and provides ACME TLS issuance (HTTP-01 + on-demand).
+
+Current version: **0.1.6**. No alias.
+
+## Install
+
+```bash
+voodu plugins:install thadeu/voodu-caddy
+```
+
+The install hook:
+
+1. Downloads the matching release binary (`voodu-caddy_linux_amd64` or `..._arm64`) into `$VOODU_PLUGIN_DIR/bin`.
+2. Creates the `voodu0` docker network if missing.
+3. Seeds state directories under `/opt/voodu/caddy/` (`data/`, `config/`, `routes/`).
+4. Pulls `caddy:2.8`.
+5. `docker run -d` it as `voodu-caddy` on `voodu0` with `--restart unless-stopped`. Publishes `:80`, `:443`, `:443/udp`, and `127.0.0.1:2019:2019`.
+6. Waits up to 15s for `127.0.0.1:2019/config/` to respond.
+
+State directories survive uninstall — certs in `/opt/voodu/caddy/data/` and route definitions in `/opt/voodu/caddy/routes/*.json` are preserved across reinstalls.
+
+## Manifest surface
+
+The plugin doesn't parse HCL — that's the controller's job. It receives the manifest as environment variables when the controller invokes `voodu caddy:apply`. The full operator-facing surface is documented in [`ingress`](/docs/manifests/ingress) and [`app`](/docs/manifests/app).
+
+The plugin understands:
+
+- One host per route (`host = "..."`).
+- One upstream `service:port` or a list of upstreams (multi-replica).
+- TLS via four shapes — see TLS section.
+- `location { path strip }` for path-based routing.
+- `lb { policy interval }` for active health checks + selection policy.
+
+It does **not** support: `rewrite`, custom `headers`, middleware, redirect handlers, body transforms.
+
+## TLS — four shapes
+
+| Shape | What it does |
+|---|---|
+| No `tls {}` | Plain HTTP on `:80`. No automation policy. |
+| `provider = "letsencrypt"` | ACME HTTP-01. CA: `https://acme-v02.api.letsencrypt.org/directory`. No wildcards (HTTP-01 can't validate them). |
+| `provider = "internal"` | Caddy's self-signed CA. Browsers warn until trusted. Dev/staging. |
+| `on_demand = true` + `ask = <url>` | Wildcard-capable. Caddy calls `ask?domain=<host>` to authorize each new hostname. **No `allow_all` fallback.** |
+
+**`tls { enabled = true }` without `provider`** is rejected at apply time.
+
+**On-demand without `ask`** is rejected at apply time — voodu-caddy refuses to issue without an authorization callback. Rationale: early experience without an app-driven gate had SSL races and ACME rate-limit hits.
+
+Policy grouping is by `(provider, email, on_demand)` tuple — operators sharing one email get one ACME account, while on-demand vs static stay in separate policies.
+
+## Active health checks
+
+```hcl
+ingress "prod" "api" {
+  host    = "api.example.com"
+  service = "api"
+  port    = 8080
+
+  lb {
+    interval = "5s"     # active probe cadence
+  }
+}
+```
+
+Caddy probes `health_check =` path on every upstream every `interval`. Failures drop the upstream from the pool until it passes.
+
+When `interval` is empty, no active probe is emitted. Passive health (Caddy's default) still applies.
+
+`health_check` defaults to `/`. Override at the deployment level if you have a dedicated `/healthz`.
+
+## Path-based routing
+
+```hcl
+ingress "prod" "api" {
+  host = "api.example.com"
+
+  location { path = "/api/v1" }
+}
+```
+
+The plugin emits one Caddy route per `location` with `match.host = [host]` + `match.path = [path, path + "/*"]`. Both forms needed because Caddy's path matcher is shell-glob — without the wildcard form, `/api/v1/foo` wouldn't match `/api/v1`.
+
+`strip = true` injects a `strip_path_prefix` handler BEFORE the reverse-proxy. Upstream sees the URL with the prefix removed.
+
+`path = "/"` collapses to a host-only catch-all (no prefix matching).
+
+Routes are emitted in declaration order, each `terminal: true`. First match wins.
+
+## CLI verbs
+
+| Verb | Used by |
+|---|---|
+| `voodu caddy:apply` | Controller (after `voodu apply` materializes an ingress) |
+| `voodu caddy:remove` | Controller (when ingress is pruned) |
+| `voodu caddy:list` | Operator inspection |
+| `voodu caddy:reload` | Operator — rebuild config from disk without changing routes |
+
+Operators typically don't invoke `apply` / `remove` directly — they happen automatically as part of `voodu apply`. `list` and `reload` are diagnostic.
+
+```bash
+voodu caddy:list                # show all known routes
+voodu caddy:reload              # rebuild Caddy config from /routes/*.json
+```
+
+## Service-name resolution
+
+voodu-caddy runs on `voodu0`. Apps and deployments join `voodu0` automatically. Upstream addresses are resolved via Docker's embedded DNS *inside the Caddy container* — so `service:port` (e.g. `api:3000`) works without IPs.
+
+This is why the install pins Caddy to `voodu0` — dropping it onto the bridge default would break DNS resolution for service names.
+
+## Multi-replica upstreams
+
+When a deployment has multiple replicas, the controller passes them as `VOODU_INGRESS_UPSTREAMS` — one `host:port` per replica. Caddy load-balances across them per `lb { policy }`:
+
+| Policy | Behavior |
+|---|---|
+| `round_robin` (default) | Cycle through upstreams |
+| `random` | Random pick per request |
+| `least_conn` | Fewest in-flight requests |
+| `ip_hash` | Sticky per client IP |
+
+With a single upstream, the `load_balancing` block is omitted (no policy to apply).
+
+## Atomic config reloads
+
+Every change atomically replaces the full Caddy config via `POST /load` — the plugin doesn't patch incrementally. The Admin API listener (`127.0.0.1:2019`) is re-declared on every load to prevent it from resetting to Caddy's defaults (which would orphan the host port mapping).
+
+If `/load` fails, the route file is already persisted on disk — the next `apply` or `reload` re-converges. Errors surface as non-zero exit + a JSON envelope with `status: "error"`.
+
+## Trade-offs
+
+**One host per ingress.** No `hosts = [...]` form. Multi-host workloads use multiple `ingress` blocks.
+
+**No HTTP transforms.** `rewrite`, custom `headers`, redirect handlers, middleware — none supported. They belong in your app.
+
+**`ask` required for on_demand.** No `allow_all` escape hatch. Your app's `ask` endpoint decides which subdomains are real customers — that's what keeps the wildcard safe.
+
+**No DNS-01.** Wildcards only work via on-demand. ACME HTTP-01 can't validate them.
+
+**Single Caddy server, `:80` / `:443` only.** No listener-config knobs.
+
+**State survives uninstall.** Certs and route definitions persist. Reinstalling picks up existing certs (no re-issuance), avoiding ACME rate-limit hits.
+
+**`/load` is atomic-replace.** Every change rewrites the full Caddy config. No partial reloads — consistency over efficiency.
+
+**Single upstream skips `load_balancing` block.** Caddy behaves identically (no policy to apply), but the dumped config stays free of inapplicable knobs.
+
+**Container restart is docker-managed.** `--restart unless-stopped` + `caddy run --resume` replay the last accepted config from `/data` on boot. The plugin doesn't manage Caddy lifecycle beyond install.
+
+**Logs via `docker logs voodu-caddy`.** The plugin writes nothing but JSON envelopes; Caddy's own logs come out of the container.
+
+## See also
+
+- [`ingress` manifest reference](/docs/manifests/ingress) — HCL surface
+- [`app`](/docs/manifests/app) — sugar form that generates an ingress
+- Source: [github.com/thadeu/voodu-caddy](https://github.com/thadeu/voodu-caddy)

@@ -1,0 +1,125 @@
+---
+title: voodu remote
+description: SSH targets for multi-host deploys.
+---
+
+`voodu remote` is the SSH-target registry. It piggybacks on `git remote` — voodu stores its targets in `.git/config`, so there's no separate config file to keep in sync.
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| `add` | Register a new remote (saves alias + URL in `.git/config`). |
+| `list` | List configured voodu remotes. |
+| `remove` (`rm`) | Forget a remote locally (does not touch the host). |
+| `setup` | Bootstrap dev-loop: SSH preflight, optional binary upload, seed `/opt/voodu`, register the remote. |
+
+For production install (Docker, systemd unit, controller service from scratch), use the [installer](/docs/getting-started/install) directly. `setup` targets the dev loop — shipping a freshly-built local binary to a host that already has the stack.
+
+## `voodu remote add`
+
+```bash
+voodu remote add <NAME> <user@host[:identity]>
+```
+
+Saves a remote. The URL has two forms:
+
+```bash
+voodu remote add voodu   ubuntu@1.2.3.4                              # uses default SSH key
+voodu remote add prod    ubuntu@ec2.example.com:~/.ssh/ec2-prod.pem  # with embedded identity
+voodu remote add backup  ubuntu@host.example.com:/etc/voodu/key.pem
+```
+
+### The `:identity` suffix
+
+Append `:<path>` to embed an SSH private key path. The CLI runs `ssh -i <path>` automatically on every command issued against that remote — no env var, no per-call flag.
+
+Suffix rules:
+
+- Must start with `/`, `~`, `./`, or `../` (unambiguously a path).
+- `~` expands to your home dir at parse time.
+- Bare tokens are rejected — voodu won't guess.
+
+Without a suffix, the CLI falls back to ssh-agent / `~/.ssh/id_*` / `~/.ssh/config` — the same resolution `git` would do for that URL.
+
+### The default-remote convention
+
+The alias named **`voodu`** is the implicit default. `voodu apply` (no `-r`) uses it. Pattern matches `origin` in git — one default, others explicit:
+
+```bash
+voodu remote add voodu   ubuntu@beta.example.com
+voodu remote add staging ubuntu@staging.example.com:~/.ssh/staging.pem
+voodu remote add prod    ubuntu@prod.example.com:~/.ssh/prod.pem
+
+voodu apply -f web              # → voodu  (default)
+voodu apply -f web -r staging   # → staging
+voodu apply -f web -r prod      # → prod
+```
+
+## `voodu remote list`
+
+```bash
+voodu remote list
+```
+
+```
+voodu     ubuntu@1.2.3.4
+staging   ubuntu@5.6.7.8
+prod      ubuntu@9.10.11.12
+```
+
+Only remotes whose URLs parse as `user@host[:identity]` show up — unrelated git remotes (`origin`, etc.) are filtered out.
+
+## `voodu remote remove`
+
+```bash
+voodu remote remove staging
+voodu remote rm staging          # alias
+```
+
+Local-only. Removes the entry from `.git/config`. Does **not** touch the remote host.
+
+## `voodu remote setup`
+
+```bash
+voodu remote setup <NAME> <user@host>
+```
+
+Dev-loop bootstrap. Runs in order:
+
+1. **SSH preflight** — `BatchMode` + `ConnectTimeout` against the host.
+2. **Optional binary upload** — `scp` a local voodu binary to the host (use `--binary`).
+3. **Seed server layout** — creates `/opt/voodu/{apps,services,plugins,scripts,state,volumes}` and writes `~/.voodurc` with `mode=server`.
+4. **Register the remote** — `git remote add NAME user@host` locally (skipped if already present).
+
+### Flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--identity` | — | SSH private key (`ssh -i <path>`). Per-invocation override. |
+| `--binary` | — | Local voodu binary to upload before seeding. |
+| `--install-path` | `/usr/local/bin/voodu` | Where to place `--binary` on the host. |
+| `--skip-seed` | `false` | Don't seed `/opt/voodu` or write `.voodurc` — useful when only the binary needs refreshing. |
+
+### When to use `setup` vs the installer
+
+- **`voodu remote setup`** — fast dev-loop iteration. The host already has Docker + systemd unit + voodu-controller; you just need to refresh a local binary build.
+- **[Installer](/docs/getting-started/install) (`curl ... install | bash`)** — clean install on a fresh host. Installs Docker, systemd unit, default plugins, controller binary. Run it inside an SSH session:
+
+  ```bash
+  ssh user@host 'curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash'
+  ```
+
+## Storage layout
+
+Remote info lives in `.git/config` under `[remote "<name>"]`. Listing/parsing goes through `git remote` directly — voodu doesn't maintain a separate config file. That means:
+
+- Standard git tooling (`git remote -v`, `git remote get-url <name>`) sees voodu's entries.
+- Cloning a repo brings the remotes along (so a teammate's clone has the same aliases).
+- Removing the `.git` dir orphans all remotes locally.
+
+## See also
+
+- [First deploy](/docs/getting-started/first-deploy) — the `voodu remote add` → `voodu apply` flow end-to-end.
+- [Install](/docs/getting-started/install) — clean-room install on a fresh host.
+- [`voodu apply`](/docs/cli/apply) — uses the remote alias via `-r <name>`.

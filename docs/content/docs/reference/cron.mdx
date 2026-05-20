@@ -1,0 +1,53 @@
+---
+title: Cron syntax
+description: The 5-field cron format Voodu schedules with.
+---
+
+## Fields
+
+```
+┌──────────── minute        (0–59)
+│ ┌────────── hour          (0–23)
+│ │ ┌──────── day of month  (1–31)
+│ │ │ ┌────── month         (1–12)
+│ │ │ │ ┌──── day of week   (0–6, Sun=0)
+│ │ │ │ │
+* * * * *
+```
+
+All Voodu schedules are interpreted in **UTC**.
+
+## Common patterns
+
+| Pattern | Meaning |
+|---|---|
+| `*/5 * * * *` | every 5 minutes |
+| `0 * * * *` | top of every hour |
+| `0 6 * * *` | daily at 06:00 UTC |
+| `5-59/15 * * * *` | every 15 min, offset +5 (useful to spread load) |
+| `0 0 * * 0` | weekly, Sunday midnight |
+| `0 9 1 * *` | first of the month, 09:00 |
+| `*/15 6-18 * * 1-5` | every 15 min, business hours, weekdays |
+
+## Concurrency
+
+When a cronjob fires while a previous run is still going:
+
+```hcl
+cronjob "scope" "name" {
+  concurrency_policy = "Forbid"   # skip the new run
+  # or "Allow"   — default, run anyway
+  # or "Replace" — kill the previous run
+}
+```
+
+## History
+
+```hcl
+cronjob "scope" "name" {
+  successful_history_limit = 3
+  failed_history_limit     = 1
+}
+```
+
+Voodu keeps that many container records (logs + exit codes) before garbage-collecting.

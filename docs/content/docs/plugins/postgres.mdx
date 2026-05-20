@@ -1,0 +1,204 @@
+---
+title: voodu-postgres
+description: Postgres plugin — replication, promote, backups, link.
+---
+
+`voodu-postgres` powers the [`postgres`](/docs/manifests/postgres) macro. It expands a `postgres "scope" "name" {}` block into a statefulset plus sidecars, ships a CLI verb surface for day-2 ops (`voodu pg:*` / `voodu postgres:*`), and owns all postgres SQL — operators never type SQL except inside `voodu pg:psql`.
+
+Current version: **0.13.1**. Single alias: `pg`.
+
+## Install
+
+```bash
+voodu plugins:install thadeu/voodu-postgres
+```
+
+The install hook downloads the matching release binary (`voodu-postgres_linux_amd64` or `..._arm64`) into `$VOODU_PLUGIN_DIR/bin`. Re-running the command updates in place — no-op if the version is already current.
+
+## Manifest surface
+
+See [postgres macro reference](/docs/manifests/postgres) for the full HCL surface (plugin-owned fields, statefulset passthrough, defaults).
+
+## CLI verbs
+
+All verbs dispatched through the `voodu-postgres` binary. Every `voodu postgres:X` is also available as `voodu pg:X`.
+
+### `voodu pg:link`
+
+```bash
+voodu pg:link <provider> <consumer> [--reads]
+```
+
+Writes a database URL into the consumer's config bucket:
+
+- `DATABASE_URL` (always) — points at the current primary.
+- `DATABASE_READ_URL` (with `--reads`, requires `replicas > 1`) — multi-host libpq URL spanning standbys with `target_session_attrs=any&load_balance_hosts=random`.
+
+The consumer is added to the provider's `POSTGRES_LINKED_CONSUMERS` bucket key, so future password rotation or promote events fan out to all linked consumers automatically.
+
+```bash
+voodu pg:link clowk-lp/db clowk-lp/web
+voodu pg:link clowk-lp/db clowk-lp/worker --reads
+```
+
+### `voodu pg:unlink`
+
+```bash
+voodu pg:unlink <provider> <consumer>
+```
+
+Unsets `DATABASE_URL` + `DATABASE_READ_URL` on consumer; removes consumer from provider's `POSTGRES_LINKED_CONSUMERS`.
+
+### `voodu pg:new-password`
+
+```bash
+voodu pg:new-password <postgres> [--no-restart]
+```
+
+Generates a fresh hex password, writes to `POSTGRES_PASSWORD`, fans out to every linked consumer with a refreshed URL. Triggers rolling restarts unless `--no-restart`.
+
+### `voodu pg:info`
+
+```bash
+voodu pg:info <postgres> [-o text|json]
+```
+
+Snapshot: image, replicas, primary FQDN, standby FQDNs, super_user, database, port, replication_user, redacted passwords, exposed bool, linked consumers.
+
+### `voodu pg:expose` / `unexpose`
+
+```bash
+voodu pg:expose <postgres>
+voodu pg:unexpose <postgres>
+```
+
+`expose` flips `PG_EXPOSE_PUBLIC=true` in the bucket and re-applies the manifest with `ports = ["0.0.0.0:<port>"]`. **Refused when `replicas > 1`** — statefulset reconciler applies ports uniformly across all pods, so binding `0.0.0.0:5432` on multiple pods host-port-conflicts.
+
+`unexpose` flips back to loopback. Always allowed.
+
+### `voodu pg:promote`
+
+```bash
+voodu pg:promote <postgres> --replica N [--force] [--no-restart]
+```
+
+The recommended way to flip primary. Operator never types SQL:
+
+1. **Lag check** (skipped under `--force`) — queries `pg_stat_replication` on the current primary, refuses if any standby is lagging beyond `max_lag_bytes = 0`. `--force` accepts data loss explicitly.
+2. **`pg_promote(true, 60)`** — runs inside the target replica.
+3. **Wait for promotion** — polls `pg_is_in_recovery()` until `f` returned (up to 30s).
+4. **Bucket flip** — `PG_PRIMARY_ORDINAL` updated; consumer URLs refreshed.
+5. **Auto-rejoin old primary as standby** (skipped under `--no-restart`).
+
+Use `--force` when the current primary is unreachable (lag check itself errors). Use `--no-restart` to rejoin the old primary manually later.
+
+### `voodu pg:failover`
+
+Alias for `voodu pg:promote`. Kept for backward compat.
+
+### `voodu pg:rejoin`
+
+```bash
+voodu pg:rejoin <postgres> --replica N
+```
+
+Rejoin a standby that fell out of replication. Sequence:
+
+1. `docker stop` the target container.
+2. `docker run` `pg_rewind` against the current primary.
+3. Touch `standby.signal`.
+4. `docker start` — boots as standby.
+
+If `pg_rewind` fails (typical when WAL diverged too far), auto-falls-back to wiping the data volume + `pg_basebackup` — slower but always works.
+
+### `voodu pg:psql`
+
+```bash
+voodu pg:psql <postgres> [--replica N] [-c "sql"] [-- args...]
+```
+
+Interactive psql shell against the current primary (or a specific replica via `--replica`). The only path where operators type raw SQL — everything else (promote, restore, password rotation) is plugin-owned.
+
+```bash
+voodu pg:psql clowk-lp/db                        # interactive
+voodu pg:psql clowk-lp/db -c "SELECT version()"  # one-shot
+voodu pg:psql clowk-lp/db -- -c "\\dx"           # passthrough psql args
+```
+
+### Backups
+
+```bash
+voodu pg:backups [<ref-or-scope>] [-o text|json]
+voodu pg:backups:capture <postgres> [--from-replica N] [--follow] [--keep N] [--max-age D]
+voodu pg:backups:logs <postgres> <id> [--follow]
+voodu pg:backups:restore <postgres> <id|url> --yes
+voodu pg:backups:download <postgres> <id> [--to path]
+voodu pg:backups:delete <postgres> <id> --yes
+voodu pg:backups:schedule <postgres> [--at "cron"] [--from-replica N] [--keep N] [--max-age D]
+voodu pg:backups:cancel <postgres> [<id>]
+voodu pg:backups:prune <postgres> [--keep N] [--max-age D] [--dry-run] [--yes]
+```
+
+**Listing** (`voodu pg:backups`) accepts three argument shapes:
+
+- bare → all clusters on host
+- `<scope>` → all clusters in scope
+- `<scope>/<name>` → single cluster
+
+**Capture** runs `pg_dump -F c -Z 6` in a sibling job container, writes to `/opt/voodu/backups/<scope>/<name>/`. Default is detached. `--follow` runs `docker run -d` directly and tails logs. Source defaults to the current primary; `--from-replica N` offloads to a standby.
+
+**Restore** runs `pg_restore --clean --if-exists --no-owner --no-privileges --single-transaction --verbose` against the primary's live DB. `--single-transaction` is non-optional — it prevents the silent partial-restore trap where pg_restore tolerates per-object failures and exits 0 with a broken database.
+
+**Retention** has two axes: `--keep` (count cap, default `30`) and `--max-age` (duration like `7d`, `14d`, `30d`). **Strict OR semantics** — a backup is pruned if EITHER rank > N OR age > D. Defaults seed in the bucket on first apply (`BACKUP_KEEP=30`).
+
+**Schedule** (`voodu pg:backups:schedule`) is a template printer — emits cronjob HCL for paste-and-apply. voodu cronjobs are the declarative source of truth.
+
+## Backup storage
+
+| Where | What |
+|---|---|
+| Host path | `/opt/voodu/backups/<scope>/<name>/` |
+| Container mount | `/backups :rw` on every pod |
+| Auto-chown | wrapper chowns to `postgres:postgres` (uid 999) on every boot |
+| File format | `pg_dump -F c -Z 6` (custom binary; restorable via `pg_restore` on any postgres ≥ source major) |
+| Filename | `bNNN-YYYYMMDDTHHMMSSZ.dump` (monotonic sequence; gaps stay gapped after deletion) |
+
+**Off-site sync** — write a cronjob that mounts the backup directory `:ro` and `aws s3 sync` / `rclone` to remote storage. Example in the [postgres macro page](/docs/manifests/postgres#backup-automation-via-cronjob--s3-sync).
+
+## Replication wiring (internals)
+
+- **No replication slots.** `wal_keep_size = '1GB'` instead. Rationale: bounded WAL retention on primary; standbys that fall behind re-bootstrap via `pg_basebackup`.
+- **`max_wal_senders = 10`**, **`hot_standby = on`**.
+- **Standby DNS**: `<name>-<ordinal>.<scope>.voodu`.
+- **`primary_conninfo`** lives in a PGDATA-resident `voodu-runtime.conf`, **rewritten by the wrapper at every boot** from env vars. This is what lets `voodu pg:promote` flip primary without re-applying HCL.
+- **Standby first boot** — wrapper waits for primary via `pg_isready` (60 × 5s = ~5min), runs `pg_basebackup -h <primary> -X stream -P`, touches `standby.signal`.
+- **Bootstrap sentinel** — `.voodu-bootstrap-incomplete` written before `pg_basebackup`, removed after `standby.signal` is armed. If found on next boot → self-healing wipe + retry.
+- **Split-brain guard** — pod configured as standby but PGDATA has no `standby.signal` → wrapper refuses to boot, logs precise recovery commands.
+
+## Trade-offs
+
+**`extensions = [...]` is validated, not auto-installed.** The plugin records the list and validates names; you `CREATE EXTENSION` yourself in app migrations or `voodu pg:psql -c "CREATE EXTENSION pgvector"`.
+
+**`pg_config` takes effect on second boot.** First boot runs `initdb` BEFORE `postgresql.conf` includes the override file. You'll see one cosmetic re-apply on initial deploys.
+
+**`expose` refuses with `replicas > 1`.** Use pgbouncer/HAProxy in front, an SSH tunnel to the primary FQDN, or temporarily `replicas = 1`.
+
+**Promote auto-rejoins the old primary.** After the flip, the old primary is rejoined as a standby via `pg_rewind` (auto-falls-back to `pg_basebackup` if rewind fails). `--no-restart` skips this — operator must rejoin manually.
+
+**`--force` accepts data loss.** Writes still on the old primary that haven't replicated are silently discarded during rejoin. Worried about orphaned writes? `pg_dump` BEFORE promote, not after.
+
+**Bucket reads bypass `env_from` at apply time.** The plugin reads policy via the controller's `/config` endpoint BEFORE the container is spawned. Use scope-level config buckets for shared defaults.
+
+**`voodu pg:psql` is the only SQL-typed surface.** Promote, restore, password rotation, lag check — all SQL is plugin-owned. Operator types SQL only at the psql prompt.
+
+**Same-host operations only.** `psql`, `promote`, `rejoin`, `backups` shell out to `docker exec` / `docker run` directly. No multi-host plumbing — run the CLI on the host where the target pod lives.
+
+**Replication password is auto-gen only.** No HCL override. Pre-seed via `voodu config <scope/name> set POSTGRES_REPLICATION_PASSWORD=...` if you need determinism.
+
+**No native PITR.** WAL archive is operator-declared (cronjob mounting the backup directory). The plugin handles logical dumps; time-travel restore is on your shoulders.
+
+## See also
+
+- [`postgres` manifest reference](/docs/manifests/postgres) — HCL surface
+- [`statefulset`](/docs/manifests/statefulset) — the kind this macro expands into
+- Source: [github.com/thadeu/voodu-postgres](https://github.com/thadeu/voodu-postgres)

@@ -1,0 +1,222 @@
+---
+title: voodu-redis
+description: Redis plugin — standalone, sentinel HA, link, backup, restore.
+---
+
+`voodu-redis` powers the [`redis`](/docs/manifests/redis) macro. It expands a `redis "scope" "name" {}` block into a statefulset plus a `redis.conf` and an entrypoint wrapper. With a `sentinel { monitor = "..." }` block, it stands up a sentinel quorum.
+
+Current version: **0.14.0**. No alias (use `voodu redis:*` literally).
+
+## Install
+
+```bash
+voodu plugins:install thadeu/voodu-redis
+```
+
+The install hook downloads the matching release binary into `$VOODU_PLUGIN_DIR/bin`. Re-running updates in place.
+
+## Manifest surface
+
+See [redis macro reference](/docs/manifests/redis) for the full HCL surface (defaults, sentinel block, statefulset passthrough).
+
+## CLI verbs
+
+| Verb | Use for |
+|---|---|
+| `voodu redis:link <provider> <consumer> [--reads] [--sentinel]` | Wire `REDIS_URL` (and optionally read URL + sentinel hosts) into a consumer bucket |
+| `voodu redis:unlink <provider> <consumer>` | Remove URL keys, untrack consumer |
+| `voodu redis:new-password <redis>` | Generate fresh password, fan out to linked consumers |
+| `voodu redis:failover <redis> --replica N [--no-restart]` | Promote ordinal N to master |
+| `voodu redis:info <redis>` | Snapshot |
+| `voodu redis:backup <redis> --destination <path> [--source N]` | Capture RDB to host path |
+| `voodu redis:restore <redis> --from <path>` | Restore from RDB snapshot |
+| `voodu redis:get-conf` | Print the plugin's default `redis.conf` |
+
+There is **no `voodu redis:cli`** verb — `redis-cli` is the binary the plugin uses inside probes and backup commands, not a plugin verb. Use `docker exec` to get a redis-cli shell:
+
+```bash
+docker exec -it $(docker ps -q --filter "label=voodu.scope=clowk-lp" --filter "label=voodu.name=redis") redis-cli -a "$REDIS_PASSWORD"
+```
+
+### `voodu redis:link`
+
+```bash
+voodu redis:link <provider> <consumer> [--reads] [--sentinel]
+```
+
+Writes URL keys to consumer's bucket. The shape depends on `replicas` and flags:
+
+| `replicas` | Flag | Keys emitted on the consumer bucket |
+|---|---|---|
+| `1` | — | `REDIS_URL = redis://default:<pwd>@<name>.<scope>.voodu:6379` (round-robin alias points to the one pod) |
+| `>1` | — | `REDIS_URL = redis://default:<pwd>@<name>-0.<scope>.voodu:6379` (master, pinned to current ordinal) **AND** `REDIS_READ_URL = redis://default:<pwd>@<name>.<scope>.voodu:6379` (round-robin across all pods) |
+| `>1` | `--reads` | **Single** `REDIS_URL = redis://default:<pwd>@<name>.<scope>.voodu:6379` (round-robin only — no master pin) |
+| any | `--sentinel` | `REDIS_URL` (per rules above) **plus** `REDIS_SENTINEL_HOSTS = sentinel-0:26379,…` and `REDIS_MASTER_NAME = voodu-master` |
+
+`--reads` is for read-only consumers — it collapses to a single round-robin URL with no master pin. It does NOT require `replicas > 1`; on a single-replica instance, the result is identical to the default link.
+
+`--sentinel` requires a sibling resource with `sentinel { monitor = "..." }` watching this redis.
+
+### `voodu redis:unlink`
+
+```bash
+voodu redis:unlink <provider> <consumer>
+```
+
+Removes URL keys from consumer; removes consumer from provider's `REDIS_LINKED_CONSUMERS`.
+
+### `voodu redis:new-password`
+
+```bash
+voodu redis:new-password <redis>
+```
+
+Generates fresh password, updates `REDIS_PASSWORD` in the bucket, fans out new `REDIS_URL` to every linked consumer. Triggers rolling restart.
+
+### `voodu redis:failover`
+
+```bash
+voodu redis:failover <redis> --replica N [--no-restart]
+```
+
+Promotes ordinal N to master. Updates `REDIS_MASTER_ORDINAL` in the bucket, refreshes consumer URLs. With sentinel siblings, also reconciles `SENTINEL` state.
+
+Use `--no-restart` to keep consumers on the old URL temporarily (for canary or staged rollouts).
+
+### `voodu redis:info`
+
+```bash
+voodu redis:info <redis>
+```
+
+Prints image, replicas, current master ordinal, redacted password, linked consumers.
+
+### `voodu redis:backup`
+
+```bash
+voodu redis:backup <redis> --destination <host-path> [--source N]
+```
+
+Captures an RDB snapshot to the host path. Default source is the highest-ordinal replica (or one step back if that ordinal is the current master). `--source N` overrides.
+
+### `voodu redis:restore`
+
+```bash
+voodu redis:restore <redis> --from <host-path>
+```
+
+Restores from a host-side RDB file. **Refused when a sentinel watches this redis** — detection is convention-based (`<name>-ha`, `<name>-sentinel`, `<name>-quorum` siblings). Operator must `voodu stop <sentinel>`, restore, `voodu start <sentinel>`.
+
+### `voodu redis:get-conf`
+
+```bash
+voodu redis:get-conf
+```
+
+Prints the plugin's default `redis.conf`. Useful as a starting point for custom configs.
+
+## Sentinel HA internals
+
+When you declare a sentinel sibling:
+
+```hcl
+redis "clowk-lp" "redis" {
+  image    = "redis:8"
+  replicas = 3
+}
+
+redis "clowk-lp" "redis-quorum" {
+  image = "redis:8"
+  sentinel { monitor = "clowk-lp/redis" }
+}
+```
+
+Behind the scenes:
+
+- **Sentinel statefulset** spawns with the same DNS scheme — `redis-quorum-0.clowk-lp.voodu`, etc.
+- **`env_from = ["clowk-lp/redis"]`** is auto-injected on the sentinel pods, pulling `REDIS_PASSWORD`, `REDIS_MASTER_ORDINAL`, `REDIS_LINKED_CONSUMERS`.
+- **Master name**: `voodu-master` (hard-coded).
+- **Sentinel port**: `26379` (hard-coded).
+- **failover-timeout**: 30000 ms (overridable via `/etc/sentinel/conf.d/*.conf`).
+- **down-after-milliseconds**: 5000 ms.
+- **parallel-syncs**: 1.
+- **`sentinel resolve-hostnames yes` + `sentinel announce-hostnames yes`** — DNS-based, so sentinel records FQDNs not bridge IPs.
+- **bash /dev/tcp health probe** — explicit because `redis:8` is Debian-slim without curl/wget.
+- **Always-rewrite-bootstrap + preserve-discovered-state** — sentinel.conf is regenerated at every boot but `known-replica` / `known-sentinel` / epoch state is preserved. Lets plugin updates take effect without wiping volumes.
+- **Logs via `/proc/1/fd/2`** — failover-hook output reaches `voodu logs`.
+- **Hook retries** — 5 attempts with exponential backoff (1→2→4→8→16s, ~31s worst case).
+- **Replica announce** — each data pod runs `redis-server … --replica-announce-ip <name>-<ord>.<scope>.voodu` so sentinel records FQDNs.
+- **Persistent state volume** — `/var/lib/sentinel/sentinel.conf` lives on a dedicated `state` volume claim.
+
+### `host.docker.internal` wiring
+
+Sentinel hooks need to reach the voodu controller (via `VOODU_CONTROLLER_URL`). Voodu's controller auto-injects this env var for every container; in special cases (alt-installation) you may need to set it explicitly:
+
+```hcl
+redis "clowk-lp" "redis-quorum" {
+  sentinel { monitor = "clowk-lp/redis" }
+
+  env = {
+    VOODU_CONTROLLER_URL = "http://host.docker.internal:8080"
+  }
+}
+```
+
+## ACL footgun — supported pattern
+
+Redis's `aclfile` directive has two failure modes inside voodu-managed instances:
+
+1. **Silent open access** — if the ACL file doesn't define `user default ...`, Redis 7+ resets `default` to `on nopass ~* +@all`. Your `requirepass` becomes a no-op.
+2. **Replication broken silently** — if the file defines `user default >somepass ...`, replicas auth with the plugin's `masterauth` (different) — `WRONGPASS` loop, writes succeed but never replicate.
+
+**Use inline `user` directives** mounted at `/etc/redis/conf.d/*.conf`, NOT the `aclfile` directive:
+
+```hcl
+asset "clowk-lp" "redis" {
+  users = file("./conf/users.conf")
+}
+
+redis "clowk-lp" "redis" {
+  image    = "redis:8"
+  replicas = 2
+
+  volumes = [
+    "${asset.clowk-lp.redis.users}:/etc/redis/conf.d/users.conf:ro"
+  ]
+}
+```
+
+`./conf/users.conf`:
+
+```
+user appwriter on >app-secret ~app:* +@write +@read
+user appreader on >read-secret ~app:* +@read
+```
+
+**Don't** write `user default ...` — the plugin manages `default` via `requirepass`. The plugin's `redis.conf` does `include /etc/redis/conf.d/*.conf` BEFORE appending `requirepass` / `masterauth`, so directive last-wins keeps the plugin in charge.
+
+## Trade-offs
+
+**AOF disabled by default** (since v0.13.0). Trade-off: ~60s of write loss on crash. If you enable `appendonly yes` via a custom conf, `voodu redis:restore` becomes unsafe.
+
+**`replicas = 2` rejected in sentinel mode.** Quorum math: `floor(2/2)+1 = 2`. Single-failure breaks failover — strictly worse than 1 (observer-only).
+
+**Cross-scope `sentinel.monitor` rejected.** Same-scope only.
+
+**Scale-down refuses to prune the current master.** If `REDIS_MASTER_ORDINAL >= desired_replicas`, apply fails with a remediation pointing at `voodu redis:failover <ref> --replica 0` first.
+
+**`voodu redis:restore` refuses with sentinel watching.** Stop the sentinel sibling, restore, start it back. Sentinel-aware restore is a future feature.
+
+**Rapid chained kills can stall sentinel** in non-prod scenarios. Recovery: `SENTINEL RESET voodu-master` against each sentinel pod (`docker exec`), or `voodu redis:failover --no-restart` to force-reconcile state.
+
+**`--reads` flag isn't persisted.** Re-emission on `new-password` / `failover` reconstructs the URL shape from whether the consumer bucket already has `REDIS_READ_URL`. So if a consumer was linked with `--reads`, they stay on read-pool URLs through rotations.
+
+**No `r:` alias.** Use `voodu redis:link` literally — `voodu r:link` doesn't work.
+
+**Same-host operations only.** `failover`, `backup`, `restore` shell out to `docker exec` / `docker run` directly.
+
+## See also
+
+- [`redis` manifest reference](/docs/manifests/redis) — HCL surface
+- [`statefulset`](/docs/manifests/statefulset) — the kind this macro expands into
+- Source: [github.com/thadeu/voodu-redis](https://github.com/thadeu/voodu-redis)

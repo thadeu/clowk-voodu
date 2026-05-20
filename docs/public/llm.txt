@@ -1,0 +1,100 @@
+# Voodu — Self-hosted PaaS
+
+> llm.txt for AI agents, LLMs, and developer tools.
+> Learn more about llm.txt at https://llmstxt.org
+
+## What is Voodu?
+
+Voodu is a **Heroku-shaped, Kubernetes-honest** deploy tool you run on your own boxes.
+
+One HCL file describes the running system. `voodu apply` reconciles it: builds, ships, routes, swaps. No bare repo, no `git push`, no plugin sprawl — apps, ingress with TLS, and stateful services (Postgres, Redis, Mongo) that actually back themselves up.
+
+```
+voodu apply -f voodu.hcl -r prod-1
+→ packing context (1.4 MB)
+→ streaming over ssh ubuntu@prod-1
+→ controller: planning ...
+✓ apply complete in 11.8s
+✓ https://api.example.com  ·  3/3 healthy
+```
+
+## Why Voodu
+
+- **Declarative apply, not git-push.** Diff shows the plan. Apply reconciles. Prunes by default — `--no-prune` is explicit.
+- **Stateful services first-class.** Postgres, Mongo, Redis (+ sentinel HA) declared like apps.
+- **TLS out of the box.** Add `tls {}` and Voodu cuts a Let's Encrypt cert via Caddy. On-demand wildcards.
+- **k8s shape, not k8s ops.** Same reconciliation loop, none of the CNI/Helm/operator bill.
+- **100% self-hosted, MIT.** Single Go binary, embedded etcd, no cloud tier, no telemetry.
+
+## Manifest example
+
+```hcl
+app "myapp" "web" {
+  image    = "ghcr.io/myorg/myapp:latest"
+  replicas = 3
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  health_check = "/healthz"
+  host         = "myapp.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+
+redis "clowk-lp" "redis" {
+  replicas = 3
+}
+
+redis "clowk-lp" "redis-ha" {
+  sentinel {
+    monitor = "clowk-lp/redis"
+  }
+}
+```
+
+## CLI surface
+
+| Command | Purpose |
+|---|---|
+| `voodu apply -f voodu.hcl -r prod-1` | Stream context, plan, reconcile |
+| `voodu diff -f voodu.hcl --detailed-exitcode` | Plan-style dry run (CI gate) |
+| `voodu logs <target> -f` | Tail logs — pod, app, scope |
+| `voodu config set KEY=VALUE -a prod` | Out-of-band env (always wins) |
+| `voodu remote setup prod-1 ubuntu@host` | Bootstrap a host over SSH |
+| `voodu plugins:install thadeu/voodu-postgres` | Install plugins from GitHub releases |
+
+## Architecture
+
+```
+your laptop                                 your server
+$ voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
+  │                                         └─ reconcile ingress / services (etcd)
+  └─ tar -czf - <path>     ──ssh──▶  voodu receive-pack
+                                              └─ extract → build image
+                                                 → swap `current` symlink
+                                                 → recreate container
+```
+
+- **One controller per host.** Embedded etcd, no cluster consensus.
+- **Caddy for ingress.** ACME, on-demand wildcard TLS.
+- **Docker for builds.** Bring a Dockerfile or auto-detect Go / Ruby / Rails / Python / Node.
+- **SSH for transport.** No public daemon. `ssh user@host` works = `voodu` works.
+
+## Plugins
+
+- `voodu-postgres` — Postgres with backup, replicas, test-restore.
+- `voodu-mongo` — MongoDB with replica set.
+- `voodu-caddy` — Reference ingress plugin (replace with NGINX/Traefik by forking).
+- Build your own — independent binary discovered from `/opt/voodu/plugins`.
+
+## Links
+
+- Website: https://voodu.sh
+- GitHub: https://github.com/thadeu/clowk-voodu
+- Docs: https://voodu.sh/docs
+- License: MIT

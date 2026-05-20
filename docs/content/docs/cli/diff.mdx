@@ -1,0 +1,51 @@
+---
+title: voodu diff
+description: Plan-style dry run. CI-gate friendly via exit codes.
+---
+
+## Synopsis
+
+```bash
+voodu diff -f voodu.hcl -r prod-1 [flags]
+```
+
+## Why diff before apply
+
+- **Trust.** See the plan before you commit to the change.
+- **CI gating.** `--detailed-exitcode` makes diff CI-friendly: 0 = no-op, 2 = changes pending, anything else = error.
+- **Auditability.** Stick the diff output into your PR description.
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `-f`, `--file` | Manifest file (repeatable). |
+| `-r`, `--remote` | SSH alias. |
+| `--detailed-exitcode` | Exit 2 if there are changes (default exits 0 either way). |
+| `--prune` | **Opt-in.** Include resources that would be deleted in the same `(scope, kind)` as the manifest. Default is upsert-only — siblings are not shown as removals. |
+
+## Example output
+
+```
+$ voodu diff -f voodu.hcl -r prod-1
+
+~ app/prod/api
+  ~ replicas       1 → 3
+  ~ env.NODE_ENV   development → production
++ redis/clowk-lp/redis-ha
+  + sentinel.monitor   clowk-lp/redis
+- cronjob/prod/old-cleanup
+```
+
+## CI gate
+
+```yaml
+- name: Plan
+  run: |
+    voodu diff -f voodu.hcl --detailed-exitcode -r prod-1
+    case $? in
+      0) echo "no changes" ;;
+      2) echo "changes pending" ;;
+      *) exit 1 ;;
+    esac
+```

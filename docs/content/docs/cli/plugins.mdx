@@ -1,0 +1,56 @@
+---
+title: voodu plugins
+description: Install, list, update, remove plugins.
+---
+
+## Why plugins
+
+Voodu core ships apps, ingress, and SSH transport. Everything else — stateful services, custom build phases, exotic integrations — is a **plugin**: an independent binary discovered from `/opt/voodu/plugins`.
+
+## Install
+
+```bash
+voodu plugins:install thadeu/voodu-postgres
+voodu plugins:install thadeu/voodu-mongo
+voodu plugins:install thadeu/voodu-caddy
+```
+
+The CLI resolves the binary from the GitHub release, downloads it, and drops it on every reachable remote. The controller picks it up on the next apply.
+
+## List
+
+```bash
+voodu plugins:list
+```
+
+```
+NAME              VERSION   KIND       STATUS
+voodu-postgres    0.3.1     postgres   ready
+voodu-mongo       0.2.0     mongo      ready
+voodu-caddy       0.1.7     ingress    ready
+```
+
+## Update
+
+```bash
+voodu plugins:update voodu-postgres
+voodu plugins:update --all
+```
+
+Pin a version:
+
+```bash
+voodu plugins:install thadeu/voodu-postgres@0.3.1
+```
+
+## Remove
+
+```bash
+voodu plugins:remove voodu-mongo
+```
+
+This deletes the plugin binary from every remote. Resources using the plugin (e.g. `mongo "..."` blocks) will fail to reconcile on the next apply until the plugin is reinstalled.
+
+## Build your own
+
+A plugin is just an executable that speaks the [voodu plugin protocol](/docs/plugins/build-your-own). The `voodu-caddy` plugin is the canonical reference — read its source first.

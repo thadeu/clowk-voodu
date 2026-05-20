@@ -1,0 +1,410 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/black.css';
+@import 'fumadocs-ui/css/preset.css';
+
+@source "../node_modules/fumadocs-ui/dist/**/*.js";
+
+@theme {
+  --color-fd-background: #0b0d0c;
+  --color-fd-foreground: #e9ece8;
+  --color-fd-muted: #111413;
+  --color-fd-muted-foreground: rgba(255, 255, 255, 0.5);
+  --color-fd-popover: #111413;
+  --color-fd-popover-foreground: #e9ece8;
+  --color-fd-card: #0e1110;
+  --color-fd-card-foreground: #fafafa;
+  --color-fd-border: rgba(255, 255, 255, 0.08);
+  --color-fd-primary: #7df9c1;
+  --color-fd-primary-foreground: #07140d;
+  --color-fd-secondary: #111413;
+  --color-fd-secondary-foreground: #e9ece8;
+  --color-fd-accent: rgba(125, 249, 193, 0.08);
+  --color-fd-accent-foreground: #7df9c1;
+  --color-fd-ring: rgba(125, 249, 193, 0.4);
+}
+
+@theme inline {
+  --color-mint-50: #ecfdf5;
+  --color-mint-100: #d1fae5;
+  --color-mint-200: #a7f3d0;
+  --color-mint-300: #6ee7b7;
+  --color-mint-400: #7df9c1;
+  --color-mint-500: #34d399;
+  --color-mint-600: #10b981;
+
+  --color-voodu-bg: #0b0d0c;
+  --color-voodu-bg-elev: #111413;
+  --color-voodu-code: #0e1110;
+  --color-voodu-fg: #e9ece8;
+  --color-voodu-fg-dim: #a8aea3;
+  --color-voodu-fg-mute: #6f7468;
+  --color-voodu-line: rgba(255, 255, 255, 0.08);
+  --color-voodu-line-strong: rgba(255, 255, 255, 0.16);
+
+  --color-tk-key: #c8f0d3;
+  --color-tk-block: #ff9b6a;
+  --color-tk-str: #c8e6c9;
+  --color-tk-num: #ffd479;
+  --color-tk-com: #6f7468;
+  --color-tk-pun: #a8aea3;
+
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+}
+
+.dark {
+  --color-fd-background: #0b0d0c;
+  --color-fd-foreground: #e9ece8;
+  --color-fd-muted: #111413;
+  --color-fd-muted-foreground: rgba(255, 255, 255, 0.5);
+  --color-fd-popover: #111413;
+  --color-fd-popover-foreground: #e9ece8;
+  --color-fd-card: #0e1110;
+  --color-fd-card-foreground: #fafafa;
+  --color-fd-border: rgba(255, 255, 255, 0.08);
+  --color-fd-primary: #7df9c1;
+  --color-fd-primary-foreground: #07140d;
+  --color-fd-secondary: #111413;
+  --color-fd-secondary-foreground: #e9ece8;
+  --color-fd-accent: rgba(125, 249, 193, 0.08);
+  --color-fd-accent-foreground: #7df9c1;
+  --color-fd-ring: rgba(125, 249, 193, 0.4);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  ::selection {
+    background: rgba(125, 249, 193, 0.28);
+    color: #e9ece8;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(125, 249, 193, 0.14), transparent 60%),
+      radial-gradient(900px 500px at -10% 30%, rgba(125, 249, 193, 0.06), transparent 60%),
+      #0b0d0c;
+    background-attachment: fixed;
+    color: #e9ece8;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    tap-highlight-color: transparent;
+
+    @media (max-width: 640px) {
+      user-select: none;
+      -webkit-user-select: none;
+    }
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* ── Landing terminal/blink keyframes ── */
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+@keyframes typeIn {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+
+.voodu-caret {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  vertical-align: -2px;
+  background: #7df9c1;
+  animation: blink 1s steps(1) infinite;
+}
+
+.voodu-typein > * {
+  animation: typeIn 0.3s ease both;
+}
+
+/* ── Fumadocs layout overrides (Voodu palette) ── */
+
+body:has(.docs-layout) {
+  background: #0b0d0c !important;
+  color: #e9ece8 !important;
+}
+
+.docs-layout {
+  --fd-sidebar-width: 0px;
+  --fd-toc-width: 0px;
+  --fd-layout-width: 100vw;
+  --fd-layout-offset: 0px;
+  --fd-page-width: 900px;
+  --docs-sidebar-width: min(22vw, 360px);
+  min-height: 100dvh;
+  background: #0b0d0c;
+  overflow-x: hidden;
+}
+
+@media (min-width: 64rem) {
+  .docs-layout {
+    --fd-layout-width: min(calc(100vw - var(--docs-sidebar-width)), 1200px);
+    --fd-toc-width: 240px;
+    padding-inline-start: var(--docs-sidebar-width);
+  }
+}
+
+.docs-sidebar {
+  width: 100vw;
+  max-width: 300px;
+}
+
+@media (min-width: 64rem) {
+  .docs-sidebar {
+    width: var(--docs-sidebar-width, 280px);
+    max-width: none;
+  }
+}
+
+.docs-sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.06) transparent;
+}
+
+.docs-sidebar-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+
+.docs-sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.docs-sidebar-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+}
+
+@media (min-width: 64rem) {
+  .docs-sidebar-trigger {
+    display: none;
+  }
+
+  .docs-sidebar-overlay {
+    display: none;
+  }
+}
+
+/* ── TOC ── */
+.docs-layout [data-fd-toc] {
+  font-size: 0.8125rem;
+}
+
+.docs-layout [data-fd-toc] a {
+  color: rgba(255, 255, 255, 0.35);
+  transition: color 0.15s;
+}
+
+.docs-layout [data-fd-toc] a:hover {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.docs-layout [data-fd-toc] a[data-active='true'] {
+  color: #7df9c1;
+  font-weight: 500;
+}
+
+.docs-layout [data-fd-toc] h3,
+.docs-layout [data-fd-toc] > div > p {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+/* ── Content ── */
+.docs-layout [data-fd-doc] {
+  color: rgba(255, 255, 255, 0.78);
+  line-height: 1.7;
+  font-size: 0.9375rem;
+}
+
+.docs-layout [data-fd-doc] h1 {
+  font-size: 2.25rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+}
+
+.docs-layout [data-fd-doc] h2 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: -0.015em;
+  margin-top: 3rem;
+  padding-bottom: 0.625rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.docs-layout [data-fd-doc] h3 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.95);
+  margin-top: 2rem;
+}
+
+.docs-layout [data-fd-doc] > p:first-of-type {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 1rem;
+}
+
+.docs-layout [data-fd-doc] pre {
+  background: #0e1110 !important;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 0;
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  padding: 1rem 1.25rem !important;
+}
+
+.docs-layout [data-fd-doc] pre code {
+  font-family: var(--font-mono);
+}
+
+.docs-layout [data-fd-doc] figure[data-rehype-pretty-code-figure] > figcaption,
+.docs-layout [data-fd-doc] div[data-rehype-pretty-code-title] {
+  background: #111413;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: none;
+  border-radius: 0;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.45);
+  font-family: var(--font-mono);
+  padding: 0.5rem 1.25rem;
+}
+
+.docs-layout [data-fd-doc] pre button {
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.docs-layout [data-fd-doc] pre:hover button {
+  opacity: 0.6;
+}
+
+.docs-layout [data-fd-doc] pre button:hover {
+  opacity: 1;
+}
+
+.docs-layout [data-fd-doc] :not(pre) > code {
+  background: rgba(125, 249, 193, 0.08);
+  border: 1px solid rgba(125, 249, 193, 0.12);
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+  font-size: 0.84em;
+  font-family: var(--font-mono);
+  color: #c8f0d3;
+}
+
+.docs-layout [data-fd-doc] table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.8125rem;
+}
+
+.docs-layout [data-fd-doc] th {
+  text-align: left;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.6);
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.docs-layout [data-fd-doc] td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.docs-layout [data-fd-doc] tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.docs-layout [data-fd-doc] a:not([class]) {
+  color: #c8f0d3;
+  text-decoration: underline;
+  text-decoration-color: rgba(125, 249, 193, 0.3);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s;
+}
+
+.docs-layout [data-fd-doc] a:not([class]):hover {
+  text-decoration-color: rgba(125, 249, 193, 0.8);
+}
+
+.docs-layout [data-fd-doc] ~ nav a,
+.docs-layout footer a[href] {
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  transition: border-color 0.15s;
+}
+
+.docs-layout [data-fd-doc] ~ nav a:hover,
+.docs-layout footer a[href]:hover {
+  border-color: rgba(125, 249, 193, 0.35);
+  background: rgba(125, 249, 193, 0.03);
+}
+
+.docs-layout ::-webkit-scrollbar {
+  width: 4px;
+}
+
+.docs-layout ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.docs-layout ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+
+.docs-layout ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.docs-layout [data-fd-doc] blockquote {
+  border-left: 2px solid rgba(125, 249, 193, 0.3);
+  background: rgba(125, 249, 193, 0.03);
+  padding: 0.75rem 1rem;
+  border-radius: 0;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.875rem;
+}
+
+.docs-layout [data-fd-doc] ul {
+  list-style-type: disc;
+}
+
+.docs-layout [data-fd-doc] ol {
+  list-style-type: decimal;
+}
+
+.docs-layout [data-fd-doc] li {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.docs-layout [data-fd-doc] li::marker {
+  color: rgba(125, 249, 193, 0.4);
+}
+
+.docs-layout [data-fd-doc] strong {
+  color: #fff;
+  font-weight: 600;
+}
+
+.docs-layout [data-fd-doc] hr {
+  border-color: rgba(255, 255, 255, 0.06);
+}

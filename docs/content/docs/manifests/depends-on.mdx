@@ -1,0 +1,142 @@
+---
+title: depends_on
+description: Explicit asset dependencies for content-addressed restart triggers.
+---
+
+`depends_on { assets = [...] }` declares **semantic** asset dependencies that aren't textually visible in the rest of the resource's spec.
+
+Use it when:
+
+- Your resource reads an asset path via an env var injected by the controller.
+- The asset is referenced indirectly (via a sibling bucket).
+- You want a resource to restart whenever an unrelated asset changes.
+
+Accepted on `deployment`, `app`, `statefulset`, `job`, `cronjob`.
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  depends_on {
+    assets = [
+      "name.key",              # 3-segment, unscoped global asset
+      "scope.name.key",        # 4-segment, scoped asset
+    ]
+  }
+}
+```
+
+## Fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `assets` | []string | `[]` | Asset references. |
+
+Each ref string accepts both shapes:
+
+- `"name.key"` — 3-segment, unscoped global asset.
+- `"scope.name.key"` — 4-segment, scoped asset.
+
+## What it actually does
+
+Voodu stamps the SHA-256 digest of each referenced asset into the consumer's `_asset_digests` field, which is folded into the spec hash. **Change the asset → digest changes → spec hash changes → consumer restarts on next apply.**
+
+This is the same mechanism that already exists for inline `${asset.…}` references in volumes / env / etc. `depends_on { assets = [...] }` is just the explicit form for when the reference isn't textually present in the spec.
+
+## Examples
+
+### Asset consumed via env var
+
+```hcl
+asset "prod" "feature-flags" {
+  flags_json = file("./config/flags.json")
+}
+
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  env = {
+    FLAGS_PATH = "${asset.prod.feature-flags.flags_json}"
+  }
+
+  # The reference IS visible in env, so depends_on isn't needed.
+}
+```
+
+vs.
+
+```hcl
+asset "prod" "feature-flags" {
+  flags_json = file("./config/flags.json")
+}
+
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  env_from = ["prod/shared"]
+
+  # The asset path lives in the prod/shared bucket, not in the spec.
+  # Without depends_on, voodu has no way to know the api depends on it.
+
+  depends_on {
+    assets = ["prod.feature-flags.flags_json"]
+  }
+}
+```
+
+### Forcing a restart on a sibling change
+
+```hcl
+asset "infra" "ca-bundle" {
+  ca_pem = url("https://example.com/internal-ca.pem", { on_failure = "stale" })
+}
+
+# Edge proxy reads the CA bundle directly via env_from'd bucket
+deployment "infra" "edge" {
+  image    = "ghcr.io/myorg/edge:1.0"
+  env_from = ["infra/proxy"]
+
+  depends_on {
+    assets = ["infra.ca-bundle.ca_pem"]
+  }
+}
+```
+
+When the upstream CA rotates, the asset digest changes; the edge proxy restarts on next apply.
+
+### Global asset shared across scopes
+
+```hcl
+asset "internal-ca" {
+  ca_pem = file("./certs/ca.pem")
+}
+
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  # CA path is injected via a controller-managed env var (not in the spec).
+  depends_on {
+    assets = ["internal-ca.ca_pem"]   # 3-segment
+  }
+}
+```
+
+## Trade-offs
+
+**Only `assets` is supported today.** No `deployments`, no `services` — voodu doesn't have a startup-ordering primitive. If you need "deployment X must start after deployment Y", use [`init`](/docs/manifests/init) with a TCP wait.
+
+**It's a hash hook, not a startup gate.** Listing an asset in `depends_on` triggers consumer restart when the asset changes. It does NOT mean "start the asset's volumes / sources first" — that's not how docker / voodu works.
+
+**Redundant with inline refs.** If your spec already contains `${asset.foo.bar.baz}` somewhere, voodu already tracks the digest. You only need `depends_on` for **invisible** references.
+
+**3-segment vs 4-segment matters.** Scoped assets (2-label `asset "scope" "name" { ... }`) use 4-segment refs. Global assets (1-label) use 3-segment. Mixing them up errors at apply time with an unresolved-ref message.
+
+**Pruning leaves the asset behind.** Removing the `depends_on` entry stops triggering restarts, but the asset itself stays as-declared elsewhere.
+
+## See also
+
+- [`asset`](/docs/manifests/asset) — the kind being referenced
+- [Interpolation reference](/docs/manifests/interpolation) — `${asset.…}` syntax
+- [`init`](/docs/manifests/init) — for startup-ordering requirements

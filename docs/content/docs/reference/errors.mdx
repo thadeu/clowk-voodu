@@ -1,0 +1,70 @@
+---
+title: Error reference
+description: Common errors, what they mean, and how to fix them.
+---
+
+## CLI errors
+
+### `remote "prod-1" not found`
+
+The alias is not in `~/.voodu/remotes.toml`.
+
+Fix: `voodu remote setup prod-1 ubuntu@host.example.com`.
+
+### `ssh: handshake failed`
+
+The SSH connection didn't establish. Most common causes:
+
+- Key not in `ssh-agent` or `~/.ssh/config`.
+- Host firewall blocking your IP.
+- Wrong user (`ubuntu` vs `root` vs `ec2-user`).
+
+Confirm with `ssh -v ubuntu@host.example.com` before re-trying.
+
+### `manifest validation failed: kind "foo" unknown`
+
+The manifest uses a kind no plugin claims. List installed plugins:
+
+```bash
+voodu plugins:list
+```
+
+If you expect a plugin to handle it, reinstall: `voodu plugins:install thadeu/voodu-foo`.
+
+## Controller errors
+
+### `apply aborted: health check failed`
+
+A new replica didn't pass its `health_check` within `--timeout`. `current` was NOT moved — the old replicas are still serving traffic.
+
+Inspect: `voodu logs app/scope/name -f` and `voodu describe app/scope/name`.
+
+### `tls: acme challenge timeout`
+
+ACME couldn't validate. Most common causes:
+
+- DNS for the host doesn't point to this remote.
+- Port 80 is blocked (HTTP-01 needs it).
+- ACME rate limit hit. Wait an hour and retry.
+
+### `etcd: lease expired`
+
+The controller lost its embedded etcd lease (usually after a crash or VM hibernation). Restart the controller — `voodu remote setup <name>` is idempotent.
+
+## Build errors
+
+### `build context too large`
+
+Default limit is 100MB. Add a `.voodugignore` to exclude `node_modules`, `.git`, build artifacts:
+
+```
+.git
+node_modules
+.next
+dist
+out
+```
+
+### `no Dockerfile and language not detected`
+
+Voodu auto-detects Go, Node, Ruby/Rails, Python. If none match, drop a `Dockerfile` in the root.

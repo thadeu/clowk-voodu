@@ -1,0 +1,229 @@
+---
+title: interpolation
+description: Variables, asset refs, fire-time templates, file() and url().
+---
+
+Voodu manifests support four orthogonal interpolation systems. Each has its own syntax, source, and time-of-resolution.
+
+| Syntax | When | Source | Where allowed |
+|---|---|---|---|
+| `${VAR}` | parse-time (CLI) | Shell env + `env_from` buckets | Anywhere |
+| `${asset.scope.name.key}` / `${asset.name.key}` | apply-time (controller) | `asset` block content | Anywhere |
+| `{{field}}` | fire-time (controller) | Rollout metadata | `on_deploy` webhook bodies only |
+| `file("./path")` / `url("...", {...})` | parse-time / reconcile-time | Local FS / remote HTTP | Inside `asset {}` only |
+
+## `${VAR}` — parse-time, your machine
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:${VERSION}"
+  env = {
+    DATABASE_URL = "${DATABASE_URL:-postgres://localhost/myapp_dev}"
+  }
+}
+```
+
+Resolved by the CLI **before** the manifest ships. Two forms:
+
+- `${VAR}` — required. Missing variable → apply error (`undefined variable(s): VAR`).
+- `${VAR:-default}` — defaultable. Missing variable → use the default. Empty default (`${VAR:-}`) is accepted.
+
+Variable names match `[A-Za-z_][A-Za-z0-9_]*` — no dashes, no dots.
+
+### Sources, in precedence order
+
+1. **Shell env** (highest) — `os.LookupEnv` on your machine.
+2. **`env_from` buckets** — config buckets declared via `env_from = ["scope/name"]` on the resource. The CLI fetches them before parsing.
+3. **`:-default`** — used only if the variable is unset from both sources above.
+
+Shell wins on collision. Ad-hoc override:
+
+```bash
+DATABASE_URL=postgres://test ./bin/voodu apply -f voodu.hcl -r prod-1
+```
+
+### Local vs remote apply
+
+When you run `voodu apply -r <remote>`, the CLI still resolves `${VAR}` on **your** machine — your shell env, your bucket fetches. The SSH-forward path keeps shell-only resolution.
+
+For HCL: `${VAR}` interpolation runs BEFORE HCL parsing. Server-side refs (`${asset.…}`, `${ref.…}`) are escaped so HCL's template engine sees them as literal text — the controller resolves them later.
+
+## `${asset.scope.name.key}` and `${asset.name.key}` — apply-time, controller
+
+```hcl
+asset "data" "pg-config" {
+  postgresql_conf = file("./postgresql.conf")
+}
+
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  volumes = [
+    "${asset.data.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro"
+  ]
+}
+```
+
+Resolves to a **host path** on the controller side at reconcile time. Consumers mount the path read-only.
+
+| Form | Use for |
+|---|---|
+| `${asset.scope.name.key}` (4 segments) | Scoped assets — `asset "scope" "name" { ... }` |
+| `${asset.name.key}` (3 segments) | Unscoped global assets — `asset "name" { ... }` |
+
+The textual reference is hashed into the consumer's spec — change the asset content, the consumer restarts.
+
+When the reference isn't textually visible (e.g. the path is injected via a bucket env var), use [`depends_on { assets = [...] }`](/docs/manifests/depends-on) instead.
+
+## `{{field}}` — fire-time, on_deploy webhook bodies only
+
+```hcl
+deployment "prod" "api" {
+  on_deploy {
+    success {
+      url = "${SLACK_WEBHOOK_URL}"
+
+      body = {
+        text = "deployed {{name}} ({{release_id}}) at {{completed_at}}"
+      }
+    }
+  }
+}
+```
+
+Resolved by the controller when the webhook actually fires — typically seconds after the rolling restart completes.
+
+### Available tokens
+
+| Token | Value |
+|---|---|
+| `{{kind}}` | The resource kind — `deployment`, `app`, etc. |
+| `{{scope}}` | Resource scope. |
+| `{{name}}` | Resource name. |
+| `{{release_id}}` | The minted release ID. |
+| `{{image}}` | Image used for the rollout. |
+| `{{status}}` | `"success"` or `"failure"`. |
+| `{{error}}` | Empty on success; error message on failure. |
+| `{{started_at}}` | RFC3339 UTC. |
+| `{{completed_at}}` | RFC3339 UTC. |
+
+Substitution recurses into nested maps and arrays. Unknown `{{...}}` tokens are **left literal** — handlebars-style placeholders in receiver-side text don't break.
+
+### Where `{{...}}` is allowed
+
+Only inside `on_deploy` webhook bodies — both inline `body = {}` and asset-backed `file = "${asset.X.Y.Z}"` contents. Nowhere else.
+
+## `file("./path")` — parse-time, your machine
+
+```hcl
+asset "data" "config" {
+  conf = file("./config/myapp.conf")
+}
+```
+
+Reads the file at parse time on the CLI machine. Returns base64-encoded content + filename. Path resolution:
+
+- **Relative** paths anchor at the manifest file's directory.
+- **Absolute** paths are used as-is.
+- **Stdin manifests** (`-f -`) resolve relative to your CWD.
+
+Only usable inside `asset` block values.
+
+## `url(href)` and `url(href, opts)` — reconcile-time, controller
+
+```hcl
+asset "data" "config" {
+  policy = url("https://example.com/policy.json", {
+    timeout    = "10s"
+    on_failure = "stale"
+  })
+}
+```
+
+Fetched by the **controller** at reconcile time. Cached by ETag / Last-Modified.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `timeout` | duration | `"30s"` | HTTP fetch timeout. |
+| `on_failure` | enum | `"stale"` | `"error"` / `"stale"` / `"skip"` — see [`asset`](/docs/manifests/asset). |
+
+Only usable inside `asset` block values.
+
+## Combining — typical patterns
+
+### Image tag from shell, secrets from bucket, asset from file
+
+```hcl
+deployment "prod" "api" {
+  image    = "ghcr.io/myorg/api:${VERSION}"   # shell
+  env_from = ["prod/shared"]                  # DATABASE_URL, REDIS_URL, ...
+
+  on_deploy {
+    success {
+      url  = "${SLACK_WEBHOOK_URL}"           # from prod/shared
+      body = {
+        text = "deployed {{name}} v{{release_id}}"   # filled at fire-time
+      }
+    }
+  }
+}
+
+asset "prod" "tls" {
+  ca = url("https://example.com/ca.pem", {    # fetched server-side
+    on_failure = "stale"
+  })
+}
+```
+
+### Per-env value resolution
+
+```hcl
+deployment "prod" "api" {
+  env_from = ["prod/shared"]
+  env = {
+    LOG_LEVEL = "${LOG_LEVEL:-info}"
+  }
+}
+
+deployment "staging" "api" {
+  env_from = ["staging/shared"]
+  env = {
+    LOG_LEVEL = "${LOG_LEVEL:-debug}"
+  }
+}
+```
+
+Same manifest shape, different buckets, different defaults.
+
+## Trade-offs
+
+**`${VAR}` is your-machine, `${asset.…}` is controller.** Two different machines, two different times. Get this wrong and your manifest either fails to parse locally or fails to resolve at reconcile.
+
+**Shell wins over bucket.** Always. Ad-hoc local override via `KEY=val voodu apply ...` is intentional — useful for testing without touching the bucket.
+
+**`env_from` is dual-purpose.** Same `env_from = ["scope/name"]` directive feeds:
+1. **Parse-time** `${VAR}` interpolation (CLI fetches the bucket before parsing).
+2. **Runtime** env var injection (controller mounts the bucket's key/value pairs as env file).
+
+So a bucket key `SLACK_URL` shows up in your manifest interpolation AND in your container's env. That's the design.
+
+**`{{field}}` is fire-time only.** Don't put `{{release_id}}` in your `image` field — it'd ship literally as `"ghcr.io/myorg/api:{{release_id}}"`. Use `${VAR}` for things resolved at parse time.
+
+**`file()` and `url()` are asset-only.** They can't appear in `env`, `volumes`, `command`, etc. Wrap them in an `asset` block and reference via `${asset.…}`.
+
+**Unknown `${VAR}` → apply error.** No silent empty strings. If you want a default, write `${VAR:-default}`.
+
+**Unknown `{{field}}` → left literal.** Handlebars passing through your receiver doesn't break.
+
+**No cross-apply bucket caching.** Each `voodu apply` re-fetches the buckets it needs from the controller. *Within* one apply, voodu dedups fetches across multi-file manifests, so listing the same bucket on five resources only hits the controller once. If the controller is unreachable, the apply fails early — better than running with stale values.
+
+**`on_failure = "stale"` falls through to `"error"` on first apply.** A `url()` asset that fails its initial fetch has no prior digest to fall back to — voodu treats this as a hard error. After a successful first apply, subsequent fetch failures use the last-known-good digest.
+
+**Remote apply still uses your shell.** `voodu apply -r prod-1` resolves `${VAR}` from your machine, not the remote's. Buckets are fetched via the controller's HTTP API, not from the remote's shell.
+
+## See also
+
+- [`config & secrets`](/docs/manifests/config) — `env_from` bucket semantics
+- [`asset`](/docs/manifests/asset) — `file()`, `url()`, `${asset.…}` reference syntax
+- [`on_deploy`](/docs/manifests/on-deploy) — where `{{field}}` is used
+- [`depends_on`](/docs/manifests/depends-on) — for invisible asset references

@@ -1,0 +1,196 @@
+---
+title: build
+description: Build mode — Dockerfile or auto-generated.
+---
+
+`build {}` puts a kind in **build mode** — voodu streams your source over SSH, runs `docker build` on the target host, and tags the result. The alternative is `image = "..."` (pull pre-built image).
+
+Mutually exclusive with `image`. Accepted on `deployment`, `app`, `statefulset`, `job`, `cronjob`.
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+    path       = "cmd/api"
+    args       = { NODE_VERSION = "24-alpine" }
+
+    lang {
+      name       = "go"
+      version    = "1.25"
+      entrypoint = ["./api"]
+    }
+  }
+}
+```
+
+## When voodu auto-detects
+
+An empty `deployment "scope" "name" {}` (no `image`, no `build`) is valid — voodu synthesizes `build { context = "." }` and tries to auto-detect the runtime. Read as "build at repo root, sniff the runtime".
+
+Auto-detection sniffs marker files: `go.mod`, `package.json`, `Gemfile`, `requirements.txt`, etc. The language handler produces a Dockerfile if there isn't one.
+
+## Fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `context` | string | `"."` | Build context — the directory sent to `docker build`. |
+| `dockerfile` | string | `"Dockerfile"` (in context) | Override Dockerfile name. |
+| `path` | string | — | Voodu-specific. Used ONLY by auto-generated Dockerfiles (e.g. Go handler emits `go build ./<path>`). Custom Dockerfiles ignore it. |
+| `args` | map[string]string | — | Docker `--build-arg KEY=value`. |
+| `lang` | block | auto-detected | Override the language handler. |
+
+## `lang {}` block
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | auto-detected | Handler key — `go`, `ruby`, `rails`, `python`, `nodejs`. |
+| `version` | string | handler default | Passed to the handler's Dockerfile template (e.g. Go base image tag). |
+| `entrypoint` | []string | handler default | Override the generated `CMD`. |
+
+Unknown `lang.name` values fall through to a generic Dockerfile path — bring your own Dockerfile.
+
+## Validation
+
+The apply is rejected when:
+
+- `image` and `build {}` are both set in the same resource.
+
+## Content-addressed caching
+
+The build tarball is sha256-hashed. **Identical content → identical hash → reuse the previous image** — no rebuild, just repoint `current`.
+
+Force a rebuild even when the hash matches:
+
+```bash
+voodu apply -f voodu.hcl --force -r prod-1
+```
+
+Or `VOODU_FORCE_REBUILD=1`.
+
+## Examples
+
+### Bring your own Dockerfile
+
+```hcl
+deployment "prod" "api" {
+  build {
+    context    = "."
+    dockerfile = "Dockerfile.prod"
+    args       = { RELEASE = "v1" }
+  }
+
+  command = ["bin/api"]
+}
+```
+
+### Go service with path-driven build
+
+```hcl
+deployment "prod" "api" {
+  build {
+    path = "cmd/api"
+
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
+  }
+}
+```
+
+Auto-generated Dockerfile runs `go build -o /app ./cmd/api`.
+
+### Multiple binaries from one repo
+
+```hcl
+deployment "prod" "api" {
+  build { path = "cmd/api" lang { name = "go" } }
+}
+
+deployment "prod" "worker" {
+  build { path = "cmd/worker" lang { name = "go" } }
+}
+
+deployment "prod" "cron-runner" {
+  build { path = "cmd/cron" lang { name = "go" } }
+}
+```
+
+Three deployments, one Go monorepo. The tarball is hashed once per `(context, dockerfile, args)` — voodu's smart enough to dedupe identical builds.
+
+### Build with version override
+
+```hcl
+deployment "prod" "web" {
+  build {
+    args = {
+      NODE_VERSION = "22-alpine"
+    }
+
+    lang {
+      name    = "nodejs"
+      version = "22"
+    }
+  }
+}
+```
+
+### Statefulset with custom postgres image
+
+```hcl
+statefulset "data" "pg" {
+  build {
+    context    = "."
+    dockerfile = "Dockerfile.pg-pgvector"
+  }
+
+  replicas = 1
+  ports    = ["5432"]
+
+  volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+}
+```
+
+Build postgres + extensions inline — no separate CI to publish a `postgres:16-pgvector` image.
+
+### Job build-mode
+
+```hcl
+job "prod" "seed" {
+  build { dockerfile = "Dockerfile.tools" }
+
+  command = ["bin/seed"]
+}
+```
+
+```bash
+voodu run prod/seed
+```
+
+The job spec is registered on apply; `voodu run` executes it. The build is cached the same way as deployments.
+
+## Trade-offs
+
+**Tarball is shipped over SSH.** Voodu tars your context directory, streams it through SSH to `voodu receive-pack` on the remote, where `docker build` runs. No bare git repos, no docker registries for in-house code.
+
+**Content-addressed.** Identical tarball hash → no rebuild, just repoint `current`. Editing a comment with the same number of whitespace characters? Same bytes, same hash, no rebuild. Voodu doesn't track "code changed since last apply" — it tracks "content changed".
+
+**`--force` rebuilds even on cache hit.** Useful when the base image moved (`FROM golang:1.25-alpine` got a security update upstream).
+
+**`path` is for auto-generated Dockerfiles only.** If you wrote your own Dockerfile, `path` is ignored — your Dockerfile sets its own `WORKDIR` and `COPY` paths.
+
+**Build args are visible.** They're shipped to `docker build`. Don't put secrets in `args`; use `env_from` / `env_file` for runtime secrets.
+
+**Auto-detection is best-effort.** voodu picks the handler from marker files. Override with `lang.name` when the heuristic gets it wrong — or always declare it for explicitness.
+
+**Build environment ≠ runtime environment.** The container that runs `docker build` is on the remote host, not your laptop. `RUN apt-get install …` runs there. Tarball excludes `.git` and `node_modules` by default — your `.dockerignore` controls the rest.
+
+**Statefulset build-mode goes through the same pipeline.** Voodu streams the source, builds, tags `<scope>-<name>:latest`, and the statefulset pulls the local tag. Useful for inline `postgres + extensions` or `redis + modules` shapes.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app), [`statefulset`](/docs/manifests/statefulset), [`job`](/docs/manifests/jobs)
+- [voodu apply](/docs/cli/apply) — the `--force` flag

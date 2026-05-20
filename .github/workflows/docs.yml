@@ -1,0 +1,63 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'install'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: docs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: docs/pnpm-lock.yaml
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # Copy the canonical install script into public/ BEFORE build so
+      # it lands at out/install. That's what makes
+      # `curl -fsSL voodu.clowk.in/install | bash` work — Cloudflare
+      # serves out/install directly, no redirect to raw.githubusercontent.
+      - name: Copy install script
+        run: cp ../install public/install
+
+      - name: Build
+        run: pnpm build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy docs/out --project-name=voodu-lp --branch=main
+          workingDirectory: '.'

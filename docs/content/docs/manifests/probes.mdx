@@ -1,0 +1,234 @@
+---
+title: probes
+description: Kubelet-style liveness / readiness / startup health checks.
+---
+
+`probes {}` declares container-level health checks. Three orthogonal decisions:
+
+- **`liveness`** — is the container still alive? Failures **restart** the container.
+- **`readiness`** — should the replica receive traffic? Failures drop it from ingress upstreams.
+- **`startup`** — has the container finished booting? Gates the **readiness** aggregation until it passes for the first time.
+
+Accepted on `deployment`, `app`, `statefulset`.
+
+## Synopsis
+
+```hcl
+probes {
+  startup {
+    http_get { path = "/health" port = 8080 }
+    initial_delay     = "0s"
+    period            = "2s"
+    timeout           = "1s"
+    failure_threshold = 30
+    success_threshold = 1
+  }
+
+  liveness {
+    http_get { path = "/health" port = 8080 }
+    period            = "10s"
+    failure_threshold = 3
+  }
+
+  readiness {
+    http_get { path = "/ready" port = 8080 }
+    period            = "5s"
+    failure_threshold = 1
+    success_threshold = 2
+  }
+}
+```
+
+## Selectors — exactly one per probe
+
+Each probe declares **one** selector. More than one or zero is rejected.
+
+| Selector | Use it for |
+|---|---|
+| `http_get { path port [scheme] [http_headers] }` | HTTP services. Returns pass on 200–399. |
+| `tcp_socket { port }` | Anything that opens a port — postgres, redis, mongo, kafka. |
+| `exec { command = [...] }` | Custom logic the container already knows how to run. |
+
+### `http_get`
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `path` | yes | — | Must start with `/`. |
+| `port` | yes | — | Positive int. |
+| `scheme` | no | `"http"` | `"http"` or `"https"`. `https` uses default TLS verification — self-signed certs fail. |
+| `http_headers` | no | — | `{ "X-Probe" = "voodu" }` extra request headers. |
+
+### `tcp_socket`
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `port` | yes | — | Positive int. Pass = TCP accept. |
+
+### `exec`
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `command` | yes | — | Non-empty argv. Pass = exit 0. |
+
+## Threshold knobs (per probe)
+
+All durations are strings (`"5s"`, `"1m30s"`).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `initial_delay` | `0s` | Wait before the first probe. |
+| `period` | `10s` | Time between probes. |
+| `timeout` | `1s` | Per-probe timeout. |
+| `failure_threshold` | `3` | Consecutive failures → fail. |
+| `success_threshold` | `1` | Consecutive passes → pass. Only meaningful for readiness — liveness and startup are binary signals. |
+
+## Behavior per probe type
+
+### Liveness
+
+Failure threshold trips → voodu runs `docker restart` on the container. Same container ID; the process restarts in place.
+
+### Readiness
+
+Phase transitions update the replica's readiness state. Voodu-caddy reads this state (when integrated) and drops failing replicas from the upstream pool. Rolling deploys gate on readiness — new replicas only receive traffic after passing.
+
+### Startup
+
+Short-lived. Gates the **readiness** aggregation until the first pass — until startup passes once, the replica is reported `not ready` to ingress so it doesn't receive traffic. Stops itself permanently after the first success.
+
+Note: voodu's current implementation does **not** mask liveness behind startup. If you set both, a slow-booting container with a failing liveness probe can still be restarted mid-boot. Use `initial_delay` on liveness as a safety margin for slow starts.
+
+## Validation
+
+The apply is rejected when:
+
+- A probe declares zero selectors.
+- A probe declares more than one selector.
+- `http_get.path` doesn't start with `/`.
+- `http_get.port` or `tcp_socket.port` ≤ 0.
+- `exec.command` is empty.
+
+`success_threshold` values other than `1` are accepted on liveness and startup but have no effect — those signals are binary.
+
+## Examples
+
+### HTTP service with all three probes
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+  ports = ["8080"]
+
+  probes {
+    startup {
+      http_get { path = "/health" port = 8080 }
+      period            = "2s"
+      failure_threshold = 30   # 60s budget before declared dead
+    }
+
+    liveness {
+      http_get { path = "/health" port = 8080 }
+      period            = "10s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      http_get { path = "/ready" port = 8080 }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+### Stateful service with TCP probe
+
+```hcl
+statefulset "data" "pg" {
+  image = "postgres:16"
+  ports = ["5432"]
+
+  probes {
+    startup {
+      tcp_socket { port = 5432 }
+      period            = "2s"
+      failure_threshold = 30
+    }
+
+    readiness {
+      exec { command = ["pg_isready", "-U", "postgres"] }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+
+  volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+}
+```
+
+### HTTPS probe with custom header
+
+```hcl
+probes {
+  liveness {
+    http_get {
+      path   = "/-/live"
+      port   = 8443
+      scheme = "https"
+
+      http_headers = {
+        "Authorization" = "Bearer ${PROBE_TOKEN}"
+      }
+    }
+    period = "10s"
+  }
+}
+```
+
+### Disable plugin-default probes (postgres / redis)
+
+The postgres and redis plugins ship default probes. Declaring **any** `probes {}` block totally replaces them — no field-level merge. To disable entirely:
+
+```hcl
+postgres "data" "pg" {
+  image = "postgres:16"
+
+  probes {}        # empty block = no probes
+}
+```
+
+To override one and keep others, redeclare both:
+
+```hcl
+postgres "data" "pg" {
+  image = "postgres:16"
+
+  probes {
+    liveness  { tcp_socket { port = 5432 } period = "10s" }
+    readiness { exec { command = ["pg_isready", "-U", "postgres", "-d", "myapp"] } period = "5s" success_threshold = 2 }
+  }
+}
+```
+
+## Trade-offs
+
+**Total override, no merge.** Operator-declared `probes {}` totally replaces what the plugin would have emitted. There's no field-level merge — declaring just `liveness {}` while expecting plugin defaults for `readiness` won't work. Copy what you want before overriding.
+
+**Liveness restarts; readiness gates traffic.** A failed liveness probe is destructive — voodu restarts the container. A failed readiness probe is non-destructive — voodu just drops it from upstreams. Use liveness for hard failures (process deadlocked), readiness for transient unavailability (DB connection lost, warming up).
+
+**Startup gates readiness, not liveness.** Without a startup probe, ingress can route to a replica before it's ready. With one, the replica stays out of upstream rotation until startup passes once. Liveness is independent — use `initial_delay` on liveness if your container boots slowly.
+
+**`success_threshold > 1` is meaningful for readiness only.** Liveness and startup are binary — `success_threshold > 1` is accepted by the parser but ignored at runtime.
+
+**Probe failures don't fail the apply.** Apply succeeds if the spec validates; whether the probe ever passes is a runtime concern. Use `voodu describe` and `voodu logs` to debug failing probes after apply.
+
+**Probe spec is hashed.** Editing a probe path, port, or threshold changes the spec hash and triggers a rolling restart on next apply.
+
+**Plugin-default probes** ship with [`postgres`](/docs/manifests/postgres) (TCP + `pg_isready`) and [`redis`](/docs/manifests/redis) (TCP + `redis-cli ping`). Both are emitted by the plugin's `expand`, not merged at the controller — totally replaced by any operator `probes {}` declaration.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app), [`statefulset`](/docs/manifests/statefulset) — kinds that accept probes
+- [voodu-caddy](/docs/plugins/caddy) — how readiness drives ingress upstream membership

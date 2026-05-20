@@ -1,0 +1,122 @@
+---
+title: Architecture overview
+description: Process model, state storage, and how the pieces fit together.
+---
+
+Voodu runs as a **single Go binary per host** — `voodu-controller` — that:
+
+- Embeds etcd as its source of truth.
+- Listens on HTTP `:8686` for `voodu apply`, `voodu describe`, etc.
+- Watches its own etcd for spec changes and reconciles them into running Docker containers.
+- Schedules cronjobs and the autoscaler from in-process tickers.
+- Invokes plugins as subprocesses for macro expansion (`postgres {}`, `redis {}`) and CLI verbs (`voodu pg:*`).
+
+The CLI on your laptop has no state. It just opens an SSH session to the host and runs `voodu` — which talks to the local `127.0.0.1:8686`.
+
+## Process model
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  prod-host                                                           │
+│                                                                      │
+│  voodu-controller (systemd, PID 1)                                   │
+│  ├── HTTP :8686         ← /apply, /describe, /logs, /config, ...     │
+│  ├── embedded etcd      ← /opt/voodu/state/ (bbolt member files)     │
+│  ├── reconciler loop    ← watches /desired/ prefix, recreates pods   │
+│  ├── cron scheduler     ← per-cronjob tickers                        │
+│  ├── autoscaler         ← 15s tick, mean CPU + hysteresis            │
+│  └── probe runners      ← liveness / readiness / startup goroutines  │
+│                                                                      │
+│  docker daemon          ← all workload containers run here           │
+│                                                                      │
+│  Plugin binaries        ← /opt/voodu/plugins/<name>/bin/             │
+│  (invoked as subprocesses for expand + dispatch)                     │
+└──────────────────────────────────────────────────────────────────────┘
+        ▲
+        │  ssh prod-host voodu apply -f voodu.hcl
+        │
+   your laptop
+```
+
+One process, one HTTP listener, embedded state. No daemon set. No separate scheduler. No external database. No control-plane / data-plane split.
+
+## State storage
+
+Rooted under `$VOODU_ROOT` (defaults to `/opt/voodu`):
+
+| Path | Contents |
+|---|---|
+| `/opt/voodu/state/` | Embedded etcd data dir (bbolt files: `member/snap/wal`). |
+| `/opt/voodu/plugins/<name>/` | One subdir per plugin — `plugin.yml` + `bin/`. |
+| `/opt/voodu/apps/<scope>-<name>/shared/.env` | The `--env-file` mounted on every container. |
+| `/opt/voodu/apps/<scope>-<name>/releases/<buildID>/` | Extracted source per build (build-mode). |
+| `/opt/voodu/apps/<scope>-<name>/current` | Symlink to active release. |
+| `/opt/voodu/volumes/<scope>-<name>/` | Per-app on-host volume root. |
+| `/opt/voodu/assets/<scope>/<name>/<key>` | Materialised asset files (read-only mounts). Unscoped assets land at `/opt/voodu/assets/<name>/<key>`. |
+| `/opt/voodu/cache/` | Plugin + asset fetch cache. |
+
+Some plugins (e.g. voodu-postgres) use convention paths like `/opt/voodu/backups/<scope>/<name>/` for backup output, but those are **plugin-allocated** — the platform's `paths` package doesn't own or create them.
+
+### etcd key layout
+
+The controller reads and writes etcd directly via the in-process `clientv3.Client`. Key prefixes:
+
+```
+/desired/<kind>s/<scope>/<name>     ← spec (source of truth)
+/actual/nodes/<node>/containers/<id> ← runtime snapshot
+/config/<scope>/_/<KEY>             ← scope-level config bucket
+/config/<scope>/<name>/<KEY>        ← app-level config (overrides scope)
+/plugins/<name>/manifest            ← installed plugin manifest
+/status/<kind>s/<name>              ← plugin-produced status
+/frozen/<kind>s/<scope>/<name>      ← JSON {replica_ids:[...]} freeze annotations
+```
+
+`/desired/` is what `voodu apply` writes. The reconciler watches the whole prefix.
+
+## Lifecycle of an apply
+
+```
+┌──────────┐   ssh + http  ┌────────────────┐   etcd Put   ┌──────────┐
+│  voodu   │  ───────────► │  controller    │ ───────────► │  /desired│
+│  CLI     │               │  /apply        │              │  prefix  │
+└──────────┘               └────────────────┘              └────┬─────┘
+                                  │                             │ Watch
+                                  │ asset materialise            │ event
+                                  │ + digest stamp               ▼
+                                  │                       ┌──────────────┐
+                                  │                       │  reconciler  │
+                                  │                       │  per-kind    │
+                                  │                       │  handler     │
+                                  │                       └────┬─────────┘
+                                  │                            │
+                                  │                            ▼
+                                  │                       ┌──────────┐
+                                  │                       │  docker  │
+                                  └─────  on_deploy   ◄───┤  daemon  │
+                                                          └──────────┘
+```
+
+1. **CLI** tars context (build-mode), pipes manifest JSON over SSH.
+2. **HTTP `/apply` handler** validates, materialises any inline assets, stamps asset digests onto consumer specs, expands plugin macros (calls `<plugin> expand`), then `Store.Put`s each manifest into `/desired/...`.
+3. **etcd Watch** fires. Reconciler picks up the event.
+4. **Per-kind handler** (`DeploymentHandler.apply`, `StatefulsetHandler.apply`, etc.) reads the spec, diffs against running containers, and acts: spawn missing replicas, prune extras, rolling-replace on spec drift, run release commands.
+5. **on_deploy webhooks** fire after the rolling restart completes (best-effort).
+
+## Trust model
+
+- The HTTP listener has **no authentication**. Trust is "if you can `ssh user@host` and run `voodu`, you're the operator".
+- The controller binds `0.0.0.0:8686` by default — operators are expected to gate it via firewall (the systemd unit doesn't restrict access on its own).
+- Plugin subprocesses get `VOODU_PLUGINS_ROOT`, `VOODU_NODE`, `VOODU_ETCD_CLIENT` env vars and receive a `pluginInvocationContext` JSON on stdin. They reach back to the controller via `http://127.0.0.1:8686` for dispatch actions.
+
+## What's deliberately not there
+
+- **No multi-host coordination today.** One controller per host. Multi-host apply is a `for r in prod-1 prod-2; do voodu apply -r $r; done` loop.
+- **No control-plane HA.** Embedded etcd is a single member. Backups are operator-driven (`vd config export` + filesystem rsync of `/opt/voodu/`).
+- **No external scheduler integration.** No `helm`, no `kubectl`, no operator CRDs. The controller is the scheduler.
+- **No service mesh.** voodu-caddy is the ingress layer; service-to-service traffic uses Docker's embedded DNS on `voodu0`.
+
+## What to read next
+
+- [Controller](/docs/architecture/controller) — boot sequence, embedded etcd, plugin discovery, build pipeline.
+- [Reconciler](/docs/architecture/reconciler) — the watch loop, spec hash, rolling-restart algorithm, autoscaler interaction.
+- [HTTP API](/docs/architecture/api) — endpoint reference with payloads.

@@ -1,0 +1,157 @@
+---
+title: First deploy
+description: Add a remote, write a manifest, run apply, watch TLS come up.
+---
+
+## 1. Register a remote
+
+A *remote* is an SSH-reachable host that runs the voodu controller. The CLI talks to it by alias, not by IP.
+
+```bash
+voodu remote add voodu user@1.2.3.4
+```
+
+This saves the SSH alias `voodu` (in your repo's `.git/config`, the same place `git remote` lives).
+
+### Using a specific SSH key — the `:identity` suffix
+
+Append `:<path-to-pem>` to embed an SSH key path into the remote. The CLI then runs `ssh -i <path>` automatically on every command — no `VOODU_SSH_IDENTITY` env, no `--identity` flag per call.
+
+```bash
+voodu remote add voodu   ubuntu@1.2.3.4                              # uses ssh-agent / ~/.ssh/id_*
+voodu remote add staging ubuntu@ec2.example.com:~/.ssh/staging.pem   # embedded key
+voodu remote add prod    ubuntu@ec2.example.com:/etc/voodu/keys/prod.pem
+```
+
+Rules for the suffix:
+
+- Must start with `/`, `~`, `./`, or `../` (so it parses unambiguously as a path).
+- `~` expands to your home dir at parse time.
+- Bare tokens are rejected — voodu refuses to guess.
+
+You can mix: one remote uses the agent, another uses a PEM. Each is independent.
+
+### The default-remote convention
+
+The alias named **`voodu`** is the implicit default. When you run `voodu apply` without `-r`, the CLI uses it. That's it — no flag, no env var, just `voodu apply`.
+
+For everything else (staging, prod, regional pairs), add more remotes and reach them with `-r <alias>`:
+
+```bash
+voodu remote add voodu   ubuntu@1.2.3.4    # default (beta / dev)
+voodu remote add staging ubuntu@5.6.7.8
+voodu remote add prod    ubuntu@9.10.11.12
+```
+
+Then:
+
+```bash
+voodu apply -f web              # → voodu  (default)
+voodu apply -f web -r staging   # → staging
+voodu apply -f web -r prod      # → prod
+```
+
+This is the same shape `git` uses — `origin` is the default, everything else is explicit. Treat `voodu` as the "I just want to push the thing" host.
+
+List what's registered:
+
+```bash
+voodu remote list
+```
+
+## 2. Write `web.hcl`
+
+```hcl title="web.hcl"
+app "prod" "web" {
+  image    = "ghcr.io/myorg/demo:latest"
+  replicas = 2
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  health_check = "/healthz"
+  host         = "demo.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+Two labels — `"prod"` (scope) and `"web"` (name) — uniquely identify the resource. That key flows through `diff`, `apply`, and prune.
+
+## 3. Preview the plan
+
+Against the default remote:
+
+```bash
+voodu diff -f web
+```
+
+Against a named remote:
+
+```bash
+voodu diff -f web -r staging
+```
+
+```
++ app/prod/web                replicas=2 image=ghcr.io/myorg/demo:latest
++ ingress/prod/web            host=demo.example.com tls.email=ops@example.com
+```
+
+`+` = create, `~` = modify, `-` = prune. Wire `--detailed-exitcode` in CI — exit 2 means changes pending.
+
+## 4. Apply
+
+Default remote:
+
+```bash
+voodu apply -f web
+```
+
+```
+→ packing context (1.4 MB)
+→ streaming over ssh ubuntu@1.2.3.4
+→ controller: planning ...
+→ build → swap current → reconcile caddy
+✓ apply complete in 11.8s
+✓ https://demo.example.com  ·  2/2 healthy
+```
+
+Different env:
+
+```bash
+voodu apply -f web -r staging
+voodu apply -f web -r prod
+```
+
+## What just happened
+
+1. The CLI tarred your working directory and streamed it over SSH to `voodu receive-pack` on the selected remote.
+2. The controller diffed the manifest against its embedded etcd, built the image (or skipped the rebuild if the tarball hash matched a previous one), and rolled the new replicas in.
+3. Caddy got a new route + an ACME cert request. TLS came up on the first valid challenge.
+
+## Watch it
+
+```bash
+voodu logs prod/web -f             # tail the running container
+voodu describe app/prod/web        # manifest + status + pod list
+voodu pods -s prod                 # all pods in scope "prod"
+```
+
+Add `-r staging` / `-r prod` to inspect those remotes instead.
+
+## Roll back
+
+```bash
+voodu rollback app/prod/web        # repoint `current` to the previous release
+```
+
+Releases are content-addressed — rolling back is just a symlink swap, not a rebuild.
+
+## See also
+
+- [`voodu remote`](/docs/cli/remote) — full CLI surface for add / list / remove
+- [Manifest overview](/docs/manifests/overview) — `(kind, scope, name)`, blocks, references

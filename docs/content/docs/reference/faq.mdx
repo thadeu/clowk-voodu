@@ -1,0 +1,56 @@
+---
+title: FAQ
+description: Honest answers to the questions devs actually ask.
+---
+
+## Why HCL and not YAML?
+
+HCL is built for humans declaring infrastructure. Blocks, labels, and typed values map cleanly to `kind/scope/name`. You can use `.yml` if you must — same schema, different syntax.
+
+## How is this different from Dokku, Coolify, CapRover?
+
+Those are excellent — and mostly git-push or click-driven. Voodu is declarative at the layer above:
+
+- one file describes the system,
+- `diff` shows the plan,
+- `apply` reconciles.
+
+Stateful services (Postgres, Mongo, Redis HA) are first-class — not bolted on as plugins-of-plugins.
+
+## Is it really commitless?
+
+Yes. `voodu apply` tars whatever directory you're in and streams it over SSH. No bare repo, no `git push`, no commit required. Edit, save, apply.
+
+## What about Kubernetes?
+
+Voodu borrows the **shape** (declarative, reconciler, source-of-truth) and skips the **operations bill** (no CNI, no Helm chart, no kube-state-metrics dashboard). One controller per host, embedded etcd, done.
+
+## Does it scale beyond one host?
+
+Yes — by design, not by clustering. Three prod boxes behind an ALB? Add three remotes and loop `voodu apply -f voodu.hcl -r $r`. Same manifest, different SSH targets. The controller is per-host and stateless about its peers — keep it boring.
+
+## How do secrets work?
+
+`voodu config set` stores env vars per-app, out-of-band from the manifest. `config:set` always wins over `env` blocks, so a runaway apply can't reset a production secret. See [config & secrets](/docs/manifests/config).
+
+## Does Voodu phone home?
+
+No. Zero telemetry, zero analytics. There is no cloud control plane.
+
+## What's the license?
+
+MIT. Self-hosted. No cloud tier, no usage telemetry, no rug pulls planned.
+
+## How big can a deployment get?
+
+Voodu has been run successfully on:
+
+- A single $5 VPS for a tiny side project.
+- Three c5.large boxes behind an ALB for a small SaaS (~200k req/day).
+- A 12-host fleet across two regions (manual remote loop, no internal mesh).
+
+Past a dozen hosts, you might want a real orchestrator. Voodu won't lie to you about that.
+
+## Can I run Voodu inside Kubernetes?
+
+You _can_, but you probably shouldn't. The point of Voodu is to not run a Kubernetes. If you're already on K8s, use what you've got.

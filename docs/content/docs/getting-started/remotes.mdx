@@ -1,0 +1,62 @@
+---
+title: Remotes
+description: Bootstrap a Linux box so voodu can ship to it over SSH.
+---
+
+## What a remote is
+
+A **remote** is just an SSH alias known to the voodu CLI. The first time you run `voodu remote setup`, the CLI:
+
+1. SSHes into the box as the user you provide.
+2. Installs Docker (if missing), Caddy, and the voodu controller.
+3. Creates `/opt/voodu/` and seeds the embedded etcd store.
+4. Records the alias in `~/.voodu/remotes.toml` on your laptop.
+
+The whole thing is idempotent — re-run it any time to refresh.
+
+## Bootstrap
+
+```bash
+voodu remote setup prod-1 ubuntu@host.example.com
+```
+
+```
+→ preflight: ssh ok, sudo ok
+→ installing docker (24.0.x)            ✓
+→ installing caddy (2.7.x)              ✓
+→ installing voodu-controller (0.9.2)   ✓
+→ seeding /opt/voodu/etcd
+✓ remote prod-1 ready
+```
+
+## List remotes
+
+```bash
+voodu remote list
+```
+
+```
+NAME      HOST                       STATUS   VERSION
+prod-1    ubuntu@host.example.com    ready    0.9.2
+prod-2    ubuntu@host2.example.com   ready    0.9.2
+```
+
+## Multi-host deploys
+
+Voodu controllers are **per-host and stateless about their peers** — there's no cluster, no consensus, no quorum. To deploy across hosts, loop:
+
+```bash
+for r in prod-1 prod-2 prod-3; do
+  voodu apply -f voodu.hcl -r $r
+done
+```
+
+Same manifest, different SSH targets. Put a load balancer in front and you've got HA.
+
+## Tear down
+
+```bash
+voodu remote remove prod-1
+```
+
+This **only** removes the laptop-side alias. The remote box still has Docker, Caddy, and `/opt/voodu/` intact. Use `voodu remote uninstall prod-1` to actually clean the box.

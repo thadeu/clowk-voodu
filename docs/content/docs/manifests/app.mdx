@@ -1,0 +1,244 @@
+---
+title: app
+description: Sugar over deployment + ingress for HTTP services.
+---
+
+`app` is shorthand for "I want a web service with a hostname". Under the hood it expands into a [`deployment`](/docs/manifests/deployment) plus an [`ingress`](/docs/manifests/ingress), both sharing the same `(scope, name)` identity.
+
+If you don't need a hostname, write a plain `deployment`. If you need fine-grained ingress control (multiple hosts, custom rewrites, separate upstream), write a `deployment` + standalone `ingress` instead.
+
+## Synopsis
+
+```hcl
+app "scope" "name" {
+  # Source — pick one or omit:
+  image = "ghcr.io/myorg/api:1.7"
+  # OR
+  build { ... }
+
+  replicas    = 3
+  command     = ["..."]
+  env         = { ... }
+  env_file    = ["./.env"]
+  env_from    = ["scope/name"]
+  ports       = ["8080"]
+  volumes     = ["..."]
+  networks    = ["..."]
+  network_mode = ""
+  restart     = "..."
+  health_check = "/healthz"
+  post_deploy = ["..."]
+  keep_releases = 5
+  extra_hosts = ["..."]
+  cap_add     = ["..."]
+
+  # Ingress-side — REQUIRED:
+  host = "myapp.example.com"
+
+  # Ingress-side — optional:
+  tls { ... }
+  location { ... }   # repeatable
+  lb { ... }
+
+  # Cross-cutting blocks:
+  release    { ... }
+  depends_on { ... }
+  resources  { ... }
+  autoscale  { ... }
+  on_deploy  { ... }
+  logs       { ... }
+  probes     { ... }
+  init "<name>" { ... }
+}
+```
+
+## Required
+
+- `host` — without a hostname, an `app` has no reason to exist; write a plain `deployment` instead.
+
+## Fields vs `deployment`
+
+Every [`deployment`](/docs/manifests/deployment) field is available verbatim. `app` adds an ingress side:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `host` | string | **required** | The hostname Caddy routes to this app. |
+| `tls` | block | — | TLS / ACME settings. See below. |
+| `location` | block (repeatable) | — | Path-based routing rules. |
+| `lb` | block | — | Active health-check + load-balancing policy. |
+
+`service` and `port` are **not** exposed on the `app` ingress side — they're derived (service = app name; port = the first declared port).
+
+## `tls {}` block
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` when block present | Toggle TLS for this host. |
+| `provider` | string | `"letsencrypt"` | `"letsencrypt"` (ACME HTTP-01) or `"internal"` (Caddy self-signed CA). |
+| `email` | string | — | ACME account email. Omitted accounts have lower issuance limits. |
+| `on_demand` | bool | `false` | On-demand cert minting for wildcards. Requires `ask`. |
+| `ask` | URL | — | **Required** when `on_demand = true`. Caddy calls this URL to authorize per-hostname issuance. |
+
+See [voodu-caddy](/docs/plugins/caddy) for how on-demand and `ask` work end-to-end.
+
+## `location {}` block (repeatable)
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `path` | string | **required** | URL prefix to match. Must start with `/`. |
+| `strip` | bool | `false` | If true, prefix is stripped before forwarding upstream. |
+
+Routes are emitted in declaration order; first match wins.
+
+## `lb {}` block
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `policy` | string | `"round_robin"` | Caddy upstream selection policy: `round_robin`, `random`, `least_conn`, `ip_hash`. |
+| `interval` | duration | — | Active health-check cadence. Empty disables active HC. Path comes from `health_check =`. |
+
+## Validation
+
+- `image` AND `build {}` both set → reject (parse-time).
+- `network_mode = "host"|"none"` + `networks` → reject (parse-time).
+- `replicas` + `autoscale {}` → reject (parse-time).
+- `host` must be non-empty (parse-time).
+- `tls.on_demand = true` with no `ask` → rejected by voodu-caddy at apply time (no `allow_all` fallback by design).
+
+## Examples
+
+### Minimal — image + TLS + 3 replicas
+
+```hcl
+app "prod" "api" {
+  image    = "ghcr.io/myorg/api:1.7"
+  replicas = 3
+  ports    = ["8080"]
+
+  env = { PORT = "8080", NODE_ENV = "production" }
+
+  host = "api.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+### Build-mode, autoscaled, with proper probes
+
+```hcl
+app "prod" "api" {
+  build {}                                  # auto-detect runtime at repo root
+
+  host = "api.example.com"
+
+  tls { email = "ops@example.com" }
+
+  autoscale {
+    min        = 3
+    max        = 15
+    cpu_target = 60
+  }
+
+  probes {
+    startup   { http_get { path = "/health" port = 8080 } period = "2s" failure_threshold = 30 }
+    readiness { http_get { path = "/ready"  port = 8080 } period = "5s" success_threshold = 2 }
+    liveness  { http_get { path = "/health" port = 8080 } period = "10s" failure_threshold = 3 }
+  }
+}
+```
+
+### Path-based fan-out — multiple apps sharing one host
+
+```hcl
+app "prod" "web" {
+  image = "ghcr.io/myorg/web:1.0"
+  host  = "example.com"
+  tls   { email = "ops@example.com" }
+}
+
+app "prod" "api-v1" {
+  image = "ghcr.io/myorg/api-v1:1.0"
+  host  = "example.com"
+  tls   { email = "ops@example.com" }
+
+  location { path = "/api/v1" }
+}
+
+app "prod" "api-v2" {
+  image = "ghcr.io/myorg/api-v2:1.0"
+  host  = "example.com"
+  tls   { email = "ops@example.com" }
+
+  location { path = "/api/v2" }
+}
+```
+
+Each `app` produces its own ingress entry pointing at its own service. More specific paths should come first in declaration order.
+
+### Multi-tenant with on-demand wildcards
+
+```hcl
+app "prod" "tenants" {
+  image = "ghcr.io/myorg/tenant-router:1.0"
+  ports = ["8080"]
+
+  host = "*.app.example.com"
+
+  tls {
+    email     = "ops@example.com"
+    on_demand = true
+    ask       = "https://tenants.example.com/internal/allow_domain"
+  }
+}
+```
+
+Caddy will hit the `ask` URL the first time a new subdomain is requested; if it returns 200, the cert is minted. No certbot cron, no manual rotation.
+
+### Release hook + webhook notification
+
+```hcl
+app "prod" "api" {
+  image    = "ghcr.io/myorg/api:1.7"
+  replicas = 3
+  host     = "api.example.com"
+  tls      { email = "ops@example.com" }
+
+  release {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+  }
+
+  on_deploy {
+    success { url = "${SLACK_WEBHOOK_URL}" }
+    failure {
+      url = "https://events.pagerduty.com/v2/enqueue"
+      headers = { "X-Routing-Key" = "${PD_ROUTING_KEY}" }
+    }
+  }
+}
+```
+
+## Trade-offs
+
+**`app` is two manifests under one block.** It expands into a `deployment` and an `ingress` with the same `(scope, name)`. An apply that mixes `app "prod" "api" {}` and a standalone `deployment "prod" "api" {}` is rejected — the identities collide.
+
+**`tls {}` defaults to enabled.** Declaring even a bare `tls {}` flips `enabled = true` and `provider = "letsencrypt"`. To run without TLS, omit the entire block.
+
+**`on_demand` requires `ask`.** voodu-caddy refuses to issue certs without a callback URL — there's no `allow_all` escape hatch. The `ask` URL is your app endpoint that decides which subdomains are real customers.
+
+**One host per `app`.** Use multiple `app` blocks (or a standalone `ingress`) for multi-host fan-out. The `host` field is a scalar string.
+
+**`location` paths support `/api/v1` AND `/api/v1/*` automatically.** Caddy's path matcher needs both for a prefix match — the plugin emits both. Don't add the wildcard yourself.
+
+**Service + port are auto-derived.** `service` defaults to the app name; `port` is the first declared port. For cross-app routing (one ingress, different deployment), write a standalone [`ingress`](/docs/manifests/ingress).
+
+**Env precedence:** `voodu config set …` > `env = {...}` > `env_from` > `env_file`. Out-of-band secrets always win — a runaway apply can't reset a production env var.
+
+## See also
+
+- [`deployment`](/docs/manifests/deployment) — the compute half
+- [`ingress`](/docs/manifests/ingress) — the routing half (standalone form)
+- [`probes`](/docs/manifests/probes), [`init`](/docs/manifests/init), [`autoscale`](/docs/manifests/autoscale), [`on_deploy`](/docs/manifests/on-deploy), [`release`](/docs/manifests/release)
+- [voodu-caddy plugin](/docs/plugins/caddy) — the ingress backend

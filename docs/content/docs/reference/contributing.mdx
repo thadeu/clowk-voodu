@@ -1,0 +1,40 @@
+---
+title: Contributing
+description: How to send a useful PR to the voodu repos.
+---
+
+## Where the code lives
+
+- **CLI + controller:** [github.com/thadeu/clowk-voodu](https://github.com/thadeu/clowk-voodu)
+- **Caddy plugin (reference):** [github.com/thadeu/voodu-caddy](https://github.com/thadeu/voodu-caddy)
+- **Postgres plugin:** [github.com/thadeu/voodu-postgres](https://github.com/thadeu/voodu-postgres)
+- **Plugin SDK:** [github.com/thadeu/voodu-plugin-sdk](https://github.com/thadeu/voodu-plugin-sdk)
+
+## Setup
+
+```bash
+git clone https://github.com/thadeu/clowk-voodu
+cd clowk-voodu
+make build      # builds the voodu binary into ./bin/voodu
+make test       # runs unit + integration tests
+```
+
+## PR guidelines
+
+- **One change per PR.** Bundling a refactor with a feature makes review harder than it needs to be.
+- **Include a test.** Bugfixes need a failing test that the fix turns green. Features need at least one happy-path test.
+- **Update docs.** If you touch CLI flags, manifest schema, or behavior, change the relevant page under `/content/docs/`.
+- **Keep commits clean.** Squash WIP commits before opening the PR.
+
+## Plugin contributions
+
+Want to add a stateful service? Don't add it to core — write a plugin. See [build your own plugin](/docs/plugins/build-your-own). Once it's stable, we'll happily link it from the docs.
+
+## Reporting bugs
+
+File an issue with:
+
+- `voodu version` output.
+- Minimal reproducer (a tiny `voodu.hcl` is gold).
+- What happened vs what you expected.
+- Logs: `voodu logs --since 5m -s <scope>` for runtime issues, or `voodu apply -v` for CLI issues.

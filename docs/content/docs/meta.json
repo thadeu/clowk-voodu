@@ -1,0 +1,12 @@
+{
+  "title": "Voodu",
+  "pages": [
+    "index",
+    "getting-started",
+    "manifests",
+    "cli",
+    "plugins",
+    "architecture",
+    "reference"
+  ]
+}

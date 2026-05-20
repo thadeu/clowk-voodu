@@ -1,0 +1,130 @@
+---
+title: Manifest overview
+description: How HCL manifests describe the running system.
+---
+
+## The shape
+
+Every resource has two labels — `scope` and `name` — and a body of typed fields:
+
+```hcl
+kind "scope" "name" {
+  field = value
+
+  nested_block {
+    other_field = "string"
+  }
+}
+```
+
+The pair `(kind, scope, name)` is the unique key used by `diff`, `apply`, and prune.
+
+## Kinds
+
+| Kind | Purpose |
+|---|---|
+| [`deployment`](/docs/manifests/deployment) | Stateless replicas. The canonical compute kind. |
+| [`app`](/docs/manifests/app) | Sugar for `deployment` + `ingress` with the same identity (~90% of web shapes) |
+| [`statefulset`](/docs/manifests/statefulset) | Stateful pods with stable ordinals + per-pod volumes (postgres, redis, etc.) |
+| [`ingress`](/docs/manifests/ingress) | Caddy route + TLS for a deployment |
+| [`job`](/docs/manifests/jobs#job) | One-shot task triggered by `voodu run` |
+| [`cronjob`](/docs/manifests/jobs#cronjob) | Scheduled task |
+| [`asset`](/docs/manifests/asset) | Declarative file bundles — `file()`, `url()`, inline literals |
+| [`registry`](/docs/manifests/registry) | Private image pull credentials (host-wide) |
+| [`postgres`](/docs/manifests/postgres) | Postgres macro: statefulset + replication + backups + default probes (via [voodu-postgres](/docs/plugins/postgres)) |
+| [`redis`](/docs/manifests/redis) | Redis macro (+ sentinel for HA) + default probes (via [voodu-redis](/docs/plugins/redis)) |
+| `mongo` | MongoDB macro (planned plugin) |
+
+### Cross-cutting blocks
+
+Most kinds (`deployment` / `app` / `statefulset` / `job` / `cronjob`) share these optional blocks:
+
+| Block | What it does |
+|---|---|
+| [`probes`](/docs/manifests/probes) | Kubelet-style liveness / readiness / startup health checks |
+| [`init`](/docs/manifests/init) | Ordered one-shot prep containers (db:migrate, asset warmup) |
+| [`autoscale`](/docs/manifests/autoscale) | CPU-based horizontal scaling (deployment / app only) |
+| [`on_deploy`](/docs/manifests/on-deploy) | Post-rollout webhook notifications (Slack, PagerDuty, custom) |
+| [`release`](/docs/manifests/release) | Once-per-release migrations / hooks (deployment / app only) |
+| [`resources`](/docs/manifests/resources) | CPU + memory caps |
+| [`logs`](/docs/manifests/logs) | Docker log driver caps (default 10m × 3) |
+| [`build`](/docs/manifests/build) | Build-mode — Dockerfile or auto-detected runtime |
+| [`depends_on`](/docs/manifests/depends-on) | Explicit asset dependencies for invisible references |
+
+### Reference
+
+- [Interpolation reference](/docs/manifests/interpolation) — `${VAR}`, `${asset.…}`, `{{field}}`, `file()`, `url()`
+- [`config` & secrets](/docs/manifests/config) — out-of-band env vars, scope/app buckets, `env_from` semantics
+
+## Multiple files, one apply
+
+Split your manifests by concern. `voodu apply` accepts `-f` repeated:
+
+```bash
+voodu apply \
+  -f infra/web.voodu \
+  -f infra/redis.voodu \
+  -f infra/pg.voodu \
+  -r prod-1
+```
+
+All files are unioned by `(kind, scope, name)`. Conflicts are a hard error — Voodu won't merge silently.
+
+## References across resources
+
+Assets and config bind values back into other resources:
+
+```hcl
+asset "clowk-lp" "acls" {
+  acls = url("http://internal/users.acl", {
+    timeout    = "10s"
+    on_failure = "error"
+  })
+}
+
+redis "clowk-lp" "redis" {
+  volumes = [
+    "${asset.clowk-lp.acls}:/etc/redis/conf.d/users.conf:ro"
+  ]
+}
+```
+
+## Prune semantics — upsert-only by default
+
+`apply` only creates and updates. Resources missing from the file are **left alone** unless you opt in:
+
+- Default: `voodu apply -f voodu.hcl` upserts everything declared, leaves siblings untouched.
+- Opt-in: `voodu apply -f voodu.hcl --prune` deletes siblings in the same `(scope, kind)` that aren't in this apply.
+
+Pruning is per `(scope, kind)`. `app` is authoring sugar — voodu expands it into a `deployment` + `ingress` at parse time, then prunes per canonical kind. So an apply with one `app "prod" "api"` block + `--prune` will delete other `deployment` resources AND other `ingress` resources in scope `prod` that aren't declared in the apply. It won't touch `cronjob` or `statefulset` siblings.
+
+To keep siblings of the same kind around, declare them in the apply (or split your manifests into separate `voodu apply --prune` calls).
+
+```bash
+# Standard apply — upsert-only, safe for multi-repo / multi-file workflows
+voodu apply -f voodu.hcl -r prod-1
+
+# Explicit opt-in to clean up siblings
+voodu apply -f voodu.hcl --prune -r prod-1
+```
+
+Common CI pattern: `voodu diff --prune` on the PR to surface what would disappear, `voodu apply --prune` on merge.
+
+## Diff semantics
+
+```bash
+voodu diff -f voodu.hcl -r prod-1
+```
+
+Output uses the same `+ ~ -` triplet you see in `apply`:
+
+```
+~ app/prod/api
+  ~ replicas         1 → 3
+  ~ env.NODE_ENV     development → production
++ redis/clowk-lp/redis-ha
+  + sentinel.monitor clowk-lp/redis
+- cronjob/prod/old-cleanup
+```
+
+Exit code is `0` (no changes), `2` (changes pending) with `--detailed-exitcode`, or non-zero on error. Wire it into CI.

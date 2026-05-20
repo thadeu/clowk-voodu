@@ -1,0 +1,237 @@
+---
+title: asset
+description: Declarative file bundles referenced from other resources.
+---
+
+`asset` declares a bundle of files (or remote URLs) that other resources mount as read-only volumes. It's how voodu wires config files, certs, SQL bootstrap scripts, and any other "data the container needs but doesn't bake into the image".
+
+Assets have **content-addressed hashes** folded into consumer spec hashes — change the asset, the consumer restarts automatically.
+
+## Synopsis
+
+### Scoped (2 labels)
+
+```hcl
+asset "scope" "name" {
+  key1 = file("./path/to/file.conf")
+  key2 = url("https://example.com/cert.pem")
+  key3 = url("https://example.com/policy.json", {
+    timeout    = "10s"
+    on_failure = "stale"
+  })
+  key4 = "inline literal"
+}
+```
+
+Referenced as `${asset.scope.name.key1}`.
+
+### Unscoped global (1 label)
+
+```hcl
+asset "name" {
+  redis_conf = file("./redis.conf")
+}
+```
+
+Referenced as `${asset.name.redis_conf}`.
+
+## Label rules
+
+- **2 labels** → scoped. Use 4-segment refs `${asset.<scope>.<name>.<key>}`.
+- **1 label** → global. Use 3-segment refs `${asset.<name>.<key>}`.
+- Any other arity is rejected at parse time.
+
+## Body
+
+The body is a flat map of `key = value` pairs. Each value is one of:
+
+| Value form | Resolved when | Notes |
+|---|---|---|
+| `file("./path")` | parse time on your machine | Path is relative to the manifest file's directory (or your CWD for stdin). Read into a base64 payload. |
+| `url("https://...")` | reconcile time on the controller | Fetched server-side, cached by ETag / Last-Modified. |
+| `url("href", { ... })` | same, with options | See [`url()` options](#url-options). |
+| `"inline literal"` | apply time | Written verbatim. |
+
+Nested blocks are not supported — assets are flat key/source pairs.
+
+`_source` is a reserved internal key — operators must not declare it.
+
+## `file()` semantics
+
+- Reads bytes at parse time on the CLI machine.
+- Relative paths anchor at the manifest file's directory (so `file("./conf/users.conf")` works regardless of where you run `voodu apply` from).
+- Absolute paths are honored as-is.
+- Stdin manifests (`voodu apply -f -`) resolve relative to CWD.
+
+## `url()` options
+
+```hcl
+url("https://example.com/file", {
+  timeout    = "30s"
+  on_failure = "stale"
+})
+```
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `timeout` | duration | `"30s"` | HTTP fetch timeout. |
+| `on_failure` | enum | `"stale"` | What happens when the fetch fails. |
+
+### `on_failure` values
+
+| Value | Behavior |
+|---|---|
+| `"error"` | Apply rejects. Strict — best for "this URL must be reachable". |
+| `"stale"` (default) | Use last-known-good digest from `/status`. If no prior, behaves like `"error"`. |
+| `"skip"` | Omit the key from digests. Consumers referencing it get an unresolved-ref error. |
+
+`"stale"` is the default because most assets (cert bundles, allow-lists) are tolerable when the cache holds and intolerable when they don't — the default makes that trade explicit.
+
+## Consumer references
+
+Consumer resources mount asset values via interpolation:
+
+```hcl
+asset "data" "pg-config" {
+  postgresql_conf = file("./postgresql.conf")
+  pg_hba_conf     = file("./pg_hba.conf")
+}
+
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  volumes = [
+    "${asset.data.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro",
+    "${asset.data.pg-config.pg_hba_conf}:/etc/postgresql/pg_hba.conf:ro",
+  ]
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+}
+```
+
+The interpolation expands to a **host path** where voodu has materialized the asset content. Consumers mount it read-only.
+
+## Digest hashing
+
+Each asset key gets a sha256 digest. Digests fold into the consumer's spec hash via `_asset_digests` — change the file content, the consumer restarts on next apply.
+
+Use [`depends_on { assets = [...] }`](/docs/manifests/depends-on) when a resource semantically depends on an asset whose path isn't textually visible in its spec (e.g. you read the asset via env var, or it's stored in a sibling bucket).
+
+## Examples
+
+### Postgres custom configuration
+
+```hcl
+asset "data" "pg" {
+  postgresql_conf = file("./conf/postgresql.conf")
+}
+
+statefulset "data" "pg" {
+  image = "postgres:16"
+
+  volumes = [
+    "${asset.data.pg.postgresql_conf}:/etc/postgresql/postgresql.conf:ro"
+  ]
+
+  volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+}
+```
+
+### Redis ACL file fetched from a remote URL (with cache)
+
+```hcl
+asset "clowk-lp" "redis" {
+  acls = url("https://r2.example.com/redis/users.conf", {
+    timeout    = "10s"
+    on_failure = "stale"
+  })
+}
+
+redis "clowk-lp" "redis" {
+  image = "redis:8"
+
+  volumes = [
+    "${asset.clowk-lp.redis.acls}:/etc/redis/conf.d/users.conf:ro"
+  ]
+}
+```
+
+If the URL is down on apply, voodu falls back to the last-known-good digest — your apply doesn't fail.
+
+### Inline literal config
+
+```hcl
+asset "data" "redis" {
+  conf = <<-EOT
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+  EOT
+}
+```
+
+### Global asset shared across scopes
+
+```hcl
+asset "internal-ca" {
+  ca_pem = file("./certs/internal-ca.pem")
+}
+
+deployment "prod" "api" {
+  volumes = [
+    "${asset.internal-ca.ca_pem}:/etc/ssl/certs/internal-ca.pem:ro"
+  ]
+}
+
+deployment "staging" "api" {
+  volumes = [
+    "${asset.internal-ca.ca_pem}:/etc/ssl/certs/internal-ca.pem:ro"
+  ]
+}
+```
+
+One CA bundle, two scopes consuming it. Global assets use the 3-segment reference (`asset.internal-ca.ca_pem`).
+
+### Webhook body template (asset-backed)
+
+```hcl
+asset "prod" "webhooks" {
+  pagerduty_event = file("./webhooks/pagerduty.json")
+}
+
+deployment "prod" "api" {
+  on_deploy {
+    failure {
+      url  = "https://events.pagerduty.com/v2/enqueue"
+      file = "${asset.prod.webhooks.pagerduty_event}"
+    }
+  }
+}
+```
+
+The JSON template can include `{{release_id}}`, `{{status}}`, etc. — resolved at fire-time. See [`on_deploy`](/docs/manifests/on-deploy).
+
+## Trade-offs
+
+**`file()` runs on your machine.** The CLI reads the file at parse time, base64-encodes it, and ships it along with the manifest. The target host never sees the raw path.
+
+**`url()` runs on the controller.** Voodu fetches the URL server-side at reconcile time. If the controller box can't reach the URL, the fetch fails — and `on_failure` decides what happens.
+
+**Digest = restart trigger.** Any change to asset content (different file bytes, different fetched body) changes the digest, which changes the consumer's spec hash, which triggers a rolling restart on next apply.
+
+**Caching is content-addressed.** Identical file bytes → identical digest → no restart. Editing a comment with the same number of whitespace characters? Same bytes, same digest, no restart. Voodu doesn't know about your editor.
+
+**`url()` cache uses ETag / Last-Modified.** If the server doesn't send them, every reconcile re-fetches. Use `on_failure = "stale"` for resilience.
+
+**`_source` is reserved.** Internal discriminator. Don't name a key `_source`.
+
+**No nested blocks.** An asset body is `key = source` — no further structure.
+
+**Pruning leaves materialized files.** `voodu apply --prune` removes the asset spec from the controller, but the on-host materialized files persist until something else cleans them up (or you `docker volume prune` if they're in volumes).
+
+## See also
+
+- [Interpolation reference](/docs/manifests/interpolation) — `${asset.…}`, `file()`, `url()`
+- [`depends_on`](/docs/manifests/depends-on) — explicit asset dependencies
+- [`on_deploy`](/docs/manifests/on-deploy) — asset-backed webhook bodies

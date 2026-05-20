@@ -1,0 +1,234 @@
+---
+title: ingress
+description: Caddy-backed routes, TLS, path-based dispatch.
+---
+
+`ingress` declares HTTP routing into your apps. Each block produces one Caddy route — hostname + (optional) path-prefix matching, TLS, upstream service, active health-check.
+
+In most cases you don't write `ingress` directly — [`app`](/docs/manifests/app) generates one for you. Reach for `ingress` when:
+
+- One service backs multiple hostnames (path-based fan-out).
+- One hostname routes to multiple deployments by path.
+- You need different TLS settings per host.
+
+The reconciliation backend is [voodu-caddy](/docs/plugins/caddy).
+
+## Synopsis
+
+```hcl
+ingress "scope" "name" {
+  host    = "api.example.com"
+  service = "api"          # defaults to ingress name
+  port    = 8080           # defaults to deployment's first port
+
+  tls {
+    enabled   = true
+    provider  = "letsencrypt"
+    email     = "ops@example.com"
+    on_demand = false
+    ask       = "https://..."
+  }
+
+  location {               # repeatable
+    path  = "/api/v1"
+    strip = false
+  }
+
+  lb {
+    policy   = "round_robin"
+    interval = "10s"
+  }
+}
+```
+
+## Required
+
+- `host` (string) — the hostname Caddy routes.
+
+## Optional fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `service` | string | ingress name | The deployment / app to forward to. Use for cross-resource routing. |
+| `port` | int | first declared port on the upstream | Upstream port. |
+
+## `tls {}` block
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` if block present | Toggle TLS. Omit the block to serve plain HTTP. |
+| `provider` | string | `"letsencrypt"` | `"letsencrypt"` (ACME HTTP-01) or `"internal"` (self-signed). |
+| `email` | string | — | ACME account email. |
+| `on_demand` | bool | `false` | On-demand cert minting (wildcards). Requires `ask`. |
+| `ask` | URL | — | **Required when `on_demand = true`.** Caddy calls it to authorize each new hostname. |
+
+**No `allow_all` fallback.** voodu-caddy refuses on-demand without an `ask` URL — it's not a config oversight, it's a deliberate safety against accidental wildcard exposure.
+
+## `location {}` block (repeatable)
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `path` | string | **required** | URL prefix to match. Must start with `/`. |
+| `strip` | bool | `false` | If true, the prefix is stripped before forwarding. |
+
+Routes are emitted in declaration order; first match wins. `path = "/"` collapses to a catch-all (no prefix matching).
+
+## `lb {}` block
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `policy` | string | `"round_robin"` | Upstream selection: `round_robin`, `random`, `least_conn`, `ip_hash`. |
+| `interval` | duration | — | Active health-check cadence. Empty = no active probe. |
+
+When `interval` is set, Caddy hits the deployment's `health_check =` path on every replica at that cadence. Replicas that fail are dropped from the upstream pool.
+
+## Validation
+
+- `host` required (HCL parser enforces).
+- `tls.on_demand = true` without `ask` → rejected by **voodu-caddy** at apply time. No `allow_all` fallback.
+
+The HCL parser does NOT enforce:
+
+- `location.path` starting with `/` — the value passes through to Caddy, which handles malformed paths at config-load time.
+- `lb.policy` enum values — passed through to Caddy verbatim.
+- `tls.enabled = true` without `provider` — empty provider defaults to `"letsencrypt"`.
+
+## Examples
+
+### Plain HTTP
+
+```hcl
+ingress "internal" "api" {
+  host    = "api.internal"
+  service = "api"
+  port    = 3000
+}
+```
+
+### Public TLS with Let's Encrypt
+
+```hcl
+ingress "prod" "api" {
+  host    = "api.example.com"
+  service = "api"
+  port    = 3000
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@example.com"
+  }
+}
+```
+
+### Internal CA (dev / staging self-signed)
+
+```hcl
+ingress "dev" "api" {
+  host    = "api.dev.local"
+  service = "api"
+  port    = 3000
+
+  tls {
+    enabled  = true
+    provider = "internal"
+  }
+}
+```
+
+### On-demand wildcard with ask callback
+
+```hcl
+ingress "prod" "tenants" {
+  host    = "*.example.com"
+  service = "app"
+  port    = 3000
+
+  tls {
+    enabled   = true
+    provider  = "letsencrypt"
+    email     = "ssl@example.com"
+    on_demand = true
+    ask       = "https://app.example.com/internal/allow_domain"
+  }
+}
+```
+
+Caddy calls `ask` with `?domain=<requested-host>` whenever a TLS handshake arrives for an unknown name. Return 2xx to authorize issuance.
+
+### Versioned API — same host, different services
+
+```hcl
+ingress "prod" "api-v1" {
+  host    = "api.example.com"
+  service = "api-v1"
+  port    = 3000
+  location { path = "/api/v1" }
+}
+
+ingress "prod" "api-v2" {
+  host    = "api.example.com"
+  service = "api-v2"
+  port    = 3000
+  location { path = "/api/v2" }
+}
+```
+
+Both ingresses share the host. Caddy serves whichever prefix matches first.
+
+### Strip-prefix forwarding for a docs subtree
+
+```hcl
+ingress "prod" "docs" {
+  host    = "example.com"
+  service = "docs"
+  port    = 80
+
+  location {
+    path  = "/docs/voodu"
+    strip = true
+  }
+}
+```
+
+Request `/docs/voodu/getting-started` arrives at the docs upstream as `/getting-started`.
+
+### Active health checks
+
+```hcl
+ingress "prod" "api" {
+  host    = "api.example.com"
+  service = "api"
+  port    = 8080
+
+  lb {
+    interval = "5s"
+  }
+}
+```
+
+Caddy probes `/` (or whatever the deployment declares as `health_check`) on each replica every 5s and drops failing ones from the pool.
+
+## Trade-offs
+
+**One host per ingress.** `host` is a scalar — no `hosts = [...]` form. Multi-host workloads use multiple ingress blocks (which can share the same `service`).
+
+**No `rewrite`, no `headers`, no middleware.** voodu-caddy supports `path` matching and `strip` prefix removal — nothing else for now. Custom HTTP transformations belong in your app.
+
+**`tls {}` defaults to enabled.** Declaring a bare `tls {}` block flips both `enabled` and `provider = "letsencrypt"`. To serve plain HTTP, omit the block entirely.
+
+**`on_demand` needs `ask`.** No `allow_all` fallback. Your app endpoint decides which subdomains are real customers — that's what keeps the wildcard safe.
+
+**`/load` is atomic.** Every ingress change rewrites the full Caddy config from disk. There's no partial reload — atomic-replace ensures consistency across all routes.
+
+**State survives uninstall.** voodu-caddy keeps `/data` (certs) and `/routes/*.json` (route definitions) on uninstall. Reinstalls pick up existing certs without re-issuing.
+
+**Path matching is glob-style.** Caddy needs both the exact prefix AND the `prefix/*` form to match. voodu-caddy emits both automatically — don't add the wildcard yourself.
+
+**Plugin scope.** Routes are reconciled by [voodu-caddy](/docs/plugins/caddy), which runs as a docker container on the `voodu0` network. Deployments and apps join `voodu0` automatically, so upstream service names resolve via Docker DNS inside the Caddy container.
+
+## See also
+
+- [`app`](/docs/manifests/app) — sugar that generates this ingress for you
+- [voodu-caddy plugin](/docs/plugins/caddy) — the backend that reconciles routes
+- [`probes`](/docs/manifests/probes) — readiness gating that interacts with active HC

@@ -1,0 +1,91 @@
+---
+title: config & secrets
+description: Out-of-band env vars that always win.
+---
+
+## Why out-of-band?
+
+Manifest env blocks are great for non-secrets (`NODE_ENV`, `PORT`, `LOG_LEVEL`). But secrets shouldn't live in a file that gets committed.
+
+`voodu config` stores env vars in the controller's encrypted store, scoped per app. **`config:set` always wins over manifest `env` blocks** — a runaway apply can't reset a production secret.
+
+## Set
+
+```bash
+voodu config set DATABASE_URL=postgres://... -a prod
+voodu config set SECRET_KEY_BASE=$(openssl rand -hex 32) -a prod
+```
+
+## Get / list
+
+```bash
+voodu config get DATABASE_URL -a prod
+voodu config list -a prod
+```
+
+## Reload
+
+Some env changes require a restart:
+
+```bash
+voodu config reload -a prod
+```
+
+`reload` re-renders the env into running containers and bounces replicas one at a time.
+
+## Virtual buckets
+
+Group secrets that belong to a tool, not an app — useful for shared CLI configs (AWS, R2, Docker auth):
+
+```bash
+voodu config aws/cli set AWS_ACCESS_KEY_ID=AKIA...
+voodu config aws/cli set AWS_SECRET_ACCESS_KEY=...
+voodu config aws/cli set AWS_DEFAULT_REGION=us-east-1
+```
+
+Reference from a manifest:
+
+```hcl
+cronjob "prod" "backup" {
+  image    = "amazon/aws-cli:latest"
+  env_from = ["aws/cli"]
+
+  command = ["s3", "sync", "/data/", "s3://bucket/data/"]
+}
+```
+
+## env_from feeds parse-time `${VAR}`
+
+`env_from = ["scope/name"]` does two things:
+
+1. **At runtime** — keys from the bucket are injected as env vars into the container.
+2. **At apply time** — the CLI fetches the bucket *before* parsing the manifest, so `${KEY}` interpolation can resolve from it.
+
+This second point is the unlock: webhook URLs, pager keys, slack hooks no longer need a per-dev `export`.
+
+```hcl
+deployment "prod" "api" {
+  env_from = ["prod/shared"]
+
+  on_deploy {
+    success { url = "${SLACK_WEBHOOK_URL}" }   # resolved from prod/shared
+  }
+}
+```
+
+```bash
+voodu config prod/shared set SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+voodu apply -f voodu.hcl -r prod-1
+```
+
+**Precedence on collision:** shell env wins over bucket. So `SLACK_WEBHOOK_URL=https://test ./bin/voodu apply ...` overrides without touching the bucket — handy for testing.
+
+**Caveat:** bucket-fed interpolation is **local-apply only**. With `-r <remote>`, the CLI runs in your shell, fetches the buckets locally, and ships the resolved manifest. The SSH-forward path keeps shell-only resolution.
+
+## Precedence
+
+```
+voodu config set ...        ← always wins
+app.env { ... }             ← manifest defaults
+build args / docker ENV     ← lowest priority
+```

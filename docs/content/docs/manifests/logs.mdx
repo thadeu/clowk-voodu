@@ -1,0 +1,126 @@
+---
+title: logs
+description: Docker log driver caps — size and rotation.
+---
+
+`logs { max_size max_files }` configures the docker log driver's local file rotation. Default is 10MB × 3 files (30MB total per container).
+
+Accepted on `deployment`, `app`, `statefulset`, `job`, `cronjob`.
+
+## Synopsis
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  logs {
+    max_size  = "10m"
+    max_files = 3
+  }
+}
+```
+
+## Fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `max_size` | string | `"10m"` | Per-file cap. Docker units. |
+| `max_files` | int | `3` | Number of files retained (active + historical). Total disk ≈ `max_size × max_files`. |
+
+## Value formats
+
+| `max_size` | Means |
+|---|---|
+| `"10m"` | 10 megabytes |
+| `"500k"` | 500 kilobytes |
+| `"1g"` | 1 gigabyte |
+| `"1024"` | 1024 bytes |
+
+Suffixes are case-insensitive (`m` = `M`).
+
+## Defaults
+
+When `logs {}` is omitted entirely, voodu synthesizes `{ max_size: "10m", max_files: 3 }`.
+
+Per-field defaults apply independently:
+
+```hcl
+logs {
+  max_size = "50m"   # max_files defaults to 3
+}
+```
+
+```hcl
+logs {
+  max_files = 10     # max_size defaults to "10m"
+}
+```
+
+## Examples
+
+### Chatty service — bigger buffer
+
+```hcl
+deployment "prod" "api" {
+  image = "ghcr.io/myorg/api:1.7"
+
+  logs {
+    max_size  = "100m"
+    max_files = 5
+  }
+}
+```
+
+500MB per replica retained on disk. Trade-off: more debugging history vs. more disk.
+
+### Long-lived service — tight buffer
+
+```hcl
+deployment "prod" "edge" {
+  image = "ghcr.io/myorg/edge:1.0"
+
+  logs {
+    max_size  = "5m"
+    max_files = 2
+  }
+}
+```
+
+10MB per replica. For ingress edges that just log requests and ship them externally, this is plenty.
+
+### Cronjob with bigger buffer
+
+```hcl
+cronjob "data" "nightly-report" {
+  schedule = "0 3 * * *"
+  image    = "ghcr.io/myorg/reports:1.0"
+
+  logs {
+    max_size  = "200m"
+    max_files = 2
+  }
+}
+```
+
+Nightly jobs often produce verbose output you want to inspect later via `voodu logs`.
+
+## Trade-offs
+
+**Docker freezes log opts at create time.** Changing `max_size` or `max_files` triggers a container recreate — `docker update` does not touch log driver options. So this knob IS in the spec hash.
+
+**Total ≈ size × files.** Docker keeps `max_files - 1` historical files plus the active one, so it's a close approximation. `max_size = "100m", max_files = 10` is roughly 1GB per replica.
+
+**`max_files = 0` or negative is normalized away.** Voodu always emits a non-nil cap — there's no "unbounded logs" escape hatch through HCL. Setting `max_files = 0` falls back to the `3` default.
+
+**Per-container, not per-resource.** Each replica of a deployment has its own rotation. A 3-replica deployment with `100m × 3` retains up to 900MB total across replicas.
+
+**No external log shipping.** voodu doesn't ship logs anywhere. You can use `voodu logs <scope/name>` to tail, but for centralized logging, run a sidecar (fluentbit, vector) or rely on docker's log driver options externally.
+
+**`voodu logs` tails from disk.** It reads the rotated files; nothing fancier. So your rotation cap is also your `voodu logs --tail` history cap.
+
+**Apply caches and resilience.** If a node loses disk, log capping at least keeps it from being your loss-of-disk root cause.
+
+## See also
+
+- [voodu logs](/docs/cli/logs) — tailing container logs
+- [`deployment`](/docs/manifests/deployment), [`app`](/docs/manifests/app), [`statefulset`](/docs/manifests/statefulset), [`job`](/docs/manifests/jobs), [`cronjob`](/docs/manifests/jobs#cronjob)

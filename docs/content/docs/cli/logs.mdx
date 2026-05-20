@@ -1,0 +1,44 @@
+---
+title: voodu logs
+description: Tail container logs — single pod, scope-wide, or multiplexed.
+---
+
+## Synopsis
+
+```bash
+voodu logs <target> [flags]
+```
+
+`<target>` can be:
+
+- A resource key: `app/prod/api`
+- A pod name: `prod-api.0`
+- A scope: `-s prod` (multiplexes all pods in scope)
+- A kind: `cronjob clowk-lp/wal-sync-s3`
+
+## Common usage
+
+```bash
+# Tail one app, all replicas multiplexed
+voodu logs app/prod/api -f
+
+# Single replica
+voodu logs prod-api.1
+
+# Whole scope (apps + cronjobs + jobs)
+voodu logs -s prod -f
+
+# Last 200 lines, no follow
+voodu logs app/prod/api -n 200
+```
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `-f`, `--follow` | Stream new lines as they appear. |
+| `-n`, `--tail` | Number of historical lines (default 100). |
+| `-s`, `--scope` | Multiplex across a scope. |
+| `--since` | Show lines since: `5m`, `1h`, `2025-01-01T00:00:00Z`. |
+| `--grep` | Server-side line filter (regex). |
+| `--no-prefix` | Omit the `[pod-name]` prefix in multiplexed output. |

@@ -1,0 +1,74 @@
+---
+title: Introduction
+description: Voodu is a self-hosted PaaS — one HCL file, one apply, no git push.
+---
+
+## What is Voodu?
+
+Voodu is a **Heroku-shaped, Kubernetes-honest** deploy tool you run on your own boxes.
+
+One HCL file describes the running system. `voodu apply` reconciles it: builds, ships, routes, swaps. No bare repo, no `git push`, no plugin sprawl — apps, ingress with TLS, and stateful services that actually back themselves up.
+
+```hcl title="voodu.hcl"
+app "myapp" "web" {
+  image    = "ghcr.io/myorg/myapp:latest"
+  replicas = 3
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  health_check = "/healthz"
+  host         = "myapp.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+```bash
+voodu apply -f voodu.hcl -r prod-1
+# ✓ apply complete in 11.8s
+# ✓ https://myapp.example.com  ·  3/3 healthy
+```
+
+## Why Voodu?
+
+- **One file, one command.** No `git push`, no bare repo, no commit ceremony. Edit, save, `voodu apply`.
+- **Declarative apply, not git-push.** Diff shows the plan. Apply reconciles. Upsert-only by default — `--prune` is the explicit opt-in (scoped per `(scope, kind)`).
+- **Stateful services are first-class.** Postgres, Mongo, Redis (+ sentinel) declared like apps. Plugins ship backup, replicas, and test-restore.
+- **TLS out of the box.** Add `tls {}` and Voodu cuts a Let's Encrypt cert via Caddy. On-demand wildcards.
+- **k8s shape, not k8s ops.** Same reconciliation loop, none of the CNI/Helm/operator bill.
+- **100% self-hosted, MIT.** Single Go binary, embedded etcd, no cloud tier, no telemetry.
+
+## Quickstart
+
+1. [Install Voodu on your laptop](/docs/getting-started/install)
+2. [Bootstrap a remote](/docs/getting-started/remotes)
+3. [Ship your first app](/docs/getting-started/first-deploy)
+
+## Manifest reference
+
+The full HCL surface, kind by kind:
+
+- [Overview](/docs/manifests/overview) — `(scope, name)`, blocks, references
+- [`app`](/docs/manifests/app) — web services, workers, replicas
+- [`ingress` + `tls`](/docs/manifests/ingress) — Caddy routes + ACME
+- [`postgres`](/docs/manifests/postgres), [`redis`](/docs/manifests/redis) — stateful with backup
+- [`job` / `cronjob`](/docs/manifests/jobs) — one-shots and schedules
+- [`config` & secrets](/docs/manifests/config) — out-of-band env
+
+## CLI
+
+Six verbs cover ~95% of day-to-day:
+
+| Command | What it does |
+|---|---|
+| [`voodu apply`](/docs/cli/apply) | Stream context, plan, reconcile |
+| [`voodu diff`](/docs/cli/diff) | Dry-run plan, exit-code-gated for CI |
+| [`voodu logs`](/docs/cli/logs) | Tail container logs (single, scope, multiplex) |
+| [`voodu config`](/docs/cli/config) | Set/get env vars per app |
+| [`voodu remote`](/docs/cli/remote) | SSH targets for multi-host |
+| [`voodu plugins`](/docs/cli/plugins) | Install/list/update plugins |
