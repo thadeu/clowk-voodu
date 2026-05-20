@@ -49,16 +49,17 @@ func TestExampleFanoutMultiTargetParses(t *testing.T) {
 	}
 }
 
-// TestExampleFswEslParses ensures the shipped examples/fsw-esl/voodu.hcl
-// validates against the current parser. Catches drift between the
-// real-world telephony example and the HCL grammar.
+// TestExampleFswEslParses pins the shape of the per-file-split fsw-esl
+// example. `ParseDir` walks the directory so every per-service file
+// validates together — the bootstrap apply path operators run on a
+// fresh host.
 func TestExampleFswEslParses(t *testing.T) {
 	vars := map[string]string{
 		"SLACK_WEBHOOK_URL": "https://hooks.slack.example/x",
 		"PD_ROUTING_KEY":    "pd-fake",
 	}
 
-	mans, err := ParseFile("../../examples/fsw-esl/voodu.hcl", vars)
+	mans, err := ParseDir("../../examples/fsw-esl", vars)
 	if err != nil {
 		t.Fatalf("parse fsw-esl example: %v", err)
 	}
@@ -78,5 +79,50 @@ func TestExampleFswEslParses(t *testing.T) {
 	}
 	if got := counts["deployment"]; got != 5 {
 		t.Errorf("deployment: got %d, want 5 (api, adapter, controller, events, jobs)", got)
+	}
+}
+
+// TestExampleFswEslIndividualFilesParse asserts each per-service file
+// is independently valid HCL — that's the whole point of the split:
+// `vd apply -f api.hcl` must work without seeing the others.
+func TestExampleFswEslIndividualFilesParse(t *testing.T) {
+	vars := map[string]string{
+		"SLACK_WEBHOOK_URL": "https://hooks.slack.example/x",
+		"PD_ROUTING_KEY":    "pd-fake",
+	}
+
+	files := []struct {
+		path    string
+		wantKind string
+		wantName string
+	}{
+		{"../../examples/fsw-esl/redis.hcl", "redis", "redis"},
+		{"../../examples/fsw-esl/rabbitmq.hcl", "statefulset", "rabbitmq"},
+		{"../../examples/fsw-esl/api.hcl", "deployment", "api"},
+		{"../../examples/fsw-esl/adapter.hcl", "deployment", "adapter"},
+		{"../../examples/fsw-esl/controller.hcl", "deployment", "controller"},
+		{"../../examples/fsw-esl/events.hcl", "deployment", "events"},
+		{"../../examples/fsw-esl/jobs.hcl", "deployment", "jobs"},
+	}
+
+	for _, f := range files {
+		mans, err := ParseFile(f.path, vars)
+		if err != nil {
+			t.Errorf("parse %s: %v", f.path, err)
+			continue
+		}
+
+		if len(mans) != 1 {
+			t.Errorf("%s: got %d manifests, want 1", f.path, len(mans))
+			continue
+		}
+
+		if string(mans[0].Kind) != f.wantKind {
+			t.Errorf("%s: kind got %q, want %q", f.path, mans[0].Kind, f.wantKind)
+		}
+
+		if mans[0].Name != f.wantName {
+			t.Errorf("%s: name got %q, want %q", f.path, mans[0].Name, f.wantName)
+		}
 	}
 }
