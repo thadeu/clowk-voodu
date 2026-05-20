@@ -25,9 +25,15 @@
 #
 # Apply:
 #
+#   ### Recommended: store SLACK_WEBHOOK_URL in the prod/shared
+#   ### bucket so every dev's vd apply picks it up without an export.
+#
+#   vd config set -s prod -n shared \
+#     SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX"
 #   cd examples/on_deploy
-#   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX"
 #   vd apply -f slack-block-kit.hcl
+#
+#   (Shell still works as override: SLACK_WEBHOOK_URL=https://test/h vd apply ...)
 
 asset "prod" "slack" {
   success_blocks = file("./webhooks/slack-block-kit-success.json")
@@ -39,6 +45,10 @@ deployment "prod" "api" {
   replicas = 3
 
   ports = ["3000"]
+
+  # Pulls SLACK_WEBHOOK_URL into parse-time ${VAR} substitution.
+  # Same bucket also mounted as runtime env file — single source.
+  env_from = ["prod/shared"]
 
   env = {
     RAILS_ENV = "production"

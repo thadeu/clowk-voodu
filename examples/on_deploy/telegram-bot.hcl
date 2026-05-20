@@ -7,12 +7,11 @@
 #
 # What this shows:
 #
-#   1. Bot token comes from shell env (${TELEGRAM_BOT_TOKEN})
-#      and lands in the URL — never in git.
-#   2. chat_id comes from shell env too, inside the template
-#      file (${TELEGRAM_CHAT_ID}). Both interpolations are
-#      client-side at parse time.
-#   3. Inline body (no asset, no file) — the Telegram payload
+#   1. Bot token + chat_id come from the prod/shared bucket
+#      via env_from. The CLI fetches the bucket at parse time
+#      and ${TELEGRAM_BOT_TOKEN} / ${TELEGRAM_CHAT_ID} resolve
+#      from there.
+#   2. Inline body (no asset, no file) — the Telegram payload
 #      is small enough that the asset overhead would be more
 #      noise than benefit. Demonstrates the OTHER body mode
 #      (compare to pagerduty-on-failure.hcl / slack-block-kit.hcl
@@ -28,12 +27,29 @@
 #   to. Slack Block Kit's payload is 30+ lines of nested
 #   structure — inline would dwarf the deployment block.
 #
-# Apply:
+# Apply — two ways to feed ${TELEGRAM_BOT_TOKEN} / ${TELEGRAM_CHAT_ID}:
 #
-#   cd examples/on_deploy
-#   export TELEGRAM_BOT_TOKEN="123456:abcdefXXX"
-#   export TELEGRAM_CHAT_ID="-1009999999999"
-#   vd apply -f telegram-bot.hcl
+#   ### Option A: store in scope bucket (recommended for teams)
+#
+#   Set once on the controller, every dev's vd apply reads it:
+#
+#     vd config set -s prod -n shared \
+#       TELEGRAM_BOT_TOKEN="123456:abcdefXXX" \
+#       TELEGRAM_CHAT_ID="-1009999999999"
+#     cd examples/on_deploy
+#     vd apply -f telegram-bot.hcl
+#
+#   Rotation = one vd config set. Every dev's next vd apply picks
+#   up the new value. No `.envrc` to maintain across the team.
+#
+#   ### Option B: local shell only (single-dev / iteration)
+#
+#     export TELEGRAM_BOT_TOKEN="123456:abcdefXXX"
+#     export TELEGRAM_CHAT_ID="-1009999999999"
+#     vd apply -f telegram-bot.hcl
+#
+#   Shell wins over bucket on collision — useful for testing
+#   a different bot/chat temporarily without touching the bucket.
 
 deployment "prod" "api" {
   image    = "ghcr.io/acme/api:1.4.2"
@@ -44,6 +60,11 @@ deployment "prod" "api" {
   env = {
     RAILS_ENV = "production"
   }
+
+  # Bucket fed into ${VAR} interpolation at parse time AND
+  # mounted as runtime env file for the container. Same source,
+  # both stages.
+  env_from = ["prod/shared"]
 
   on_deploy {
     # Success notification — concise inline body. Telegram's

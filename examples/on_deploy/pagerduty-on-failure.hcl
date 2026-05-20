@@ -36,10 +36,16 @@
 #
 # Apply:
 #
+#   ### Recommended: store webhook secrets in the prod/shared
+#   ### bucket so the entire team applies without exports.
+#
+#   vd config set -s prod -n shared \
+#     SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX" \
+#     PD_ROUTING_KEY="R0000000000000000000000000000000"
 #   cd examples/on_deploy
-#   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX"
-#   export PD_ROUTING_KEY="R0000000000000000000000000000000"
 #   vd apply -f pagerduty-on-failure.hcl
+#
+#   (Shell still wins as override for testing: PD_ROUTING_KEY=test-key vd apply ...)
 
 asset "prod" "webhooks" {
   # PagerDuty Events API v2 body template. Contains the
@@ -53,6 +59,11 @@ asset "prod" "webhooks" {
 deployment "prod" "checkout" {
   image    = "ghcr.io/acme/checkout:2.7.0"
   replicas = 4
+
+  # Pulls SLACK_WEBHOOK_URL + PD_ROUTING_KEY into parse-time
+  # ${VAR} substitution. The bucket is also mounted as runtime
+  # env file for the container — single source of truth.
+  env_from = ["prod/shared"]
 
   ports = ["8080"]
 
