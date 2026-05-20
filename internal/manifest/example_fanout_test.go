@@ -48,3 +48,35 @@ func TestExampleFanoutMultiTargetParses(t *testing.T) {
 		t.Errorf("failure targets: got %d, want 2 (PagerDuty + OpsGenie)", got)
 	}
 }
+
+// TestExampleFswEslParses ensures the shipped examples/fsw-esl/voodu.hcl
+// validates against the current parser. Catches drift between the
+// real-world telephony example and the HCL grammar.
+func TestExampleFswEslParses(t *testing.T) {
+	vars := map[string]string{
+		"SLACK_WEBHOOK_URL": "https://hooks.slack.example/x",
+		"PD_ROUTING_KEY":    "pd-fake",
+	}
+
+	mans, err := ParseFile("../../examples/fsw-esl/voodu.hcl", vars)
+	if err != nil {
+		t.Fatalf("parse fsw-esl example: %v", err)
+	}
+
+	// Count by kind to pin the shape: 1 redis (macro), 1 rabbitmq
+	// statefulset, 5 deployments (api/adapter/controller/events/jobs).
+	counts := map[string]int{}
+	for _, m := range mans {
+		counts[string(m.Kind)]++
+	}
+
+	if got := counts["redis"]; got != 1 {
+		t.Errorf("redis: got %d, want 1", got)
+	}
+	if got := counts["statefulset"]; got != 1 {
+		t.Errorf("statefulset: got %d, want 1 (rabbitmq)", got)
+	}
+	if got := counts["deployment"]; got != 5 {
+		t.Errorf("deployment: got %d, want 5 (api, adapter, controller, events, jobs)", got)
+	}
+}
