@@ -1,6 +1,10 @@
 import InstallShell from './InstallShell';
 import HeroTerminal from './HeroTerminal';
 
+// Resolved at build time by docs.yml from the latest GitHub release tag.
+// Fallback to "dev" for local pnpm dev (no CI context).
+const VOODU_VERSION = process.env.NEXT_PUBLIC_VOODU_VERSION ?? 'dev';
+
 export default function Hero() {
   return (
     <header
@@ -11,7 +15,7 @@ export default function Hero() {
         <div>
           <span className="inline-flex items-center gap-2 font-mono text-[12px] tracking-[0.04em] text-voodu-fg-dim mb-6 py-1 pl-1.5 pr-2.5 border border-voodu-line rounded-full whitespace-nowrap">
             <span className="w-1.5 h-1.5 rounded-full bg-mint-400 shadow-[0_0_0_4px_rgba(125,249,193,0.22)]" />
-            v0.9.2 · <code className="font-mono text-voodu-fg ml-1">voodu apply</code>, no git push
+            {VOODU_VERSION} · <code className="font-mono text-voodu-fg ml-1">voodu apply</code>, no git push
           </span>
 
           <h1 className="font-sans font-semibold text-[clamp(40px,7vw,88px)] leading-[0.98] tracking-[-0.035em] mb-6 text-balance text-white">

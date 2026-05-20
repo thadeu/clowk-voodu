@@ -7,6 +7,12 @@ on:
       - 'docs/**'
       - 'install'
       - '.github/workflows/docs.yml'
+  # Rebuild whenever release.yml completes — picks up the new tag so
+  # the version pill in the hero stays in sync with the published binary.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
   workflow_dispatch:
 
 permissions:
@@ -51,7 +57,24 @@ jobs:
       - name: Copy install script
         run: cp ../install public/install
 
+      # Resolve the latest GitHub Release tag and inject it into the
+      # Next.js build as NEXT_PUBLIC_VOODU_VERSION. The Hero pill reads
+      # this at build time (NEXT_PUBLIC_* gets inlined into the static
+      # bundle). Empty result (no releases yet) falls through to the
+      # 'dev' default in Hero.tsx.
+      - name: Resolve latest release tag
+        id: version
+        working-directory: ${{ github.workspace }}
+        run: |
+          TAG="$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          echo "Latest release tag: ${TAG:-<none>}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build
+        env:
+          NEXT_PUBLIC_VOODU_VERSION: ${{ steps.version.outputs.tag }}
         run: pnpm build
 
       - name: Deploy to Cloudflare Pages
