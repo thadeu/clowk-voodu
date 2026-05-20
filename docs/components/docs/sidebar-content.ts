@@ -39,6 +39,13 @@ import {
   Disc3,
   GitMerge,
   Webhook,
+  FolderOpen,
+  Sparkle,
+  Lock,
+  HeartPulse,
+  Layers3,
+  GitFork,
+  Factory,
 } from 'lucide-react';
 
 export interface ListItem {
@@ -72,6 +79,26 @@ export const contents: SidebarSection[] = [
       { title: 'Controller', href: '/docs/architecture/controller', icon: Server },
       { title: 'Reconciler', href: '/docs/architecture/reconciler', icon: GitMerge },
       { title: 'HTTP API', href: '/docs/architecture/api', icon: Webhook },
+    ],
+  },
+  {
+    title: 'Examples',
+    icon: FolderOpen,
+    list: [
+      { title: 'Overview', href: '/docs/examples/overview', icon: Layers },
+      { title: 'Hello world', href: '/docs/examples/hello-world', icon: Sparkle },
+      { title: 'Ingress routing', href: '/docs/examples/ingress-routing', icon: Network },
+      { title: 'Build modes', href: '/docs/examples/build-modes', icon: Hammer },
+      { title: 'Private registry', href: '/docs/examples/private-registry', icon: Lock },
+      { title: 'Assets', href: '/docs/examples/assets', icon: Package },
+      { title: 'Health checks', href: '/docs/examples/health-checks', icon: HeartPulse },
+      { title: 'Init containers', href: '/docs/examples/init-containers', icon: Sparkles },
+      { title: 'Autoscale', href: '/docs/examples/autoscale', icon: Scaling },
+      { title: 'On-deploy webhooks', href: '/docs/examples/on-deploy', icon: Webhook },
+      { title: 'Stateful services', href: '/docs/examples/stateful-services', icon: Database },
+      { title: 'Multi-environment', href: '/docs/examples/multi-environment', icon: Layers3 },
+      { title: 'Shared scope', href: '/docs/examples/shared-scope', icon: GitFork },
+      { title: 'Production stack', href: '/docs/examples/production-stack', icon: Factory },
     ],
   },
   {

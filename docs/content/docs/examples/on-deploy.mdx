@@ -1,0 +1,175 @@
+---
+title: On-deploy webhooks
+description: Notify Slack / PagerDuty / Datadog after rollouts — parallel fan-out, independent retries.
+---
+
+`on_deploy {}` fires HTTP webhooks after a rolling restart settles. Two slots (`success` / `failure`), each accepts **multiple targets** that fire in parallel goroutines with independent retry budgets.
+
+Delivery is best-effort: 3 attempts (1s / 5s / 30s backoff), drop on floor. A webhook outage NEVER fails the deploy.
+
+Source: [`examples/on_deploy/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/on_deploy)
+
+## 1. Slack — default payload, same URL both slots
+
+```hcl title="slack-notify.hcl"
+deployment "prod" "api" {
+  image    = "ghcr.io/acme/api:1.4.2"
+  env_from = ["prod/shared"]
+  replicas = 3
+  ports    = ["3000"]
+
+  on_deploy {
+    success { url = "${SLACK_WEBHOOK_URL}" }
+    failure { url = "${SLACK_WEBHOOK_URL}" }
+  }
+}
+```
+
+Voodu sends a default payload `{kind, scope, name, status, release_id, image, error, started_at, completed_at}`. Slack-side workflow (Slack Workflow Builder, or an incoming-webhook formatter) keys off the JSON `status` field to switch tone.
+
+**Why declare both blocks with the same URL** — a bare `on_deploy { success { ... } }` would silently DROP every failure notification. That's the worst failure mode: operator thinks the channel is wired but only sees green-path events. Declaring both is explicit: "I want every outcome via this channel."
+
+**`SLACK_WEBHOOK_URL`** comes from the `prod/shared` config bucket via `env_from`. CLI fetches the bucket before parsing — the secret-bearing webhook URL never lives in git.
+
+## 2. Telegram — inline body
+
+Different shape: Telegram expects `{chat_id, text, parse_mode}` and the URL itself carries the bot token. Voodu's flexible body lets you POST it directly.
+
+```hcl title="telegram-bot.hcl"
+deployment "prod" "api" {
+  image    = "ghcr.io/acme/api:1.4.2"
+  env_from = ["prod/shared"]
+  ports    = ["3000"]
+
+  on_deploy {
+    success {
+      url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+
+      body = {
+        chat_id    = "${TELEGRAM_CHAT_ID}"
+        parse_mode = "MarkdownV2"
+        text       = "✅ deployed *{{scope}}/{{name}}*\n\nrelease: `{{release_id}}`"
+      }
+    }
+
+    failure {
+      url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+
+      body = {
+        chat_id              = "${TELEGRAM_CHAT_ID}"
+        parse_mode           = "MarkdownV2"
+        disable_notification = false
+        text                 = "🚨 FAILED *{{scope}}/{{name}}*\n\nrelease: `{{release_id}}`\nerror: ```{{error}}```"
+      }
+    }
+  }
+}
+```
+
+**Two interpolation contexts at play:**
+
+| Syntax | When | Resolves from |
+|---|---|---|
+| `${VAR}` | Parse time, client-side | Shell env + `env_from` buckets |
+| `{{field}}` | Fire time, controller-side | Rollout context (release_id, name, status, error, started_at, completed_at, image, scope, kind) |
+
+So `${TELEGRAM_BOT_TOKEN}` resolves on the operator's machine; `{{release_id}}` resolves on the server when the webhook actually fires.
+
+## 3. Multi-target fan-out
+
+The new pattern (since `success`/`failure` became slices). Each block = one HTTP target = one goroutine = one retry budget.
+
+```hcl title="fanout-multi-target.hcl"
+deployment "prod" "api" {
+  image    = "ghcr.io/myorg/api:1.7"
+  env_from = ["prod/shared"]   # SLACK_WEBHOOK_URL, DD_API_KEY, PD_ROUTING_KEY, OPSGENIE_KEY
+
+  on_deploy {
+    # Success → 3 destinations in parallel
+    success {
+      url = "${SLACK_WEBHOOK_URL}"
+    }
+
+    success {
+      url     = "https://api.datadoghq.com/api/v1/events"
+      headers = { "DD-API-KEY" = "${DD_API_KEY}" }
+
+      body = {
+        title = "voodu deploy: {{name}}"
+        text  = "Released {{release_id}} ({{image}})"
+        tags  = ["env:{{scope}}", "service:{{name}}", "deploy_outcome:success"]
+      }
+    }
+
+    success {
+      url    = "https://status.example.com/internal/api/deploys"
+      method = "POST"
+
+      body = {
+        service = "{{name}}"
+        version = "{{image}}"
+        when    = "{{completed_at}}"
+      }
+    }
+
+    # Failure → PagerDuty primary, OpsGenie backup
+    failure {
+      url     = "https://events.pagerduty.com/v2/enqueue"
+      headers = { "X-Routing-Key" = "${PD_ROUTING_KEY}" }
+      file    = "${asset.prod.webhooks.pagerduty_event}"
+    }
+
+    failure {
+      url     = "https://api.opsgenie.com/v2/alerts"
+      headers = { "Authorization" = "GenieKey ${OPSGENIE_KEY}" }
+
+      body = {
+        message     = "voodu rollout failed: {{scope}}/{{name}}"
+        description = "{{error}}"
+        priority    = "P2"
+        tags        = ["voodu", "deploy-failure", "{{scope}}"]
+      }
+    }
+  }
+}
+
+asset "prod" "webhooks" {
+  pagerduty_event = file("./webhooks/pagerduty-event.json")
+}
+```
+
+**Independent retry budgets** — a slow PagerDuty doesn't delay Slack. A failed OpsGenie doesn't affect PagerDuty's outcome. Each goroutine has its own 3-attempt budget, its own backoff, its own drop-on-floor.
+
+**Three body modes** in one example:
+- `body` omitted → voodu's default JSON payload (Slack workflow case)
+- `body = { ... }` → inline structure (Datadog, OpsGenie cases)
+- `file = "${asset.…}"` → asset-backed JSON template (PagerDuty case — full schema lives in `./webhooks/pagerduty-event.json`)
+
+## When to inline vs file-backed body
+
+| Body shape | Use |
+|---|---|
+| ≤ 3-5 flat fields | Inline `body = { ... }` — keeps intent visible alongside the URL |
+| ≥ 5 lines of nested JSON | Asset + `file = "${asset.…}"` — lints in your editor, fits a real JSON file |
+
+Block Kit (Slack), PagerDuty Events v2, and similar receiver-specific schemas usually fall into the second category.
+
+## Apply
+
+```bash
+# Seed the bucket with all the secrets
+vd config set -s prod -n shared \
+  SLACK_WEBHOOK_URL=... \
+  DD_API_KEY=... \
+  PD_ROUTING_KEY=... \
+  OPSGENIE_KEY=...
+
+# Apply
+voodu apply -f fanout-multi-target.hcl -r prod
+```
+
+## Related
+
+- [`on_deploy` manifest reference](/docs/manifests/on-deploy) — slot semantics, validation, log format
+- [Assets](/docs/examples/assets) — for `file = "${asset.…}"` template-backed bodies
+- [Interpolation reference](/docs/manifests/interpolation) — `${VAR}` vs `{{field}}` deep dive

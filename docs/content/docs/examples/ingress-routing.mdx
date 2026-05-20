@@ -1,0 +1,157 @@
+---
+title: Ingress routing
+description: Path-based fan-out, multiple hosts, TLS profiles.
+---
+
+Once a single deployment + ingress works, real apps grow into:
+
+- Multiple paths on one host
+- Multiple deployments fronted by one host (versioned APIs)
+- Mix of public TLS, internal CA, on-demand wildcards
+
+Source:
+- [`examples/ingress/paths.hcl`](https://github.com/thadeu/clowk-voodu/blob/main/examples/ingress/paths.hcl)
+- [`examples/ingress/profiles.hcl`](https://github.com/thadeu/clowk-voodu/blob/main/examples/ingress/profiles.hcl)
+
+## Path-based fan-out
+
+```hcl
+deployment "acme" "api-v1" {
+  image = "ghcr.io/acme/api-v1:latest"
+}
+
+deployment "acme" "api-v2" {
+  image = "ghcr.io/acme/api-v2:latest"
+}
+
+ingress "acme" "api-v1" {
+  host    = "api.example.com"
+  service = "api-v1"
+
+  location { path = "/api/v1" }
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+
+ingress "acme" "api-v2" {
+  host    = "api.example.com"
+  service = "api-v2"
+
+  location { path = "/api/v2" }
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+Two distinct deployments behind one host, each owning its path. Voodu rejects two ingresses claiming the same host **unless** they declare distinct `location {}` blocks. Caddy matches the most specific prefix first, so order in the manifest doesn't matter.
+
+## Strip prefix
+
+```hcl
+ingress "clowk" "voodu-docs" {
+  host    = "clowk.in"
+  service = "voodu-docs"
+
+  location {
+    path  = "/docs/voodu"
+    strip = true
+  }
+}
+```
+
+The container sees `/getting-started` instead of `/docs/voodu/getting-started` — useful when routing a generic image (nginx serving from `/`, an unmodified static site) that doesn't know about your URL prefix.
+
+## Catch-all next to specific paths
+
+```hcl
+ingress "clowk" "landing" {
+  host    = "clowk.in"
+  service = "landing"
+}
+```
+
+No `location {}` block → matches every request not claimed by a more-specific ingress on the same host. Equivalent to `location { path = "/" }`, just less boilerplate.
+
+## TLS profiles
+
+Four shapes supported by [voodu-caddy](/docs/plugins/caddy):
+
+### 1. Plain HTTP
+
+```hcl
+ingress "public" "api_http" {
+  host    = "api.internal"
+  service = "api"
+  port    = 3000
+}
+```
+
+No `tls {}` block. Plain `:80` proxy. Use for internal-only services or when you front voodu with another TLS terminator.
+
+### 2. Public TLS (Let's Encrypt)
+
+```hcl
+ingress "public" "api_public" {
+  host    = "api.clowk.in"
+  service = "api"
+  port    = 3000
+
+  tls {
+    email = "ops@clowk.in"
+  }
+}
+```
+
+The default — declare `tls {}` and Caddy provisions a Let's Encrypt cert via ACME HTTP-01. Multiple ingresses sharing `email` reuse one ACME account. Does **not** support wildcards (HTTP-01 can't validate `*.example.com`).
+
+### 3. Internal CA
+
+```hcl
+ingress "public" "api_internal" {
+  host    = "api.dev.local"
+  service = "api"
+  port    = 3000
+
+  tls {
+    enabled  = true
+    provider = "internal"
+  }
+}
+```
+
+Caddy's built-in CA. Dev / staging without a public domain — browsers warn until you trust the CA. Cheap and offline.
+
+### 4. On-demand wildcard
+
+```hcl
+ingress "public" "tenants_wildcard" {
+  host    = "*.clowk.in"
+  service = "app"
+  port    = 3000
+
+  tls {
+    enabled   = true
+    provider  = "letsencrypt"
+    email     = "ssl@clowk.in"
+    on_demand = true
+    ask       = "http://app:3000/internal/allow_domain"
+  }
+}
+```
+
+The only profile that accepts true wildcards. Cert issued on the first HTTPS hit, gated by `ask` — an HTTP endpoint on your app that returns 200 for legit tenants. **`ask` is required** when `on_demand = true`; without it voodu-caddy would be an open cert-issuance proxy.
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+```
+
+## Related
+
+- [`ingress` manifest reference](/docs/manifests/ingress) — full field list
+- [voodu-caddy plugin](/docs/plugins/caddy) — the backend that drives this

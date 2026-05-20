@@ -1,0 +1,203 @@
+---
+title: Build modes
+description: Skip the registry — voodu builds your image from source on every apply.
+---
+
+`build {}` tells voodu to compile the image on the controller instead of pulling from a registry. The CLI tarballs your context, streams it over SSH, runs `docker build`, tags it `<scope>-<name>:latest`, and starts the container.
+
+Source: [`examples/build/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/build)
+
+## 1. Auto-detect runtime (no Dockerfile, no `build {}`)
+
+The terse shape. Voodu sniffs `go.mod`, `Gemfile`, `package.json`, `pyproject.toml`, etc. and generates a Dockerfile when your repo doesn't ship one.
+
+```hcl title="auto-detect.hcl"
+deployment "demo" "web" {
+  replicas = 1
+  ports    = ["3000"]
+
+  env = {
+    NODE_ENV = "production"
+  }
+}
+
+ingress "demo" "web" {
+  host = "demo.lvh.me"
+  port = 3000
+
+  tls {
+    provider = "internal"
+  }
+}
+```
+
+Use this when:
+- the repo **is** the app (no monorepo split)
+- the runtime is one voodu auto-detects
+- you don't need custom build args
+
+Note `tls { provider = "internal" }` — Caddy self-signed for local development. Public TLS would be `provider = "letsencrypt"` (the default when `tls {}` is bare).
+
+## 2. Custom Dockerfile + build args + capabilities
+
+For real-world services with non-trivial requirements (kernel caps, host networking, hand-written Dockerfile).
+
+```hcl title="custom-dockerfile.hcl"
+deployment "voice" "fsw" {
+  replicas = 1
+  ports    = ["5060/udp", "5061/tcp", "16384-32768/udp"]
+
+  network_mode = "host"
+  cap_add      = ["SYS_NICE", "NET_ADMIN"]
+
+  extra_hosts = [
+    "sip-gateway:10.0.0.42",
+    "voicemail-store:10.0.0.43",
+  ]
+
+  env = {
+    FS_PROFILE = "production"
+  }
+
+  build {
+    context    = "apps/esl"
+    dockerfile = "Dockerfile.fsw"
+
+    args = {
+      SERVICE        = "fsw"
+      FREESWITCH_TAG = "1.10.11"
+    }
+  }
+}
+```
+
+**Why each knob:**
+
+| Knob | Purpose |
+|---|---|
+| `build.context = "apps/esl"` | Only this subtree is tarballed (smaller upload, tighter cache) |
+| `build.dockerfile = "Dockerfile.fsw"` | Custom name → voodu skips auto-gen, uses what you wrote |
+| `build.args` | docker-compose-style. Parametrises one Dockerfile for multiple services (`SERVICE=api`, `SERVICE=worker`) |
+| `cap_add = ["SYS_NICE", "NET_ADMIN"]` | FreeSWITCH needs realtime scheduling — without these caps the kernel rejects `sched_setscheduler()` |
+| `network_mode = "host"` | RTP NAT traversal needs the host's interfaces directly |
+| `extra_hosts` | Legacy SIP gateways that aren't in Docker DNS |
+
+No `lang {}` block — custom Dockerfiles bypass language handlers entirely.
+
+## 3. Go monorepo with multiple services
+
+Each deployment picks a different `build.context` so the tarball only includes the relevant subtree. Faster uploads + tighter docker build cache.
+
+```hcl title="go-monorepo.hcl"
+deployment "shop" "api" {
+  replicas = 2
+  ports    = ["8080"]
+
+  build {
+    context = "apps/api"
+    path    = "cmd/api"
+
+    args = {
+      GIT_SHA = "${GIT_SHA:-dev}"
+    }
+
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
+  }
+}
+
+deployment "shop" "worker" {
+  replicas = 3
+
+  build {
+    context = "apps/worker"
+    path    = "cmd/worker"
+
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
+  }
+}
+
+deployment "shop" "scheduler" {
+  replicas = 1
+
+  build {
+    context = "apps/scheduler"
+    path    = "cmd/scheduler"
+
+    lang {
+      name    = "go"
+      version = "1.25"
+    }
+  }
+}
+```
+
+**`build.path = "cmd/api"`** tells the Go handler which subdirectory inside the context to compile. The auto-generated Dockerfile becomes `go build ./cmd/api`. Useful for cmd/-style monorepos.
+
+**`${GIT_SHA:-dev}`** is parse-time shell interpolation. `GIT_SHA=$(git rev-parse HEAD) voodu apply ...` bakes the SHA into the binary via `-ldflags`. Falls back to `"dev"` locally.
+
+## 4. Statefulset with inline-built image
+
+Postgres + pgvector compiled on the controller — no separate CI to publish the image.
+
+```hcl title="statefulset-pgvector.hcl"
+statefulset "data" "pg" {
+  replicas = 1
+  ports    = ["5432"]
+
+  env = {
+    POSTGRES_DB = "appdata"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+    size       = "20Gi"
+  }
+
+  build {
+    context    = "infra/postgres"
+    dockerfile = "Dockerfile.pgvector"
+
+    args = {
+      PG_MAJOR         = "16"
+      PGVECTOR_VERSION = "0.7.4"
+    }
+  }
+}
+```
+
+`infra/postgres/Dockerfile.pgvector`:
+
+```dockerfile
+ARG PG_MAJOR=16
+ARG PGVECTOR_VERSION=0.7.4
+
+FROM postgres:${PG_MAJOR}
+RUN apt-get update && apt-get install -y \
+    postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_VERSION}* \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+Statefulsets support `build {}` identically to deployments — same fields, same defaults. The difference vs a deployment is runtime side (stable ordinal identity, per-pod volume claims), orthogonal to how the image is produced.
+
+## Build cache
+
+Tarball hashing is content-addressed: identical context bytes → identical sha256 → voodu skips the rebuild and just repoints `current`. Edit a comment with the same number of whitespace bytes? Same tarball, same hash, no rebuild.
+
+Force a rebuild:
+
+```bash
+voodu apply -f voodu.hcl --force
+# or
+VOODU_FORCE_REBUILD=1 voodu apply -f voodu.hcl
+```
+
+## Related
+
+- [`build` manifest reference](/docs/manifests/build) — full field list
+- [`statefulset` reference](/docs/manifests/statefulset) — for the pgvector example

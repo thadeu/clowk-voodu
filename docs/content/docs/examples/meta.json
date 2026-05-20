@@ -1,0 +1,20 @@
+{
+  "title": "Examples",
+  "icon": "FolderOpen",
+  "pages": [
+    "overview",
+    "hello-world",
+    "ingress-routing",
+    "build-modes",
+    "private-registry",
+    "assets",
+    "health-checks",
+    "init-containers",
+    "autoscale",
+    "on-deploy",
+    "stateful-services",
+    "multi-environment",
+    "shared-scope",
+    "production-stack"
+  ]
+}

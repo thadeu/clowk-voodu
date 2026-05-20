@@ -1,0 +1,277 @@
+---
+title: Production stack
+description: Real-world docker-compose translation — per-service file split, multi-tier, multi-env-ready.
+---
+
+The capstone example: a working production stack translated from docker-compose. Telephony layer (FreeSWITCH ESL) with redis + rabbitmq + 5 Go services, all built from one shared `apps/esl` context with a `SERVICE` build-arg.
+
+Demonstrates everything the previous pages cover, composed:
+
+- **Per-service file split** — `redis.hcl`, `rabbitmq.hcl`, `api.hcl`, `adapter.hcl`, `controller.hcl`, `events.hcl`, `jobs.hcl`. Each deploys independently.
+- **Statefulset with persistent volume** (rabbitmq) + **redis macro** (replaces compose's bare service).
+- **Init containers** waiting on dependencies (redis + rabbitmq + sibling services) before booting.
+- **Autoscale** on the stateless tier (api, adapter, events, jobs).
+- **Multi-target `on_deploy`** — controller rollouts fan out to Slack + PagerDuty in parallel goroutines.
+- **Build-cache sharing** — same `./apps/esl` context with different `SERVICE` build-args, layers reused.
+- **Shared config bucket** (`fsw/shared`) for all `${VAR}` interpolation.
+
+Source: [`examples/fsw-esl/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/fsw-esl)
+
+## Layout
+
+```
+examples/fsw-esl/
+├── README.md
+├── redis.hcl           # harness (rarely changes)
+├── rabbitmq.hcl        # harness (rarely changes)
+├── api.hcl             # per-service files, each deployable in isolation
+├── adapter.hcl
+├── controller.hcl
+├── events.hcl
+└── jobs.hcl
+```
+
+## Mapping from docker-compose
+
+| Compose service | File | Voodu kind | Why |
+|---|---|---|---|
+| `redis` | `redis.hcl` | `redis` macro | Plugin gives default probes + `REDIS_URL` emission via `vd redis:link`. |
+| `rabbitmq` | `rabbitmq.hcl` | `statefulset` | Per-pod `volume_claim "data"` survives `vd apply --prune`. |
+| `api` | `api.hcl` | `deployment` + `autoscale` | Stateless HTTP. Compose runs 1 replica; voodu scales 2–4. |
+| `adapter` | `adapter.hcl` | `deployment` + `autoscale` | Stateless HTTP router. Voodu scales 2–6. |
+| `controller` | `controller.hcl` | `deployment` (replicas=1) | Single-instance + `on_deploy` Slack/PagerDuty fan-out. |
+| `events` | `events.hcl` | `deployment` + `autoscale` | Background AMQP consumer. Voodu scales 1–4. |
+| `jobs` | `jobs.hcl` | `deployment` + `autoscale` | Background workers + host bind-mount. Voodu scales 2–10. |
+
+## What voodu adds
+
+1. **Per-service deploys** — touching `jobs.hcl` only deploys jobs; api/adapter/controller/events stay running on their current images.
+2. **Autoscale** — CPU-based hysteresis on the stateless tier (compose has no native scaling).
+3. **Probes drive readiness** — Caddy (when fronting any service) routes traffic only to ready replicas. Compose's healthchecks only restart.
+4. **`on_deploy` multi-target** — controller rollouts notify Slack AND PagerDuty in parallel.
+5. **Statefulset volumes survive prune** — rabbitmq data is per-pod-ordinal.
+6. **Same HCL for staging + prod** — values come from per-host config bucket; manifests are bit-identical.
+7. **Build cache shared** — content-addressed tarball hashes; identical source skips the rebuild.
+8. **`vd diff --detailed-exitcode`** — terraform-style CI exit codes (0 = no change, 2 = changes pending).
+
+## The harness
+
+Redis (macro) — default probes + entrypoint wrapper:
+
+```hcl title="redis.hcl"
+redis "fsw" "redis" {
+  image = "redis:8"
+
+  resources {
+    limits {
+      cpu    = "1"
+      memory = "512Mi"
+    }
+  }
+}
+```
+
+RabbitMQ (statefulset) — persistent volume + management UI:
+
+```hcl title="rabbitmq.hcl"
+statefulset "fsw" "rabbitmq" {
+  image    = "rabbitmq:3-management"
+  replicas = 1
+  ports    = ["5672", "15672"]
+
+  env = {
+    RABBITMQ_DEFAULT_USER = "guest"
+    RABBITMQ_DEFAULT_PASS = "guest"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/rabbitmq"
+  }
+
+  probes {
+    startup {
+      tcp_socket { port = 5672 }
+      period            = "5s"
+      failure_threshold = 30
+    }
+
+    liveness {
+      exec { command = ["rabbitmq-diagnostics", "-q", "ping"] }
+      period            = "10s"
+      timeout           = "5s"
+      failure_threshold = 3
+    }
+  }
+}
+```
+
+## The application tier (excerpt)
+
+Each Go service uses the same `./apps/esl` context with a different `SERVICE` build-arg.
+
+```hcl title="api.hcl"
+deployment "fsw" "api" {
+  build {
+    context    = "./apps/esl"
+    dockerfile = "Dockerfile"
+    args = {
+      SERVICE = "api"
+    }
+  }
+
+  env_from = ["fsw/shared"]
+  ports    = ["9092"]
+
+  autoscale {
+    min        = 2
+    max        = 4
+    cpu_target = 60
+  }
+
+  probes {
+    readiness {
+      http_get { path = "/healthz" port = 9092 }
+      period            = "5s"
+      success_threshold = 2
+    }
+
+    liveness {
+      http_get { path = "/healthz" port = 9092 }
+      period            = "10s"
+      failure_threshold = 3
+    }
+  }
+}
+```
+
+## Controller — the mission-critical service
+
+Single replica + `init` waiting for every dep + `on_deploy` multi-target.
+
+```hcl title="controller.hcl"
+deployment "fsw" "controller" {
+  build {
+    context    = "./apps/esl"
+    dockerfile = "Dockerfile"
+    args = {
+      SERVICE = "controller"
+    }
+  }
+
+  env_from = ["fsw/shared"]
+  ports    = ["9090", "9091"]
+  replicas = 1
+
+  init "wait-deps" {
+    image   = "alpine:latest"
+    command = ["sh", "-c", <<-EOT
+      set -eu
+      apk add --no-cache redis netcat-openbsd > /dev/null
+      until redis-cli -h redis.fsw.voodu -p 6379 ping > /dev/null 2>&1; do sleep 1; done
+      until nc -z rabbitmq-0.fsw.voodu 5672; do sleep 1; done
+      until nc -z api.fsw.voodu 9092; do sleep 1; done
+      until nc -z adapter.fsw.voodu 8080; do sleep 1; done
+    EOT
+    ]
+    timeout = "120s"
+  }
+
+  on_deploy {
+    success {
+      url = "${SLACK_WEBHOOK_URL}"
+      body = { text = ":white_check_mark: controller deployed: {{release_id}}" }
+    }
+
+    failure {
+      url = "${SLACK_WEBHOOK_URL}"
+      body = { text = ":rotating_light: controller deploy failed: {{error}}" }
+    }
+
+    failure {
+      url     = "https://events.pagerduty.com/v2/enqueue"
+      headers = { "X-Routing-Key" = "${PD_ROUTING_KEY}" }
+      body = {
+        routing_key  = "${PD_ROUTING_KEY}"
+        event_action = "trigger"
+        payload = {
+          summary  = "voodu controller deploy failed: {{error}}"
+          severity = "critical"
+        }
+      }
+    }
+  }
+}
+```
+
+(See [the full file](https://github.com/thadeu/clowk-voodu/blob/main/examples/fsw-esl/controller.hcl) for `probes`, `resources`.)
+
+## Setup once per environment
+
+```bash
+# 1. Register the remote
+voodu remote add prod ubuntu@your.prod.host
+
+# 2. Seed the shared config bucket
+vd config set -s fsw -n shared \
+  REDIS_ADDR="redis.fsw.voodu:6379" \
+  RABBITMQ_URL="amqp://guest:guest@rabbitmq-0.fsw.voodu:5672/" \
+  DIAL_ADAPTER_URL="http://adapter.fsw.voodu:8080" \
+  FSW_API_BASE_URL="http://api.fsw.voodu:9092" \
+  WEBSERVICE_URL="http://host.docker.internal:9099" \
+  CONTROLLER_ESL_SOCKET_ADDR="controller.fsw.voodu:9090" \
+  ESL_INBOUND_ADDR="fsw.voodu:8021" \
+  FSW_RECORDINGS_BASE_DIR="/var/lib/fsw/recordings" \
+  -r prod
+
+# 3. Notification webhooks
+vd config set -s fsw -n shared \
+  SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
+  PD_ROUTING_KEY="R000..." \
+  -r prod
+```
+
+## Deploy
+
+```bash
+# First bootstrap — apply the whole stack
+voodu apply -f infra/fsw/ -r prod
+
+# Day-to-day — single-service deploy after a code change
+voodu apply -f infra/fsw/jobs.hcl -r prod
+
+# Promote staging → prod (same HCL, different remote)
+voodu apply -f infra/fsw/ -r staging
+# validate
+voodu apply -f infra/fsw/ -r prod
+```
+
+## ⚠️ `--prune` rule with per-file split
+
+**Never** use `--prune` on a per-file deploy:
+
+```bash
+voodu apply -f infra/fsw/jobs.hcl --prune -r prod   # ❌
+```
+
+This would list existing `(fsw, deployment)` resources (5 of them) and delete the 4 that aren't in `jobs.hcl`. Catastrophe.
+
+| Command | `--prune` |
+|---|---|
+| `vd apply -f infra/fsw/<one>.hcl` | **never** |
+| `vd apply -f infra/fsw/` (whole dir) | safe — voodu sees every declared resource |
+
+The default upsert-only behavior protects you. Only opt into `--prune` when you're applying the full source-of-truth.
+
+## What's intentionally not here
+
+- **FreeSWITCH itself** (`fsw.voodu:8021`) — lives on a separate manifest or another host. RTP/SIP UDP ports + heavy resources.
+- **Public ingress** — services here are internal-only. To expose `api`, swap its `deployment` for `app` and add `host = "..."` + `tls {}`.
+- **AWS S3** — separate bucket pattern (`vd config set -s aws -n cli ...`) consumed via `env_from`.
+
+## Related
+
+- [Build modes](/docs/examples/build-modes) — the shared-context build pattern
+- [Stateful services](/docs/examples/stateful-services) — rabbitmq statefulset + redis macro details
+- [Health checks](/docs/examples/health-checks) — probes that gate ingress
+- [On-deploy webhooks](/docs/examples/on-deploy) — multi-target fan-out
+- [Multi-environment](/docs/examples/multi-environment) — staging + prod via remotes

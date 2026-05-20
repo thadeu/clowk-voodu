@@ -1,0 +1,147 @@
+---
+title: Autoscale
+description: CPU-based horizontal scaling with asymmetric cooldowns — fast up, slow down.
+---
+
+`autoscale {}` lets voodu adjust replica count based on mean CPU. Asymmetric cooldown is the key feature — scale up aggressively (don't queue 503s), scale down conservatively (don't collapse capacity during a quiet window).
+
+Source: [`examples/autoscale/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/autoscale)
+
+## Two profiles, two shapes
+
+Different workload classes need different knobs. The two examples below show worker tier (queue-driven, latency-tolerant) and HTTP tier (request-driven, latency-sensitive).
+
+## Worker tier (sidekiq)
+
+```hcl title="sidekiq-worker.hcl"
+deployment "prod" "sidekiq" {
+  image   = "ghcr.io/acme/api:1.4"
+  command = ["bundle", "exec", "sidekiq"]
+
+  env = {
+    RAILS_ENV           = "production"
+    RAILS_LOG_TO_STDOUT = "1"
+  }
+
+  env_from = ["prod/shared"]
+
+  autoscale {
+    min = 2
+    max = 20
+
+    cpu_target = 70
+
+    cooldown_up   = "15s"
+    cooldown_down = "2m"
+  }
+}
+```
+
+**Why these knobs:**
+
+| Knob | Value | Rationale |
+|---|---|---|
+| `min = 2` | Two baseline workers | Single-host hiccup doesn't drain the queue to zero throughput. Revenue-touching jobs (payments, notifications) need ≥ 2. |
+| `max = 20` | Hard ceiling | 20 sidekiq × concurrency 10 = 200 in-flight jobs. Lower if DB is the bottleneck. |
+| `cpu_target = 70` | Higher than HTTP | Workers don't have a latency SLA. 200ms wait in the queue is fine. |
+| `cooldown_up = "15s"` | Aggressive | Queue depth changes fast. A backed-up queue costs real money. |
+| `cooldown_down = "2m"` | Tighter than default | Idle workers are cheap to undo (no traffic = no 503 risk). |
+
+## HTTP tier (web API)
+
+Different shape — web tiers care about P95/P99 latency, not average throughput.
+
+```hcl title="web-api-burst.hcl"
+deployment "prod" "api" {
+  image = "ghcr.io/acme/api:1.4"
+  ports = ["3000"]
+
+  env = {
+    RAILS_ENV           = "production"
+    RAILS_LOG_TO_STDOUT = "1"
+  }
+
+  env_from = ["prod/shared"]
+
+  autoscale {
+    min = 3
+    max = 15
+
+    cpu_target = 60
+
+    # cooldown_up omitted — 30s default is correct
+    cooldown_down = "10m"
+  }
+}
+
+ingress "prod" "api" {
+  service = "api"
+  host    = "api.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+**Why these knobs differ from the worker:**
+
+| Knob | Value | Why different from worker |
+|---|---|---|
+| `min = 3` | Higher floor | Web needs quorum during single-replica restarts (rolling deploys, OOM). Drop to 2, lose one to restart, you're down to 1. |
+| `cpu_target = 60` | Lower target | HTTP latency degrades non-linearly with CPU saturation. At 85% CPU, P99 is already in the seconds. Headroom per replica is the point. |
+| `cooldown_down = "10m"` | Way longer | HTTP bursts come in clusters: campaign drives a 5-minute burst, 90-second lull, then mobile clients retry. Collapse capacity during the lull → 503s on the next wave. |
+
+## Decision band
+
+For both profiles, voodu's autoscaler uses hysteresis to avoid flap:
+
+```
+                  scale up
+        ┌──────────────────────────►
+        │
+        │   target × 1.1                    target × 0.7
+   ─────┼────────|────────|────────|────────|─────────►
+            scale up    target    scale down
+        │
+        ◄──────────────────────────┐
+                  scale down
+```
+
+- Mean CPU > `target × 1.1` AND replicas < max AND last scale-up > `cooldown_up` ago → +1 replica
+- Mean CPU < `target × 0.7` AND replicas > min AND last scale-down > `cooldown_down` ago → −1 replica
+- Anywhere in the deadband → hold
+
+Tick rate is 15 seconds. CPU sampled per-replica via Docker stats, averaged.
+
+## Mutex with `replicas`
+
+You can't declare both. Apply rejects:
+
+```hcl
+deployment "prod" "api" {
+  replicas = 3        # ❌
+  autoscale { ... }   # ❌
+}
+```
+
+To switch from fixed to autoscaled, just remove `replicas =` and add `autoscale {}`. To pin, do the inverse.
+
+## What it doesn't do
+
+- **No memory-based scaling** — CPU only. Memory-bound workloads need a different approach.
+- **No request-rate scaling** — voodu doesn't see request metrics. Wire Prometheus + a custom controller for that shape.
+- **No scale-to-zero** — `min = 1` is the lowest. Cold-start latency from zero would need a separate dispatcher layer.
+- **No cross-host scheduling** — single-host. Multi-host needs you to add the host as a separate remote and loop apply.
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+voodu describe deployment prod/api -r prod   # see current replica count + autoscale state
+```
+
+## Related
+
+- [`autoscale` manifest reference](/docs/manifests/autoscale) — full field list + hysteresis math
+- [Health checks](/docs/examples/health-checks) — readiness probes gate new replicas before Caddy routes to them

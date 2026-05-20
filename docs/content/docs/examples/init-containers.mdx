@@ -1,0 +1,201 @@
+---
+title: Init containers
+description: Ordered one-shot steps that run before the main container starts.
+---
+
+`init "<name>" {}` blocks declare prep work that must complete (exit 0) before the main container boots. Examples: schema migrations, cache warm-ups, dependency-readiness waits, replica bootstrapping.
+
+Init containers run **sequentially in declaration order**. Any failure (past `retries`) keeps the replica from spawning.
+
+Source: [`examples/init/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/init)
+
+## 1. Single migration (Rails)
+
+```hcl title="rails-migrate.hcl"
+deployment "prod" "rails-web" {
+  image    = "ghcr.io/acme/rails-web:2025-05-19"
+  replicas = 3
+  ports    = ["3000"]
+
+  env = {
+    RAILS_ENV           = "production"
+    RAILS_LOG_TO_STDOUT = "1"
+  }
+
+  env_from = ["prod/db-credentials"]
+
+  init "migrate" {
+    # image omitted → inherits rails-web:2025-05-19.
+    # Migration runs against the SAME code the main pod will run.
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+    retries = 0
+  }
+}
+```
+
+**Why `init` vs `release`:**
+
+| Block | When it runs | Use for |
+|---|---|---|
+| `init "<name>"` | Per replica, every spawn | Idempotent steps where every pod re-checks (schema, cache warm) |
+| `release { command }` | Once per deploy, before any rolling restart | Things that must happen exactly once (data migrations, schema gates) |
+
+For `db:migrate` either works (Rails tracks schema versions). Init wins when:
+- Scale-up after an out-of-band schema change needs to re-check
+- The init's env equals the main container's env (no separate "release env" debug rabbit hole)
+
+## 2. Multi-step (validate → migrate → warmup)
+
+Three sequential inits. Each is its own block, declared in execution order.
+
+```hcl title="multi-step.hcl"
+deployment "prod" "api" {
+  image    = "ghcr.io/acme/api:1.4"
+  replicas = 3
+  ports    = ["3000"]
+
+  env_from = ["prod/db-credentials", "prod/cache-credentials"]
+
+  # Step 1: cheapest gate. Fail in 2s if env is malformed.
+  init "validate-config" {
+    command = ["bin/config-check"]
+    timeout = "30s"
+    retries = 0
+  }
+
+  # Step 2: schema migration. Idempotent, may take a while.
+  init "migrate" {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+    retries = 1   # absorbs lock contention on rapid scale-up
+  }
+
+  # Step 3: cache warm-up. Memory-heavy — override resources
+  # so we don't OOM under the parent's cap.
+  init "warm-cache" {
+    command = ["bin/warm-cache"]
+    timeout = "5m"
+
+    resources {
+      limits {
+        cpu    = "2"
+        memory = "1Gi"
+      }
+    }
+  }
+}
+```
+
+**Failure surfaces in `voodu describe`:**
+
+```
+$ voodu describe deployment prod/api
+
+init failures (recent):
+  a3f9   init=validate-config   exit=2   attempts=1   30s   container exited 2: missing DATABASE_URL
+```
+
+If `validate-config` fails, `migrate` never runs and the replica never spawns. Cheap gates first — that's the design rule.
+
+## 3. Per-pod bootstrap (postgres replicas)
+
+Init containers in statefulsets run **per ordinal**. The bootstrap script can check `VOODU_REPLICA_ORDINAL` to do different work per pod.
+
+```hcl title="statefulset-pg-bootstrap.hcl"
+statefulset "data" "pg" {
+  image    = "postgres:16"
+  replicas = 3
+  ports    = ["5432"]
+
+  env = {
+    POSTGRES_DB   = "myapp"
+    POSTGRES_USER = "postgres"
+    PGDATA        = "/var/lib/postgresql/data/pgdata"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+    size       = "20Gi"
+  }
+
+  init "bootstrap" {
+    image = "postgres:16"
+
+    command = [
+      "sh", "-c",
+      <<-EOT
+        set -e
+        if [ -s "$PGDATA/PG_VERSION" ]; then
+          echo "PGDATA already initialised, skipping bootstrap"
+          exit 0
+        fi
+        if [ "$VOODU_REPLICA_ORDINAL" = "0" ]; then
+          echo "ordinal 0 = primary, initdb"
+          initdb -U postgres -D "$PGDATA"
+        else
+          echo "ordinal $VOODU_REPLICA_ORDINAL = replica, pg_basebackup from pg-0"
+          PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup \
+            -h pg-0.data -U postgres -D "$PGDATA" -X stream -P -R
+        fi
+      EOT
+    ]
+
+    timeout = "60m"   # pg_basebackup on multi-GB primary takes time
+    retries = 0       # bootstrap failures need operator investigation
+  }
+
+  probes {
+    liveness {
+      tcp_socket { port = 5432 }
+      initial_delay     = "30s"
+      period            = "10s"
+      failure_threshold = 3
+    }
+    readiness {
+      exec { command = ["pg_isready", "-U", "postgres", "-d", "myapp"] }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+**The pattern:**
+
+| Pod | First boot | Subsequent boots |
+|---|---|---|
+| `pg-0` (primary) | `initdb` — creates empty cluster | Init short-circuits (`PGDATA` non-empty) |
+| `pg-1` ... | `pg_basebackup` from `pg-0` — baseline copy | Init short-circuits |
+
+Voodu auto-injects `VOODU_REPLICA_ORDINAL` into each pod's env. The bootstrap script branches on it.
+
+Custom entrypoint wrappers would also work but couple bootstrap logic into the image. Init containers keep the image stock (`postgres:16`) and the orchestration in HCL.
+
+## Inheritance
+
+Init containers inherit from the parent:
+
+- `image` (override with `image = "..."` in the init block)
+- `env`, `env_from`, `env_file`
+- `volumes`, `networks`
+- `extra_hosts`, `cap_add`
+
+**But not `resources`.** Init steps default to no limits — prep work often needs more headroom than steady-state. Declare `resources {}` inside the init block when you want explicit caps.
+
+## When to skip init
+
+For `voodu-postgres` and `voodu-redis` macros: don't write your own bootstrap. The plugin handles `initdb` / `pg_basebackup` / sentinel wiring internally. Init containers are for **your application's** prep — migrations, warmups, dependency waits.
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+```
+
+## Related
+
+- [`init` manifest reference](/docs/manifests/init) — full field list + inheritance rules
+- [`release` block](/docs/manifests/release) — once-per-deploy alternative
+- [Health checks](/docs/examples/health-checks) — probes that run AFTER init completes

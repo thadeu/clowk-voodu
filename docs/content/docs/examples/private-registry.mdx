@@ -1,0 +1,110 @@
+---
+title: Private registry
+description: Pull from GHCR, ECR, Harbor — credentials declared once, host-wide.
+---
+
+The `registry` block configures docker credentials so deployments can pull from private repositories. Voodu rewrites `~/.docker/config.json` on every apply — atomic, host-wide, no per-deployment dance.
+
+Source: [`examples/registry/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/registry)
+
+## Single registry (GHCR)
+
+```hcl title="ghcr-private.hcl"
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+
+deployment "acme" "api" {
+  image    = "ghcr.io/acme/private-api:1.0"
+  replicas = 2
+  ports    = ["3000"]
+}
+```
+
+**`${GHCR_USER}` / `${GHCR_TOKEN}`** resolve from the operator's shell env at parse time. Plaintext never lands in the manifest or in git.
+
+**The deployment carries nothing registry-specific** — once any registry block on the host declares credentials for `ghcr.io`, every deployment that pulls from `ghcr.io/*` benefits transparently. Docker picks the right auth entry by hostname.
+
+## Multiple registries
+
+```hcl title="multi-registry.hcl"
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+
+registry "harbor" {
+  url      = "harbor.internal.acme.com"
+  username = "${HARBOR_USER}"
+  token    = "${HARBOR_TOKEN}"
+}
+
+deployment "public" "marketing-site" {
+  image = "ghcr.io/acme/marketing-site:2.1"   # → ghcr block
+  ports = ["8080"]
+}
+
+deployment "internal" "backend" {
+  image = "harbor.internal.acme.com/team/backend:2.5"   # → harbor block
+  ports = ["9000"]
+}
+```
+
+Both registries coexist. `config.json` ends up with two entries under `auths`; docker matches the image hostname against the keys.
+
+Notice the deployments live in different scopes (`public`, `internal`). `registry` is **host-wide, not scoped** — you declare it once, anywhere, and every deployment on the host can pull from any of the configured registries.
+
+## Service account tokens — not personal PATs
+
+`~/.docker/config.json` is singular per registry, per host. Every apply that includes a `registry` block rewrites the file with **whatever token is in the operator's shell at the time**.
+
+If two devs each apply with their personal GHCR PAT, the last applier wins — and the other dev's deploys break when the controller next pulls. The right shape for a team:
+
+1. **Create a dedicated machine user / bot** on the registry. GitHub: Settings → Developer settings → Personal access tokens (classic) on a service account user. Scope: `read:packages`.
+2. **Store the token in your team password manager.**
+3. **Distribute via gitignored `.envrc`** (direnv) inside the repo:
+
+   ```bash
+   # .envrc (gitignored)
+   export GHCR_USER=acme-deploy-bot
+   export GHCR_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+
+4. Every `voodu apply` substitutes the same value, regardless of who runs it. Rotation = one password-manager update + every dev's next `direnv reload`.
+
+## Why not `env_from`?
+
+`registry` does NOT support `env_from` (config buckets) — by design. The bootstrap order is wrong: voodu needs the credential **before** any container can pull, including the controller's own first reconcile. Use shell env via `${VAR}`.
+
+## Token alias
+
+`token` and `password` are interchangeable — both decode into the same wire field:
+
+```hcl
+registry "harbor" {
+  url      = "harbor.internal.acme.com"
+  username = "${HARBOR_USER}"
+  password = "${HARBOR_TOKEN}"   # same as `token = "..."`
+}
+```
+
+Use whichever reads better against your registry's UI conventions.
+
+## Apply
+
+```bash
+# Load shell env (direnv allow, or source manually)
+direnv allow
+
+# Apply
+voodu apply -f ghcr-private.hcl
+```
+
+After apply, `docker pull ghcr.io/acme/private-api:1.0` succeeds on the host without further `docker login`. The credentials persist across controller reboots and autoscale-driven pulls until the next `voodu apply` rewrites them.
+
+## Related
+
+- [`registry` manifest reference](/docs/manifests/registry) — full field list + atomic-rewrite semantics

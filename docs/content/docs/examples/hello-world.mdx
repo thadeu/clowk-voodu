@@ -1,0 +1,101 @@
+---
+title: Hello world
+description: One deployment, one ingress, TLS — the simplest shape that works in production.
+---
+
+A single HTTP service with TLS. This is the starting point — everything else in this section builds on these two blocks.
+
+Source: [`examples/fullstack/deployment.hcl`](https://github.com/thadeu/clowk-voodu/blob/main/examples/fullstack/deployment.hcl)
+
+## The shape
+
+```hcl title="voodu.hcl"
+deployment "clowk" "api" {
+  image    = "ghcr.io/clowk/api:${VERSION:-latest}"
+  replicas = 2
+
+  env = {
+    PORT     = "8080"
+    DATABASE = "postgres://main:5432/app"
+  }
+
+  ports = ["8080"]
+
+  restart      = "always"
+  health_check = "/healthz"
+}
+
+ingress "clowk" "api" {
+  host = "api.clowk.in"
+  port = 8080
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@voodu.clowk.in"
+  }
+}
+```
+
+## What's going on
+
+**Two labels per resource** — `"clowk"` (scope) and `"api"` (name). Scope is a free-form organizational tag (app, team, environment); names are unique per-scope. This pair is what `voodu apply`, `voodu diff`, and prune use to identify the resource.
+
+**1-to-1 `deployment` ↔ `ingress`** — `service` inside `ingress` defaults to the ingress name. With `deployment "clowk" "api"` + `ingress "clowk" "api"`, voodu wires them automatically. Override with `service = "other"` only when you route to a different deployment in the same scope.
+
+**`${VERSION:-latest}`** — shell env interpolation at parse time. CI sets `VERSION=v1.2.3`; locally it falls back to `latest`. Resolved on your machine before the manifest ships.
+
+**`tls {}` defaults** — declaring the block (even bare) flips `enabled = true` and `provider = "letsencrypt"`. To run without TLS, omit the block entirely.
+
+**`health_check = "/healthz"`** — the path Caddy uses for active health checks against the upstream. Different from container-level [probes](/docs/examples/health-checks) — that's the next page.
+
+## Sugar form
+
+The shape above is so common that voodu ships an `app` block that collapses both into one:
+
+```hcl
+app "clowk" "api" {
+  image    = "ghcr.io/clowk/api:${VERSION:-latest}"
+  replicas = 2
+  ports    = ["8080"]
+
+  env = {
+    PORT     = "8080"
+    DATABASE = "postgres://main:5432/app"
+  }
+
+  health_check = "/healthz"
+  host         = "api.clowk.in"
+
+  tls {
+    email = "ops@voodu.clowk.in"
+  }
+}
+```
+
+Same result, one block. Voodu expands it into a `deployment` + `ingress` with shared identity at parse time. Use `app` for the 90% case; reach for separate blocks only when you need cross-resource routing (one ingress, different deployment).
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+```
+
+Output:
+
+```
+→ packing context (1.4 MB)
+→ streaming over ssh ubuntu@your-host
+→ controller: planning ...
+→ build → swap current → reconcile caddy
+✓ apply complete in 11.8s
+✓ https://api.clowk.in  ·  2/2 healthy
+```
+
+## What to add next
+
+- **Multiple paths on the same host** → [Ingress routing](/docs/examples/ingress-routing)
+- **Build the image on the server instead of pulling** → [Build modes](/docs/examples/build-modes)
+- **HTTP probe gating ingress traffic** → [Health checks](/docs/examples/health-checks)
+- **Migrations before the container boots** → [Init containers](/docs/examples/init-containers)
+- **Slack/PagerDuty notification on deploy** → [On-deploy webhooks](/docs/examples/on-deploy)

@@ -1,0 +1,67 @@
+---
+title: Overview
+description: Every manifest example in the repo, organized from simplest to most production-grade.
+---
+
+These pages walk through every example in the [`examples/`](https://github.com/thadeu/clowk-voodu/tree/main/examples) directory of the repo. Each example is a real, working HCL file you can copy, adjust, and apply.
+
+The order goes from **one file, one resource** (a single web app) to **per-service multi-file production stacks** (the fsw-esl telephony example). Pick the page that matches the shape you're building.
+
+## Find your shape
+
+| You want to... | Start here |
+|---|---|
+| Deploy a single web service with TLS | [Hello world](/docs/examples/hello-world) |
+| Route multiple paths or hosts to different services | [Ingress routing](/docs/examples/ingress-routing) |
+| Build images on the server instead of pulling from a registry | [Build modes](/docs/examples/build-modes) |
+| Pull from a private registry (GHCR, ECR, GitLab) | [Private registry](/docs/examples/private-registry) |
+| Mount config files / certs / templates into containers | [Assets](/docs/examples/assets) |
+| Gate ingress traffic on real readiness checks | [Health checks](/docs/examples/health-checks) |
+| Run migrations or warmup before the main container boots | [Init containers](/docs/examples/init-containers) |
+| Scale replicas based on CPU usage | [Autoscale](/docs/examples/autoscale) |
+| Notify Slack / PagerDuty / Datadog after deploys | [On-deploy webhooks](/docs/examples/on-deploy) |
+| Run postgres or redis with per-pod volumes | [Stateful services](/docs/examples/stateful-services) |
+| Deploy the same HCL to staging and prod | [Multi-environment](/docs/examples/multi-environment) |
+| Multiple repos applying into one logical scope | [Shared scope](/docs/examples/shared-scope) |
+| Translate a docker-compose stack into voodu (real-world) | [Production stack](/docs/examples/production-stack) |
+
+## Complexity gradient
+
+```
+       basic                                                fullstack
+       ─────                                                ─────────
+single-file   ────► ────► ────► ────► ────►              multi-file
+                                                              │
+hello-world ─► ingress ─► build ─► registry ─► assets         │
+                                                              │
+                          ┌── health-checks                   │
+                          ├── init-containers                 │
+                          ├── autoscale                       │
+                          └── on-deploy                       │
+                                                              │
+                          stateful-services                   │
+                                                              ▼
+                          multi-environment  ─►  shared-scope  ─►  production-stack
+```
+
+## How to use these examples
+
+Every page shows the relevant HCL inline. To run them:
+
+```bash
+# Clone the repo (if you haven't)
+git clone https://github.com/thadeu/clowk-voodu
+cd clowk-voodu/examples/<dir>
+
+# Apply (default remote)
+voodu apply -f .
+
+# Or pick a specific remote
+voodu apply -f . -r prod
+```
+
+Each example is self-contained — no cross-dependencies, no setup scripts. Adjust the `image`, `host`, and resource limits to your environment.
+
+## Manifest reference vs examples
+
+These pages are **scenario-driven**: "I want to do X, what does that look like?" For the full surface of each kind (every field, every default, every validation rule), see the [manifest reference](/docs/manifests/overview).

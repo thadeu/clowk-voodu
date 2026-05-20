@@ -1,0 +1,155 @@
+---
+title: Shared scope
+description: Multiple repos applying into one logical scope — `--no-prune` opt-in.
+---
+
+By default, every `voodu apply` is a full source-of-truth statement for the `(scope, kind)` pairs it touches — anything missing gets pruned. That's right for a single repo that owns its scope.
+
+But sometimes one **logical environment** spans **multiple repos**: a Rails app, a landing page, an API, and a worker, all belonging to "clowk", each in its own repo with its own CI. Each repo declares only its slice; `--no-prune` tells voodu "upsert, don't delete the others".
+
+Source: [`examples/shared-scope/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/shared-scope)
+
+## The shape
+
+Four repos, one scope `clowk`, each applying its own deployment.
+
+**`github.com/you/clowk` → `clowk-app.voodu`:**
+
+```hcl
+deployment "clowk" "app" {
+  image    = "ghcr.io/you/clowk:${IMAGE_TAG:-latest}"
+  replicas = 2
+  ports    = ["3000"]
+
+  env = {
+    RAILS_ENV = "production"
+    PORT      = "3000"
+  }
+}
+
+ingress "clowk" "app" {
+  host = "app.clowk.in"
+
+  tls {
+    email = "ops@clowk.in"
+  }
+}
+```
+
+**`github.com/you/clowk-landingpage` → `clowk-lp.voodu`:**
+
+```hcl
+deployment "clowk" "lp" {
+  image    = "ghcr.io/you/clowk-lp:${IMAGE_TAG:-latest}"
+  replicas = 1
+  ports    = ["8080"]
+}
+
+ingress "clowk" "lp" {
+  host = "clowk.in"
+
+  tls {
+    email = "ops@clowk.in"
+  }
+}
+```
+
+**`github.com/you/clowk-api` → `clowk-api.voodu`:**
+
+```hcl
+deployment "clowk" "api" {
+  image    = "ghcr.io/you/clowk-api:${IMAGE_TAG:-latest}"
+  replicas = 3
+  ports    = ["4000"]
+}
+
+ingress "clowk" "api" {
+  host = "api.clowk.in"
+
+  tls {
+    email = "ops@clowk.in"
+  }
+}
+```
+
+**`github.com/you/clowk-jobs` → `clowk-jobs.voodu`:**
+
+```hcl
+deployment "clowk" "jobs" {
+  image    = "ghcr.io/you/clowk-jobs:${IMAGE_TAG:-latest}"
+  replicas = 2
+
+  env = {
+    WORKER_CONCURRENCY = "10"
+  }
+}
+```
+
+Notice: **no ingress for jobs** — workers don't serve HTTP.
+
+## Each CI applies with `--no-prune`
+
+From every repo's CI:
+
+```bash
+voodu apply -f clowk-app.voodu --no-prune    # in clowk repo
+voodu apply -f clowk-lp.voodu  --no-prune    # in clowk-landingpage
+voodu apply -f clowk-api.voodu --no-prune    # in clowk-api
+voodu apply -f clowk-jobs.voodu --no-prune   # in clowk-jobs
+```
+
+**Why `--no-prune` is critical:** without it, every apply would delete the other three deployments. The clowk repo doesn't know about `clowk/api`; applying its own `clowk/app` slice would see "only one deployment in scope clowk in this apply, the others must be stale" → wipe.
+
+`--no-prune` says: "I'm upserting my slice; leave everything else alone."
+
+## When to use shared scope vs distinct scopes
+
+Default-prune behavior is the right shape for single-repo-owns-scope. Use shared scope sparingly.
+
+| Pattern | Use when |
+|---|---|
+| One scope per repo (`clowk-app`, `clowk-lp`, `clowk-api`, `clowk-jobs`) | Ownership is obvious. `voodu list -s clowk-api` scopes neatly. No `--no-prune` discipline needed. **Default recommendation.** |
+| Shared scope + `--no-prune` | Grouping is a first-class concern: you want to query/config the env as a unit (`voodu config set -s clowk DEPLOY_ENV=prod` reaches every component). |
+
+The flag must live in **every** CI pipeline that touches the scope. One pipeline forgetting `--no-prune` and you wipe three other services.
+
+## Where shared scope shines
+
+The grouping payoff:
+
+```bash
+# Set a flag once for the whole logical env
+vd config set -s clowk DEPLOY_BANNER="Pre-launch maintenance window 2025-05-20"
+
+# Every deployment in scope `clowk` (app, lp, api, jobs) picks it up.
+# Cross-repo, cross-CI, one operator action.
+
+# Inspect everything in one place
+vd list -s clowk
+vd describe -s clowk
+vd logs clowk/app -f
+```
+
+For multi-env (staging/prod) layered on top of shared scope, you can:
+- Use separate remotes (`-r staging` vs `-r prod`) — bucket values diverge per host.
+- OR use distinct scopes per env (`clowk-staging`, `clowk-prod`) and forget about `--no-prune`.
+
+## Apply (CI snippet)
+
+```yaml
+# .github/workflows/deploy.yml (in clowk-app repo)
+- name: Deploy
+  run: |
+    voodu apply -f clowk-app.voodu --no-prune -r prod
+  env:
+    IMAGE_TAG: ${{ github.sha }}
+    VOODU_SSH_KEY: ${{ secrets.VOODU_DEPLOY_KEY }}
+```
+
+Same pattern in every sibling repo's CI.
+
+## Related
+
+- [Multi-environment](/docs/examples/multi-environment) — same HCL, multiple remotes (the staging/prod axis)
+- [Production stack](/docs/examples/production-stack) — alternative pattern: per-service file split inside ONE repo
+- [`voodu apply` reference](/docs/cli/apply) — full flag list including `--no-prune` semantics

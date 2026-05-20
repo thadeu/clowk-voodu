@@ -1,0 +1,234 @@
+---
+title: Health checks
+description: Liveness / readiness / startup probes that drive container restarts and ingress routing.
+---
+
+Probes solve two orthogonal problems:
+
+1. **Should this container be restarted?** → liveness
+2. **Should this replica receive traffic?** → readiness
+3. **Has the container finished booting yet?** → startup (gates readiness during cold boot)
+
+Probes drive both voodu's own restart loop AND ingress (Caddy) upstream membership — declare them once, both gates fire.
+
+Source: [`examples/probes/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/probes)
+
+## HTTP deployment with liveness + readiness
+
+The 80% case for stateless web apps.
+
+```hcl title="deployment-http.hcl"
+deployment "prod" "api" {
+  image    = "ghcr.io/acme/api:1.4"
+  replicas = 3
+  ports    = ["3000"]
+
+  env = { RAILS_ENV = "production" }
+
+  probes {
+    liveness {
+      http_get {
+        path = "/healthz"
+        port = 3000
+      }
+
+      initial_delay     = "15s"
+      period            = "10s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      http_get {
+        path = "/ready"
+        port = 3000
+      }
+
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+
+ingress "prod" "api" {
+  service = "api"
+  host    = "api.example.com"
+  tls     { email = "ops@example.com" }
+}
+```
+
+**Two independent gates from one declaration:**
+
+- **`liveness` on `/healthz`** — if the app's request loop deadlocks (Ruby GVL stuck, Go goroutine livelock), 3 consecutive fails trigger `docker restart`.
+- **`readiness` on `/ready`** — returns 503 while the app is mid-shutdown (draining), or while a dependency is down. Pod stays alive but Caddy stops routing traffic to it.
+
+**Auto Caddy gating** — the `ingress` block pairs with the readiness probe automatically. No `health_check =` on the deployment, no `lb { interval }` on the ingress. The controller emits the right config so voodu-caddy generates `health_uri /ready` per upstream.
+
+## Three probes: startup + liveness + readiness (Rails)
+
+Rails apps cold-boot slowly. Without a startup probe you'd either:
+
+- Crank `initial_delay` on liveness/readiness to the worst-case boot time → steady-state checks are also delayed → real deadlocks take a minute+ to detect.
+- Accept that ingress routes traffic to a half-booted process and serves 503s for the first ~30s.
+
+Startup probe gives both: generous boot window + tight steady-state checks.
+
+```hcl title="rails-with-startup.hcl"
+deployment "prod" "rails-web" {
+  image    = "ghcr.io/acme/rails-web:2025-05-19"
+  replicas = 4
+  ports    = ["3000"]
+
+  env = {
+    RAILS_ENV           = "production"
+    RAILS_LOG_TO_STDOUT = "1"
+  }
+
+  probes {
+    # 30 × 2s = 60s grace window before liveness takes over
+    startup {
+      http_get {
+        path = "/health"
+        port = 3000
+      }
+
+      period            = "2s"
+      failure_threshold = 30
+      success_threshold = 1
+    }
+
+    # Tight steady-state once startup passes
+    liveness {
+      http_get {
+        path = "/healthz"
+        port = 3000
+      }
+
+      period            = "5s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      http_get {
+        path = "/ready"
+        port = 3000
+      }
+
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+**How the gate works:**
+
+1. Container starts. ProbeRegistry spawns three runners.
+2. Pod marked NOT ready (`StartupPassed = false`). Caddy bypasses this replica.
+3. Startup probe samples `/health` every 2s. First pass → runner self-stops, gate opens.
+4. From here on, readiness controls "in rotation?" and liveness controls "needs restart?".
+
+## TCP probe — statefulset (Redis)
+
+For stateful services without a universal HTTP endpoint, mix `tcp_socket` (cheap, alive-or-not) with `exec` (real round-trip).
+
+```hcl title="statefulset-tcp.hcl"
+statefulset "data" "cache" {
+  image    = "redis:7"
+  replicas = 3
+  ports    = ["6379"]
+  command  = ["redis-server", "--appendonly", "yes"]
+
+  probes {
+    liveness {
+      tcp_socket { port = 6379 }
+      period            = "10s"
+      failure_threshold = 3
+    }
+
+    readiness {
+      exec { command = ["redis-cli", "ping"] }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+**Why mix probe types:**
+
+- **TCP socket for liveness** — Redis listens on 6379; if the socket doesn't accept connections, the process is hung. Cheap, no auth, no command overhead.
+- **`redis-cli ping` for readiness** — TCP open doesn't mean "ready to serve". A Redis pod loading AOF / RDB on boot has the socket open but returns `LOADING` to commands. `ping` returns `PONG` only when the server is in a serving state.
+
+Per-pod application: each ordinal (`cache-0`, `cache-1`, `cache-2`) gets its own probe runners. `cache-0` unhealthy doesn't affect `cache-1`.
+
+## Exec probe — postgres
+
+`pg_isready` is built specifically for liveness/readiness probes — exit codes map cleanly to the probe contract.
+
+```hcl title="postgres-pg-isready.hcl"
+statefulset "data" "pg" {
+  image    = "postgres:16"
+  replicas = 2
+  ports    = ["5432"]
+
+  env = {
+    POSTGRES_DB   = "myapp"
+    POSTGRES_USER = "postgres"
+    PGDATA        = "/var/lib/postgresql/data/pgdata"
+  }
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+    size       = "20Gi"
+  }
+
+  probes {
+    # Cheapest: TCP open = process alive
+    liveness {
+      tcp_socket { port = 5432 }
+      initial_delay     = "20s"
+      period            = "10s"
+      failure_threshold = 3
+    }
+
+    # Stricter: actually accepting queries
+    readiness {
+      exec {
+        command = ["pg_isready", "-U", "postgres", "-d", "myapp"]
+      }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+The standby case is the key motivator: a postgres replica mid-`pg_basebackup` will open port 5432 long before it accepts queries. `pg_isready` catches that gap.
+
+## Threshold tuning
+
+Quick reference:
+
+| Probe | period | failure_threshold | success_threshold | Tone |
+|---|---|---|---|---|
+| `liveness` | `10s` | `3` (= 30s tolerance) | `1` | Slow + forgiving (one-off GC pauses OK) |
+| `readiness` | `5s` | `1` (= immediate drop) | `2` (= flap-resistant) | Fast + strict |
+| `startup` | `2s` | `30` (= 60s grace) | `1` | Tight cadence, generous window |
+
+The defaults are conservative — start there, tighten only if you have evidence of a specific failure mode.
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+```
+
+## Related
+
+- [`probes` manifest reference](/docs/manifests/probes) — full selector + threshold field list
+- [Init containers](/docs/examples/init-containers) — for prep that must complete before probes start
+- [voodu-caddy plugin](/docs/plugins/caddy) — how readiness drives upstream membership

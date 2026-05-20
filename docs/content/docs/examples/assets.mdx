@@ -1,0 +1,131 @@
+---
+title: Assets
+description: Declarative file bundles — config files, certs, ACLs — mounted into containers.
+---
+
+`asset` lets you declare files (or URL-fetched bytes) once, and any deployment can mount them. Voodu materialises them on the host under `/opt/voodu/assets/...` so containers see them as bind volumes.
+
+Source: [`examples/asset/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/asset)
+
+## Why use asset blocks
+
+Without `asset`, you have three bad options:
+
+1. **Bake the file into the image** — every config change rebuilds.
+2. **`docker cp` after deploy** — manual, brittle, drifts.
+3. **`volumes = ["/host/path:/in/container"]`** — host path must already exist; not declarative.
+
+`asset` solves this: files travel with the manifest, materialise atomically on the server, mount as bind volumes. Content changes drive a rolling restart automatically (content-addressed digest → spec hash).
+
+## Sources
+
+Three source kinds:
+
+```hcl
+asset "data" "redis-config" {
+  # 1. Local file read at apply time on the operator's machine.
+  configuration = file("./redis/redis.conf")
+
+  # 2. Fetched server-side at reconcile time; cached by ETag.
+  users_acl = url("https://r2.example.com/configs/redis-users.acl")
+
+  # 3. Inline string — embedded verbatim.
+  motd = "Welcome to production redis"
+}
+```
+
+| Source | Resolved when | Use for |
+|---|---|---|
+| `file("./path")` | Apply time, client-side | Files you edit alongside the manifest |
+| `url("https://...")` | Reconcile time, server-side | Pre-signed URLs (S3/R2) for private bytes that shouldn't ship through git |
+| `"literal string"` | Embedded in manifest | Tiny snippets, MOTDs, version banners |
+
+## Scoped vs unscoped
+
+```hcl
+# Scoped — referenced as ${asset.data.redis-config.configuration}
+asset "data" "redis-config" {
+  configuration = file("./redis/redis.conf")
+}
+
+# Unscoped — referenced as ${asset.ca-bundle.pem}
+asset "ca-bundle" {
+  pem = file("./tls/ca-bundle.pem")
+}
+```
+
+**Scoped** (4-segment ref): the common case. Tied to a specific scope, easy to colocate with consumer resources.
+
+**Unscoped** (3-segment ref): shared bytes (CA bundles, common ACLs, MOTDs) that don't belong to a specific tenant. Address from any scope.
+
+## Mounting into a deployment
+
+```hcl title="with-deployment.hcl"
+asset "clowk-lp" "web-config" {
+  runtime = file("./web/config.json")
+}
+
+deployment "clowk-lp" "web" {
+  image    = "ghcr.io/clowk/web:latest"
+  replicas = 2
+  ports    = ["8080"]
+
+  volumes = [
+    "${asset.clowk-lp.web-config.runtime}:/etc/web/config.json:ro",
+  ]
+
+  env = {
+    PORT        = "8080"
+    CONFIG_FILE = "/etc/web/config.json"
+  }
+
+  health_check = "/healthz"
+}
+
+ingress "clowk-lp" "web" {
+  host = "web.example.com"
+  port = 8080
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+**The flow:**
+
+1. You edit `./web/config.json` on your machine
+2. `voodu apply -f voodu.hcl` reads the file, embeds the bytes in the manifest, POSTs to the server
+3. Server materialises `/opt/voodu/assets/clowk-lp/web-config/runtime`
+4. The deployment handler resolves `${asset.clowk-lp.web-config.runtime}` to the host path and mounts it as a bind volume read-only
+5. The container at `/etc/web/config.json` sees the file
+
+**Content changes → rolling restart.** Edit `config.json`, re-apply — content hash changes, spec hash changes, voodu rolls the deployment. No restart command, no `docker cp`.
+
+## Asset keys vs filenames
+
+The **key** in the asset body (`runtime`, `pem`, `users_acl`) is an identifier — alphanumeric, underscore, hyphen, **no dots**. It maps to a file under `/opt/voodu/assets/<scope>/<name>/<key>` on the host.
+
+The **filename inside the container** is set by the mount target in `volumes`:
+
+```hcl
+volumes = [
+  "${asset.clowk-lp.web-config.runtime}:/etc/web/config.json:ro",
+                                       │                       └─ ro = read-only
+                                       └─ container-side path & filename
+]
+```
+
+So the same asset can mount under different paths in different containers.
+
+## Apply
+
+```bash
+voodu apply -f voodu.hcl
+```
+
+## Related
+
+- [`asset` manifest reference](/docs/manifests/asset) — full source kinds + digest semantics
+- [Stateful services](/docs/examples/stateful-services) — postgres/redis using assets for config files
+- [On-deploy webhooks](/docs/examples/on-deploy) — `file = "${asset.…}"` for webhook templates

@@ -1,0 +1,138 @@
+---
+title: Multi-environment
+description: One manifest, many servers — staging and prod via -r.
+---
+
+The scope + name in HCL is the **app identity**, stable across every environment. Which SERVER receives the apply is a CLI-level concern controlled by `-r` (short for `--remote`). Same file → many environments → values diverge via env vars.
+
+Source: [`examples/multi-env/app.voodu`](https://github.com/thadeu/clowk-voodu/blob/main/examples/multi-env/app.voodu)
+
+## The shape
+
+```hcl title="app.voodu"
+deployment "clowk-lp" "web" {
+  image    = "ghcr.io/clowk/lp:${IMAGE_TAG:-latest}"
+  replicas = 2
+  ports    = ["8080"]
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  restart      = "always"
+  health_check = "/"
+}
+
+ingress "clowk-lp" "web" {
+  host = "${APP_HOST:-clowk.in}"
+  port = 8080
+
+  tls {
+    enabled  = true
+    provider = "letsencrypt"
+    email    = "ops@clowk.in"
+  }
+}
+```
+
+Two variables resolved at parse time on your machine:
+- `${IMAGE_TAG:-latest}` — image tag (CI sets to git SHA; local falls back)
+- `${APP_HOST:-clowk.in}` — hostname (prod uses `clowk.in`, staging uses `staging.clowk.in`)
+
+## Setup
+
+Register the remotes once per laptop:
+
+```bash
+voodu remote add staging ubuntu@staging.example.com
+voodu remote add prod-1  ubuntu@prod-1.example.com
+voodu remote add prod-2  ubuntu@prod-2.example.com
+```
+
+## Apply
+
+Same file, different `-r`:
+
+```bash
+# staging
+IMAGE_TAG=v1.4.2-rc1 APP_HOST=staging.clowk.in \
+  voodu apply -f app.voodu -r staging
+
+# prod
+IMAGE_TAG=v1.4.2 APP_HOST=clowk.in \
+  voodu apply -f app.voodu -r prod-1
+
+IMAGE_TAG=v1.4.2 APP_HOST=clowk.in \
+  voodu apply -f app.voodu -r prod-2
+```
+
+Fan-out a production rollout with a simple loop:
+
+```bash
+for r in prod-1 prod-2; do
+  IMAGE_TAG=v1.4.2 APP_HOST=clowk.in voodu apply -f app.voodu -r $r
+done
+```
+
+## Where the values come from
+
+Three layers, in precedence:
+
+1. **Inline env on the command** — `IMAGE_TAG=... voodu apply ...`. Highest priority. Good for CI.
+2. **direnv / `.envrc`** — gitignored file with `export IMAGE_TAG=...`. Per-checkout, per-laptop. Survives `cd`.
+3. **`${VAR:-default}`** — inline fallback in the manifest. Last resort.
+
+`${VAR}` resolution happens **client-side at parse time** — the bytes voodu ships to the server already have the final values substituted. The server never sees your shell env.
+
+## Per-env config buckets
+
+Image tags and hostnames belong in shell env (they're ephemeral per-deploy). **Persistent per-env config** (database URLs, API keys, feature flags) belongs in the config bucket:
+
+```bash
+# Per-remote bucket values
+voodu config set -s clowk-lp -n web DATABASE_URL="postgres://..." -r staging
+voodu config set -s clowk-lp -n web DATABASE_URL="postgres://..." -r prod-1
+voodu config set -s clowk-lp -n web DATABASE_URL="postgres://..." -r prod-2
+```
+
+The bucket lives in **each remote's etcd** — totally independent values per host. The HCL doesn't need to know which env it's targeting.
+
+To consume the bucket inside the manifest, use `env_from`:
+
+```hcl
+deployment "clowk-lp" "web" {
+  env_from = ["clowk-lp/web"]    # injects DATABASE_URL, etc.
+  ...
+}
+```
+
+## File extensions
+
+`.voodu` parses as HCL, identical to `.hcl`. `.vdu` and `.vd` are shorter aliases. Pick whichever reads best in your editor and file tree. The example uses `.voodu` to signal "this is the canonical deploy manifest".
+
+## Promote staging → prod
+
+Pin the same `IMAGE_TAG` to both. The image is byte-identical; only env / config differs.
+
+```bash
+# Build once, tag once
+git tag v1.4.2 && git push --tags
+
+# CI builds + pushes ghcr.io/clowk/lp:v1.4.2
+
+# Validate on staging
+IMAGE_TAG=v1.4.2 APP_HOST=staging.clowk.in \
+  voodu apply -f app.voodu -r staging
+
+# Promote (same image)
+for r in prod-1 prod-2; do
+  IMAGE_TAG=v1.4.2 APP_HOST=clowk.in voodu apply -f app.voodu -r $r
+done
+```
+
+## Related
+
+- [Shared scope](/docs/examples/shared-scope) — multiple repos applying into ONE logical scope
+- [Production stack](/docs/examples/production-stack) — same multi-env pattern but per-service file split
+- [`voodu remote`](/docs/cli/remote) — full CLI reference for managing remotes

@@ -3,10 +3,11 @@
   "pages": [
     "index",
     "getting-started",
+    "architecture",
+    "examples",
     "manifests",
     "cli",
     "plugins",
-    "architecture",
     "reference"
   ]
 }

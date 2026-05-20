@@ -1,0 +1,225 @@
+---
+title: Stateful services
+description: Postgres, Redis, statefulsets — per-pod volumes, stable ordinals, config via assets.
+---
+
+Stateful services need things deployments don't: per-pod identity, persistent volumes that survive restarts, and config files mounted into the container. Voodu's `statefulset` (and the `postgres` / `redis` macros that wrap it) handle all three.
+
+Source:
+- [`examples/statefulset/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/statefulset) — raw statefulset shapes
+- [`examples/stack/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/stack) — full production stack with asset-backed configs
+
+## 1. Bare postgres (single-node)
+
+```hcl title="statefulset/postgres.hcl"
+statefulset "data" "pg" {
+  image    = "postgres:15-alpine"
+  replicas = 1
+
+  env = {
+    POSTGRES_DB = "myapp"
+    PGDATA      = "/var/lib/postgresql/data/pgdata"
+  }
+
+  ports = ["5432"]
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+}
+```
+
+**`POSTGRES_PASSWORD` is NOT in the manifest** — secrets stay out of declarative config. Operator runs:
+
+```bash
+vd config set -s data -n pg POSTGRES_PASSWORD=<value>
+```
+
+before the first apply; the controller injects it via the env file the container loads at boot.
+
+**Per-pod volume** — each ordinal gets its own docker volume:
+- `voodu-data-pg-data-0`
+- `voodu-data-pg-data-1` (when replicas grows)
+
+Volumes survive restarts, image bumps, scale-down, even `vd delete statefulset/data/pg`. They're destroyed only on explicit `vd delete ... --prune`.
+
+## 2. Per-ordinal DNS
+
+```hcl title="statefulset/postgres-cluster.hcl"
+statefulset "data" "pg" {
+  image    = "postgres:15-alpine"
+  replicas = 3
+
+  env = {
+    POSTGRES_DB = "myapp"
+    PGDATA      = "/var/lib/postgresql/data/pgdata"
+  }
+
+  ports = ["5432"]
+
+  volume_claim "data" {
+    mount_path = "/var/lib/postgresql/data"
+  }
+}
+```
+
+**What this gives you:**
+
+```
+3 docker containers:
+  data-pg.0   DNS: pg-0.data, pg.data   (primary by convention)
+  data-pg.1   DNS: pg-1.data, pg.data
+  data-pg.2   DNS: pg-2.data, pg.data
+
+3 docker volumes (each pod's own state):
+  voodu-data-pg-data-0
+  voodu-data-pg-data-1
+  voodu-data-pg-data-2
+```
+
+The shared alias (`pg.data`) round-robins across all three on docker DNS. Per-pod aliases (`pg-0.data`) give deterministic targeting — that's how replication wiring works ("replica connects to `pg-0.data` for `pg_basebackup`").
+
+⚠ **The bare statefulset DOES NOT bootstrap replication.** All three pods come up as independent primaries. To get real streaming replication, either:
+
+- Use the `voodu-postgres` macro (covered below) — handles `pg_basebackup`, `primary_conninfo`, `wal_keep_size` automatically
+- Write a custom image with an entrypoint that branches on `VOODU_REPLICA_ORDINAL`
+- Use [init containers](/docs/examples/init-containers#3-per-pod-bootstrap-postgres-replicas) for ordinal-aware bootstrap
+
+## 3. Redis with AOF
+
+```hcl title="statefulset/redis.hcl"
+statefulset "data" "cache" {
+  image    = "redis:7-alpine"
+  replicas = 1
+
+  command = ["redis-server", "--appendonly", "yes"]
+  ports   = ["6379"]
+
+  volume_claim "data" {
+    mount_path = "/data"
+  }
+}
+```
+
+For ACL / TLS / custom tuning, replace `command` with a config-file invocation paired with an `asset` block — see the full-stack example below.
+
+## 4. Full production stack — postgres + redis + app (via macros)
+
+This is the canonical "real app" shape: config files as assets, postgres + redis as macros, app as `app` block with TLS.
+
+```hcl title="stack/voodu.hcl"
+# ───── Database configs as assets ─────
+
+asset "data" "pg-config" {
+  postgresql_conf = file("./configs/postgresql.conf")
+  pg_hba_conf     = file("./configs/pg_hba.conf")
+}
+
+asset "data" "redis-config" {
+  configuration = file("./configs/redis.conf")
+  users_acl     = url("https://r2.example.com/voodu/redis-users.acl")
+}
+
+# ───── Database statefulsets via macro plugins ─────
+
+postgres "data" "pg" {
+  plugin {
+    version = "0.2.0"   # pin
+  }
+
+  image = "postgres:15-alpine"
+
+  command = [
+    "postgres",
+    "-c", "config_file=/etc/postgresql/postgresql.conf",
+    "-c", "hba_file=/etc/postgresql/pg_hba.conf",
+  ]
+
+  volumes = [
+    "${asset.data.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro",
+    "${asset.data.pg-config.pg_hba_conf}:/etc/postgresql/pg_hba.conf:ro",
+  ]
+}
+
+redis "data" "cache" {
+  plugin {
+    version = "latest"   # rolling
+  }
+
+  image   = "redis:8"
+  command = ["redis-server", "/etc/redis/redis.conf"]
+
+  volumes = [
+    "${asset.data.redis-config.configuration}:/etc/redis/redis.conf:ro",
+    "${asset.data.redis-config.users_acl}:/etc/redis/users.acl:ro",
+  ]
+}
+
+# ───── App: deployment + ingress in one block ─────
+
+app "myapp" "web" {
+  image    = "ghcr.io/myorg/myapp:latest"
+  replicas = 3
+  ports    = ["8080"]
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  health_check = "/healthz"
+
+  host = "myapp.example.com"
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+```
+
+**What ends up running on the host:**
+
+```
+data-pg.0          statefulset pod  (postgres single-node)
+data-cache.0       statefulset pod  (redis single-node)
+myapp-web.<hash>   deployment       (3 replicas)
+voodu-caddy        ingress          (terminates TLS, fronts myapp-web)
+```
+
+**`DATABASE_URL` / `REDIS_URL` live in the config bucket**, not the manifest:
+
+```bash
+PG_PASS=$(openssl rand -hex 16)
+
+vd config set -s data -n pg POSTGRES_PASSWORD=$PG_PASS
+vd config set -s myapp DATABASE_URL="postgres://postgres:$PG_PASS@pg-0.data:5432/myapp"
+vd config set -s myapp REDIS_URL="redis://cache-0.data:6379/0"
+```
+
+**Apply:**
+
+```bash
+vd apply -f voodu.hcl
+```
+
+First apply JIT-installs `voodu-postgres` and `voodu-redis` plugins. Subsequent applies skip the install (plugins pinned under `/opt/voodu/plugins`).
+
+**Asset content change drives rolling restart.** Edit `./configs/redis.conf`, re-apply — content hash changes, statefulset spec hash changes, redis-0 restarts with the new config. No manual `docker exec` or `redis-cli CONFIG SET`.
+
+## When to use macros vs raw statefulset
+
+| Pattern | Use when |
+|---|---|
+| `postgres "scope" "name" {}` | You want streaming replication, automatic password rotation, `vd pg:promote`, `vd pg:backups` — the [voodu-postgres plugin](/docs/plugins/postgres) features. |
+| `redis "scope" "name" {}` | You want sentinel HA, `vd redis:link`, automatic password injection — [voodu-redis features](/docs/plugins/redis). |
+| Raw `statefulset` | You're running something neither plugin covers (Kafka, NATS, MinIO, MongoDB), or you want full control over `command` / `entrypoint`. |
+
+The macros expand server-side into statefulsets, so the underlying primitives are the same. You can mix freely (postgres macro + raw statefulset for kafka in the same manifest).
+
+## Related
+
+- [`statefulset` manifest reference](/docs/manifests/statefulset) — full field list, ordinal/DNS rules
+- [`postgres` manifest reference](/docs/manifests/postgres) — macro fields
+- [`redis` manifest reference](/docs/manifests/redis) — macro fields
+- [voodu-postgres plugin](/docs/plugins/postgres) — replication, promote, backups
+- [voodu-redis plugin](/docs/plugins/redis) — sentinel HA, link, ACL pattern
