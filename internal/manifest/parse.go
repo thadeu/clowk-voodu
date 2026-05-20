@@ -232,13 +232,19 @@ type hclOnDeployBlock struct {
 }
 
 // hclDeployWebhook surfaces one webhook target — url plus the
-// optional method/headers knobs. The shape mirrors
-// manifest.DeployWebhook one-for-one so spec conversion is
-// trivial.
+// optional method/headers + body customisation knobs.
+//
+// Body is `cty.Value` (not `map[string]any`) because gohcl's
+// struct-tag path can't decode arbitrary nested objects into Go
+// generic types — it needs the cty layer. We convert via
+// ctyValueToGo at spec-time so the wire shape stays
+// JSON-friendly.
 type hclDeployWebhook struct {
 	URL     string            `hcl:"url"`
 	Method  string            `hcl:"method,optional"`
 	Headers map[string]string `hcl:"headers,optional"`
+	Body    cty.Value         `hcl:"body,optional"`
+	File    string            `hcl:"file,optional"`
 }
 
 // onDeployBlockToSpec converts the HCL surface into the wire
@@ -260,11 +266,31 @@ func deployWebhookBlockToSpec(b *hclDeployWebhook) *DeployWebhook {
 		return nil
 	}
 
-	return &DeployWebhook{
+	out := &DeployWebhook{
 		URL:     b.URL,
 		Method:  b.Method,
 		Headers: b.Headers,
+		File:    b.File,
 	}
+
+	// Body is cty.Value. NullVal / unknown → operator didn't
+	// declare it; leave Body nil. Otherwise convert the cty
+	// tree into a Go map[string]any so JSON / YAML serialisers
+	// can round-trip without cty as a dependency on the wire.
+	if b.Body.IsNull() || !b.Body.IsKnown() {
+		return out
+	}
+
+	goVal := ctyValueToGo(b.Body)
+
+	if m, ok := goVal.(map[string]any); ok {
+		out.Body = m
+	}
+	// Non-map root (a string, a list) is rejected by
+	// validateDeployWebhook below — the wire shape is "JSON
+	// object", not arbitrary scalar.
+
+	return out
 }
 
 // validateOnDeploy runs the semantic checks the HCL surface can't
@@ -310,7 +336,34 @@ func validateDeployWebhook(w *DeployWebhook, slot string) error {
 		}
 	}
 
+	// body and file are mutually exclusive. Declaring both
+	// would force voodu to pick one silently — better to fail
+	// loud than ship a confused webhook.
+	if w.Body != nil && w.File != "" {
+		return fmt.Errorf("on_deploy.%s: body and file are mutually exclusive", slot)
+	}
+
+	// File must be an asset reference. Bare paths are rejected
+	// because the asset layer is what gives voodu a stable
+	// host path + content materialisation pipeline; a relative
+	// path would either fail at fire time or surprise the
+	// operator with "relative to what?" semantics.
+	if w.File != "" && !looksLikeAssetRef(w.File) {
+		return fmt.Errorf("on_deploy.%s.file must be an asset reference (${asset.<scope>.<name>.<key>}), got %q", slot, w.File)
+	}
+
 	return nil
+}
+
+// looksLikeAssetRef returns true when s contains an
+// `${asset...}` interpolation. The check is permissive — it
+// catches both scoped (`${asset.scope.name.key}`) and unscoped
+// (`${asset.name.key}`) forms without re-implementing the asset
+// resolver's parser. Pure-text strings without the marker fail
+// the parse-time validation; asset existence is then verified
+// at apply time when the controller resolves the ref.
+func looksLikeAssetRef(s string) bool {
+	return strings.Contains(s, "${asset.")
 }
 
 // hclLogsBlock is the HCL surface for the docker-log-driver cap.

@@ -2626,6 +2626,140 @@ deployment "prod" "api" {
 	}
 }
 
+// TestParseHCLDeploymentOnDeploy_InlineBody pins that an HCL
+// object literal in `body = { ... }` decodes into the spec as
+// map[string]any (nested OK), round-trips through JSON
+// serialisation, and survives parse-time validation.
+func TestParseHCLDeploymentOnDeploy_InlineBody(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    failure {
+      url = "https://events.pagerduty.com/v2/enqueue"
+
+      body = {
+        routing_key  = "ROUTING_KEY"
+        event_action = "trigger"
+        payload = {
+          summary  = "voodu rollout {{name}} failed"
+          severity = "error"
+          custom_details = {
+            release_id = "{{release_id}}"
+          }
+        }
+      }
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy_body.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.OnDeploy == nil || spec.OnDeploy.Failure == nil {
+		t.Fatal("failure block lost")
+	}
+
+	body := spec.OnDeploy.Failure.Body
+	if body == nil {
+		t.Fatal("inline body lost in parse")
+	}
+
+	if body["routing_key"] != "ROUTING_KEY" {
+		t.Errorf("top-level field lost: %+v", body)
+	}
+
+	payload, ok := body["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested payload missing or wrong type: %T", body["payload"])
+	}
+
+	if payload["summary"] != "voodu rollout {{name}} failed" {
+		t.Errorf("nested summary lost: %+v", payload)
+	}
+
+	cd, ok := payload["custom_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("doubly-nested custom_details missing: %+v", payload)
+	}
+
+	if cd["release_id"] != "{{release_id}}" {
+		t.Errorf("deeply-nested template token: %+v", cd)
+	}
+}
+
+// TestParseHCLDeploymentOnDeploy_FileMustBeAssetRef pins that
+// the `file` field rejects bare paths. Asset-only enforces a
+// uniform resolution pipeline (host path + content hash) and
+// avoids "relative to what?" ambiguity.
+func TestParseHCLDeploymentOnDeploy_FileMustBeAssetRef(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    failure {
+      url  = "https://example.com/hook"
+      file = "./webhooks/body.json"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy_bare_file.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for bare path in file attribute")
+	}
+
+	if !strings.Contains(err.Error(), "must be an asset reference") {
+		t.Errorf("expected asset-ref error, got %v", err)
+	}
+}
+
+// TestParseHCLDeploymentOnDeploy_BodyAndFileMutex pins that
+// declaring both inline body AND file is rejected at parse —
+// they're conceptually two ways to do the same thing, and
+// silent precedence would confuse the operator.
+func TestParseHCLDeploymentOnDeploy_BodyAndFileMutex(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_deploy {
+    success {
+      url  = "https://example.com/hook"
+      file = "${asset.prod.webhooks.template}"
+
+      body = {
+        text = "hello"
+      }
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_deploy_both.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error when both body and file declared")
+	}
+
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutex error, got %v", err)
+	}
+}
+
 // TestParseHCLDeploymentOnDeploy_UrlRequired pins that a sub-block
 // must carry a non-empty url. An empty url would silently no-op
 // the webhook — better to fail parse and surface the typo.

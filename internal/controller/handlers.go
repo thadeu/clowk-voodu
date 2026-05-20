@@ -201,12 +201,24 @@ type onDeployWireSpec struct {
 
 // deployWebhookWireSpec mirrors manifest.DeployWebhook field-for-
 // field. Controller-local; controller-side webhook poster reads
-// Method + Headers directly off this struct to build the HTTP
-// request.
+// Method + Headers + Body/File directly off this struct to build
+// the HTTP request.
 type deployWebhookWireSpec struct {
 	URL     string            `json:"url"`
 	Method  string            `json:"method,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// Body is the inline JSON body to send, decoded as a generic
+	// map. Stored as map[string]any (not json.RawMessage) so YAML
+	// decoders round-trip cleanly — RawMessage's base64 default
+	// for []byte breaks the wire round-trip.
+	Body map[string]any `json:"body,omitempty"`
+
+	// File is the resolved host path (post-asset-resolution) of
+	// a JSON template the controller reads at fire time. Mutex
+	// with Body. Empty (with Body also empty) means "use the
+	// default WebhookPayload."
+	File string `json:"file,omitempty"`
 }
 
 // logsWireSpec mirrors manifest.LogsSpec. Same anti-cycle posture
@@ -1679,6 +1691,28 @@ func resolveDeploymentSpecAssets(ctx context.Context, store Store, spec *deploym
 		return err
 	}
 
+	// on_deploy webhook body templates can live in assets so the
+	// HCL stays clean. Each webhook's File field carries an
+	// `${asset.X.Y}` ref that resolves to the host path the
+	// controller reads at fire time. Parse-time validation
+	// already rejected non-asset paths; the InterpolateAssetRefs
+	// call here either succeeds with the resolved path or
+	// surfaces a "no such asset" error loudly.
+	if spec.OnDeploy != nil {
+		for _, w := range []*deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			if w == nil || w.File == "" {
+				continue
+			}
+
+			resolved, ierr := InterpolateAssetRefs(w.File, lookup)
+			if ierr != nil {
+				return ierr
+			}
+
+			w.File = resolved
+		}
+	}
+
 	return nil
 }
 
@@ -2058,6 +2092,23 @@ func collectDeploymentAssetRefs(spec deploymentSpec) []assetRef {
 
 	for _, v := range spec.Env {
 		out = append(out, collectAssetRefs(v)...)
+	}
+
+	// on_deploy webhook body files reference assets so the
+	// controller can materialise them at apply time. The asset
+	// digest is collected here so /status carries the digest
+	// map, but the digest does NOT fold into the spec hash
+	// (deploymentSpecHash deliberately excludes the OnDeploy
+	// block — rotating webhook body content shouldn't churn
+	// replicas, same posture as rotating webhook URLs).
+	if spec.OnDeploy != nil {
+		for _, w := range []*deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			if w == nil || w.File == "" {
+				continue
+			}
+
+			out = append(out, collectAssetRefs(w.File)...)
+		}
 	}
 
 	return out

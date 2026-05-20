@@ -428,6 +428,42 @@ type DeployWebhook struct {
 	// "application/json"; declaring it here overrides the
 	// default.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// Body is the inline JSON body sent to the webhook. The
+	// operator declares an HCL object literal or a YAML map; it
+	// gets JSON-marshalled and POSTed verbatim, replacing
+	// voodu's default WebhookPayload. Mutex with File.
+	//
+	// Empty (and File empty) → voodu sends the default
+	// WebhookPayload (kind, scope, name, release_id, image,
+	// status, started_at, completed_at, error). That's the
+	// backward-compat path for the 90% of receivers that just
+	// want "any JSON".
+	//
+	// String values within Body support two interpolation
+	// contexts: `${VAR}` resolves shell env at parse time on
+	// the operator's machine (same as URL / Headers); `{{field}}`
+	// resolves deploy fields at fire time on the controller
+	// (see WebhookPayload for the field list — name, status,
+	// release_id, etc.).
+	Body map[string]any `yaml:"body,omitempty" json:"body,omitempty"`
+
+	// File is an asset reference pointing at a JSON template
+	// file. The file's content becomes the webhook body (after
+	// `{{field}}` substitution at fire time). Use this when the
+	// body is too rich to keep inline — Slack Block Kit,
+	// PagerDuty Events API v2, Telegram bot payloads, etc.
+	// Mutex with Body.
+	//
+	// Format: an asset reference like
+	// `${asset.<scope>.<name>.<key>}`. Bare paths are rejected
+	// — assets give voodu the materialised host path + content
+	// hash without operators needing to think about relative-
+	// to-what semantics.
+	//
+	// Content type is opaque to voodu; the receiver decides
+	// (declare Content-Type in Headers if not application/json).
+	File string `yaml:"file,omitempty" json:"file,omitempty"`
 }
 
 // LogsSpec caps the docker json-file log driver per container.

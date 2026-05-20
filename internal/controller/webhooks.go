@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -110,6 +111,15 @@ type WebhookTarget struct {
 	// after the operator's headers apply, so source-of-call
 	// debugging on the receiver side stays reliable.
 	Headers map[string]string
+
+	// Body is the request body bytes the poster should send. nil
+	// → poster serialises the WebhookPayload arg as JSON
+	// (default behaviour, back-compat with pre-customisation
+	// webhooks). Non-nil → poster sends Body verbatim and
+	// ignores the WebhookPayload arg for body purposes (operator
+	// declared inline body or file template; substitution
+	// already done upstream).
+	Body []byte
 }
 
 // HTTPWebhookPoster is the production poster. Each Post is a
@@ -146,9 +156,18 @@ const webhookAttemptTimeout = 10 * time.Second
 // endpoint flapping between 4xx/2xx is rare enough not to
 // special-case.
 func (p HTTPWebhookPoster) Post(ctx context.Context, target WebhookTarget, payload WebhookPayload) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal webhook payload: %w", err)
+	body := target.Body
+
+	if body == nil {
+		// Default behaviour: serialise the platform payload.
+		// Operator declared neither inline body nor file
+		// template — they get the standard JSON shape.
+		var err error
+
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal webhook payload: %w", err)
+		}
 	}
 
 	client := p.Client
@@ -310,6 +329,29 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		Headers: target.Headers,
 	}
 
+	// Body materialisation. Three branches:
+	//
+	//   target.Body set  → inline operator-supplied body. Walk
+	//                      the map tree substituting {{...}}
+	//                      tokens, then json.Marshal.
+	//   target.File set  → asset already resolved to a host path
+	//                      at apply time. Read the file, parse
+	//                      as JSON, walk + substitute, marshal.
+	//   neither          → leave wt.Body nil; poster falls back
+	//                      to marshalling the default
+	//                      WebhookPayload. Back-compat path.
+	if body, err := buildCustomBody(target, payload); err != nil {
+		if logf != nil {
+			logf("deployment/%s/%s on_deploy webhook (%s) body build failed: %v", scope, name, status, err)
+		}
+		// Falls through with wt.Body nil; poster sends the
+		// default payload as a safety net. Drop-on-floor is
+		// worse than half-defaulting because the operator
+		// would never know their custom body was ignored.
+	} else if body != nil {
+		wt.Body = body
+	}
+
 	go func() {
 		// Fresh context — the apply caller's ctx may already be
 		// done (HTTP response written) by the time we get here.
@@ -324,4 +366,118 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 			}
 		}
 	}()
+}
+
+// buildCustomBody returns the operator-customised body bytes when
+// target declares inline body or file template, with all
+// `{{field}}` tokens substituted against the live payload.
+// Returns (nil, nil) when neither is declared (caller falls back
+// to the default WebhookPayload marshal).
+//
+// Error paths:
+//   - file read failure (file vanished between apply and fire)
+//   - JSON parse failure on the file content
+// In both cases the caller logs + sends the default payload as
+// a safety net (see fireDeployWebhook).
+func buildCustomBody(target *deployWebhookWireSpec, payload WebhookPayload) ([]byte, error) {
+	var tree map[string]any
+
+	switch {
+	case len(target.Body) > 0:
+		// Inline body. The map[string]any tree decoded from
+		// HCL is unsafe to mutate (it lives on the wire spec
+		// stored in etcd and possibly cached); deep-clone via
+		// JSON round-trip before substituting.
+		raw, err := json.Marshal(target.Body)
+		if err != nil {
+			return nil, fmt.Errorf("clone inline body: %w", err)
+		}
+
+		if err := json.Unmarshal(raw, &tree); err != nil {
+			return nil, fmt.Errorf("decode inline body: %w", err)
+		}
+
+	case target.File != "":
+		raw, err := os.ReadFile(target.File)
+		if err != nil {
+			return nil, fmt.Errorf("read body file %s: %w", target.File, err)
+		}
+
+		if err := json.Unmarshal(raw, &tree); err != nil {
+			return nil, fmt.Errorf("parse body file %s: %w", target.File, err)
+		}
+
+	default:
+		return nil, nil
+	}
+
+	substituteWebhookTokens(tree, payload)
+
+	out, err := json.Marshal(tree)
+	if err != nil {
+		return nil, fmt.Errorf("marshal substituted body: %w", err)
+	}
+
+	return out, nil
+}
+
+// substituteWebhookTokens walks the JSON tree in place, replacing
+// `{{field}}` markers in string values with their live payload
+// equivalent. Recurses into nested maps and lists. Unknown tokens
+// are left literal (no replacement) — operators may legitimately
+// have `{{...}}` text in body content (some receivers themselves
+// use handlebars-style templates).
+//
+// Token surface (case-sensitive):
+//
+//	{{kind}}         {{scope}}         {{name}}
+//	{{release_id}}   {{image}}
+//	{{status}}       {{error}}
+//	{{started_at}}   {{completed_at}}
+func substituteWebhookTokens(node any, payload WebhookPayload) {
+	switch n := node.(type) {
+	case map[string]any:
+		for k, v := range n {
+			switch child := v.(type) {
+			case string:
+				n[k] = applyWebhookTokens(child, payload)
+			default:
+				substituteWebhookTokens(child, payload)
+			}
+		}
+
+	case []any:
+		for i, v := range n {
+			switch child := v.(type) {
+			case string:
+				n[i] = applyWebhookTokens(child, payload)
+			default:
+				substituteWebhookTokens(child, payload)
+			}
+		}
+	}
+}
+
+// applyWebhookTokens replaces every known {{token}} in s with its
+// payload value. strings.NewReplacer would handle the bulk
+// replacements in one pass but we keep the explicit map so
+// adding a new token is one line, not a Replacer rebuild.
+func applyWebhookTokens(s string, payload WebhookPayload) string {
+	if !strings.Contains(s, "{{") {
+		return s
+	}
+
+	replacements := []string{
+		"{{kind}}", payload.Kind,
+		"{{scope}}", payload.Scope,
+		"{{name}}", payload.Name,
+		"{{release_id}}", payload.ReleaseID,
+		"{{image}}", payload.Image,
+		"{{status}}", payload.Status,
+		"{{error}}", payload.Error,
+		"{{started_at}}", payload.StartedAt,
+		"{{completed_at}}", payload.CompletedAt,
+	}
+
+	return strings.NewReplacer(replacements...).Replace(s)
 }
