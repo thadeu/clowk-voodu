@@ -34,6 +34,44 @@ deployment "prod" "api" {
 | `url` | yes | — | Absolute endpoint. Supports `${VAR}` shell-env interpolation (client-side at parse time) so secret-bearing URLs and headers stay out of git. |
 | `method` | no | `POST` | Whitelist: `POST` / `PUT` / `PATCH` / `DELETE`. GET / HEAD / OPTIONS rejected at parse — webhook payload IS a body. |
 | `headers` | no | empty | Map of extra request headers. Operator overrides `Content-Type` if declared. **`User-Agent` is force-set** to `voodu-deploy-webhook` (source-of-call debug signal). |
+| `body` | no, mutex with `file` | — | Inline HCL object literal. Becomes the JSON request body verbatim. Use for small / one-off bodies (≤ 5 lines of flat fields). |
+| `file` | no, mutex with `body` | — | Asset reference (`${asset.scope.name.key}`) pointing at a JSON template file. Use for rich bodies (Slack Block Kit, PagerDuty Events v2, anything multi-line nested). Asset-only (bare paths rejected). |
+
+### Body interpolation
+
+Two contexts. Both work inside the inline `body { ... }` and inside the asset-backed JSON file:
+
+| token | resolved | when | example |
+|---|---|---|---|
+| `${VAR}` | shell env | parse-time, client-side | `${PD_ROUTING_KEY}`, `${SLACK_WEBHOOK_URL}` |
+| `{{field}}` | release context | fire-time, controller-side | `{{name}}`, `{{status}}`, `{{error}}` |
+
+Allowed `{{...}}` tokens (case-sensitive):
+
+```
+{{kind}}        {{scope}}         {{name}}
+{{release_id}}  {{image}}
+{{status}}      {{error}}
+{{started_at}}  {{completed_at}}
+```
+
+Unknown `{{...}}` markers are left **literal** — some webhook receivers themselves use handlebars-style templates and shouldn't be touched.
+
+### Default body
+
+If neither `body` nor `file` is declared, voodu sends the fixed default payload:
+
+```json
+{
+  "kind": "deployment", "scope": "...", "name": "...",
+  "release_id": "...", "image": "...", "status": "success|failure",
+  "started_at": "...", "completed_at": "...", "error": ""
+}
+```
+
+`Content-Type: application/json`, `User-Agent: voodu-deploy-webhook`.
+
+When `body` or `file` IS declared, voodu sends EXCLUSIVELY the operator's body — the default fields are NOT merged in. If you want them, include them explicitly in your template (the `{{...}}` tokens cover every default field).
 
 ## What it ISN'T
 
@@ -67,44 +105,32 @@ operational benefit. So `on_deploy` lives outside the hash.
 You can rotate webhook URLs as freely as you'd rotate Slack channel
 names.
 
-## Payload shape
-
-```json
-{
-  "kind": "deployment",
-  "scope": "prod",
-  "name": "api",
-  "release_id": "a3f9c1b2e",
-  "image": "ghcr.io/acme/api:1.4.2",
-  "status": "success",
-  "started_at": "2026-05-19T14:22:10Z",
-  "completed_at": "2026-05-19T14:22:47Z",
-  "error": ""
-}
-```
-
-`status` is `"success"` or `"failure"`. On failure, `error` carries
-the first failure message that aborted the rollout (same string
-`vd release <ref>` shows). `release_id` is the 9-char release
-record ID; empty for env-change-only restarts that don't mint a
-release record. All timestamps are RFC3339 UTC.
-
-`Content-Type: application/json`, `User-Agent: voodu-deploy-webhook`.
-
 ## One URL vs two
 
 - **Same URL for both** — single channel, ops team sees every
-  rollout regardless of outcome. The receiving workflow keys off
-  the `status` field for tone (emoji, colour, mention rules). See
-  [`slack-notify.hcl`](./slack-notify.hcl).
+  rollout regardless of outcome. Default payload includes a
+  `status` field receivers branch on. See [`slack-notify.hcl`](./slack-notify.hcl).
 - **Different URLs per outcome** — successes are informational
   (low-urgency channel, no paging); failures are actionable
-  (PagerDuty, on-call channel). Asymmetric urgency = asymmetric
-  routing. See [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl).
+  (PagerDuty, on-call channel). See [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl).
+
+## Inline `body` vs asset `file` — when to use which
+
+Rule of thumb:
+
+- **≤ a few flat fields** → inline body. Keeps the request shape
+  visible alongside the URL it ships to. See [`telegram-bot.hcl`](./telegram-bot.hcl).
+- **≥ 5 lines of nested JSON** → asset-backed file. The HCL stays
+  short; the body template lives in a `.json` file you can lint,
+  diff, syntax-highlight, and share across deployments. See
+  [`slack-block-kit.hcl`](./slack-block-kit.hcl) and [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl).
 
 ## Examples
 
 | file | what it shows |
 |---|---|
-| [`slack-notify.hcl`](./slack-notify.hcl) | Same Slack URL for both outcomes; receiving workflow branches on `status` |
-| [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl) | PagerDuty page on failure, low-urgency Slack on success — asymmetric routing |
+| [`slack-notify.hcl`](./slack-notify.hcl) | Default voodu payload — no `body`/`file` declared. Slack workflow branches on `status` for tone |
+| [`slack-block-kit.hcl`](./slack-block-kit.hcl) | Asset-backed Slack Block Kit JSON: rich messages with headers, code blocks, @channel mentions. Different template per outcome |
+| [`telegram-bot.hcl`](./telegram-bot.hcl) | **Inline body** — small Telegram bot API payload (`chat_id`, `text`, `parse_mode`). Token in URL, chat_id from shell env |
+| [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl) | Asymmetric routing: Slack on success (default body), PagerDuty Events API v2 direct on failure (asset-backed body with the receiver-specific schema) |
+| `webhooks/*.json` | Body template files referenced by the asset-backed examples |

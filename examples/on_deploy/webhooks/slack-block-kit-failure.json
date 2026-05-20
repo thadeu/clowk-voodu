@@ -1,0 +1,48 @@
+{
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": "🚨 {{name}} rollout FAILED",
+        "emoji": true
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*<!channel> Rollout aborted in {{scope}}/{{name}}*"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Image:*\n`{{image}}`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Release:*\n`{{release_id}}`"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Error:*\n```{{error}}```"
+      }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "voodu • {{started_at}} → {{completed_at}}"
+        }
+      ]
+    }
+  ]
+}

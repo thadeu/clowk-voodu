@@ -1,6 +1,11 @@
-# Slack notification for every rollout — same URL for success and
-# failure, receiving workflow branches on the payload's `status`
-# field for tone.
+# Slack notification for every rollout — bare default payload
+# (kind/scope/name/status/...) goes through, receiving workflow
+# branches on the `status` field for tone.
+#
+# Want richer Slack messages (headers, code blocks, @channel
+# mentions, multi-column fields)? See slack-block-kit.hcl in
+# this directory — same delivery contract, asset-backed Block
+# Kit JSON templates for full visual control.
 #
 # Two new things vs. the M6-original shape:
 #

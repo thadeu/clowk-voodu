@@ -1,0 +1,42 @@
+{
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": "✅ {{name}} deployed successfully",
+        "emoji": true
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Scope:*\n{{scope}}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image:*\n`{{image}}`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Release:*\n`{{release_id}}`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Completed:*\n{{completed_at}}"
+        }
+      ]
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "voodu • started {{started_at}}"
+        }
+      ]
+    }
+  ]
+}
