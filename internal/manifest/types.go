@@ -367,9 +367,10 @@ type AutoscaleSpec struct {
 
 // OnDeploySpec carries the operator-supplied webhook
 // endpoints invoked at the END of a rolling-restart. Both
-// sub-blocks are optional and independent: an operator who only
-// cares about failure pages declares `failure` alone and skips
-// the chatty "everything's fine" pings.
+// slots are optional and independent — and each slot accepts
+// MULTIPLE targets so a single rollout can fan out (e.g. Slack
+// for the team channel + Datadog for the dashboard on success;
+// PagerDuty + OpsGenie + an internal incident bot on failure).
 //
 //	deployment "x" "api" {
 //	  on_deploy {
@@ -377,30 +378,39 @@ type AutoscaleSpec struct {
 //	      url = "https://hooks.slack.com/services/T../B../..."
 //	    }
 //
+//	    success {
+//	      url = "https://api.datadoghq.com/api/v1/events"
+//	      headers = { "DD-API-KEY" = "${DD_API_KEY}" }
+//	    }
+//
 //	    failure {
 //	      url     = "https://events.pagerduty.com/v2/enqueue"
-//	      method  = "POST"               # default
+//	      method  = "POST"
 //	      headers = {
 //	        "Authorization" = "Token token=${PD_TOKEN}"
 //	      }
 //	    }
+//
+//	    failure {
+//	      url = "https://api.opsgenie.com/v2/alerts"
+//	      headers = { "Authorization" = "GenieKey ${OPSGENIE_KEY}" }
+//	    }
 //	  }
 //	}
 //
-// Delivery is best-effort. The controller sends a small JSON
-// payload (kind, scope, name, release_id, image, status, error,
-// timestamps) to each endpoint, retries 3 times with exponential
-// backoff (1s, 5s, 30s), and then drops on the floor. A webhook
-// failure NEVER fails the deploy — the rollout already happened
-// and there's nothing useful to "fail" by then.
+// Delivery is best-effort AND parallel — each target gets its
+// own goroutine, its own retry loop (3 attempts, exponential
+// backoff 1s/5s/30s), and its own drop-on-floor outcome. A
+// failure on one target does NOT affect the others, and no
+// target failure ever fails the deploy.
 //
 // Payload shape stays fixed (see controller.WebhookPayload).
 // Header + method customisation lets the operator hit real
 // service APIs (PagerDuty Events v2, Datadog, internal
 // receivers) without a transformer in the middle.
 type OnDeploySpec struct {
-	Success *DeployWebhook `yaml:"success,omitempty" json:"success,omitempty"`
-	Failure *DeployWebhook `yaml:"failure,omitempty" json:"failure,omitempty"`
+	Success []DeployWebhook `yaml:"success,omitempty" json:"success,omitempty"`
+	Failure []DeployWebhook `yaml:"failure,omitempty" json:"failure,omitempty"`
 }
 
 // DeployWebhook is one configured webhook target — URL plus the

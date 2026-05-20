@@ -193,10 +193,12 @@ type autoscaleWireSpec struct {
 
 // onDeployWireSpec mirrors manifest.OnDeploySpec — JSON tags match
 // so spec decode round-trips cleanly. Controller-local because
-// internal/manifest imports controller (cycle).
+// internal/manifest imports controller (cycle). Both slots are
+// slices: multiple targets per slot fire in parallel at delivery
+// time, each with its own retry budget.
 type onDeployWireSpec struct {
-	Success *deployWebhookWireSpec `json:"success,omitempty"`
-	Failure *deployWebhookWireSpec `json:"failure,omitempty"`
+	Success []deployWebhookWireSpec `json:"success,omitempty"`
+	Failure []deployWebhookWireSpec `json:"failure,omitempty"`
 }
 
 // deployWebhookWireSpec mirrors manifest.DeployWebhook field-for-
@@ -1699,17 +1701,19 @@ func resolveDeploymentSpecAssets(ctx context.Context, store Store, spec *deploym
 	// call here either succeeds with the resolved path or
 	// surfaces a "no such asset" error loudly.
 	if spec.OnDeploy != nil {
-		for _, w := range []*deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
-			if w == nil || w.File == "" {
-				continue
-			}
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
 
-			resolved, ierr := InterpolateAssetRefs(w.File, lookup)
-			if ierr != nil {
-				return ierr
-			}
+				resolved, ierr := InterpolateAssetRefs(slot[i].File, lookup)
+				if ierr != nil {
+					return ierr
+				}
 
-			w.File = resolved
+				slot[i].File = resolved
+			}
 		}
 	}
 
@@ -2102,12 +2106,14 @@ func collectDeploymentAssetRefs(spec deploymentSpec) []assetRef {
 	// block — rotating webhook body content shouldn't churn
 	// replicas, same posture as rotating webhook URLs).
 	if spec.OnDeploy != nil {
-		for _, w := range []*deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
-			if w == nil || w.File == "" {
-				continue
-			}
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
 
-			out = append(out, collectAssetRefs(w.File)...)
+				out = append(out, collectAssetRefs(slot[i].File)...)
+			}
 		}
 	}
 

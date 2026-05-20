@@ -145,8 +145,8 @@ func TestWebhook_PostedOnSuccess(t *testing.T) {
 	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
 		Image: "nginx:1.28",
 		OnDeploy: &onDeployWireSpec{
-			Success: &deployWebhookWireSpec{URL: "https://hooks.example.com/success"},
-			Failure: &deployWebhookWireSpec{URL: "https://hooks.example.com/failure"},
+			Success: []deployWebhookWireSpec{{URL: "https://hooks.example.com/success"}},
+			Failure: []deployWebhookWireSpec{{URL: "https://hooks.example.com/failure"}},
 		},
 	})
 
@@ -172,6 +172,111 @@ func TestWebhook_PostedOnSuccess(t *testing.T) {
 	if call.Payload.Status != "success" {
 		t.Errorf("Status: got %q, want success", call.Payload.Status)
 	}
+}
+
+// TestWebhook_FanoutMultipleTargets pins the multi-target fan-out:
+// declaring N webhooks under one slot fires N POSTs in parallel,
+// each with the same payload, each with its own URL. Without this
+// pin a regression that picks "only the first target" would
+// silently break operators who declared Slack + Datadog + an
+// internal incident bot under one `success {}` shape.
+func TestWebhook_FanoutMultipleTargets(t *testing.T) {
+	withZeroWebhookBackoff(t)
+
+	poster := &fakeWebhookPoster{}
+
+	started := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	completed := started.Add(45 * time.Second)
+
+	fireDeployWebhook(
+		poster, nil,
+		&onDeployWireSpec{
+			Success: []deployWebhookWireSpec{
+				{URL: "https://slack.example/hook"},
+				{URL: "https://datadog.example/event"},
+				{URL: "https://internal.example/bot"},
+			},
+		},
+		"deployment", "prod", "api",
+		"rel-42",
+		"ghcr.io/me/api:v1",
+		"success", "",
+		started, completed,
+	)
+
+	waitFor(t, func() bool { return poster.callCount() >= 3 })
+
+	if got := poster.callCount(); got != 3 {
+		t.Fatalf("want 3 webhook calls (one per target), got %d", got)
+	}
+
+	// Capture every URL hit; order is not guaranteed because each
+	// target fires in its own goroutine.
+	got := map[string]bool{}
+
+	poster.mu.Lock()
+	for _, c := range poster.calls {
+		got[c.URL] = true
+
+		if c.Payload.Status != "success" {
+			t.Errorf("payload.Status: %q on %q, want success", c.Payload.Status, c.URL)
+		}
+	}
+	poster.mu.Unlock()
+
+	for _, url := range []string{
+		"https://slack.example/hook",
+		"https://datadog.example/event",
+		"https://internal.example/bot",
+	} {
+		if !got[url] {
+			t.Errorf("missing webhook call to %q", url)
+		}
+	}
+}
+
+// TestWebhook_FanoutMixedSlotsOnlyFiresMatchingStatus pins that
+// declaring both `success` and `failure` slots, and emitting only
+// "success", fires ONLY the success targets (and vice versa).
+// Without this an N×N regression where everything fires on every
+// event would spam every operator's PagerDuty on every healthy
+// rollout.
+func TestWebhook_FanoutMixedSlotsOnlyFiresMatchingStatus(t *testing.T) {
+	withZeroWebhookBackoff(t)
+
+	poster := &fakeWebhookPoster{}
+
+	now := time.Now().UTC()
+
+	fireDeployWebhook(
+		poster, nil,
+		&onDeployWireSpec{
+			Success: []deployWebhookWireSpec{
+				{URL: "https://slack.example/ok"},
+				{URL: "https://datadog.example/ok"},
+			},
+			Failure: []deployWebhookWireSpec{
+				{URL: "https://pagerduty.example/incident"},
+			},
+		},
+		"deployment", "prod", "api", "rel-1", "img:v1",
+		"success", "",
+		now, now,
+	)
+
+	waitFor(t, func() bool { return poster.callCount() >= 2 })
+
+	if got := poster.callCount(); got != 2 {
+		t.Fatalf("want 2 calls (success slot, 2 targets), got %d", got)
+	}
+
+	poster.mu.Lock()
+	for _, c := range poster.calls {
+		if strings.Contains(c.URL, "pagerduty") {
+			t.Errorf("failure-slot URL fired on success event: %q", c.URL)
+		}
+	}
+	poster.mu.Unlock()
 }
 
 // TestWebhook_PostedOnFailure asserts the failure URL fires when
@@ -202,7 +307,7 @@ func TestWebhook_PostedOnFailure(t *testing.T) {
 	ev := putEvent(t, KindDeployment, "api", deploymentSpec{
 		Image: "nginx:1.27",
 		OnDeploy: &onDeployWireSpec{
-			Failure: &deployWebhookWireSpec{URL: "https://hooks.example.com/failure"},
+			Failure: []deployWebhookWireSpec{{URL: "https://hooks.example.com/failure"}},
 		},
 	})
 
@@ -302,7 +407,7 @@ func TestWebhook_PayloadShape(t *testing.T) {
 
 	fireDeployWebhook(
 		poster, nil,
-		&onDeployWireSpec{Success: &deployWebhookWireSpec{URL: "https://example/hook"}},
+		&onDeployWireSpec{Success: []deployWebhookWireSpec{{URL: "https://example/hook"}}},
 		"deployment", "prod", "api",
 		"rel-42",
 		"ghcr.io/me/api:v1",
@@ -370,14 +475,14 @@ func TestWebhook_MethodAndHeadersPropagate(t *testing.T) {
 	fireDeployWebhook(
 		poster, nil,
 		&onDeployWireSpec{
-			Failure: &deployWebhookWireSpec{
+			Failure: []deployWebhookWireSpec{{
 				URL:    "https://events.pagerduty.com/v2/enqueue",
 				Method: "PUT",
 				Headers: map[string]string{
 					"Authorization": "Token token=secret123",
 					"X-Source":      "voodu",
 				},
-			},
+			}},
 		},
 		"deployment", "prod", "api",
 		"rel-42",
@@ -470,7 +575,7 @@ func TestWebhook_InlineBodySubstitutes(t *testing.T) {
 	fireDeployWebhook(
 		poster, nil,
 		&onDeployWireSpec{
-			Failure: &deployWebhookWireSpec{
+			Failure: []deployWebhookWireSpec{{
 				URL: "https://events.pagerduty.com/v2/enqueue",
 				Body: map[string]any{
 					"routing_key":  "R000",
@@ -485,7 +590,7 @@ func TestWebhook_InlineBodySubstitutes(t *testing.T) {
 						},
 					},
 				},
-			},
+			}},
 		},
 		"deployment", "prod", "api",
 		"rel-42",
@@ -538,14 +643,14 @@ func TestWebhook_InlineBodyBytesReachPoster_ViaHTTP(t *testing.T) {
 	fireDeployWebhook(
 		HTTPWebhookPoster{}, nil,
 		&onDeployWireSpec{
-			Success: &deployWebhookWireSpec{
+			Success: []deployWebhookWireSpec{{
 				URL: srv.URL,
 				Body: map[string]any{
 					"text":         "✅ {{name}} {{image}}",
 					"release_id":   "{{release_id}}",
 					"environment":  "{{scope}}",
 				},
-			},
+			}},
 		},
 		"deployment", "prod", "api",
 		"rel-99",
@@ -610,10 +715,10 @@ func TestWebhook_FileBodyReadsFromAsset(t *testing.T) {
 	fireDeployWebhook(
 		HTTPWebhookPoster{}, nil,
 		&onDeployWireSpec{
-			Success: &deployWebhookWireSpec{
+			Success: []deployWebhookWireSpec{{
 				URL:  srv.URL,
 				File: path,
-			},
+			}},
 		},
 		"deployment", "prod", "api", "rel-1",
 		"ghcr.io/me/api:v3",
@@ -655,14 +760,14 @@ func TestWebhook_UnknownTokensLeftLiteral(t *testing.T) {
 	fireDeployWebhook(
 		HTTPWebhookPoster{}, nil,
 		&onDeployWireSpec{
-			Success: &deployWebhookWireSpec{
+			Success: []deployWebhookWireSpec{{
 				URL: srv.URL,
 				Body: map[string]any{
 					"text":   "{{name}} - {{this_is_not_a_voodu_token}}",
 					"room":   "{{room_id}}",
 					"action": "{{status}}",
 				},
-			},
+			}},
 		},
 		"deployment", "prod", "api", "", "img:v1", "success", "", now, now,
 	)

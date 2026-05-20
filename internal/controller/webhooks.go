@@ -279,35 +279,42 @@ func postWithRetry(ctx context.Context, poster WebhookPoster, target WebhookTarg
 }
 
 // fireDeployWebhook is the handler's one-call helper. It builds
-// the payload, picks the URL based on status, and dispatches the
-// retry loop in a goroutine so the apply/release path doesn't
-// block on webhook latency.
+// the shared payload, picks the slot based on status, and fans
+// out one goroutine per declared target so multi-destination
+// success / failure hooks fire in parallel.
 //
-// nil poster or empty URL → no-op. This keeps the handler call
+// nil poster or empty slot → no-op. This keeps the handler call
 // site terse: every rolling-restart success path calls
 // fireDeployWebhook regardless of whether the operator declared
 // on_deploy, and the no-op gate makes the absent-block case free.
 //
-// Why a goroutine: a webhook can take ~36s in the worst case
-// (3 timed-out attempts). Deploying to a deployment with a slow
-// or unreachable webhook endpoint shouldn't add half a minute to
-// every `vd apply`. The fire-and-forget posture is intentional —
-// the operator chose "best effort" semantics by using the
-// feature.
+// Why goroutines: a single webhook can take ~36s in the worst
+// case (3 timed-out attempts). With N targets, sequential
+// delivery would scale linearly — N×36s of wall-clock latency
+// the operator wouldn't notice (the apply path already
+// returned), but log lines would dribble out across minutes.
+// Per-target goroutines give bounded total wall-clock (max
+// across targets, not sum) and independent retry budgets — a
+// slow PagerDuty doesn't delay Slack.
+//
+// Per-target identity in log lines: `target=<index>/<total>`
+// when total > 1, so operators grepping "on_deploy webhook"
+// can correlate retries to a specific declared block in the
+// HCL surface.
 func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *onDeployWireSpec, kind, scope, name, releaseID, image, status, errMsg string, startedAt, completedAt time.Time) {
 	if poster == nil || spec == nil {
 		return
 	}
 
-	var target *deployWebhookWireSpec
+	var targets []deployWebhookWireSpec
 	switch status {
 	case "success":
-		target = spec.Success
+		targets = spec.Success
 	case "failure":
-		target = spec.Failure
+		targets = spec.Failure
 	}
 
-	if target == nil || target.URL == "" {
+	if len(targets) == 0 {
 		return
 	}
 
@@ -323,49 +330,71 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		Error:       errMsg,
 	}
 
-	wt := WebhookTarget{
-		URL:     target.URL,
-		Method:  target.Method,
-		Headers: target.Headers,
-	}
+	total := len(targets)
 
-	// Body materialisation. Three branches:
-	//
-	//   target.Body set  → inline operator-supplied body. Walk
-	//                      the map tree substituting {{...}}
-	//                      tokens, then json.Marshal.
-	//   target.File set  → asset already resolved to a host path
-	//                      at apply time. Read the file, parse
-	//                      as JSON, walk + substitute, marshal.
-	//   neither          → leave wt.Body nil; poster falls back
-	//                      to marshalling the default
-	//                      WebhookPayload. Back-compat path.
-	if body, err := buildCustomBody(target, payload); err != nil {
-		if logf != nil {
-			logf("deployment/%s/%s on_deploy webhook (%s) body build failed: %v", scope, name, status, err)
+	for i := range targets {
+		target := targets[i]
+
+		if target.URL == "" {
+			continue
 		}
-		// Falls through with wt.Body nil; poster sends the
-		// default payload as a safety net. Drop-on-floor is
-		// worse than half-defaulting because the operator
-		// would never know their custom body was ignored.
-	} else if body != nil {
-		wt.Body = body
-	}
 
-	go func() {
-		// Fresh context — the apply caller's ctx may already be
-		// done (HTTP response written) by the time we get here.
-		// We don't share its cancellation; the per-attempt
-		// timeout is enough to bound runtime.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
+		// Build per-target identity for log correlation. Single-
+		// target is the common case; the index is noise when
+		// total == 1, so we suppress it.
+		ident := status
+		if total > 1 {
+			ident = fmt.Sprintf("%s[%d/%d]", status, i+1, total)
+		}
 
-		if err := postWithRetry(ctx, poster, wt, payload, nil); err != nil {
+		wt := WebhookTarget{
+			URL:     target.URL,
+			Method:  target.Method,
+			Headers: target.Headers,
+		}
+
+		// Body materialisation. Three branches:
+		//
+		//   target.Body set  → inline operator-supplied body. Walk
+		//                      the map tree substituting {{...}}
+		//                      tokens, then json.Marshal.
+		//   target.File set  → asset already resolved to a host path
+		//                      at apply time. Read the file, parse
+		//                      as JSON, walk + substitute, marshal.
+		//   neither          → leave wt.Body nil; poster falls back
+		//                      to marshalling the default
+		//                      WebhookPayload. Back-compat path.
+		if body, err := buildCustomBody(&target, payload); err != nil {
 			if logf != nil {
-				logf("deployment/%s/%s on_deploy webhook (%s) dropped after retries: %v", scope, name, status, err)
+				logf("deployment/%s/%s on_deploy webhook (%s) body build failed: %v", scope, name, ident, err)
 			}
+			// Falls through with wt.Body nil; poster sends the
+			// default payload as a safety net. Drop-on-floor is
+			// worse than half-defaulting because the operator
+			// would never know their custom body was ignored.
+		} else if body != nil {
+			wt.Body = body
 		}
-	}()
+
+		// Capture wt + ident in this iteration's scope so the
+		// goroutine sees its own target — Go's range-loop reuses
+		// the loop variable address across iterations, so a naive
+		// closure over `target` would race on the wire spec.
+		go func(wt WebhookTarget, ident string) {
+			// Fresh context — the apply caller's ctx may already be
+			// done (HTTP response written) by the time we get here.
+			// We don't share its cancellation; the per-attempt
+			// timeout is enough to bound runtime.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			if err := postWithRetry(ctx, poster, wt, payload, nil); err != nil {
+				if logf != nil {
+					logf("deployment/%s/%s on_deploy webhook (%s) dropped after retries: %v", scope, name, ident, err)
+				}
+			}
+		}(wt, ident)
+	}
 }
 
 // buildCustomBody returns the operator-customised body bytes when

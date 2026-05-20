@@ -6,8 +6,13 @@ small JSON payload to the URL(s) the operator declared.
 
 ## What it IS
 
-A fire-and-forget notification hook. Two independent sub-blocks
-(`success`, `failure`); declare either or both.
+A fire-and-forget notification hook. Two independent slots
+(`success`, `failure`); each slot accepts **zero, one, or many**
+target blocks. Multiple targets per slot fire in parallel
+goroutines with independent retry budgets — a slow PagerDuty
+doesn't delay Slack.
+
+Single target per slot — the common case:
 
 ```hcl
 deployment "prod" "api" {
@@ -27,7 +32,34 @@ deployment "prod" "api" {
 }
 ```
 
-### Sub-block fields
+Multiple targets per slot — fan-out:
+
+```hcl
+deployment "prod" "api" {
+  on_deploy {
+    success { url = "${SLACK_WEBHOOK_URL}" }
+    success {
+      url     = "https://api.datadoghq.com/api/v1/events"
+      headers = { "DD-API-KEY" = "${DD_API_KEY}" }
+    }
+
+    failure {
+      url     = "https://events.pagerduty.com/v2/enqueue"
+      headers = { "X-Routing-Key" = "${PD_KEY}" }
+    }
+    failure {
+      url     = "https://api.opsgenie.com/v2/alerts"
+      headers = { "Authorization" = "GenieKey ${OPSGENIE_KEY}" }
+    }
+  }
+}
+```
+
+Each declared block = one goroutine, one URL, one retry loop.
+See [`fanout-multi-target.hcl`](./fanout-multi-target.hcl) for a
+full example.
+
+### Target fields (per block)
 
 | field | required | default | notes |
 |---|---|---|---|
@@ -118,11 +150,38 @@ When `body` or `file` IS declared, voodu sends EXCLUSIVELY the operator's body �
 
 ## Delivery contract
 
-Best-effort. **3 attempts** with exponential backoff (1s, 5s, 30s
-between attempts; 10s per-attempt HTTP timeout). If all three
-fail, voodu logs the drop and moves on. **The rollout outcome is
-NEVER affected by webhook delivery** — by the time the hook fires,
-the deploy already succeeded or failed on its own merits.
+Best-effort, **per-target**. Each declared block fires in its
+own goroutine with its own 3-attempt retry budget (exponential
+backoff: 1s, 5s, 30s between attempts; 10s per-attempt HTTP
+timeout). If all three fail for one target, voodu logs the drop
+(`target=<i>/<total>` identity when multiple targets exist) and
+moves on. A failure on one target does NOT affect the others.
+
+**The rollout outcome is NEVER affected by webhook delivery** —
+by the time the hook fires, the deploy already succeeded or
+failed on its own merits.
+
+### Parallel fan-out
+
+When a slot has multiple blocks, voodu spawns one goroutine per
+target. Total wall-clock = `max(per-target latency)`, not sum.
+No ordering guarantees: log lines from different targets are
+interleaved by goroutine scheduling.
+
+### Validation errors with index
+
+When multiple targets are declared and one fails parse-time
+validation, the error includes the offending block index:
+
+```
+on_deploy.failure[2].url is required
+```
+
+Single-target validation stays terse:
+
+```
+on_deploy.failure.url is required
+```
 
 ## Why NOT in spec hash
 
@@ -164,4 +223,5 @@ Rule of thumb:
 | [`slack-block-kit.hcl`](./slack-block-kit.hcl) | Asset-backed Slack Block Kit JSON: rich messages with headers, code blocks, @channel mentions. Different template per outcome |
 | [`telegram-bot.hcl`](./telegram-bot.hcl) | **Inline body** — small Telegram bot API payload (`chat_id`, `text`, `parse_mode`). Token in URL, chat_id from shell env |
 | [`pagerduty-on-failure.hcl`](./pagerduty-on-failure.hcl) | Asymmetric routing: Slack on success (default body), PagerDuty Events API v2 direct on failure (asset-backed body with the receiver-specific schema) |
+| [`fanout-multi-target.hcl`](./fanout-multi-target.hcl) | **Multi-target fan-out** — 3 success targets (Slack + Datadog + internal status bot) and 2 failure targets (PagerDuty + OpsGenie). Each fires in its own goroutine with its own retry budget |
 | `webhooks/*.json` | Body template files referenced by the asset-backed examples |

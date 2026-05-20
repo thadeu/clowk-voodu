@@ -2414,28 +2414,28 @@ deployment "prod" "api" {
 		t.Fatal("on_deploy missing in parsed spec")
 	}
 
-	if spec.OnDeploy.Success == nil || spec.OnDeploy.Success.URL != "https://hooks.slack.com/services/T1/B1/abc" {
+	if len(spec.OnDeploy.Success) != 1 || spec.OnDeploy.Success[0].URL != "https://hooks.slack.com/services/T1/B1/abc" {
 		t.Errorf("success url lost: %+v", spec.OnDeploy.Success)
 	}
 
-	if spec.OnDeploy.Success != nil && spec.OnDeploy.Success.Method != "" {
-		t.Errorf("success.method should be empty when omitted (parser leaves default to runtime); got %q", spec.OnDeploy.Success.Method)
+	if len(spec.OnDeploy.Success) == 1 && spec.OnDeploy.Success[0].Method != "" {
+		t.Errorf("success.method should be empty when omitted (parser leaves default to runtime); got %q", spec.OnDeploy.Success[0].Method)
 	}
 
-	if spec.OnDeploy.Failure == nil || spec.OnDeploy.Failure.URL != "https://events.pagerduty.com/v2/enqueue" {
+	if len(spec.OnDeploy.Failure) != 1 || spec.OnDeploy.Failure[0].URL != "https://events.pagerduty.com/v2/enqueue" {
 		t.Errorf("failure url lost: %+v", spec.OnDeploy.Failure)
 	}
 
-	if spec.OnDeploy.Failure.Method != "POST" {
-		t.Errorf("failure.method: %q, want POST", spec.OnDeploy.Failure.Method)
+	if spec.OnDeploy.Failure[0].Method != "POST" {
+		t.Errorf("failure.method: %q, want POST", spec.OnDeploy.Failure[0].Method)
 	}
 
-	if spec.OnDeploy.Failure.Headers["Authorization"] != "Token token=abc123" {
-		t.Errorf("Authorization header lost: %+v", spec.OnDeploy.Failure.Headers)
+	if spec.OnDeploy.Failure[0].Headers["Authorization"] != "Token token=abc123" {
+		t.Errorf("Authorization header lost: %+v", spec.OnDeploy.Failure[0].Headers)
 	}
 
-	if spec.OnDeploy.Failure.Headers["X-Source"] != "voodu" {
-		t.Errorf("X-Source header lost: %+v", spec.OnDeploy.Failure.Headers)
+	if spec.OnDeploy.Failure[0].Headers["X-Source"] != "voodu" {
+		t.Errorf("X-Source header lost: %+v", spec.OnDeploy.Failure[0].Headers)
 	}
 }
 
@@ -2508,11 +2508,11 @@ deployment "prod" "api" {
 		t.Fatal(err)
 	}
 
-	if spec.OnDeploy == nil || spec.OnDeploy.Failure == nil {
+	if spec.OnDeploy == nil || len(spec.OnDeploy.Failure) == 0 {
 		t.Fatal("failure block lost")
 	}
 
-	body := spec.OnDeploy.Failure.Body
+	body := spec.OnDeploy.Failure[0].Body
 	if body == nil {
 		t.Fatal("inline body lost in parse")
 	}

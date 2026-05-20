@@ -229,12 +229,13 @@ type hclDeployment struct {
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
-// hooks. Both sub-blocks are optional; an empty block is a no-op.
-// See manifest.OnDeploySpec for the wire shape and delivery
-// contract (best-effort, 3-attempt exponential backoff).
+// hooks. Both slots are slices — operators may declare zero,
+// one, or many `success` / `failure` blocks per resource, and
+// each declared target fires independently in parallel (see
+// manifest.OnDeploySpec for the delivery contract).
 type hclOnDeployBlock struct {
-	Success *hclDeployWebhook `hcl:"success,block"`
-	Failure *hclDeployWebhook `hcl:"failure,block"`
+	Success []hclDeployWebhook `hcl:"success,block"`
+	Failure []hclDeployWebhook `hcl:"failure,block"`
 }
 
 // hclDeployWebhook surfaces one webhook target — url plus the
@@ -262,17 +263,32 @@ func onDeployBlockToSpec(b *hclOnDeployBlock) *OnDeploySpec {
 	}
 
 	return &OnDeploySpec{
-		Success: deployWebhookBlockToSpec(b.Success),
-		Failure: deployWebhookBlockToSpec(b.Failure),
+		Success: deployWebhookBlocksToSpec(b.Success),
+		Failure: deployWebhookBlocksToSpec(b.Failure),
 	}
 }
 
-func deployWebhookBlockToSpec(b *hclDeployWebhook) *DeployWebhook {
-	if b == nil {
+// deployWebhookBlocksToSpec converts a slice of HCL webhook
+// blocks into the wire shape, preserving declaration order
+// (fan-out fires in parallel anyway, but tests + describe
+// outputs are easier to reason about when order is stable).
+// Empty / nil slice → nil so JSON omitempty drops the key.
+func deployWebhookBlocksToSpec(blocks []hclDeployWebhook) []DeployWebhook {
+	if len(blocks) == 0 {
 		return nil
 	}
 
-	out := &DeployWebhook{
+	out := make([]DeployWebhook, 0, len(blocks))
+
+	for i := range blocks {
+		out = append(out, deployWebhookBlockToSpec(blocks[i]))
+	}
+
+	return out
+}
+
+func deployWebhookBlockToSpec(b hclDeployWebhook) DeployWebhook {
+	out := DeployWebhook{
 		URL:     b.URL,
 		Method:  b.Method,
 		Headers: b.Headers,
@@ -313,24 +329,34 @@ func validateOnDeploy(o *OnDeploySpec) error {
 		return nil
 	}
 
-	if err := validateDeployWebhook(o.Success, "success"); err != nil {
-		return err
+	for i := range o.Success {
+		if err := validateDeployWebhook(&o.Success[i], "success", i, len(o.Success)); err != nil {
+			return err
+		}
 	}
 
-	if err := validateDeployWebhook(o.Failure, "failure"); err != nil {
-		return err
+	for i := range o.Failure {
+		if err := validateDeployWebhook(&o.Failure[i], "failure", i, len(o.Failure)); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func validateDeployWebhook(w *DeployWebhook, slot string) error {
-	if w == nil {
-		return nil
+// validateDeployWebhook checks one webhook target. The slot
+// label distinguishes "success" / "failure", and the index is
+// surfaced in errors only when multiple targets share the slot
+// (otherwise the index would be noisy for the common single-
+// target case).
+func validateDeployWebhook(w *DeployWebhook, slot string, index, total int) error {
+	loc := slot
+	if total > 1 {
+		loc = fmt.Sprintf("%s[%d]", slot, index)
 	}
 
 	if strings.TrimSpace(w.URL) == "" {
-		return fmt.Errorf("on_deploy.%s.url is required", slot)
+		return fmt.Errorf("on_deploy.%s.url is required", loc)
 	}
 
 	if w.Method != "" {
@@ -338,7 +364,7 @@ func validateDeployWebhook(w *DeployWebhook, slot string) error {
 		case "POST", "PUT", "PATCH", "DELETE":
 			// ok
 		default:
-			return fmt.Errorf("on_deploy.%s.method must be one of POST/PUT/PATCH/DELETE (got %q)", slot, w.Method)
+			return fmt.Errorf("on_deploy.%s.method must be one of POST/PUT/PATCH/DELETE (got %q)", loc, w.Method)
 		}
 	}
 
@@ -346,7 +372,7 @@ func validateDeployWebhook(w *DeployWebhook, slot string) error {
 	// would force voodu to pick one silently — better to fail
 	// loud than ship a confused webhook.
 	if w.Body != nil && w.File != "" {
-		return fmt.Errorf("on_deploy.%s: body and file are mutually exclusive", slot)
+		return fmt.Errorf("on_deploy.%s: body and file are mutually exclusive", loc)
 	}
 
 	// File must be an asset reference. Bare paths are rejected
@@ -355,7 +381,7 @@ func validateDeployWebhook(w *DeployWebhook, slot string) error {
 	// path would either fail at fire time or surprise the
 	// operator with "relative to what?" semantics.
 	if w.File != "" && !looksLikeAssetRef(w.File) {
-		return fmt.Errorf("on_deploy.%s.file must be an asset reference (${asset.<scope>.<name>.<key>}), got %q", slot, w.File)
+		return fmt.Errorf("on_deploy.%s.file must be an asset reference (${asset.<scope>.<name>.<key>}), got %q", loc, w.File)
 	}
 
 	return nil
