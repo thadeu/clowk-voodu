@@ -1,9 +1,7 @@
 package manifest
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +16,6 @@ import (
 	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/zclconf/go-cty/cty"
-	"gopkg.in/yaml.v3"
 
 	"go.voodu.clowk.in/internal/controller"
 )
@@ -28,20 +25,25 @@ import (
 type Format string
 
 const (
-	FormatHCL  Format = "hcl"
-	FormatYAML Format = "yaml"
+	FormatHCL Format = "hcl"
 	// FormatJSON accepts a pre-parsed []controller.Manifest. It's what the
 	// client uses to stream manifests to a remote over SSH: ${VAR}
 	// interpolation must happen on the dev machine (the server doesn't
-	// see local env vars), so the client parses HCL/YAML then re-emits
-	// JSON for the remote to re-ingest.
+	// see local env vars), so the client parses HCL then re-emits JSON
+	// for the remote to re-ingest.
 	FormatJSON Format = "json"
 )
 
 // ParseFile reads a single manifest file and returns zero-or-more
-// manifests. The format is picked from the extension (.hcl vs .yml/.yaml).
-// ${VAR} interpolation is applied to the raw bytes before parsing so the
-// same mechanism works for both formats.
+// manifests. The format is picked from the extension (.hcl / .voodu /
+// .vdu / .vd). ${VAR} interpolation is applied to the raw bytes
+// before HCL parsing.
+//
+// YAML input support was removed in beta — voodu's manifest surface
+// (blocks with labels, sub-blocks, `file()` / asset references) maps
+// poorly to YAML's nested-map model. Operators wanting "config as
+// data" should use HCL's object literals (`env = { K = "V" }`),
+// which compose with the rest of the surface naturally.
 func ParseFile(path string, vars map[string]string) ([]controller.Manifest, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -61,8 +63,9 @@ func ParseFile(path string, vars map[string]string) ([]controller.Manifest, erro
 	return mans, nil
 }
 
-// ParseDir walks root recursively collecting .hcl/.yml/.yaml files.
-// Files are parsed in lexicographic order so apply is deterministic.
+// ParseDir walks root recursively collecting .hcl/.voodu/.vdu/.vd
+// files. Files are parsed in lexicographic order so apply is
+// deterministic.
 func ParseDir(root string, vars map[string]string) ([]controller.Manifest, error) {
 	var files []string
 
@@ -131,8 +134,6 @@ func parseBytes(source string, raw []byte, format Format, vars map[string]string
 		// They land in the manifest as literal `${…}` and the
 		// controller resolves them at reconcile time.
 		return parseHCL(source, []byte(escapeServerSideRefsForHCL(interp)))
-	case FormatYAML:
-		return parseYAML([]byte(interp))
 	default:
 		return nil, fmt.Errorf("unsupported format %q", format)
 	}
@@ -170,14 +171,11 @@ func FormatFromExt(path string) (Format, error) {
 func formatFromExt(path string) (Format, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
-	switch {
-	case hclExts[ext]:
+	if hclExts[ext] {
 		return FormatHCL, nil
-	case ext == ".yml", ext == ".yaml":
-		return FormatYAML, nil
-	default:
-		return "", fmt.Errorf("unsupported extension %q (want .hcl, .voodu, .vdu, .vd, .yml, .yaml)", filepath.Ext(path))
 	}
+
+	return "", fmt.Errorf("unsupported extension %q (want .hcl, .voodu, .vdu, .vd)", filepath.Ext(path))
 }
 
 // HCL block structs list their fields explicitly — hcl/v2 doesn't
@@ -2169,111 +2167,6 @@ func assertNoDuplicateIdentities(mans []controller.Manifest) error {
 	}
 
 	return nil
-}
-
-// yamlDoc mirrors the controller wire shape so users can hand-roll
-// manifests that match what the API already consumes. Multi-doc files
-// are supported via `---` separators. Scope is optional in the YAML
-// surface — HCL is the preferred syntax for scoped kinds and is where
-// the 2-label shape becomes natural; YAML users who need scope can
-// still set it via the explicit `scope:` field.
-type yamlDoc struct {
-	Kind  string    `yaml:"kind"`
-	Scope string    `yaml:"scope,omitempty"`
-	Name  string    `yaml:"name"`
-	Spec  yaml.Node `yaml:"spec"`
-}
-
-func parseYAML(raw []byte) ([]controller.Manifest, error) {
-	dec := yaml.NewDecoder(bytes.NewReader(raw))
-
-	var out []controller.Manifest
-
-	for {
-		var doc yamlDoc
-
-		err := dec.Decode(&doc)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-
-		if err != nil {
-			return nil, err
-		}
-
-		if doc.Kind == "" && doc.Name == "" {
-			continue
-		}
-
-		kind, err := controller.ParseKind(doc.Kind)
-		if err != nil {
-			return nil, err
-		}
-
-		spec, err := decodeYAMLSpec(kind, doc.Name, doc.Spec)
-		if err != nil {
-			return nil, fmt.Errorf("%s/%s: %w", doc.Kind, doc.Name, err)
-		}
-
-		m, err := encode(kind, doc.Scope, doc.Name, spec)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, m)
-	}
-
-	return out, nil
-}
-
-// decodeYAMLSpec enforces the per-kind schema when reading YAML. HCL gets
-// this for free from hclsimple; YAML has to do it explicitly to keep
-// error messages actionable.
-func decodeYAMLSpec(kind controller.Kind, name string, node yaml.Node) (any, error) {
-	switch kind {
-	case controller.KindDeployment:
-		var s DeploymentSpec
-		if err := node.Decode(&s); err != nil {
-			return s, err
-		}
-
-		s.applyDefaults()
-
-		return s, nil
-
-	case controller.KindStatefulset:
-		var s StatefulsetSpec
-		if err := node.Decode(&s); err != nil {
-			return s, err
-		}
-
-		s.applyDefaults()
-
-		return s, nil
-
-	case controller.KindIngress:
-		var s IngressSpec
-		return s, node.Decode(&s)
-
-	case controller.KindJob:
-		var s JobSpec
-		return s, node.Decode(&s)
-
-	case controller.KindCronJob:
-		var s CronJobSpec
-		return s, node.Decode(&s)
-
-	case controller.KindAsset:
-		var s AssetSpec
-		return s, node.Decode(&s)
-
-	case controller.KindRegistry:
-		var s RegistrySpec
-		return s, node.Decode(&s)
-
-	default:
-		return nil, fmt.Errorf("unknown kind %q", kind)
-	}
 }
 
 // encode marshals a typed spec into the JSON-valued Manifest shape the

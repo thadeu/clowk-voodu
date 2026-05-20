@@ -155,7 +155,6 @@ editor and file tree:
 | `.hcl` | Tooling compatibility (most editors / IDEs highlight this by default) |
 | `.voodu` | Branded, reads like a first-class config (`web.voodu`, `api.voodu`) |
 | `.vdu`, `.vd` | Shorter aliases for the same |
-| `.yml`, `.yaml` | YAML variant — same schema, different syntax |
 
 `voodu apply -f web` resolves bare names against all of the above in
 order, so editing `web.voodu` and running `voodu apply -f web` just

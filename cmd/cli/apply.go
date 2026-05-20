@@ -46,7 +46,7 @@ type controllerExpansionRef struct {
 
 type applyFlags struct {
 	files            []string
-	format           string // stdin only: "hcl" | "yaml"
+	format           string // stdin only: "hcl"
 	applyPrune       bool   // apply + diff: opt-in to delete siblings in the same (scope, kind) not declared in this apply
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
 	autoApprove      bool   // apply + delete: skip the interactive confirmation
@@ -61,15 +61,15 @@ func newApplyCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "apply",
-		Short: "Apply manifests (HCL or YAML) to the controller",
+		Short: "Apply manifests (HCL) to the controller",
 		Long: `Reads one or more manifests and POSTs them to the controller.
 
 Accepted inputs:
-  -f api               short form — tries .hcl/.voodu/.vdu/.vd/.yml/.yaml
+  -f api               short form — tries .hcl/.voodu/.vdu/.vd
   -f file.hcl          apply a single file (.hcl/.voodu/.vdu/.vd are all HCL)
   -f ./dir             walk dir recursively for manifest files
-  -f a.voodu -f b.yml  mix files of either format
-  -f -                 read from stdin (requires --format hcl|yaml)
+  -f a.voodu -f b.hcl  mix files of any HCL-compatible extension
+  -f -                 read from stdin (requires --format hcl)
 
 Use -a <remote> to forward the apply to a configured voodu remote.
 The file is parsed locally so ${VAR} expands on your dev machine,
@@ -107,7 +107,7 @@ raw stream when debugging a failed build.`,
 	}
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
-	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl or json (required for -f -)")
 	cmd.Flags().BoolVar(&f.applyPrune, "prune", false, "delete sibling resources in the same (scope, kind) that aren't declared in this apply (default: upsert-only, leave existing siblings alone)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
@@ -143,7 +143,7 @@ ran 'vd apply --prune'.`,
 	}
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
-	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl or json (required for -f -)")
 	cmd.Flags().BoolVar(&f.applyPrune, "prune", false, "preview which siblings would be deleted by 'apply --prune' (default: upsert-only)")
 	cmd.Flags().BoolVar(&f.detailedExitcode, "detailed-exitcode", false, "exit 0 when no changes, 2 when changes, 1 on error (CI-friendly)")
 
@@ -229,7 +229,7 @@ before committing to the destructive operation.`,
 	}
 
 	cmd.Flags().StringArrayVarP(&f.files, "file", "f", nil, "manifest file (extension optional), directory, or - for stdin (repeatable)")
-	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl, yaml, or json (required for -f -)")
+	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl or json (required for -f -)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "render the plan and exit without deleting anything")
 	cmd.Flags().BoolVar(&f.prune, "prune", false, "also wipe app config + on-disk state (env file, releases dir, volumes); REQUIRED for scope-wipe shape")
@@ -1240,7 +1240,7 @@ func loadManifests(cmd *cobra.Command, f applyFlags) ([]controller.Manifest, err
 func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
 	if path == "-" {
 		if stdinFormat == "" {
-			return nil, fmt.Errorf("-f -: --format hcl|yaml is required for stdin")
+			return nil, fmt.Errorf("-f -: --format hcl is required for stdin")
 		}
 
 		raw, err := io.ReadAll(os.Stdin)
@@ -1311,15 +1311,13 @@ func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]s
 
 // resolveManifestPath adds a manifest extension when the user omitted
 // one. `voodu apply -f api` should just work when api.voodu (or .hcl,
-// .vdu, .vd, .yml, .yaml) is sitting next to it. HCL variants are
-// probed before YAML so a project with both wins toward the typed
-// format.
+// .vdu, .vd) is sitting next to it.
 func resolveManifestPath(path string) (string, os.FileInfo, error) {
 	if info, err := os.Stat(path); err == nil {
 		return path, info, nil
 	}
 
-	for _, ext := range []string{".hcl", ".voodu", ".vdu", ".vd", ".yml", ".yaml"} {
+	for _, ext := range []string{".hcl", ".voodu", ".vdu", ".vd"} {
 		candidate := path + ext
 
 		if info, err := os.Stat(candidate); err == nil {

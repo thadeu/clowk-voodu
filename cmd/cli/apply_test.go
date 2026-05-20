@@ -346,14 +346,16 @@ func TestResolveManifestPath(t *testing.T) {
 	dir := t.TempDir()
 
 	hcl := filepath.Join(dir, "api.hcl")
-	yml := filepath.Join(dir, "legacy.yml")
-	yaml := filepath.Join(dir, "old.yaml")
+	voodu := filepath.Join(dir, "web.voodu")
+	vdu := filepath.Join(dir, "worker.vdu")
+	vd := filepath.Join(dir, "cron.vd")
 	exact := filepath.Join(dir, "exact.hcl")
 	subdir := filepath.Join(dir, "stack")
 
 	mustWrite(t, hcl, `deployment "test" "api" { image = "x" }`+"\n")
-	mustWrite(t, yml, "apps:\n  - name: legacy\n")
-	mustWrite(t, yaml, "apps:\n  - name: old\n")
+	mustWrite(t, voodu, `deployment "test" "web" { image = "x" }`+"\n")
+	mustWrite(t, vdu, `deployment "test" "worker" { image = "x" }`+"\n")
+	mustWrite(t, vd, `cronjob "test" "cron" { schedule = "* * * * *" image = "x" }`+"\n")
 	mustWrite(t, exact, `deployment "test" "exact" { image = "x" }`+"\n")
 
 	if err := os.Mkdir(subdir, 0755); err != nil {
@@ -367,8 +369,9 @@ func TestResolveManifestPath(t *testing.T) {
 	}{
 		{"exact file wins over extension fallback", exact, exact},
 		{"bare name resolves to .hcl", filepath.Join(dir, "api"), hcl},
-		{"bare name resolves to .yml", filepath.Join(dir, "legacy"), yml},
-		{"bare name resolves to .yaml", filepath.Join(dir, "old"), yaml},
+		{"bare name resolves to .voodu", filepath.Join(dir, "web"), voodu},
+		{"bare name resolves to .vdu", filepath.Join(dir, "worker"), vdu},
+		{"bare name resolves to .vd", filepath.Join(dir, "cron"), vd},
 		{"directory passes through", subdir, subdir},
 	}
 

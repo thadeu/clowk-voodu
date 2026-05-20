@@ -17,7 +17,6 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | [`on_deploy/`](./on_deploy) | Post-rollout webhook notifications. Sub-blocks per outcome with `url` / `method` / `headers` / inline `body` / asset-backed `file`. `${VAR}` in any of those fields can come from `env_from`'d config buckets — set webhook URLs / API tokens once via `vd config set`, every dev's `vd apply` picks them up. Examples: bare Slack (default payload), Slack Block Kit (asset-backed rich messages), Telegram bot (inline body), PagerDuty Events v2 (asset-backed receiver-specific schema) |
 | [`registry/`](./registry) | The `registry` kind — private image pulls. Atomic ~/.docker/config.json regen, host-wide auth, single + multi-registry examples |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
-| [`fullstack-yaml/`](./fullstack-yaml) | Same shape as `fullstack/`, written in YAML to show the alternate format |
 | [`ingress/`](./ingress) | Path-based routing, multiple hosts, load-balancing knobs |
 | [`multi-env/`](./multi-env) | One manifest, many remotes — apply the same file to staging / prod-1 / prod-2 via `-r` |
 | [`shared-scope/`](./shared-scope) | Cross-repo applies into the same scope using `?prune=false` |

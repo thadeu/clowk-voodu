@@ -1,15 +1,22 @@
-// Package manifest parses Voodu resource manifests (HCL or YAML) into
-// the on-the-wire controller.Manifest shape. The controller never sees
-// HCL/YAML — it only stores the JSON produced here.
+// Package manifest parses voodu resource manifests (HCL) into the
+// on-the-wire controller.Manifest shape. The controller never sees
+// HCL — it only stores the JSON produced here.
 //
-// Supported kinds: deployment, database, ingress, job. Each kind has
-// a typed Spec; the parser validates the shape before handing off to the
-// controller, which keeps /apply errors local and readable.
+// Each kind has a typed Spec; the parser validates the shape
+// before handing off to the controller, which keeps /apply errors
+// local and readable.
 //
-// YAML tags drive the YAML path and JSON serialization into the
-// controller wire format. HCL decoding goes through per-kind block
-// structs in parse.go (hcl/v2 does not walk embedded specs), so these
-// Spec structs stay free of HCL-specific tags.
+// `yaml:"..."` struct tags persist on the spec types for ONE
+// purpose: the CLI's output formatters (`vd describe -o yaml`,
+// `vd diff -o yaml`) serialize these structs via gopkg.in/yaml.v3
+// and want the same snake_case keys operators see in HCL. The
+// YAML INPUT path was removed during beta — voodu's surface
+// (blocks with labels, sub-blocks, `file()` / asset refs) maps
+// poorly to YAML's nested-map model.
+//
+// HCL decoding goes through per-kind block structs in parse.go
+// (hcl/v2 does not walk embedded specs), so these Spec structs
+// stay free of HCL-specific tags.
 package manifest
 
 // DeploymentSpec is an app the controller should run as a container.
@@ -430,8 +437,8 @@ type DeployWebhook struct {
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// Body is the inline JSON body sent to the webhook. The
-	// operator declares an HCL object literal or a YAML map; it
-	// gets JSON-marshalled and POSTed verbatim, replacing
+	// operator declares an HCL object literal; it gets JSON-
+	// marshalled and POSTed verbatim, replacing
 	// voodu's default WebhookPayload. Mutex with File.
 	//
 	// Empty (and File empty) → voodu sends the default
@@ -992,8 +999,7 @@ type VolumeClaim struct {
 //   - plain string — inline literal, materialised verbatim
 //
 // HCL parses `key = file(…)` / `key = url(…)` / `key = "literal"`
-// directly into this shape; YAML callers spell out the object
-// form (see decodeYAMLSpec for how YAML rebuilds it).
+// directly into this shape.
 type AssetSpec struct {
 	// Files is keyed by the asset key (alphanumeric +
 	// underscore). Values are heterogeneous JSON — string for

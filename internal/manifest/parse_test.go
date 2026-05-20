@@ -1286,43 +1286,15 @@ deployment "clowk-lp" "worker" {
 	}
 }
 
-func TestParseYAMLMultiDoc(t *testing.T) {
-	src := `
----
-kind: deployment
-scope: test
-name: api
-spec:
-  image: nginx:1
-  replicas: 2
----
-kind: statefulset
-scope: data
-name: pg
-spec:
-  image: postgres:15
-`
-	tmp := writeTemp(t, "stack.yaml", src)
-
-	mans, err := ParseFile(tmp, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(mans) != 2 {
-		t.Fatalf("want 2 manifests, got %d", len(mans))
-	}
-
-	if mans[0].Kind != controller.KindDeployment || mans[1].Kind != controller.KindStatefulset {
-		t.Errorf("unexpected kinds: %+v %+v", mans[0], mans[1])
-	}
-}
-
-func TestParseDirMixedFormats(t *testing.T) {
+// TestParseDirWalksRecursively verifies ParseDir walks subdirs
+// and parses every voodu-branded HCL file it finds while skipping
+// unrelated content (README.md, etc.). Replaces an older mixed-
+// format variant that exercised the YAML parser too.
+func TestParseDirWalksRecursively(t *testing.T) {
 	dir := t.TempDir()
 
 	writeAt(t, filepath.Join(dir, "a.hcl"), `deployment "test" "api" { image = "x:1" }`)
-	writeAt(t, filepath.Join(dir, "b.yaml"), "kind: statefulset\nscope: data\nname: pg\nspec:\n  image: postgres:15\n")
+	writeAt(t, filepath.Join(dir, "b.voodu"), `statefulset "data" "pg" { image = "postgres:15" }`)
 	writeAt(t, filepath.Join(dir, "README.md"), "ignored")
 
 	sub := filepath.Join(dir, "sub")
@@ -1330,7 +1302,7 @@ func TestParseDirMixedFormats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	writeAt(t, filepath.Join(sub, "c.yml"), "kind: deployment\nscope: test\nname: worker\nspec:\n  image: worker:1\n")
+	writeAt(t, filepath.Join(sub, "c.vd"), `deployment "test" "worker" { image = "worker:1" }`)
 
 	mans, err := ParseDir(dir, nil)
 	if err != nil {
@@ -1428,17 +1400,6 @@ func TestParseJSONSkipsInterpolation(t *testing.T) {
 
 	if !strings.Contains(string(got[0].Spec), "${STILL_HERE}") {
 		t.Errorf("JSON path ran interpolation, spec was: %s", got[0].Spec)
-	}
-}
-
-func TestParseRejectsUnknownKind(t *testing.T) {
-	src := "kind: potato\nname: x\nspec: {}\n"
-
-	tmp := writeTemp(t, "bad.yaml", src)
-
-	_, err := ParseFile(tmp, nil)
-	if err == nil || !strings.Contains(err.Error(), "potato") {
-		t.Errorf("want unknown-kind error, got %v", err)
 	}
 }
 
@@ -1556,60 +1517,6 @@ func TestParseHCLJobMissingScope(t *testing.T) {
 	}
 }
 
-// TestParseYAMLJob covers the YAML variant. spec.image / spec.command /
-// spec.env all decode into JobSpec via the generic decodeYAMLSpec
-// dispatch. Tests the kind switch in decodeYAMLSpec.
-func TestParseYAMLJob(t *testing.T) {
-	src := `
-kind: job
-scope: api
-name: migrate
-spec:
-  image: ghcr.io/acme/api:1.0.0
-  command:
-    - ./migrate.sh
-    - --up
-  env:
-    DATABASE_URL: postgres://u:p@h:5432/db
-  timeout: 5m
-`
-	tmp := writeTemp(t, "job.yaml", src)
-
-	mans, err := ParseFile(tmp, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(mans) != 1 {
-		t.Fatalf("want 1 manifest, got %d", len(mans))
-	}
-
-	if mans[0].Kind != controller.KindJob || mans[0].Scope != "api" || mans[0].Name != "migrate" {
-		t.Errorf("unexpected header: %+v", mans[0])
-	}
-
-	var spec JobSpec
-	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
-		t.Fatal(err)
-	}
-
-	if spec.Image != "ghcr.io/acme/api:1.0.0" {
-		t.Errorf("image: %q", spec.Image)
-	}
-
-	if len(spec.Command) != 2 || spec.Command[0] != "./migrate.sh" {
-		t.Errorf("command: %+v", spec.Command)
-	}
-
-	if spec.Env["DATABASE_URL"] != "postgres://u:p@h:5432/db" {
-		t.Errorf("env: %+v", spec.Env)
-	}
-
-	if spec.Timeout != "5m" {
-		t.Errorf("timeout: %q", spec.Timeout)
-	}
-}
-
 // TestParseHCLCronJob locks in the M4 surface for `cronjob`. The
 // schedule + concurrency knobs sit at the block root next to the
 // flattened job spec — no nested `job {}` — so authoring stays
@@ -1714,71 +1621,6 @@ func TestParseHCLCronJobScheduleRequired(t *testing.T) {
 
 	if _, err := ParseFile(tmp, nil); err == nil {
 		t.Fatal("expected error when schedule is missing")
-	}
-}
-
-// TestParseYAMLCronJob covers the YAML variant. Note YAML's CronJobSpec
-// shape: the job fields nest under `spec.job` because YAML doesn't
-// give us the flattening sugar the HCL block does, and the wire shape
-// the controller decodes already mirrors that.
-func TestParseYAMLCronJob(t *testing.T) {
-	src := `
-kind: cronjob
-scope: ops
-name: purge
-spec:
-  schedule: "*/15 * * * *"
-  timezone: America/Sao_Paulo
-  concurrency_policy: Forbid
-  successful_history_limit: 5
-  failed_history_limit: 2
-  job:
-    image: ghcr.io/acme/api:1.0.0
-    command:
-      - ./purge.sh
-      - --retention=30d
-    env:
-      DATABASE_URL: postgres://u:p@h:5432/db
-    timeout: 10m
-`
-	tmp := writeTemp(t, "cron.yaml", src)
-
-	mans, err := ParseFile(tmp, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(mans) != 1 {
-		t.Fatalf("want 1 manifest, got %d", len(mans))
-	}
-
-	if mans[0].Kind != controller.KindCronJob || mans[0].Scope != "ops" || mans[0].Name != "purge" {
-		t.Errorf("unexpected header: %+v", mans[0])
-	}
-
-	var spec CronJobSpec
-	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
-		t.Fatal(err)
-	}
-
-	if spec.Schedule != "*/15 * * * *" {
-		t.Errorf("schedule: %q", spec.Schedule)
-	}
-
-	if spec.ConcurrencyPolicy != "Forbid" {
-		t.Errorf("concurrency_policy: %q", spec.ConcurrencyPolicy)
-	}
-
-	if spec.Job.Image != "ghcr.io/acme/api:1.0.0" {
-		t.Errorf("job.image: %q", spec.Job.Image)
-	}
-
-	if len(spec.Job.Command) != 2 {
-		t.Errorf("job.command: %+v", spec.Job.Command)
-	}
-
-	if spec.SuccessfulHistoryLimit != 5 || spec.FailedHistoryLimit != 2 {
-		t.Errorf("history limits: succ=%d fail=%d", spec.SuccessfulHistoryLimit, spec.FailedHistoryLimit)
 	}
 }
 
