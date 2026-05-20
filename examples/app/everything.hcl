@@ -1,25 +1,3 @@
-// Feature-complete stack: postgres + redis + app, with EVERY
-// post-launch voodu feature wired up. Use this as a "what does
-// a real production deployment look like in 2026" reference.
-//
-// What runs after `vd apply`:
-//
-//   data-pg.0        postgres statefulset pod (single primary)
-//   data-cache.0     redis statefulset pod
-//   prod-api.<hash>  app deployment replicas (3-15 autoscaled)
-//   ingress          caddy routing api.acme.com → prod-api with TLS
-//
-// Features demonstrated (every shipped milestone):
-//
-//   M1.1 — liveness probes (per-pod restart on deadlock)
-//   M1.2 — readiness + startup probes + auto caddy gating
-//   M1.3 — same probes on the statefulset side
-//   M2   — private registry credentials (ghcr.io PAT)
-//   M5   — init container (db:migrate before main pod starts)
-//   M6   — on_deploy webhooks (success Slack + failure PagerDuty
-//          direct via headers, no transformer Lambda)
-//   M7   — CPU-based autoscale (replaces fixed replicas)
-//
 // Setup before first apply:
 //
 //   PG_PASS=$(openssl rand -hex 16)
@@ -58,6 +36,23 @@ registry "ghcr" {
   url      = "ghcr.io"
   username = "${GHCR_USER}"
   token    = "${GHCR_TOKEN}"
+}
+
+// ---------------------------------------------------------------------------
+// Asset — webhook body templates for on_deploy
+// ---------------------------------------------------------------------------
+//
+// PagerDuty Events API v2 expects a specific JSON shape
+// (routing_key, event_action, payload.summary/severity/source/...).
+// Keeping that as inline HCL would pollute the app block; we
+// keep it in a versioned .json file and reference via asset.
+//
+// `${PD_ROUTING_KEY}` substituted client-side at apply (operator
+// shell env). `{{name}}`, `{{error}}`, etc. substituted at fire
+// time on the controller against the live release data.
+
+asset "prod" "webhooks" {
+  pagerduty_failure = file("./webhooks/pagerduty-failure.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -171,20 +166,32 @@ app "prod" "api" {
   // restart?".
   probes {
     startup {
-      http_get { path = "/health" port = 3000 }
+      http_get {
+        path = "/health"
+        port = 3000
+      }
+
       period            = "2s"
       failure_threshold = 30   // up to 60s boot window
       success_threshold = 1
     }
 
     liveness {
-      http_get { path = "/health" port = 3000 }
+      http_get {
+        path = "/health"
+        port = 3000
+      }
+
       period            = "5s"
       failure_threshold = 3
     }
 
     readiness {
-      http_get { path = "/ready" port = 3000 }
+      http_get {
+        path = "/ready"
+        port = 3000
+      }
+
       period            = "5s"
       failure_threshold = 1
       success_threshold = 2
@@ -211,9 +218,11 @@ app "prod" "api" {
 
   // ------ M6: post-deploy webhooks ------------------------------
   //
-  // Success → Slack (informational, low urgency).
-  // Failure → PagerDuty Events API v2 direct (no transformer
-  //           Lambda — headers carry the routing key).
+  // Success → Slack (informational, low urgency). Default voodu
+  //           payload — Slack incoming webhook accepts any JSON.
+  // Failure → PagerDuty Events API v2 direct, with the exact
+  //           schema it expects (asset-backed body template).
+  //           No transformer Lambda in the middle.
   //
   // Both URLs/secrets come from shell env.
   on_deploy {
@@ -222,13 +231,8 @@ app "prod" "api" {
     }
 
     failure {
-      url    = "https://events.pagerduty.com/v2/enqueue"
-      method = "POST"
-
-      headers = {
-        "Content-Type"  = "application/json"
-        "X-Routing-Key" = "${PD_ROUTING_KEY}"
-      }
+      url  = "https://events.pagerduty.com/v2/enqueue"
+      file = "${asset.prod.webhooks.pagerduty_failure}"
     }
   }
 

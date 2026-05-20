@@ -10,11 +10,11 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | [`build/`](./build) | `build {}` block — build images from source instead of pulling from a registry. docker-compose-shaped (`context`, `dockerfile`, `args`). Covers auto-detect, custom Dockerfile, Go monorepo, statefulset build |
 | [`statefulset/`](./statefulset) | Single-node and multi-replica statefulsets (postgres, redis) with per-pod ordinal identity and persistent volume claims |
 | [`stack/`](./stack) | Production-grade full stack: postgres + redis (macro plugins) + asset (postgresql.conf / pg_hba.conf / redis.conf / ACL) + app (deployment + ingress) with TLS |
-| [`app/`](./app) | The `app` sugar block (deployment + ingress in one). One example showing EVERY shipped feature composed together: init / probes / autoscale / on_deploy / resources / registry + postgres + redis |
+| [`app/`](./app) | The `app` sugar block (deployment + ingress in one). One example showing EVERY shipped feature composed together: init / probes / autoscale / on_deploy (asset-backed PagerDuty body) / resources / registry + postgres + redis |
 | [`probes/`](./probes) | Kubelet-style health probes (liveness / readiness / startup) on deployments and statefulsets. HTTP, TCP, exec selectors. Auto caddy ingress gating via the readiness probe |
 | [`init/`](./init) | Ordered one-shot prep steps (db:migrate, pg_basebackup, config-validate) that must complete before main container starts. HCL keyword: `init`. |
 | [`autoscale/`](./autoscale) | CPU-based horizontal autoscale block on deployments. Worker (sidekiq) + HTTP-tier tunings with the asymmetric "respond fast, retreat slowly" posture |
-| [`on_deploy/`](./on_deploy) | Post-rollout webhook notifications (success / failure URLs). Slack same-channel pattern, asymmetric PagerDuty-on-failure pattern |
+| [`on_deploy/`](./on_deploy) | Post-rollout webhook notifications. Sub-blocks per outcome with `url` / `method` / `headers` / inline `body` / asset-backed `file`. Examples: bare Slack (default payload), Slack Block Kit (asset-backed rich messages), Telegram bot (inline body), PagerDuty Events v2 (asset-backed receiver-specific schema) |
 | [`registry/`](./registry) | The `registry` kind — private image pulls. Atomic ~/.docker/config.json regen, host-wide auth, single + multi-registry examples |
 | [`fullstack/`](./fullstack) | Simple deployment + ingress pair (no databases). Good first read for the basic shapes |
 | [`fullstack-yaml/`](./fullstack-yaml) | Same shape as `fullstack/`, written in YAML to show the alternate format |

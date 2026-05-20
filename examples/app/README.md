@@ -18,7 +18,7 @@ deployment knobs.
 | `resources { limits { cpu memory } }` | ✓ |
 | `logs { max_size max_files }` | ✓ |
 | `release {}` | ✓ |
-| `on_deploy {}` (with new block form + headers) | ✓ |
+| `on_deploy {}` (block form + method + headers + body inline / file asset) | ✓ |
 | `probes { liveness readiness startup }` | ✓ |
 | `init "name" {}` | ✓ |
 | Plus: `host`, `tls`, `location`, `lb` | ingress side only |
@@ -39,7 +39,8 @@ For 90% of web apps, `app` is the right shape.
 
 | file | what it shows |
 |---|---|
-| [`everything.hcl`](./everything.hcl) | Full production stack: postgres + redis statefulsets with probes, registry block, app with init / probes / autoscale / on_deploy / resources, plus ingress with TLS. Every shipped milestone wired up in one file. |
+| [`everything.hcl`](./everything.hcl) | Full production stack: postgres + redis statefulsets with probes, registry block, app with init / probes / autoscale / on_deploy (asset-backed PagerDuty body) / resources, plus ingress with TLS. Every shipped milestone wired up in one file. |
+| `webhooks/pagerduty-failure.json` | PagerDuty Events API v2 body template referenced from `everything.hcl` via the `asset` block. Shows the recommended asset-backed pattern for non-trivial webhook receivers. |
 
 ## Why one big example instead of many small ones
 
