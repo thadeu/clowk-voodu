@@ -43,8 +43,39 @@ Two contexts. Both work inside the inline `body { ... }` and inside the asset-ba
 
 | token | resolved | when | example |
 |---|---|---|---|
-| `${VAR}` | shell env | parse-time, client-side | `${PD_ROUTING_KEY}`, `${SLACK_WEBHOOK_URL}` |
+| `${VAR}` | shell env **+ env_from'd config buckets** | parse-time, client-side | `${PD_ROUTING_KEY}`, `${SLACK_WEBHOOK_URL}` |
 | `{{field}}` | release context | fire-time, controller-side | `{{name}}`, `{{status}}`, `{{error}}` |
+
+### Where `${VAR}` reads from
+
+When the resource declares `env_from = ["prod/shared"]`, the CLI **fetches that bucket from the controller before parsing the manifest** and layers its values into the `${VAR}` interpolation context. So:
+
+```hcl
+app "prod" "api" {
+  env_from = ["prod/shared"]
+
+  on_deploy {
+    success {
+      url = "${SLACK_WEBHOOK_URL}"  # ← resolves from prod/shared bucket
+    }
+  }
+}
+```
+
+Setup the bucket once:
+```bash
+vd config set -s prod -n shared \
+  SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
+  PD_ROUTING_KEY="R000..."
+```
+
+After that, anyone on the team runs `vd apply` and the manifest substitutes correctly — no per-dev `export` needed, no `.envrc` to maintain. Rotation via `vd config set` propagates to every dev's next apply.
+
+Precedence (later wins, mirrors runtime env_from layering):
+1. env_from'd bucket vars, in declared order (later refs override earlier on the same key)
+2. operator's shell env (always wins — allows ad-hoc override: `SLACK_URL=https://test/h vd apply`)
+
+Caveat: this lookup is **local-apply only**. `vd apply -r prod` (SSH-forward path) keeps the legacy shell-only interpolation — the local CLI doesn't know which controller's buckets to ask. For remote applies, fall back to direnv / shell exports.
 
 Allowed `{{...}}` tokens (case-sensitive):
 

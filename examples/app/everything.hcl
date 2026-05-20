@@ -5,22 +5,27 @@
 //   # Postgres reads POSTGRES_PASSWORD from its scope env file
 //   vd config set -s data -n pg POSTGRES_PASSWORD=$PG_PASS
 //
-//   # Shared scope bucket the app inherits via env_from. Both
-//   # web and any future workers in the same scope can env_from
-//   # this single source of truth — no per-app duplication.
+//   # Shared scope bucket. EVERYTHING the manifest references via
+//   # ${VAR} goes here — webhook URLs, registry credentials, app
+//   # connection strings. Because the app declares
+//   # `env_from = ["prod/shared"]`, the CLI fetches this bucket
+//   # at parse time and ${VAR} substitutes from these values.
+//   # No per-dev `export` needed; rotation via vd config set
+//   # propagates to every dev's next vd apply.
 //   vd config set -s prod -n shared \
 //     DATABASE_URL="postgres://postgres:$PG_PASS@pg-0.data:5432/myapp" \
 //     REDIS_URL="redis://cache-0.data:6379/0" \
-//     RAILS_ENV="production"
-//
-//   # Registry credentials, on_deploy URLs, and on_deploy secrets
-//   # all from the shell env at apply time. None reach git.
-//   export GHCR_USER="acme-deploy-bot"
-//   export GHCR_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-//   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX"
-//   export PD_ROUTING_KEY="R0000000000000000000000000000000"
+//     RAILS_ENV="production" \
+//     GHCR_USER="acme-deploy-bot" \
+//     GHCR_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+//     SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX" \
+//     PD_ROUTING_KEY="R0000000000000000000000000000000"
 //
 //   vd apply -f everything.hcl
+//
+// Shell env still works for ad-hoc override during testing
+// (`SLACK_WEBHOOK_URL=https://test/h vd apply ...`) — shell
+// always wins over bucket on collision.
 //
 // On first apply, the controller JIT-installs voodu-postgres
 // and voodu-redis plugins from thadeu/voodu-{postgres,redis}.
@@ -65,8 +70,6 @@ asset "prod" "webhooks" {
 // gating per-pod.
 
 postgres "data" "pg" {
-  plugin { version = "0.5.0" }
-
   image = "postgres:16"
 
   probes {
@@ -100,9 +103,7 @@ postgres "data" "pg" {
 // ---------------------------------------------------------------------------
 
 redis "data" "cache" {
-  plugin { version = "0.11.0" }
-
-  image = "redis:7"
+  image = "redis:8"
 
   probes {
     liveness {

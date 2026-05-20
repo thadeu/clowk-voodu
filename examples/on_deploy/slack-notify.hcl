@@ -59,14 +59,37 @@
 #     workspace migrated) does NOT churn replicas. Just edit and
 #     re-apply.
 #
-# Apply:
+# Apply — two ways to feed ${SLACK_WEBHOOK_URL}:
 #
-#   cd examples/on_deploy
-#   export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../XXXX"
-#   vd apply -f slack-notify.hcl
+#   ### Option A: store in scope bucket (recommended for teams)
+#
+#   Set once on the controller, every dev's vd apply reads it:
+#
+#     vd config set -s prod -n shared SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
+#     cd examples/on_deploy
+#     vd apply -f slack-notify.hcl
+#
+#   Rotation via vd config set propagates to every dev's next apply.
+#   The env_from line below declares the bucket; the CLI fetches it
+#   at parse time and ${SLACK_WEBHOOK_URL} resolves from there.
+#
+#   ### Option B: local shell only (single-dev / iteration)
+#
+#     export SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
+#     vd apply -f slack-notify.hcl
+#
+#   Shell always wins over bucket on collision — useful for testing
+#   a different URL temporarily without touching the bucket.
 
 deployment "prod" "api" {
   image    = "ghcr.io/acme/api:1.4.2"
+
+  # When this deployment declares env_from, the CLI fetches the
+  # bucket BEFORE parsing — making bucket vars available for
+  # ${VAR} substitution in this manifest. The bucket also gets
+  # mounted as runtime env file for the container; same source,
+  # both stages.
+  env_from = ["prod/shared"]
   replicas = 3
 
   ports = ["3000"]
