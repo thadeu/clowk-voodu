@@ -1,5 +1,9 @@
 # voodu
 
+[![ci](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/ci.yml)
+[![docs](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/docs.yml)
+[![release](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml/badge.svg)](https://github.com/thadeu/clowk-voodu/actions/workflows/release.yml)
+
 > Self-hosted, commitless-deploy PaaS with first-class stateful services.
 
 Voodu is the evolution of [Gokku](https://github.com/thadeu/gokku). It keeps
