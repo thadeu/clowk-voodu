@@ -105,25 +105,41 @@ export const contents: SidebarSection[] = [
     title: 'Manifests (HCL)',
     icon: FileCode2,
     list: [
+      // ── Concepts: read first ──────────────────────────────
       { title: 'Overview', href: '/docs/manifests/overview', icon: Layers },
       { title: 'Interpolation', href: '/docs/manifests/interpolation', icon: Braces },
+
+      // ── Workloads: what runs ──────────────────────────────
       { title: 'deployment', href: '/docs/manifests/deployment', icon: Server },
       { title: 'app', href: '/docs/manifests/app', icon: Box },
       { title: 'statefulset', href: '/docs/manifests/statefulset', icon: Disc3 },
-      { title: 'ingress & TLS', href: '/docs/manifests/ingress', icon: Network },
       { title: 'jobs & cronjobs', href: '/docs/manifests/jobs', icon: Workflow },
-      { title: 'asset', href: '/docs/manifests/asset', icon: Package },
-      { title: 'registry', href: '/docs/manifests/registry', icon: Container },
+
+      // ── Networking: how it's reached ──────────────────────
+      { title: 'ingress & TLS', href: '/docs/manifests/ingress', icon: Network },
+
+      // ── Stateful services (plugin-managed) ────────────────
       { title: 'postgres', href: '/docs/manifests/postgres', icon: Database },
       { title: 'redis', href: '/docs/manifests/redis', icon: Database },
+
+      // ── Supply chain: how it's built ──────────────────────
+      { title: 'build', href: '/docs/manifests/build', icon: Hammer },
+      { title: 'registry', href: '/docs/manifests/registry', icon: Container },
+      { title: 'asset', href: '/docs/manifests/asset', icon: Package },
+
+      // ── Runtime tuning: per-container caps & health ───────
+      { title: 'resources', href: '/docs/manifests/resources', icon: Gauge },
+      { title: 'logs', href: '/docs/manifests/logs', icon: FileText },
       { title: 'probes', href: '/docs/manifests/probes', icon: Activity },
       { title: 'init containers', href: '/docs/manifests/init', icon: Sparkles },
       { title: 'autoscale', href: '/docs/manifests/autoscale', icon: Scaling },
-      { title: 'on_deploy', href: '/docs/manifests/on-deploy', icon: Webhook },
+
+      // ── Lifecycle hooks: events around rollouts & runtime ─
       { title: 'release', href: '/docs/manifests/release', icon: Send },
-      { title: 'resources', href: '/docs/manifests/resources', icon: Gauge },
-      { title: 'logs', href: '/docs/manifests/logs', icon: FileText },
-      { title: 'build', href: '/docs/manifests/build', icon: Hammer },
+      { title: 'on_deploy', href: '/docs/manifests/on-deploy', icon: Webhook },
+      { title: 'on_probe', href: '/docs/manifests/on-probe', icon: Webhook },
+
+      // ── Cross-cutting: relations & config ─────────────────
       { title: 'depends_on', href: '/docs/manifests/depends-on', icon: Link2 },
       { title: 'config & secrets', href: '/docs/manifests/config', icon: KeyRound },
     ],

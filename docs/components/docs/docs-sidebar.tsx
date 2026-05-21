@@ -90,8 +90,23 @@ export function DocsSidebar() {
   );
 }
 
+// normalizePath strips a trailing slash so comparisons are stable
+// regardless of next.config's `trailingSlash` setting. The CLI
+// renders `/docs/manifests/deployment/` (with slash); sidebar-content
+// declares `/docs/manifests/deployment` (without). Without this
+// helper, every `pathname === item.href` comparison returns false
+// and no item ever lights up as active.
+function normalizePath(p: string): string {
+  if (p.length > 1 && p.endsWith('/')) {
+    return p.slice(0, -1);
+  }
+
+  return p;
+}
+
 function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pathname: string }) {
-  const isActive = section.list.some(item => pathname === item.href);
+  const normalized = normalizePath(pathname);
+  const isActive = section.list.some(item => normalized === item.href);
   const [open, setOpen] = useState(isActive);
   const contentRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLAnchorElement>(null);
@@ -118,9 +133,9 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
     <div className="mt-5 first:mt-0">
       <button
         onClick={toggleOpen}
-        className="w-full text-left flex items-center gap-2 px-4 py-2 transition-colors text-[11px] uppercase tracking-[0.1em] font-medium text-white/50 hover:text-white/75"
+        className="w-full text-left flex items-center gap-2 px-4 py-2 transition-colors text-[11px] uppercase tracking-[0.1em] font-medium text-white/40 hover:text-white/60"
       >
-        <Icon size={13} className="opacity-60" />
+        <Icon size={13} className="opacity-40" />
         <span>{section.title}</span>
         <div className="ml-auto flex items-center gap-1.5">
           {!open && isActive && (
@@ -131,7 +146,7 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
           )}
           <ChevronDown
             size={11}
-            className={`opacity-40 transition-transform duration-200 ${open ? 'rotate-0' : '-rotate-90'}`}
+            className={`opacity-30 transition-transform duration-200 ${open ? 'rotate-0' : '-rotate-90'}`}
           />
         </div>
       </button>
@@ -145,7 +160,7 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
         <div className="overflow-hidden">
           <div className="pt-1">
             {section.list.map(item => {
-              const active = pathname === item.href;
+              const active = normalized === item.href;
               const ItemIcon = item.icon;
 
               return (
@@ -156,10 +171,10 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
                   className={`relative flex items-center gap-2.5 pl-[14px] pr-4 py-1.5 text-[14px] border-l-2 transition-colors duration-150 ${
                     active
                       ? 'text-mint-400 font-medium bg-mint-400/[0.06] border-mint-400'
-                      : 'text-white/70 hover:text-white/95 hover:bg-white/[0.04] border-transparent'
+                      : 'text-white hover:text-white hover:bg-white/[0.04] border-transparent'
                   }`}
                 >
-                  {ItemIcon && <ItemIcon size={16} className={active ? 'opacity-80' : 'opacity-45'} />}
+                  {ItemIcon && <ItemIcon size={16} className={active ? 'opacity-80' : 'opacity-60'} />}
                   {item.title}
                 </Link>
               );
