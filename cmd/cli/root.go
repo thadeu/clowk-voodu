@@ -58,6 +58,7 @@ Use ":" syntax as shorthand for subcommands:
 		newRemoteCmd(),
 		newPluginsCmd(),
 		newStatsCmd(),
+		newSelfUpdateCmd(),
 	)
 
 	return root
