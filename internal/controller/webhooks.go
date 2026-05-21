@@ -19,12 +19,15 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -75,6 +78,46 @@ type WebhookPayload struct {
 	// rollout. Empty for successful runs. Same shape the release
 	// record's Error field uses.
 	Error string `json:"error,omitempty"`
+
+	// --- on_probe extensions (omitempty on the wire so on_deploy
+	// payloads stay byte-identical to pre-existing receivers) ---
+
+	// Pod is the full ordinal-stable container name (e.g.
+	// `myorg-web-1`, `data-pg-2`). Populated for on_probe events
+	// only; empty for on_deploy events. Useful for receiver-side
+	// routing ("page only when pod-0 fails") and `vd logs <pod>`
+	// follow-up.
+	Pod string `json:"pod,omitempty"`
+
+	// Probe identifies which probe transitioned: "liveness",
+	// "readiness", or "startup". Receivers format alerts
+	// differently per probe — liveness fail means container will
+	// restart, readiness fail means caddy drops it from rotation,
+	// startup fail means it never came up.
+	Probe string `json:"probe,omitempty"`
+
+	// Transition is "failure" or "recovery" for on_probe. Distinct
+	// from Status (which is the on_deploy "success"/"failure"
+	// vocabulary) so receivers can branch on either without
+	// ambiguity.
+	Transition string `json:"transition,omitempty"`
+
+	// TransitionID is a deterministic dedup key derived from the
+	// transition's intrinsic identity (scope|name|pod|probe|
+	// to_phase|timestamp-truncated-to-1s). Receivers dedupe on
+	// this when retries or backpressure produce duplicate fires.
+	TransitionID string `json:"transition_id,omitempty"`
+
+	// Reason carries the probe runner's last Result.Reason —
+	// HTTP code / exec exit / TCP connect failure text. Separate
+	// from Error (which is the deploy-level error) so receivers
+	// know which context they're in. Empty for on_deploy events.
+	Reason string `json:"reason,omitempty"`
+
+	// Timestamp is the RFC3339 wall-clock of the transition.
+	// Populated for on_probe events; on_deploy uses StartedAt /
+	// CompletedAt instead.
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 // WebhookPoster is the seam between the handler and the HTTP
@@ -330,6 +373,33 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		Error:       errMsg,
 	}
 
+	identityRoot := fmt.Sprintf("%s/%s/%s on_deploy", kind, scope, name)
+	fireWebhooks(poster, logf, targets, payload, identityRoot, status)
+}
+
+// fireWebhooks is the shared fan-out + per-target retry primitive,
+// extracted from fireDeployWebhook so on_probe (and any future hook
+// kind) reuse the same retry/template/log-correlation behaviour.
+// Caller is responsible for picking the right slot (success/failure
+// for on_deploy, failure/recovery for on_probe) and constructing
+// the kind-specific payload.
+//
+// `identityRoot` is the resource-scoped log prefix
+// (e.g. "deployment/prod/api on_deploy" or
+// "statefulset/data/db/data-db-2 on_probe"). `slotLabel` is the
+// per-target log tag — "success" / "failure" / "recovery" — paired
+// with an index suffix when the slot has multiple targets.
+func fireWebhooks(
+	poster WebhookPoster,
+	logf func(string, ...any),
+	targets []deployWebhookWireSpec,
+	payload WebhookPayload,
+	identityRoot, slotLabel string,
+) {
+	if poster == nil || len(targets) == 0 {
+		return
+	}
+
 	total := len(targets)
 
 	for i := range targets {
@@ -342,9 +412,9 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		// Build per-target identity for log correlation. Single-
 		// target is the common case; the index is noise when
 		// total == 1, so we suppress it.
-		ident := status
+		ident := slotLabel
 		if total > 1 {
-			ident = fmt.Sprintf("%s[%d/%d]", status, i+1, total)
+			ident = fmt.Sprintf("%s[%d/%d]", slotLabel, i+1, total)
 		}
 
 		wt := WebhookTarget{
@@ -366,7 +436,7 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 		//                      WebhookPayload. Back-compat path.
 		if body, err := buildCustomBody(&target, payload); err != nil {
 			if logf != nil {
-				logf("deployment/%s/%s on_deploy webhook (%s) body build failed: %v", scope, name, ident, err)
+				logf("%s webhook (%s) body build failed: %v", identityRoot, ident, err)
 			}
 			// Falls through with wt.Body nil; poster sends the
 			// default payload as a safety net. Drop-on-floor is
@@ -390,11 +460,154 @@ func fireDeployWebhook(poster WebhookPoster, logf func(string, ...any), spec *on
 
 			if err := postWithRetry(ctx, poster, wt, payload, nil); err != nil {
 				if logf != nil {
-					logf("deployment/%s/%s on_deploy webhook (%s) dropped after retries: %v", scope, name, ident, err)
+					logf("%s webhook (%s) dropped after retries: %v", identityRoot, ident, err)
 				}
 			}
 		}(wt, ident)
 	}
+}
+
+// ProbeTransitionEvent is the input shape for probe-triggered
+// webhook firing. The probe registry constructs one of these for
+// every healthy↔unhealthy edge the runner detects, then calls
+// fireProbeWebhook with the cached on_probe spec for the resource.
+//
+// Translation from the probe-runner's internal phase vocabulary to
+// the operator-facing "failure" / "recovery" labels happens at the
+// registry layer — by the time this event lands here, Transition is
+// already normalised.
+type ProbeTransitionEvent struct {
+	Kind       string    // "deployment" | "statefulset"; filled by handler (registry doesn't know kind)
+	Scope      string    // resource scope
+	Name       string    // resource name
+	Pod        string    // ordinal-stable container name
+	Probe      string    // "liveness" | "readiness" | "startup"
+	Transition string    // "failure" | "recovery"
+	Reason     string    // probe Result.Reason; may be empty
+	At         time.Time // wall-clock of the transition
+
+	// OnProbe is the per-runner cached webhook spec, threaded
+	// through from runnerEntry so the handler's OnProbeTransition
+	// impl doesn't have to re-load the manifest from the store.
+	// Nil for resources without on_probe declared (in which case
+	// fireProbeWebhook short-circuits).
+	OnProbe *onProbeWireSpec
+}
+
+// fireProbeWebhook fires the operator-supplied on_probe webhooks
+// for a single probe transition. Picks the failure or recovery
+// slot based on ev.Transition, computes a deterministic
+// TransitionID, and short-circuits when the same id was already
+// fired within the dedup window.
+//
+// nil poster or nil spec → no-op (steady state for resources
+// without on_probe declared).
+func fireProbeWebhook(poster WebhookPoster, logf func(string, ...any), spec *onProbeWireSpec, ev ProbeTransitionEvent) {
+	if poster == nil || spec == nil {
+		return
+	}
+
+	var targets []deployWebhookWireSpec
+
+	switch ev.Transition {
+	case "failure":
+		targets = spec.Failure
+	case "recovery":
+		targets = spec.Recovery
+	default:
+		return
+	}
+
+	if len(targets) == 0 {
+		return
+	}
+
+	transitionID := computeTransitionID(ev)
+
+	// In-firer dedup: same transition emitted multiple times
+	// within the dedup window fires the webhook only once.
+	// Defends against probe-event races on controller restart
+	// (initial state push + first edge can produce overlapping
+	// signals) and any future caller that double-invokes.
+	if !markFiredOnce(transitionID) {
+		return
+	}
+
+	payload := WebhookPayload{
+		Kind:         ev.Kind,
+		Scope:        ev.Scope,
+		Name:         ev.Name,
+		Pod:          ev.Pod,
+		Probe:        ev.Probe,
+		Transition:   ev.Transition,
+		TransitionID: transitionID,
+		Reason:       ev.Reason,
+		Timestamp:    ev.At.UTC().Format(time.RFC3339),
+	}
+
+	identityRoot := fmt.Sprintf("%s/%s/%s/%s on_probe", ev.Kind, ev.Scope, ev.Name, ev.Pod)
+	fireWebhooks(poster, logf, targets, payload, identityRoot, ev.Transition)
+}
+
+// computeTransitionID returns a deterministic 12-char dedup key
+// derived from the transition's intrinsic identity. Time is
+// truncated to 1 second so retries within the same second produce
+// the same id (receiver-side dedup safe), while transitions across
+// the second boundary get distinct ids.
+//
+// sha256 prefix is overkill for collision resistance at the rates
+// probes fire (one per period per pod), but the cost is negligible
+// and the deterministic-from-inputs property is what matters.
+func computeTransitionID(ev ProbeTransitionEvent) string {
+	sec := ev.At.Truncate(time.Second).Unix()
+	src := fmt.Sprintf("%s|%s|%s|%s|%s|%d", ev.Scope, ev.Name, ev.Pod, ev.Probe, ev.Transition, sec)
+	sum := sha256.Sum256([]byte(src))
+
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// transitionCacheTTL is the in-firer dedup window. 60s is long
+// enough to absorb retries from the postWithRetry loop (~36s
+// worst-case wall-clock) without holding entries indefinitely.
+// var (not const) so tests can shrink it.
+var transitionCacheTTL = 60 * time.Second
+
+// transitionCache is the in-firer dedup map. Sync-protected via
+// the mutex; entries are garbage-collected lazily on each
+// markFiredOnce call (cheap because the cache is bounded by the
+// rate of unique transitions, which is small).
+var (
+	transitionCacheMu sync.Mutex
+	transitionCache   = make(map[string]time.Time)
+)
+
+// markFiredOnce returns true if the transitionID hasn't been seen
+// in the last transitionCacheTTL. Concurrent callers see at most
+// one true return per id per window.
+func markFiredOnce(transitionID string) bool {
+	now := time.Now()
+	cutoff := now.Add(-transitionCacheTTL)
+
+	transitionCacheMu.Lock()
+	defer transitionCacheMu.Unlock()
+
+	// Lazy GC of stale entries on every call. The map size is
+	// proportional to the number of unique transitions within the
+	// TTL window; for typical probe periods (1-30s) this stays in
+	// the dozens range across an entire fleet.
+	for id, t := range transitionCache {
+		if t.Before(cutoff) {
+			delete(transitionCache, id)
+		}
+	}
+
+	if _, ok := transitionCache[transitionID]; ok {
+		return false
+	}
+
+	transitionCache[transitionID] = now
+
+	return true
 }
 
 // buildCustomBody returns the operator-customised body bytes when
@@ -506,6 +719,17 @@ func applyWebhookTokens(s string, payload WebhookPayload) string {
 		"{{error}}", payload.Error,
 		"{{started_at}}", payload.StartedAt,
 		"{{completed_at}}", payload.CompletedAt,
+
+		// on_probe tokens — empty values just collapse to "" via
+		// strings.NewReplacer, so on_deploy bodies that use the new
+		// tokens accidentally won't error out, just render as empty
+		// substrings.
+		"{{pod}}", payload.Pod,
+		"{{probe}}", payload.Probe,
+		"{{transition}}", payload.Transition,
+		"{{transition_id}}", payload.TransitionID,
+		"{{reason}}", payload.Reason,
+		"{{timestamp}}", payload.Timestamp,
 	}
 
 	return strings.NewReplacer(replacements...).Replace(s)

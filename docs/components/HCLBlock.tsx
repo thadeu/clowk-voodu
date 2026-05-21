@@ -145,6 +145,33 @@ cronjob "myorg" "pg-backup" {
   env_from = ["myorg/shared"]
 }`,
   },
+  {
+    id: 'notifications',
+    label: 'Notifications',
+    code: `// Push alerts to Telegram + Slack when a probe transitions.
+// Works on any kind that has pods — same shape for app/redis/postgres.
+deployment "myorg" "web" {
+  image = "ghcr.io/myorg/web:latest"
+
+  probes {
+    liveness  { http_get { path = "/healthz" } }
+    readiness { http_get { path = "/ready"   } }
+  }
+
+  on_probe {
+    failure {
+      url = "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage"
+
+      body = {
+        chat_id = "\${TG_CHAT_ID}"
+        text    = "🚨 {{pod}} {{probe}} failed: {{reason}}"
+      }
+    }
+    failure  { url = "\${SLACK_CRITICAL}" }
+    recovery { url = "\${SLACK_INFO}" }
+  }
+}`,
+  },
 ];
 
 export default function HCLBlock() {

@@ -1,0 +1,277 @@
+---
+title: on_probe
+description: Runtime-health webhooks — Slack, Telegram, PagerDuty on probe transitions.
+---
+
+`on_probe {}` declares webhooks voodu fires when a liveness, readiness, or startup probe transitions between healthy and unhealthy states. The runtime sibling of [`on_deploy`](/docs/manifests/on-deploy) — same shape, different vocabulary: `failure` fires when a pod just went bad, `recovery` fires when it came back.
+
+Accepted on `deployment`, `statefulset`, and every plugin-expanded kind (`postgres`, `redis`, future `mongo` / `rabbitmq` / `kafka`). Each slot accepts multiple targets, fired in parallel — same delivery contract as `on_deploy`.
+
+Delivery is **best-effort**: 3 attempts with backoff, failure to deliver does not affect the container. Each target gets its own retry budget.
+
+## Synopsis
+
+Single target — minimal config, common case:
+
+```hcl
+deployment "myorg" "web" {
+  image = "ghcr.io/myorg/web:latest"
+
+  probes {
+    liveness  { http_get { path = "/healthz" } }
+    readiness { http_get { path = "/ready"   } }
+  }
+
+  on_probe {
+    failure  { url = "${SLACK_WEBHOOK_URL}" }
+    recovery { url = "${SLACK_WEBHOOK_URL}" }
+  }
+}
+```
+
+Stateful resource via plugin — same shape, plugin splices it through to the expanded statefulset:
+
+```hcl
+postgres "myorg" "db" {
+  image    = "postgres:16"
+  replicas = 3
+
+  on_probe {
+    failure {
+      url = "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+
+      body = {
+        chat_id = "${TG_CHAT_ID}"
+        text    = "🚨 {{pod}} {{probe}} failed: {{reason}}"
+      }
+    }
+  }
+}
+```
+
+Multiple targets per slot — fan out:
+
+```hcl
+on_probe {
+  failure { url = "${SLACK_CRITICAL}" }
+  failure {
+    url     = "https://events.pagerduty.com/v2/enqueue"
+    headers = { "X-Routing-Key" = "${PD_KEY}" }
+  }
+  failure {
+    url     = "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+    body    = { chat_id = "${TG_CHAT_ID}", text = "{{pod}} unhealthy" }
+  }
+
+  recovery { url = "${SLACK_INFO}" }
+}
+```
+
+Each declared block becomes one HTTP target, fired in its own goroutine with its own retry loop.
+
+## `failure {}` and `recovery {}` slots
+
+Repeatable. Each block is one target. Fields mirror `on_deploy` exactly:
+
+| Field | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `url` | string | yes | — | Target URL. |
+| `method` | string | no | `"POST"` | One of `POST`, `PUT`, `PATCH`, `DELETE`. |
+| `headers` | map | no | `{}` | Extra HTTP headers. |
+| `body` | object | no | default payload (see below) | Inline body. Mutex with `file`. |
+| `file` | string | no | — | Asset ref `${asset.X.Y.Z}`. Mutex with `body`. |
+
+`recovery` is optional. Omit it and only failures notify; the runtime state machine still tracks transitions so the next recovery, if you add the slot later, fires correctly.
+
+## When `failure` fires
+
+Any healthy → unhealthy edge from any of the three probes:
+
+- **liveness fail** — container is about to be restarted (`docker restart`). Webhook fires before the restart.
+- **readiness fail** — pod is dropped from caddy's rotation. Container keeps running.
+- **startup fail** — startup probe didn't pass within its threshold. Pod is still considered "not ready".
+
+A freshly started container that fails its very first probe samples DOES fire `failure` — that's the "redis never came up" signal operators rely on.
+
+## When `recovery` fires
+
+Unhealthy → healthy edge **only after a prior failure**. A pod going healthy for the first time on a fresh startup does NOT fire recovery — that would be noise on every `vd apply`.
+
+The state machine pairs edges: failure → recovery. Each recovery resets the gate, so the next recovery requires another failure first.
+
+## Default payload
+
+When neither `body` nor `file` is set, voodu sends this JSON:
+
+```json
+{
+  "kind":          "deployment",
+  "scope":         "myorg",
+  "name":          "web",
+  "pod":           "myorg-web-2",
+  "probe":         "liveness",
+  "transition":    "failure",
+  "transition_id": "a1b2c3d4e5f6",
+  "reason":        "HTTP 503",
+  "timestamp":     "2026-05-21T14:23:01Z"
+}
+```
+
+`Content-Type: application/json` is set by default but **can be overridden** via `headers`. `User-Agent: voodu-deploy-webhook` is forced.
+
+## Idempotency
+
+The `transition_id` is a deterministic 12-character hash derived from `(scope, name, pod, probe, transition, timestamp truncated to 1 second)`. Same transition observed twice (e.g. controller restart races) produces the same id — your receiver can dedupe safely.
+
+Plus an in-firer 60-second cache on the controller side: if the same `transition_id` would fire twice within 60 seconds, only the first gets through.
+
+## Available `{{...}}` tokens
+
+| Token | Meaning |
+|---|---|
+| `{{kind}}` | `deployment` or `statefulset` (plugin-expanded kinds resolve to `statefulset`). |
+| `{{scope}}` | Resource scope (e.g. `myorg`). |
+| `{{name}}` | Resource name (e.g. `web`). |
+| `{{pod}}` | Ordinal-stable container name (e.g. `myorg-web-2`). |
+| `{{probe}}` | `liveness`, `readiness`, or `startup`. |
+| `{{transition}}` | `failure` or `recovery`. |
+| `{{reason}}` | Probe `Result.Reason` (e.g. `HTTP 503`, `exit code 1`, `connect: connection refused`). |
+| `{{transition_id}}` | 12-char deterministic dedup key. |
+| `{{timestamp}}` | RFC3339 wall-clock of the transition. |
+
+Unknown `{{...}}` tokens are left literal — they won't break handlebars-style templates in receiver-side text.
+
+Substitution recurses into nested maps and arrays — every string value inside `body` can be templated.
+
+## Validation
+
+The apply is rejected when:
+
+- `url` is empty.
+- `method` is not one of `POST`, `PUT`, `PATCH`, `DELETE`.
+- Both `body` and `file` are set in the same sub-block.
+- `file` is not a `${asset.…}` reference.
+
+Errors include the slot label and (when more than one target) the index: `on_probe.failure[1].url is required`.
+
+## Examples
+
+### Telegram bot — failures only
+
+```hcl
+deployment "prod" "api" {
+  env_from = ["prod/notifications"]   # TG_TOKEN, TG_CHAT_ID
+
+  probes {
+    liveness  { http_get { path = "/healthz" } }
+  }
+
+  on_probe {
+    failure {
+      url = "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+
+      body = {
+        chat_id    = "${TG_CHAT_ID}"
+        text       = "🚨 *{{kind}}/{{scope}}/{{name}}* — *{{pod}}* {{probe}} failed: {{reason}}"
+        parse_mode = "Markdown"
+      }
+    }
+  }
+}
+```
+
+### Slack critical + info channels — failures and recoveries split
+
+```hcl
+deployment "prod" "api" {
+  on_probe {
+    failure  { url = "${SLACK_CRITICAL}" }   # #ops-alerts
+    recovery { url = "${SLACK_INFO}" }       # #ops-info
+  }
+}
+```
+
+### Postgres replica health — fanout to PagerDuty + Slack
+
+```hcl
+postgres "prod" "db" {
+  image    = "postgres:16"
+  replicas = 3
+
+  on_probe {
+    failure {
+      url     = "https://events.pagerduty.com/v2/enqueue"
+      headers = { "X-Routing-Key" = "${PD_KEY}" }
+
+      body = {
+        routing_key  = "${PD_KEY}"
+        event_action = "trigger"
+        dedup_key    = "{{transition_id}}"
+        payload = {
+          summary  = "{{pod}} {{probe}} failed"
+          severity = "error"
+          source   = "voodu"
+          custom_details = {
+            scope  = "{{scope}}"
+            reason = "{{reason}}"
+          }
+        }
+      }
+    }
+
+    failure { url = "${SLACK_DB_CRITICAL}" }
+    recovery { url = "${SLACK_DB_INFO}" }
+  }
+}
+```
+
+PagerDuty's `dedup_key` maps directly to voodu's `transition_id` — flapping probes won't open multiple incidents.
+
+### Per-env routing via env_from
+
+```hcl
+deployment "prod" "api" {
+  env_from = ["prod/notifications"]
+
+  on_probe {
+    failure { url = "${SLACK_CRITICAL}" }
+  }
+}
+
+deployment "staging" "api" {
+  env_from = ["staging/notifications"]
+
+  on_probe {
+    failure { url = "${SLACK_CRITICAL}" }   # resolves to a different URL
+  }
+}
+```
+
+Same manifest shape, per-env values come from scope-specific config buckets.
+
+## Trade-offs
+
+**Webhook config is NOT in the spec hash.** Rotating a Slack URL or PagerDuty routing key does NOT trigger a rolling restart. The probe registry caches the latest spec per replica; reconcile picks up the new value next time the runner starts.
+
+**Per-pod, not per-resource.** Each replica transition fires its own webhook. With 5 replicas and 3 webhook targets, a deployment-wide outage fires 15 webhooks — the receiver decides whether to aggregate.
+
+**`recovery` requires a prior failure.** A fresh container reaching healthy on its first sample does NOT fire recovery. The state machine pairs edges. Without this gate, every `vd apply` would spam recovery webhooks.
+
+**Suppressed during planned teardown.** Rolling restart, scale-down, and manual `vd restart` mark the runner before tearing it down — transitions caused by the orchestrator's graceful stop don't fire `failure` alerts.
+
+**Best-effort delivery.** Same posture as `on_deploy`: 3 attempts with backoff `[1s, 5s, 30s]`, 10s per HTTP attempt, drop-on-floor on exhaustion. Webhook failure never affects container state.
+
+**No backpressure cap.** A flapping container with 4 targets spawns up to 4 goroutines per transition. The probe spec's `failure_threshold` × `period_seconds` is the natural dampener — pick conservative values for noisy workloads.
+
+**`file` must be asset-backed.** No raw paths. Same rule as `on_deploy`.
+
+**Mutex: `body` OR `file`, never both.** Same rule as `on_deploy`.
+
+**Not available on jobs / cronjobs.** Those have completion semantics, not runtime-health probes. Use the workload's own exit code for completion notifications.
+
+## See also
+
+- [`on_deploy`](/docs/manifests/on-deploy) — sibling for post-rollout webhooks
+- [`probes`](/docs/manifests/probes) — declaring the liveness / readiness / startup checks that drive `on_probe`
+- [`asset`](/docs/manifests/asset) — for `file = "${asset.…}"` references
+- [Interpolation reference](/docs/manifests/interpolation) — `${VAR}` vs `{{field}}`

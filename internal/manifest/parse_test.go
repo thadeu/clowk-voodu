@@ -2629,6 +2629,207 @@ deployment "prod" "api" {
 	}
 }
 
+// TestParseHCLDeploymentOnProbe pins the on_probe webhook block
+// surface — the runtime-health sibling of on_deploy. Failure +
+// recovery sub-blocks both parse, URL round-trips verbatim, the
+// method whitelist applies, and headers preserve operator keys.
+// The shape mirrors on_deploy so operators learn one pattern; the
+// vocabulary changes from success/failure to failure/recovery.
+func TestParseHCLDeploymentOnProbe(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_probe {
+    failure {
+      url    = "https://hooks.slack.com/services/T1/B1/critical"
+      method = "POST"
+
+      headers = {
+        "Authorization" = "Bearer abc123"
+      }
+    }
+
+    recovery {
+      url = "https://hooks.slack.com/services/T1/B1/info"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_probe.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.OnProbe == nil {
+		t.Fatal("on_probe missing in parsed spec")
+	}
+
+	if len(spec.OnProbe.Failure) != 1 || spec.OnProbe.Failure[0].URL != "https://hooks.slack.com/services/T1/B1/critical" {
+		t.Errorf("failure url lost: %+v", spec.OnProbe.Failure)
+	}
+
+	if spec.OnProbe.Failure[0].Method != "POST" {
+		t.Errorf("failure.method: %q, want POST", spec.OnProbe.Failure[0].Method)
+	}
+
+	if spec.OnProbe.Failure[0].Headers["Authorization"] != "Bearer abc123" {
+		t.Errorf("Authorization header lost: %+v", spec.OnProbe.Failure[0].Headers)
+	}
+
+	if len(spec.OnProbe.Recovery) != 1 || spec.OnProbe.Recovery[0].URL != "https://hooks.slack.com/services/T1/B1/info" {
+		t.Errorf("recovery url lost: %+v", spec.OnProbe.Recovery)
+	}
+
+	if spec.OnProbe.Recovery[0].Method != "" {
+		t.Errorf("recovery.method should be empty when omitted, got %q", spec.OnProbe.Recovery[0].Method)
+	}
+}
+
+// TestParseHCLDeploymentOnProbe_FailureOnly pins the "minimal
+// config" use case — operator only wants failure alerts, recovery
+// is implicit silence. The plan agent's design says recovery is
+// optional; omitting it must not error.
+func TestParseHCLDeploymentOnProbe_FailureOnly(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_probe {
+    failure {
+      url = "https://hooks.slack.com/services/critical"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_probe_failonly.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.OnProbe == nil || len(spec.OnProbe.Failure) != 1 {
+		t.Fatalf("failure slot missing: %+v", spec.OnProbe)
+	}
+
+	if spec.OnProbe.Recovery != nil && len(spec.OnProbe.Recovery) > 0 {
+		t.Errorf("recovery should be nil/empty when omitted, got %+v", spec.OnProbe.Recovery)
+	}
+}
+
+// TestParseHCLDeploymentOnProbe_InvalidMethod pins the shared
+// method whitelist. The fact that this fails identically to
+// on_deploy is the whole point — operators learn one rule.
+// The error prefix MUST be "on_probe." so the operator can locate
+// the offending block (not "on_deploy." — that would be a
+// validateDeployWebhook regression mixing up the parameterised
+// block label).
+func TestParseHCLDeploymentOnProbe_InvalidMethod(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_probe {
+    failure {
+      url    = "https://example.com/hook"
+      method = "GET"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_probe_get.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for GET method on on_probe webhook")
+	}
+
+	if !strings.Contains(err.Error(), "on_probe.failure.method must be one of") {
+		t.Errorf("expected on_probe-prefixed method error, got: %v", err)
+	}
+}
+
+// TestParseHCLDeploymentOnProbe_UrlRequired pins URL-required
+// validation reuses the shared validateDeployWebhook and surfaces
+// the on_probe block label correctly.
+func TestParseHCLDeploymentOnProbe_UrlRequired(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  on_probe {
+    recovery {
+      url = ""
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "dep_on_probe_emptyurl.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected error for empty url")
+	}
+
+	if !strings.Contains(err.Error(), "on_probe.recovery.url is required") {
+		t.Errorf("expected on_probe-prefixed url-required error, got: %v", err)
+	}
+}
+
+// TestParseHCLStatefulsetOnProbe pins that statefulsets accept
+// on_probe too. This is the path postgres/redis/mongo plugins
+// rely on — the operator's on_probe block on a plugin call site
+// (e.g. `postgres "myorg" "db" { on_probe { ... } }`) splices
+// through to the expanded statefulset.
+func TestParseHCLStatefulsetOnProbe(t *testing.T) {
+	src := `
+statefulset "data" "db" {
+  image    = "postgres:16"
+  replicas = 3
+
+  on_probe {
+    failure {
+      url = "https://hooks.slack.com/services/db-critical"
+    }
+  }
+}
+`
+	tmp := writeTemp(t, "ss_on_probe.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec StatefulsetSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.OnProbe == nil || len(spec.OnProbe.Failure) != 1 {
+		t.Fatalf("statefulset on_probe.failure lost: %+v", spec.OnProbe)
+	}
+
+	if spec.OnProbe.Failure[0].URL != "https://hooks.slack.com/services/db-critical" {
+		t.Errorf("failure url lost: %q", spec.OnProbe.Failure[0].URL)
+	}
+}
+
 // TestParseHCLDeploymentLogs pins the logs cap block: both fields
 // round-trip through the parser without docker-side coercion (no
 // "10m" → bytes conversion at parse time; that's the runtime

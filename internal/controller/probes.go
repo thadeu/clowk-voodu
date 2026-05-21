@@ -85,6 +85,23 @@ type ProbeExecutor interface {
 type ReadinessRecorder interface {
 	RecordReplicaReadiness(ctx context.Context, app string, status ReplicaReadinessStatus)
 	ClearReplicaReadiness(ctx context.Context, app, containerName string)
+
+	// OnProbeTransition is called once per healthy↔unhealthy edge
+	// the probe runner detects. The state-machine gating
+	// (plannedTeardown suppression, hadFailure recovery gate)
+	// happens inside the registry BEFORE this method is invoked,
+	// so by the time a recorder sees the call it's guaranteed to
+	// be a "fire-worthy" transition.
+	//
+	// Recorder impls (DeploymentHandler, StatefulsetHandler)
+	// stamp ev.Kind, look up the cached on_probe spec, and call
+	// fireProbeWebhook. The registry stays free of webhook /
+	// HTTP knowledge.
+	//
+	// nil-tolerant: a Recorder may implement this as a no-op
+	// (no webhooks wired in tests, or operator hasn't declared
+	// on_probe on any resource).
+	OnProbeTransition(ctx context.Context, ev ProbeTransitionEvent)
 }
 
 // ReplicaReadinessStatus is one entry in
@@ -200,6 +217,13 @@ type runnerEntry struct {
 	cancels []context.CancelFunc
 	dones   []<-chan struct{}
 	state   *replicaReadiness
+
+	// onProbe is the operator-supplied webhook spec for this
+	// container's probe transitions. Cached on the runner so the
+	// drain goroutines fetch it locally instead of round-tripping
+	// to etcd per transition. Immutable after Start; nil for
+	// resources that didn't declare on_probe.
+	onProbe *onProbeWireSpec
 }
 
 // replicaReadiness is the in-memory mirror of
@@ -219,6 +243,22 @@ type replicaReadiness struct {
 	readinessPhase probe.Phase
 	reason         string
 	lastTransition time.Time
+
+	// plannedTeardown is set by MarkPlannedTeardown immediately
+	// before Stop so the drain goroutines suppress webhook
+	// emission for the in-flight transitions caused by graceful
+	// container shutdown (rolling restart, scale-down, manual
+	// vd restart). Cleared by Stop's entry deletion.
+	plannedTeardown bool
+
+	// hadFailure is the recovery-gating state machine: true once
+	// the runner has observed at least one failure transition,
+	// reset to false after firing a recovery event. The next
+	// recovery requires another failure first. Prevents the
+	// "freshly started pod going healthy on its first probe"
+	// case from emitting a spurious recovery webhook on every
+	// vd apply.
+	hadFailure bool
 }
 
 // ready aggregates startup + readiness into a single Ready bool.
@@ -280,7 +320,13 @@ func (s *replicaReadiness) snapshot(containerName, replicaID string) ReplicaRead
 //
 // nilSpec or a probes block with all three sub-blocks empty is a
 // clean no-op so callers can wire Start unconditionally.
-func (r *ProbeRegistry) Start(app, containerName string, spec *probesWireSpec) {
+//
+// onProbe is the operator-supplied webhook spec for this
+// container's transitions. Cached on the runnerEntry so the
+// drain goroutines emit OnProbeTransition events with the right
+// targets pre-attached. nil → no webhooks fired (steady state for
+// resources without on_probe declared).
+func (r *ProbeRegistry) Start(app, containerName string, spec *probesWireSpec, onProbe *onProbeWireSpec) {
 	if r == nil || spec == nil {
 		return
 	}
@@ -328,7 +374,10 @@ func (r *ProbeRegistry) Start(app, containerName string, spec *probesWireSpec) {
 		readinessPhase: probe.PhaseHealthy,
 	}
 
-	entry := &runnerEntry{state: state}
+	entry := &runnerEntry{
+		state:   state,
+		onProbe: onProbe,
+	}
 
 	// Spawn startup probe first so the gate logic is in place
 	// before liveness/readiness start emitting events. The order
@@ -339,7 +388,7 @@ func (r *ProbeRegistry) Start(app, containerName string, spec *probesWireSpec) {
 	}
 
 	if spec.Liveness != nil {
-		r.spawnLiveness(containerName, host, spec.Liveness, entry, logger)
+		r.spawnLiveness(containerName, host, app, spec.Liveness, entry, logger)
 	}
 
 	if spec.Readiness != nil {
@@ -358,8 +407,10 @@ func (r *ProbeRegistry) Start(app, containerName string, spec *probesWireSpec) {
 
 // spawnLiveness creates the per-container liveness runner and
 // drains its events. OnTrigger fires docker restart on the
-// transition into PhaseUnhealthy — same behaviour as M1.1.
-func (r *ProbeRegistry) spawnLiveness(containerName, host string, livenessSpec *probeWireSpec, entry *runnerEntry, logger *log.Logger) {
+// transition into PhaseUnhealthy — same behaviour as M1.1; the
+// drain additionally emits OnProbeTransition so the webhook
+// firer learns about the same edges.
+func (r *ProbeRegistry) spawnLiveness(containerName, host, app string, livenessSpec *probeWireSpec, entry *runnerEntry, logger *log.Logger) {
 	probeSpec := wireToProbeSpec(livenessSpec)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -393,11 +444,15 @@ func (r *ProbeRegistry) spawnLiveness(containerName, host string, livenessSpec *
 
 	go runner.Run(ctx)
 
-	// Liveness doesn't care about events for state propagation
-	// (state is implicit: the container's running or it's been
-	// restarted). Drain to keep the runner's emit channel
-	// unblocked.
-	go drainEvents(runner.Events())
+	// Liveness doesn't propagate state to /pods/{name}/ready (that's
+	// the readiness probe's job), but we DO consume its events to
+	// emit OnProbeTransition for the on_probe webhook firer.
+	// Healthy→Unhealthy fires failure (alongside the OnTrigger
+	// restart); Unhealthy→Healthy fires recovery once the
+	// post-restart container probes pass again. The drain naturally
+	// ends when ctx is cancelled and the runner closes its events
+	// channel.
+	go r.drainLivenessEvents(runner.Events(), containerName, app, entry, logger)
 }
 
 // spawnReadiness creates the readiness runner and wires the
@@ -471,6 +526,11 @@ func (r *ProbeRegistry) spawnStartup(containerName, host string, startupSpec *pr
 // mutates state on transitions, and pushes to the Recorder once
 // per transition. Steady-state samples (Transition=false) update
 // nothing — exactly the debouncing the plan calls for.
+//
+// In addition to the readiness state push, this drain now emits
+// OnProbeTransition events so the on_probe webhook firer reacts
+// to the same edges. State-machine gating (plannedTeardown,
+// hadFailure) lives in emitProbeTransition.
 func (r *ProbeRegistry) drainReadinessEvents(events <-chan probe.Event, containerName, app string, entry *runnerEntry, logger *log.Logger) {
 	for ev := range events {
 		if !ev.Transition {
@@ -489,45 +549,183 @@ func (r *ProbeRegistry) drainReadinessEvents(events <-chan probe.Event, containe
 			snap := entry.state.snapshot(containerName, replicaIDFromContainerName(containerName))
 			r.Recorder.RecordReplicaReadiness(context.Background(), app, snap)
 		}
+
+		r.emitProbeTransition(app, containerName, "readiness", ev, entry)
 	}
 }
 
-// drainStartupEvents listens for the first PhaseHealthy transition
-// (the "startup probe passed" signal). The runner has
-// StopOnReady=true so it self-exits after that transition — this
-// drain naturally ends when the events channel closes.
+// drainLivenessEvents consumes the liveness runner's events solely
+// for OnProbeTransition emission. State updates (readiness phase,
+// snapshot to /pods/{name}/ready) belong to the readiness drain —
+// liveness conceptually says "container is alive or being
+// restarted", not "ready to take traffic". The runner's own
+// OnTrigger callback still handles the docker restart side.
+//
+// Replaces M1.1's no-op drainEvents which discarded these events
+// entirely. Now we put them to work.
+func (r *ProbeRegistry) drainLivenessEvents(events <-chan probe.Event, containerName, app string, entry *runnerEntry, logger *log.Logger) {
+	for ev := range events {
+		if !ev.Transition {
+			continue
+		}
+
+		logger.Printf("probe/%s liveness → %s (%s)", containerName, ev.Phase.String(), ev.Result.Reason)
+
+		r.emitProbeTransition(app, containerName, "liveness", ev, entry)
+	}
+}
+
+// drainStartupEvents listens for startup probe transitions. The
+// PhaseHealthy edge (the "gate opens" signal) flips startupPassed
+// and lets the runner self-exit (StopOnReady=true).
+//
+// Unhealthy transitions are NOT a no-op anymore: we emit
+// OnProbeTransition so on_probe.failure fires when the container
+// stays unhealthy past its FailureThreshold — the operator gets a
+// signal that the pod is failing to come up. The runner keeps
+// probing until either healthy (then exits) or ctx is cancelled.
+//
+// We don't fire on_probe.recovery from startup transitions
+// because the "gate opened" event is not a recovery — it's the
+// first time the pod was ever healthy, which the state machine
+// in emitProbeTransition already filters out via the hadFailure
+// gate. If a startup probe went unhealthy then healthy, the
+// recovery WILL fire because hadFailure was set by the unhealthy
+// drain.
 func (r *ProbeRegistry) drainStartupEvents(events <-chan probe.Event, containerName, app string, entry *runnerEntry, logger *log.Logger) {
 	for ev := range events {
 		if !ev.Transition {
 			continue
 		}
 
-		// Only PhaseHealthy is the "gate opens" signal. An
-		// unhealthy transition from a startup probe means the
-		// container is still starting; we don't act on those (the
-		// kubelet contract is that startup failure threshold
-		// triggers a restart via the orchestrator, but we
-		// deliberately keep startup probes routing-only in M1.2 —
-		// liveness handles restart).
-		if ev.Phase != probe.PhaseHealthy {
-			continue
+		if ev.Phase == probe.PhaseHealthy {
+			entry.state.mu.Lock()
+			entry.state.startupPassed = true
+			entry.state.lastTransition = time.Now().UTC()
+			entry.state.reason = ev.Result.Reason
+			entry.state.mu.Unlock()
+
+			logger.Printf("probe/%s startup probe passed (%s)", containerName, ev.Result.Reason)
+
+			if r.Recorder != nil {
+				snap := entry.state.snapshot(containerName, replicaIDFromContainerName(containerName))
+				r.Recorder.RecordReplicaReadiness(context.Background(), app, snap)
+			}
 		}
 
-		entry.state.mu.Lock()
-		entry.state.startupPassed = true
-		entry.state.lastTransition = time.Now().UTC()
-		entry.state.reason = ev.Result.Reason
-		entry.state.mu.Unlock()
-
-		logger.Printf("probe/%s startup probe passed (%s)", containerName, ev.Result.Reason)
-
-		if r.Recorder != nil {
-			snap := entry.state.snapshot(containerName, replicaIDFromContainerName(containerName))
-			r.Recorder.RecordReplicaReadiness(context.Background(), app, snap)
-		}
-		// The runner will self-exit; the for-range exits when its
-		// events channel closes. No explicit break needed.
+		r.emitProbeTransition(app, containerName, "startup", ev, entry)
+		// The runner self-exits on PhaseHealthy; the for-range
+		// exits when its events channel closes. No explicit break.
 	}
+}
+
+// emitProbeTransition is the shared edge-to-event helper used by
+// all three drains. Encapsulates:
+//
+//   - plannedTeardown suppression (skip emission when the
+//     container is being gracefully stopped)
+//   - recovery state-machine gating (a fresh runner's first
+//     PhaseHealthy doesn't fire recovery — only after a prior
+//     PhaseUnhealthy)
+//   - hadFailure bookkeeping (set on failure, reset on recovery
+//     so the next cycle has to see another failure before its
+//     recovery webhook fires)
+//   - PhaseUnknown filter (no edge worth a webhook)
+//
+// Calls Recorder.OnProbeTransition only when all gates pass.
+// Nil-tolerant: skips when r.Recorder is nil (in-memory test
+// configuration).
+func (r *ProbeRegistry) emitProbeTransition(app, containerName, probeName string, ev probe.Event, entry *runnerEntry) {
+	if r.Recorder == nil || entry == nil {
+		return
+	}
+
+	if ev.Phase != probe.PhaseHealthy && ev.Phase != probe.PhaseUnhealthy {
+		// Unknown / other phases are not edge-worthy.
+		return
+	}
+
+	var transition string
+
+	entry.state.mu.Lock()
+
+	if entry.state.plannedTeardown {
+		entry.state.mu.Unlock()
+		// Suppress: this transition is caused by an
+		// orchestrator-driven stop, not a real probe failure.
+		return
+	}
+
+	switch ev.Phase {
+	case probe.PhaseUnhealthy:
+		transition = "failure"
+		entry.state.hadFailure = true
+	case probe.PhaseHealthy:
+		if !entry.state.hadFailure {
+			entry.state.mu.Unlock()
+			// First-time healthy on a fresh runner — normal
+			// startup, not a recovery from anything.
+			return
+		}
+
+		transition = "recovery"
+		// Reset so the next recovery requires another failure
+		// first. Without this reset, a flapping container that
+		// goes failure→recovery→recovery would fire two recovery
+		// webhooks; the state machine should be paired edges only.
+		entry.state.hadFailure = false
+	}
+
+	entry.state.mu.Unlock()
+
+	scope, name := splitAppID(app)
+
+	r.Recorder.OnProbeTransition(context.Background(), ProbeTransitionEvent{
+		Scope:      scope,
+		Name:       name,
+		Pod:        containerName,
+		Probe:      probeName,
+		Transition: transition,
+		Reason:     ev.Result.Reason,
+		At:         time.Now().UTC(),
+		OnProbe:    entry.onProbe,
+	})
+}
+
+// MarkPlannedTeardown flags a container's runnerEntry so the
+// drain goroutines suppress OnProbeTransition emission for any
+// transitions caused by the orchestrator's graceful shutdown
+// (rolling restart, scale-down, manual vd restart). Must be
+// called IMMEDIATELY before Probes.Stop — the flag is read by
+// the drains during the cancellation race, so setting it after
+// Stop would be too late.
+//
+// No-op when the container has no live runner (Stop already
+// called, or never started). Safe to call multiple times.
+func (r *ProbeRegistry) MarkPlannedTeardown(app, containerName string) {
+	if r == nil {
+		return
+	}
+
+	v, ok := r.runners.Load(containerName)
+	if !ok {
+		return
+	}
+
+	entry, ok := v.(*runnerEntry)
+	if !ok || entry == nil || entry.state == nil {
+		return
+	}
+
+	entry.state.mu.Lock()
+	entry.state.plannedTeardown = true
+	entry.state.mu.Unlock()
+
+	// app is unused for now (the flag is per-container, app is
+	// just there to mirror Stop's signature so the wiring is
+	// symmetric). Reserved in case future suppression rules
+	// need per-app scoping.
+	_ = app
 }
 
 // compositeReadinessLookup chains multiple ReadinessLookup

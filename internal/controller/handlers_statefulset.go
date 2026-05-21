@@ -61,6 +61,13 @@ type StatefulsetHandler struct {
 	// so writes land in the statefulset status blob.
 	Probes *ProbeRegistry
 
+	// Webhooks is the on_probe delivery seam — mirror of
+	// DeploymentHandler.Webhooks. Optional; nil → OnProbeTransition
+	// short-circuits (no webhooks fired). Production wires the
+	// same HTTPWebhookPoster instance the deployment handler uses,
+	// so a single configuration knob controls both kinds.
+	Webhooks WebhookPoster
+
 	// rolloutLocks serialises rolling restart per (scope, name).
 	// Two concurrent reconciles for the same statefulset would
 	// otherwise race on container creation order — mutex granularity
@@ -128,6 +135,13 @@ type statefulsetSpec struct {
 	// spec hash so probe-spec edits trigger a top-down rolling
 	// restart, picking up the new config on every ordinal.
 	Probes *probesWireSpec `json:"probes,omitempty"`
+
+	// OnProbe mirrors manifest.OnProbeSpec — webhook fan-out on
+	// per-ordinal probe transitions. Statefulset transitions are
+	// PER-ORDINAL, so the payload's {{pod}} token resolves to the
+	// ordinal-stable container name (`<scope>-<name>-N`). NOT in
+	// the spec hash: webhook-URL edits do not churn ordinals.
+	OnProbe *onProbeWireSpec `json:"on_probe,omitempty"`
 
 	// AssetDigests is the apply-time-stamped sha256 map for asset
 	// refs the consumer touches. Server-managed (StampAssetDigests
@@ -455,7 +469,9 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 
 			// Probes first so the runner can't fire a restart
 			// against a container in mid-delete.
-			h.Probes.Stop(app, s.Name)
+			h.Probes.MarkPlannedTeardown(app, s.Name)
+			h.Probes.MarkPlannedTeardown(app, s.Name)
+		h.Probes.Stop(app, s.Name)
 
 			if err := h.Containers.Remove(s.Name); err != nil {
 				return fmt.Errorf("remove %s: %w", s.Name, err)
@@ -655,7 +671,7 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 		// the entry already exists. Probes block is hash-folded,
 		// so any change triggers a rolling restart which Stops the
 		// old runners before spawn lands here for the replacement.
-		h.Probes.Start(app, cname, spec.Probes)
+		h.Probes.Start(app, cname, spec.Probes, spec.OnProbe)
 
 		// Brief pause before spawning the next ordinal. Replaces
 		// the readiness probe we don't have yet — pod-(N+1) often
@@ -709,6 +725,7 @@ func (h *StatefulsetHandler) pruneOrdinalsAbove(scope, name, app string, want in
 		// Stop probes before container removal so the runner
 		// can't fire a restart against an ordinal we're about
 		// to delete.
+		h.Probes.MarkPlannedTeardown(app, s.Name)
 		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
@@ -851,6 +868,7 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 		// Stop the old pod's probes BEFORE removal so the runner
 		// can't fire a restart against a container in mid-delete.
 		// Same posture as the deployment rolling-replace path.
+		h.Probes.MarkPlannedTeardown(app, s.Name)
 		h.Probes.Stop(app, s.Name)
 
 		// Same name as before — Remove + Ensure with the original
@@ -951,7 +969,7 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 		// Start probes for the replacement ordinal. Spec is
 		// re-read so an in-flight rolling restart triggered by
 		// a probe-spec change picks up the new config naturally.
-		h.Probes.Start(app, newName, spec.Probes)
+		h.Probes.Start(app, newName, spec.Probes, spec.OnProbe)
 
 		h.logf("statefulset/%s ordinal %d replaced", name, ord)
 
@@ -993,6 +1011,28 @@ func resolveStatefulsetSpecAssets(ctx context.Context, store Store, spec *statef
 
 	if spec.Env, err = resolveAssetRefsInMap(spec.Env, lookup); err != nil {
 		return err
+	}
+
+	// on_probe webhook body templates can live in assets — same
+	// resolution semantics as the deployment path. Parse-time
+	// validation already rejected non-asset paths; this loop
+	// turns the `${asset.X.Y}` ref into the host path the
+	// controller reads at probe-transition fire time.
+	if spec.OnProbe != nil {
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnProbe.Failure, spec.OnProbe.Recovery} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
+
+				resolved, ierr := InterpolateAssetRefs(slot[i].File, lookup)
+				if ierr != nil {
+					return ierr
+				}
+
+				slot[i].File = resolved
+			}
+		}
 	}
 
 	return nil
@@ -1142,6 +1182,23 @@ func collectStatefulsetAssetRefs(spec statefulsetSpec) []assetRef {
 		out = append(out, collectAssetRefs(v)...)
 	}
 
+	// on_probe webhook body files mirror on_deploy collection
+	// in the deployment path. Digest is collected so /status sees
+	// it; the OnProbe block is intentionally excluded from the
+	// statefulset spec hash (URL/body changes shouldn't churn
+	// ordinals).
+	if spec.OnProbe != nil {
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnProbe.Failure, spec.OnProbe.Recovery} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
+
+				out = append(out, collectAssetRefs(slot[i].File)...)
+			}
+		}
+	}
+
 	return out
 }
 
@@ -1253,6 +1310,20 @@ func (h *StatefulsetHandler) ClearReplicaReadiness(ctx context.Context, app, con
 	if err := h.Store.PutStatus(ctx, KindStatefulset, app, blob); err != nil {
 		h.logf("statefulset/%s status persist failed (clear readiness): %v", app, err)
 	}
+}
+
+// OnProbeTransition is the ReadinessRecorder impl for statefulsets.
+// Sibling of DeploymentHandler.OnProbeTransition — same shape, just
+// stamps "statefulset" as the kind so the webhook payload's
+// {{kind}} token renders correctly for postgres/redis/mongo
+// (all of which are statefulsets under the hood). State-machine
+// gating happened upstream in ProbeRegistry.
+func (h *StatefulsetHandler) OnProbeTransition(ctx context.Context, ev ProbeTransitionEvent) {
+	ev.Kind = string(KindStatefulset)
+
+	fireProbeWebhook(h.Webhooks, h.logf, ev.OnProbe, ev)
+
+	_ = ctx
 }
 
 // ClearInitFailures drops every InitFailure entry for the given
@@ -1677,6 +1748,7 @@ func (h *StatefulsetHandler) PruneVolumes(scope, name string) ([]string, error) 
 	for _, p := range pods {
 		// Probes first — runner-against-deleted-container is the
 		// same hazard as the rolling-restart path.
+		h.Probes.MarkPlannedTeardown(app, p.Name)
 		h.Probes.Stop(app, p.Name)
 
 		// Best-effort — Remove handles the "already gone" case
@@ -1784,6 +1856,7 @@ func (h *StatefulsetHandler) RebootstrapPod(ctx context.Context, scope, name str
 
 	// Probes first so the runner can't fire a restart against an
 	// ordinal we're about to wipe.
+	h.Probes.MarkPlannedTeardown(app, cname)
 	h.Probes.Stop(app, cname)
 
 	// Idempotent force-remove. The Containers.Remove abstraction

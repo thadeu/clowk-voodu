@@ -484,7 +484,93 @@ func (a *API) runExpand(ctx context.Context, plug *plugins.LoadedPlugin, m *Mani
 		}
 	}
 
+	// Splice operator-supplied observability blocks through to
+	// every pod-bearing core kind the plugin emitted, so a
+	// `postgres "x" "y" { on_probe { failure = [...] } }` block
+	// gains webhook fan-out without requiring the postgres plugin
+	// to learn about on_probe. The plugin's own decoder ignores
+	// unknown fields (Go json default), so the operator HCL flows
+	// in unharmed; we re-merge here so the persisted statefulset
+	// JSON carries the block the controller's probe registry
+	// reads at fire time.
+	//
+	// Only deployment + statefulset get the splice: those are the
+	// pod-bearing core kinds the probe registry tracks. Other
+	// core kinds (asset, ingress, job, cronjob) ignore on_probe.
+	if err := splicePassthroughBlocks(m.Spec, manifests); err != nil {
+		return nil, fmt.Errorf("plugin %q expand: %w", plug.Manifest.Name, err)
+	}
+
 	return manifests, nil
+}
+
+// splicePassthroughBlocks copies observability blocks (on_probe
+// today; other notification-routing blocks in future) from the
+// operator-supplied plugin spec onto every pod-bearing core kind
+// the plugin emitted. Mutates manifests in place.
+//
+// Why this lives in the controller rather than in each plugin:
+// observability is a platform concern, not a plugin concern.
+// Asking every plugin author to add an on_probe pass-through
+// would (a) duplicate code across voodu-postgres / voodu-redis /
+// voodu-mongo and (b) bind the controller's notification feature
+// flag to the slowest-shipping plugin. Splicing in the controller
+// makes the feature universally available the moment the
+// controller ships it.
+func splicePassthroughBlocks(operatorSpec json.RawMessage, expanded []*Manifest) error {
+	if len(operatorSpec) == 0 {
+		return nil
+	}
+
+	var passthrough struct {
+		OnProbe json.RawMessage `json:"on_probe,omitempty"`
+	}
+
+	if err := json.Unmarshal(operatorSpec, &passthrough); err != nil {
+		// Operator spec was bad JSON — earlier validation would
+		// have caught this; nothing to splice if it didn't.
+		return nil
+	}
+
+	if len(passthrough.OnProbe) == 0 {
+		return nil
+	}
+
+	for _, em := range expanded {
+		if em.Kind != KindDeployment && em.Kind != KindStatefulset {
+			continue
+		}
+
+		merged, err := spliceJSONField(em.Spec, "on_probe", passthrough.OnProbe)
+		if err != nil {
+			return fmt.Errorf("splice on_probe onto %s/%s/%s: %w", em.Kind, em.Scope, em.Name, err)
+		}
+
+		em.Spec = merged
+	}
+
+	return nil
+}
+
+// spliceJSONField inserts `value` under `key` into `spec`, leaving
+// every other field of `spec` byte-identical (other than map-key
+// ordering, which json.Marshal already normalises alphabetically).
+// Used by splicePassthroughBlocks to merge operator-supplied
+// observability blocks into plugin output without round-tripping
+// the entire spec through map[string]any (which would lose
+// json.Number precision for any large integer fields).
+func spliceJSONField(spec json.RawMessage, key string, value json.RawMessage) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+
+	if len(spec) == 0 {
+		m = map[string]json.RawMessage{}
+	} else if err := json.Unmarshal(spec, &m); err != nil {
+		return spec, err
+	}
+
+	m[key] = value
+
+	return json.Marshal(m)
 }
 
 // decodeExpandedPayload handles three shapes a plugin may emit

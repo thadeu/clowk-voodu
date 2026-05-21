@@ -130,6 +130,15 @@ type deploymentSpec struct {
 	// the cause.
 	OnDeploy *onDeployWireSpec `json:"on_deploy,omitempty"`
 
+	// OnProbe carries the optional webhook URLs invoked when a
+	// runtime probe (liveness / readiness / startup) transitions
+	// between healthy and unhealthy states — the runtime sibling of
+	// OnDeploy. Two slots, failure + recovery. See
+	// manifest.OnProbeSpec for the per-event contract. Also
+	// excluded from the spec hash for the same reason: a URL
+	// change must not churn replicas.
+	OnProbe *onProbeWireSpec `json:"on_probe,omitempty"`
+
 	// Logs caps the docker json-file log driver per replica. The
 	// parser synthesises a 10m/3 default when the operator omits
 	// the block, so a nil value here means "legacy spec from before
@@ -199,6 +208,19 @@ type autoscaleWireSpec struct {
 type onDeployWireSpec struct {
 	Success []deployWebhookWireSpec `json:"success,omitempty"`
 	Failure []deployWebhookWireSpec `json:"failure,omitempty"`
+}
+
+// onProbeWireSpec mirrors manifest.OnProbeSpec — webhook fan-out on
+// probe transitions. Same controller-local rationale as
+// onDeployWireSpec (anti-cycle with internal/manifest).
+//
+// The two slots map to opposite-direction edges on the probe state
+// machine: Failure fires on healthy → unhealthy, Recovery on
+// unhealthy → healthy (gated on prior-failure to suppress
+// fresh-startup noise).
+type onProbeWireSpec struct {
+	Failure  []deployWebhookWireSpec `json:"failure,omitempty"`
+	Recovery []deployWebhookWireSpec `json:"recovery,omitempty"`
 }
 
 // deployWebhookWireSpec mirrors manifest.DeployWebhook field-for-
@@ -485,6 +507,7 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 
 			// Probe runners go first so they can't restart a
 			// container we're about to delete.
+			h.Probes.MarkPlannedTeardown(app, slot.Name)
 			h.Probes.Stop(app, slot.Name)
 
 			if err := h.Containers.Remove(slot.Name); err != nil {
@@ -503,6 +526,7 @@ func (h *DeploymentHandler) remove(ctx context.Context, ev WatchEvent) error {
 			// Legacy containers shouldn't have probe runners
 			// (pre-M1 code never started any), but Stop is
 			// idempotent so the defensive call costs nothing.
+			h.Probes.MarkPlannedTeardown(app, name)
 			h.Probes.Stop(app, name)
 
 			if err := h.Containers.Remove(name); err != nil {
@@ -1063,7 +1087,7 @@ func (h *DeploymentHandler) ensureReplicaCount(ctx context.Context, scope, name,
 		// block is hash-folded, so changes to it trigger a rolling
 		// restart that destroys the old replica + cancels its runner
 		// before this path spawns the new one.
-		h.Probes.Start(app, cname, spec.Probes)
+		h.Probes.Start(app, cname, spec.Probes, spec.OnProbe)
 
 		created = append(created, cname)
 	}
@@ -1153,6 +1177,7 @@ func (h *DeploymentHandler) pruneExtraReplicas(name, app string, live []Containe
 
 		// Stop probes before container removal — see rolling
 		// restart for the same rationale.
+		h.Probes.MarkPlannedTeardown(app, s.Name)
 		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
@@ -1342,6 +1367,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// container — otherwise the runner might fire one last
 		// restart against a container that's being deleted, and
 		// docker would error noisily.
+		h.Probes.MarkPlannedTeardown(app, s.Name)
 		h.Probes.Stop(app, s.Name)
 
 		if err := h.Containers.Remove(s.Name); err != nil {
@@ -1422,7 +1448,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// spec is re-read from the manifest so an in-flight rolling
 		// restart triggered by a probe-spec change picks up the new
 		// config naturally.
-		h.Probes.Start(app, newName, spec.Probes)
+		h.Probes.Start(app, newName, spec.Probes, spec.OnProbe)
 
 		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
 
@@ -1702,6 +1728,28 @@ func resolveDeploymentSpecAssets(ctx context.Context, store Store, spec *deploym
 	// surfaces a "no such asset" error loudly.
 	if spec.OnDeploy != nil {
 		for _, slot := range [][]deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
+
+				resolved, ierr := InterpolateAssetRefs(slot[i].File, lookup)
+				if ierr != nil {
+					return ierr
+				}
+
+				slot[i].File = resolved
+			}
+		}
+	}
+
+	// on_probe webhook body templates also flow through assets —
+	// same resolution semantics as on_deploy. Parse-time validation
+	// already rejected non-asset paths; this loop turns the
+	// `${asset.X.Y}` ref into the host path the controller reads
+	// at fire time.
+	if spec.OnProbe != nil {
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnProbe.Failure, spec.OnProbe.Recovery} {
 			for i := range slot {
 				if slot[i].File == "" {
 					continue
@@ -2050,6 +2098,11 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		// is a notification-routing edit, not a runtime change.
 		// Rolling-restarting every replica because the operator
 		// edited a Slack URL would be unjustifiable churn.
+		//
+		// OnProbe is OMITTED for the same reason — the runtime
+		// probe machinery reads the cached spec from the registry
+		// on every transition, so notification routing picks up
+		// the latest URL without any container churn.
 		Logs: spec.Logs,
 		// Probes fold into the hash so a probe configuration change
 		// (path, port, threshold, period) triggers a rolling restart
@@ -2107,6 +2160,22 @@ func collectDeploymentAssetRefs(spec deploymentSpec) []assetRef {
 	// replicas, same posture as rotating webhook URLs).
 	if spec.OnDeploy != nil {
 		for _, slot := range [][]deployWebhookWireSpec{spec.OnDeploy.Success, spec.OnDeploy.Failure} {
+			for i := range slot {
+				if slot[i].File == "" {
+					continue
+				}
+
+				out = append(out, collectAssetRefs(slot[i].File)...)
+			}
+		}
+	}
+
+	// on_probe webhook body files participate in the same
+	// asset-resolution pipeline as on_deploy. Same hash-exclusion
+	// posture: digest is collected for /status visibility but
+	// does NOT fold into the spec hash.
+	if spec.OnProbe != nil {
+		for _, slot := range [][]deployWebhookWireSpec{spec.OnProbe.Failure, spec.OnProbe.Recovery} {
 			for i := range slot {
 				if slot[i].File == "" {
 					continue
@@ -2299,6 +2368,24 @@ func (h *DeploymentHandler) ClearReplicaReadiness(ctx context.Context, app, cont
 	if err := h.Store.PutStatus(ctx, KindDeployment, app, blob); err != nil {
 		h.logf("deployment/%s status persist failed (clear readiness): %v", app, err)
 	}
+}
+
+// OnProbeTransition is the ReadinessRecorder impl for deployments.
+// Stamps the kind and routes the event into fireProbeWebhook so the
+// operator-supplied on_probe webhooks fire (when declared). All the
+// state-machine gating happened upstream in ProbeRegistry; by the
+// time we land here it's guaranteed to be a fire-worthy edge.
+//
+// Nil-tolerant on Webhooks (the WebhookPoster seam) — tests inject
+// nil to assert the registry runs without firing HTTP.
+func (h *DeploymentHandler) OnProbeTransition(ctx context.Context, ev ProbeTransitionEvent) {
+	ev.Kind = string(KindDeployment)
+
+	fireProbeWebhook(h.Webhooks, h.logf, ev.OnProbe, ev)
+
+	// ctx is reserved for future per-event tracing / cancellation;
+	// the firer manages its own context inside the goroutine.
+	_ = ctx
 }
 
 // truncateReplicaReadiness enforces the maxReplicaReadiness cap by

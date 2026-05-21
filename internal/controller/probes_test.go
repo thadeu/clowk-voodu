@@ -97,9 +97,9 @@ func TestProbeRegistry_StartIdempotent(t *testing.T) {
 		},
 	}
 
-	r.Start("app", "x", spec)
-	r.Start("app", "x", spec)
-	r.Start("app", "x", spec)
+	r.Start("app", "x", spec, nil)
+	r.Start("app", "x", spec, nil)
+	r.Start("app", "x", spec, nil)
 
 	count := 0
 	r.runners.Range(func(_, _ any) bool {
@@ -121,8 +121,8 @@ func TestProbeRegistry_NilSpecNoOps(t *testing.T) {
 	restarter := &fakeContainerRestarter{}
 	r := &ProbeRegistry{Restart: restarter}
 
-	r.Start("app", "x", nil)
-	r.Start("app", "y", &probesWireSpec{}) // probes block but no liveness inside
+	r.Start("app", "x", nil, nil)
+	r.Start("app", "y", &probesWireSpec{}, nil) // probes block but no liveness inside
 
 	if restarter.callCount() != 0 {
 		t.Errorf("nil spec must not trigger any restart, got %d calls", restarter.callCount())
@@ -157,7 +157,7 @@ func TestProbeRegistry_StopCancelsRunner(t *testing.T) {
 		},
 	}
 
-	r.Start("app", "x", spec)
+	r.Start("app", "x", spec, nil)
 
 	// Give it a moment to make a few samples.
 	time.Sleep(50 * time.Millisecond)
@@ -221,7 +221,7 @@ func TestProbeRegistry_LivenessFailureRestartsContainer(t *testing.T) {
 		},
 	}
 
-	r.Start("voodu-x", "voodu-x.a1", spec)
+	r.Start("voodu-x", "voodu-x.a1", spec, nil)
 
 	// 2 failures × 20ms = ~40ms. Give 500ms slack for CI jitter.
 	deadline := time.After(500 * time.Millisecond)
@@ -317,9 +317,10 @@ func TestParseProbeDuration(t *testing.T) {
 // debouncing (one persist per Phase transition, not per sample)
 // and the per-replica clear on Stop.
 type fakeReadinessRecorder struct {
-	mu       sync.Mutex
-	records  []ReplicaReadinessStatus
-	cleared  []string
+	mu          sync.Mutex
+	records     []ReplicaReadinessStatus
+	cleared     []string
+	transitions []ProbeTransitionEvent
 }
 
 func (f *fakeReadinessRecorder) RecordReplicaReadiness(_ context.Context, _ string, s ReplicaReadinessStatus) {
@@ -334,10 +335,42 @@ func (f *fakeReadinessRecorder) ClearReplicaReadiness(_ context.Context, _ strin
 	f.cleared = append(f.cleared, name)
 }
 
+// OnProbeTransition captures every transition event for assertions
+// in the on_probe webhook-emission tests. Implements the new method
+// on the ReadinessRecorder interface — the production handlers route
+// these into fireProbeWebhook; tests just verify the registry made
+// the call with the right shape.
+func (f *fakeReadinessRecorder) OnProbeTransition(_ context.Context, ev ProbeTransitionEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transitions = append(f.transitions, ev)
+}
+
 func (f *fakeReadinessRecorder) recordCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.records)
+}
+
+// transitionCount returns the number of OnProbeTransition events
+// recorded. Sibling of recordCount for the on_probe assertions.
+func (f *fakeReadinessRecorder) transitionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.transitions)
+}
+
+// snapshotTransitions returns a copy of every transition event
+// observed. Defensive copy so test code can iterate while the
+// registry continues firing.
+func (f *fakeReadinessRecorder) snapshotTransitions() []ProbeTransitionEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]ProbeTransitionEvent, len(f.transitions))
+	copy(out, f.transitions)
+
+	return out
 }
 
 // TestProbeRegistry_NoProbes_NoOp pins the backward-compat
@@ -349,7 +382,7 @@ func TestProbeRegistry_NoProbes_NoOp(t *testing.T) {
 	rec := &fakeReadinessRecorder{}
 	r := &ProbeRegistry{Recorder: rec}
 
-	r.Start("app", "x", &probesWireSpec{}) // empty block — no sub-probes
+	r.Start("app", "x", &probesWireSpec{}, nil) // empty block — no sub-probes
 
 	count := 0
 
@@ -387,7 +420,7 @@ func TestProbeRegistry_ReadinessOnlyNoLiveness(t *testing.T) {
 		},
 	}
 
-	r.Start("app", "x", spec)
+	r.Start("app", "x", spec, nil)
 
 	// Initial state push should arrive — verify a record landed.
 	deadline := time.After(500 * time.Millisecond)
@@ -512,7 +545,7 @@ func TestProbeRegistry_Stop_CallsClear(t *testing.T) {
 		},
 	}
 
-	r.Start("app", "x", spec)
+	r.Start("app", "x", spec, nil)
 	r.Stop("app", "x")
 
 	// Drain any in-flight goroutine.
@@ -567,4 +600,211 @@ func TestCapturingWriter(t *testing.T) {
 	if got != "hello worl" {
 		t.Errorf("captured content: %q, want first 10 bytes only", got)
 	}
+}
+
+// makeEntryForGatingTest builds a runnerEntry suitable for driving
+// emitProbeTransition directly (bypassing the runner so the state
+// machine is tested in isolation). The caller mutates entry.state
+// fields between calls to model lifecycle scenarios.
+func makeEntryForGatingTest(onProbe *onProbeWireSpec) *runnerEntry {
+	return &runnerEntry{
+		state:   &replicaReadiness{},
+		onProbe: onProbe,
+	}
+}
+
+// TestEmitProbeTransition_InitialHealthyDoesNotFireRecovery pins
+// the recovery-gating state machine. A freshly-started runner's
+// first PhaseHealthy edge MUST NOT emit a recovery event — that's
+// just normal startup, not a recovery from anything. Without this
+// guard, every `vd apply` would spam recovery webhooks for every
+// new replica.
+func TestEmitProbeTransition_InitialHealthyDoesNotFireRecovery(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	entry := makeEntryForGatingTest(nil)
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "readiness", probe.Event{
+		Phase:      probe.PhaseHealthy,
+		Transition: true,
+		Result:     probe.Result{Reason: "200 OK"},
+	}, entry)
+
+	if got := rec.transitionCount(); got != 0 {
+		t.Errorf("initial healthy must NOT fire recovery (hadFailure=false), got %d transitions", got)
+	}
+}
+
+// TestEmitProbeTransition_FailureSetsHadFailureFlag pins the
+// failure → recovery state-machine wiring: an unhealthy edge
+// must set hadFailure so the next healthy edge fires recovery.
+// Without this, the gating logic would never let a recovery fire.
+func TestEmitProbeTransition_FailureSetsHadFailureFlag(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	entry := makeEntryForGatingTest(nil)
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "liveness", probe.Event{
+		Phase:      probe.PhaseUnhealthy,
+		Transition: true,
+		Result:     probe.Result{Reason: "connect refused"},
+	}, entry)
+
+	if got := rec.transitionCount(); got != 1 {
+		t.Fatalf("unhealthy edge must fire failure transition, got %d", got)
+	}
+
+	if rec.transitions[0].Transition != "failure" {
+		t.Errorf("Transition: %q, want failure", rec.transitions[0].Transition)
+	}
+
+	if !entry.state.hadFailure {
+		t.Error("hadFailure must be set after firing a failure transition")
+	}
+}
+
+// TestEmitProbeTransition_RecoveryFiresAfterFailure pins the
+// happy path: failure → recovery sequence fires both webhooks
+// in order, with the same probe identity but distinct
+// Transition labels.
+func TestEmitProbeTransition_RecoveryFiresAfterFailure(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	entry := makeEntryForGatingTest(nil)
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "readiness", probe.Event{
+		Phase:      probe.PhaseUnhealthy,
+		Transition: true,
+		Result:     probe.Result{Reason: "HTTP 503"},
+	}, entry)
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "readiness", probe.Event{
+		Phase:      probe.PhaseHealthy,
+		Transition: true,
+		Result:     probe.Result{Reason: "200 OK"},
+	}, entry)
+
+	if got := rec.transitionCount(); got != 2 {
+		t.Fatalf("expected failure+recovery transitions, got %d", got)
+	}
+
+	if rec.transitions[0].Transition != "failure" || rec.transitions[1].Transition != "recovery" {
+		t.Errorf("transition order: [%s, %s], want [failure, recovery]",
+			rec.transitions[0].Transition, rec.transitions[1].Transition)
+	}
+
+	// hadFailure must reset after recovery so the next cycle
+	// requires another failure first.
+	if entry.state.hadFailure {
+		t.Error("hadFailure should reset to false after firing recovery")
+	}
+}
+
+// TestEmitProbeTransition_PlannedTeardownSuppresses pins the
+// suppression contract: a transition observed AFTER
+// MarkPlannedTeardown set the flag must not emit a webhook.
+// Without this, every rolling restart, scale-down, and manual
+// `vd restart` would fire a phantom failure alert as the container
+// is being gracefully stopped.
+func TestEmitProbeTransition_PlannedTeardownSuppresses(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	entry := makeEntryForGatingTest(nil)
+
+	entry.state.mu.Lock()
+	entry.state.plannedTeardown = true
+	entry.state.mu.Unlock()
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "liveness", probe.Event{
+		Phase:      probe.PhaseUnhealthy,
+		Transition: true,
+		Result:     probe.Result{Reason: "container stopping"},
+	}, entry)
+
+	if got := rec.transitionCount(); got != 0 {
+		t.Errorf("planned teardown must suppress emission, got %d transitions", got)
+	}
+}
+
+// TestEmitProbeTransition_PassesOnProbeSpecThrough pins that the
+// cached on_probe spec on the runner reaches the recorder via
+// ev.OnProbe — the handler's OnProbeTransition impl reads it to
+// pick the failure/recovery slot and pass to fireProbeWebhook.
+// A regression here would mean operator-declared on_probe gets
+// silently dropped.
+func TestEmitProbeTransition_PassesOnProbeSpecThrough(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{{URL: "https://example.com/hook"}},
+	}
+
+	entry := makeEntryForGatingTest(spec)
+
+	r.emitProbeTransition("prod/api", "prod-api-1", "liveness", probe.Event{
+		Phase:      probe.PhaseUnhealthy,
+		Transition: true,
+	}, entry)
+
+	if rec.transitionCount() != 1 {
+		t.Fatalf("expected one transition, got %d", rec.transitionCount())
+	}
+
+	if rec.transitions[0].OnProbe != spec {
+		t.Errorf("OnProbe spec did not flow through: got %p, want %p", rec.transitions[0].OnProbe, spec)
+	}
+}
+
+// TestEmitProbeTransition_PopulatesScopeAndName pins the
+// app → (scope, name) parsing via splitAppID. The recorder's
+// fireProbeWebhook needs both for the {{scope}} / {{name}}
+// template tokens — passing app as a single string would
+// require every handler impl to re-parse it.
+func TestEmitProbeTransition_PopulatesScopeAndName(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	entry := makeEntryForGatingTest(nil)
+
+	r.emitProbeTransition("acme-web", "acme-web-2", "readiness", probe.Event{
+		Phase:      probe.PhaseUnhealthy,
+		Transition: true,
+	}, entry)
+
+	if rec.transitionCount() != 1 {
+		t.Fatal("expected one transition")
+	}
+
+	ev := rec.transitions[0]
+
+	if ev.Scope != "acme" || ev.Name != "web" {
+		t.Errorf("scope/name parsing wrong: got (%q, %q), want (acme, web)", ev.Scope, ev.Name)
+	}
+
+	if ev.Pod != "acme-web-2" {
+		t.Errorf("Pod: %q, want acme-web-2", ev.Pod)
+	}
+
+	if ev.Probe != "readiness" {
+		t.Errorf("Probe: %q, want readiness", ev.Probe)
+	}
+}
+
+// TestProbeRegistry_MarkPlannedTeardown_NoOpOnUnknownContainer
+// pins the defensive behaviour: calling MarkPlannedTeardown on a
+// container that never started must not crash. The handlers
+// wire it unconditionally before every Stop, so a non-started
+// container (most edge cases on apply replays) must be a clean
+// no-op.
+func TestProbeRegistry_MarkPlannedTeardown_NoOpOnUnknownContainer(t *testing.T) {
+	r := &ProbeRegistry{}
+
+	// Just shouldn't panic.
+	r.MarkPlannedTeardown("app", "never-started")
+	r.MarkPlannedTeardown("app", "")
 }

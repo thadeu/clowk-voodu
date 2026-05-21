@@ -223,6 +223,7 @@ type hclDeployment struct {
 	Resources      *hclResourcesBlock      `hcl:"resources,block"`
 	Autoscale      *hclAutoscaleBlock      `hcl:"autoscale,block"`
 	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
+	OnProbe        *hclOnProbeBlock        `hcl:"on_probe,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
 	InitContainers []hclInitContainerBlock `hcl:"init,block"`
@@ -330,13 +331,13 @@ func validateOnDeploy(o *OnDeploySpec) error {
 	}
 
 	for i := range o.Success {
-		if err := validateDeployWebhook(&o.Success[i], "success", i, len(o.Success)); err != nil {
+		if err := validateDeployWebhook(&o.Success[i], "on_deploy", "success", i, len(o.Success)); err != nil {
 			return err
 		}
 	}
 
 	for i := range o.Failure {
-		if err := validateDeployWebhook(&o.Failure[i], "failure", i, len(o.Failure)); err != nil {
+		if err := validateDeployWebhook(&o.Failure[i], "on_deploy", "failure", i, len(o.Failure)); err != nil {
 			return err
 		}
 	}
@@ -344,19 +345,21 @@ func validateOnDeploy(o *OnDeploySpec) error {
 	return nil
 }
 
-// validateDeployWebhook checks one webhook target. The slot
-// label distinguishes "success" / "failure", and the index is
+// validateDeployWebhook checks one webhook target. The block label
+// distinguishes the source HCL block ("on_deploy" / "on_probe"); the
+// slot label distinguishes the slot within it ("success" / "failure"
+// for on_deploy, "failure" / "recovery" for on_probe). The index is
 // surfaced in errors only when multiple targets share the slot
-// (otherwise the index would be noisy for the common single-
-// target case).
-func validateDeployWebhook(w *DeployWebhook, slot string, index, total int) error {
+// (otherwise the index would be noisy for the common single-target
+// case).
+func validateDeployWebhook(w *DeployWebhook, block, slot string, index, total int) error {
 	loc := slot
 	if total > 1 {
 		loc = fmt.Sprintf("%s[%d]", slot, index)
 	}
 
 	if strings.TrimSpace(w.URL) == "" {
-		return fmt.Errorf("on_deploy.%s.url is required", loc)
+		return fmt.Errorf("%s.%s.url is required", block, loc)
 	}
 
 	if w.Method != "" {
@@ -364,7 +367,7 @@ func validateDeployWebhook(w *DeployWebhook, slot string, index, total int) erro
 		case "POST", "PUT", "PATCH", "DELETE":
 			// ok
 		default:
-			return fmt.Errorf("on_deploy.%s.method must be one of POST/PUT/PATCH/DELETE (got %q)", loc, w.Method)
+			return fmt.Errorf("%s.%s.method must be one of POST/PUT/PATCH/DELETE (got %q)", block, loc, w.Method)
 		}
 	}
 
@@ -372,7 +375,7 @@ func validateDeployWebhook(w *DeployWebhook, slot string, index, total int) erro
 	// would force voodu to pick one silently — better to fail
 	// loud than ship a confused webhook.
 	if w.Body != nil && w.File != "" {
-		return fmt.Errorf("on_deploy.%s: body and file are mutually exclusive", loc)
+		return fmt.Errorf("%s.%s: body and file are mutually exclusive", block, loc)
 	}
 
 	// File must be an asset reference. Bare paths are rejected
@@ -381,7 +384,54 @@ func validateDeployWebhook(w *DeployWebhook, slot string, index, total int) erro
 	// path would either fail at fire time or surprise the
 	// operator with "relative to what?" semantics.
 	if w.File != "" && !looksLikeAssetRef(w.File) {
-		return fmt.Errorf("on_deploy.%s.file must be an asset reference (${asset.<scope>.<name>.<key>}), got %q", loc, w.File)
+		return fmt.Errorf("%s.%s.file must be an asset reference (${asset.<scope>.<name>.<key>}), got %q", block, loc, w.File)
+	}
+
+	return nil
+}
+
+// hclOnProbeBlock is the HCL surface for the on_probe webhook hooks
+// — the runtime sibling of hclOnDeployBlock. Both slots are slices;
+// each declared target fires independently in parallel when the
+// runner observes a probe transition matching the slot (see
+// manifest.OnProbeSpec for the per-event contract).
+type hclOnProbeBlock struct {
+	Failure  []hclDeployWebhook `hcl:"failure,block"`
+	Recovery []hclDeployWebhook `hcl:"recovery,block"`
+}
+
+// onProbeBlockToSpec converts the HCL surface into the wire
+// OnProbeSpec. nil-in / nil-out so callers don't synthesise an
+// empty block when the operator omitted on_probe entirely.
+func onProbeBlockToSpec(b *hclOnProbeBlock) *OnProbeSpec {
+	if b == nil {
+		return nil
+	}
+
+	return &OnProbeSpec{
+		Failure:  deployWebhookBlocksToSpec(b.Failure),
+		Recovery: deployWebhookBlocksToSpec(b.Recovery),
+	}
+}
+
+// validateOnProbe runs the semantic checks the HCL surface can't
+// express. Sibling of validateOnDeploy — same validation rules per
+// webhook target, different slot vocabulary.
+func validateOnProbe(o *OnProbeSpec) error {
+	if o == nil {
+		return nil
+	}
+
+	for i := range o.Failure {
+		if err := validateDeployWebhook(&o.Failure[i], "on_probe", "failure", i, len(o.Failure)); err != nil {
+			return err
+		}
+	}
+
+	for i := range o.Recovery {
+		if err := validateDeployWebhook(&o.Recovery[i], "on_probe", "recovery", i, len(o.Recovery)); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -934,6 +984,12 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 	if err := validateOnDeploy(s.OnDeploy); err != nil {
 		return DeploymentSpec{}, err
 	}
+
+	s.OnProbe = onProbeBlockToSpec(b.OnProbe)
+
+	if err := validateOnProbe(s.OnProbe); err != nil {
+		return DeploymentSpec{}, err
+	}
 	s.Logs = logsBlockToSpec(b.Logs)
 	s.Probes = probesBlockToSpec(b.Probes)
 
@@ -1024,6 +1080,7 @@ type hclApp struct {
 	Resources      *hclResourcesBlock      `hcl:"resources,block"`
 	Autoscale      *hclAutoscaleBlock      `hcl:"autoscale,block"`
 	OnDeploy       *hclOnDeployBlock       `hcl:"on_deploy,block"`
+	OnProbe        *hclOnProbeBlock        `hcl:"on_probe,block"`
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
 	InitContainers []hclInitContainerBlock `hcl:"init,block"`
@@ -1094,6 +1151,12 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 	s.OnDeploy = onDeployBlockToSpec(b.OnDeploy)
 
 	if err := validateOnDeploy(s.OnDeploy); err != nil {
+		return DeploymentSpec{}, err
+	}
+
+	s.OnProbe = onProbeBlockToSpec(b.OnProbe)
+
+	if err := validateOnProbe(s.OnProbe); err != nil {
 		return DeploymentSpec{}, err
 	}
 	s.Logs = logsBlockToSpec(b.Logs)
@@ -1178,6 +1241,7 @@ type hclStatefulset struct {
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	InitContainers []hclInitContainerBlock `hcl:"init,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
+	OnProbe        *hclOnProbeBlock        `hcl:"on_probe,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -1241,6 +1305,12 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 	s.Probes = probesBlockToSpec(b.Probes)
 
 	if err := validateProbes(s.Probes); err != nil {
+		return StatefulsetSpec{}, err
+	}
+
+	s.OnProbe = onProbeBlockToSpec(b.OnProbe)
+
+	if err := validateOnProbe(s.OnProbe); err != nil {
 		return StatefulsetSpec{}, err
 	}
 

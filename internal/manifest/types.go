@@ -170,6 +170,15 @@ type DeploymentSpec struct {
 	// churn running replicas.
 	OnDeploy *OnDeploySpec `yaml:"on_deploy,omitempty" json:"on_deploy,omitempty"`
 
+	// OnProbe carries the optional webhook URLs invoked when a
+	// runtime probe (liveness, readiness, startup) transitions
+	// between healthy and unhealthy states. Sibling of OnDeploy
+	// covering the runtime-health story — see OnProbeSpec for the
+	// per-event contract. Empty / nil = no notifications fired.
+	// Also excluded from the spec hash: URL changes never churn
+	// running replicas.
+	OnProbe *OnProbeSpec `yaml:"on_probe,omitempty" json:"on_probe,omitempty"`
+
 	// Logs caps the docker json-file log driver per container. nil
 	// means "platform default" — applyDefaults synthesises a
 	// 10m/3-files cap so a runaway container can't fill the host
@@ -411,6 +420,38 @@ type AutoscaleSpec struct {
 type OnDeploySpec struct {
 	Success []DeployWebhook `yaml:"success,omitempty" json:"success,omitempty"`
 	Failure []DeployWebhook `yaml:"failure,omitempty" json:"failure,omitempty"`
+}
+
+// OnProbeSpec carries the operator-supplied webhook targets invoked
+// when a runtime probe transitions between healthy and unhealthy
+// states — the runtime sibling of OnDeploySpec, which only sees the
+// deploy moment.
+//
+// Two slots, mirroring on_deploy's shape so operators learn one
+// pattern:
+//
+//   - Failure: any healthy → unhealthy probe edge (liveness fail
+//     before a docker restart kicks in, readiness fail dropping the
+//     pod from caddy rotation, startup probe budget exhausted). The
+//     90%-case channel: tell me when something just went bad.
+//
+//   - Recovery: unhealthy → healthy edge on the SAME runner that
+//     previously emitted a Failure. The state machine gating in
+//     ProbeRegistry guarantees a freshly-started pod going healthy
+//     for the first time does NOT fire Recovery — that would be
+//     normal startup, not a recovery from anything, and would spam
+//     every `vd apply`.
+//
+// Optional; nil → no webhooks fired. Per-resource: deployments,
+// statefulsets, and plugin-expanded kinds (postgres/redis/mongo) all
+// carry the same field, so operator declares it once where the
+// resource lives.
+//
+// Like OnDeploySpec, on_probe is intentionally NOT folded into the
+// spec hash: changing a webhook URL must not churn running replicas.
+type OnProbeSpec struct {
+	Failure  []DeployWebhook `yaml:"failure,omitempty"  json:"failure,omitempty"`
+	Recovery []DeployWebhook `yaml:"recovery,omitempty" json:"recovery,omitempty"`
 }
 
 // DeployWebhook is one configured webhook target — URL plus the
@@ -933,6 +974,14 @@ type StatefulsetSpec struct {
 	// for stateful workloads where pg_isready / redis-cli ping
 	// are the canonical "alive" signals.
 	Probes *ProbesSpec `yaml:"probes,omitempty" json:"probes,omitempty"`
+
+	// OnProbe mirrors DeploymentSpec.OnProbe — webhook fan-out on
+	// probe transitions. Statefulset transitions are PER-ORDINAL, so
+	// the payload's {{pod}} token resolves to the full ordinal-stable
+	// name (`<scope>-<name>-N`). Used by postgres/redis/mongo plugins
+	// to notify on per-replica health independently from the cluster
+	// view.
+	OnProbe *OnProbeSpec `yaml:"on_probe,omitempty" json:"on_probe,omitempty"`
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`

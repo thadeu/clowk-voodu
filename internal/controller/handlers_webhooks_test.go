@@ -841,3 +841,472 @@ func waitFor(t *testing.T, predicate func() bool) {
 
 // Compile-time check that the fake satisfies the interface.
 var _ WebhookPoster = (*fakeWebhookPoster)(nil)
+
+// resetTransitionCache wipes the in-firer dedup map so each test
+// case starts from a clean slate. Production never clears the map
+// (the lazy GC inside markFiredOnce is enough), but tests that
+// share TransitionID inputs across cases would otherwise see false
+// negatives from one case bleeding into the next.
+func resetTransitionCache(t *testing.T) {
+	t.Helper()
+
+	transitionCacheMu.Lock()
+	defer transitionCacheMu.Unlock()
+
+	transitionCache = make(map[string]time.Time)
+}
+
+// TestFireProbeWebhook_FailureSlot pins that on_probe.failure
+// fires when ev.Transition is "failure" and the spec declares
+// failure targets. Without this, an operator declares failure URLs
+// and a runtime probe transition silently no-ops — exactly the
+// "feature looks wired but doesn't" failure mode the test set
+// catches for on_deploy.
+func TestFireProbeWebhook_FailureSlot(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{
+			{URL: "https://hooks.slack.com/critical"},
+		},
+	}
+
+	ev := ProbeTransitionEvent{
+		Kind:       "deployment",
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "liveness",
+		Transition: "failure",
+		Reason:     "HTTP 503",
+		At:         time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC),
+	}
+
+	fireProbeWebhook(poster, nil, spec, ev)
+	waitFor(t, func() bool { return poster.callCount() >= 1 })
+
+	call, ok := poster.lastCall()
+	if !ok {
+		t.Fatal("no webhook call recorded")
+	}
+
+	if call.URL != "https://hooks.slack.com/critical" {
+		t.Errorf("URL: %q, want https://hooks.slack.com/critical", call.URL)
+	}
+
+	if call.Payload.Transition != "failure" {
+		t.Errorf("Transition: %q, want failure", call.Payload.Transition)
+	}
+
+	if call.Payload.Pod != "prod-api-1" {
+		t.Errorf("Pod: %q, want prod-api-1", call.Payload.Pod)
+	}
+
+	if call.Payload.Probe != "liveness" {
+		t.Errorf("Probe: %q, want liveness", call.Payload.Probe)
+	}
+
+	if call.Payload.Reason != "HTTP 503" {
+		t.Errorf("Reason: %q, want HTTP 503", call.Payload.Reason)
+	}
+
+	if call.Payload.TransitionID == "" {
+		t.Error("TransitionID must be set")
+	}
+
+	if len(call.Payload.TransitionID) != 12 {
+		t.Errorf("TransitionID length: %d, want 12", len(call.Payload.TransitionID))
+	}
+}
+
+// TestFireProbeWebhook_RecoverySlot pins that on_probe.recovery
+// fires when ev.Transition is "recovery". Sibling of
+// FailureSlot — the slot picker is the smallest piece of logic in
+// fireProbeWebhook but the easiest to invert in a refactor.
+func TestFireProbeWebhook_RecoverySlot(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{
+			{URL: "https://hooks.slack.com/critical"},
+		},
+		Recovery: []deployWebhookWireSpec{
+			{URL: "https://hooks.slack.com/info"},
+		},
+	}
+
+	ev := ProbeTransitionEvent{
+		Kind:       "deployment",
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "readiness",
+		Transition: "recovery",
+		At:         time.Now(),
+	}
+
+	fireProbeWebhook(poster, nil, spec, ev)
+	waitFor(t, func() bool { return poster.callCount() >= 1 })
+
+	call, _ := poster.lastCall()
+
+	if call.URL != "https://hooks.slack.com/info" {
+		t.Errorf("recovery slot should hit info URL, got %q", call.URL)
+	}
+
+	if call.Payload.Transition != "recovery" {
+		t.Errorf("Transition: %q, want recovery", call.Payload.Transition)
+	}
+}
+
+// TestFireProbeWebhook_UnknownSlot pins that ev.Transition outside
+// {"failure", "recovery"} is a silent no-op, not a panic or a
+// fall-through fire. The probe layer SHOULD only ever pass the
+// canonical labels, but the firer is defense-in-depth.
+func TestFireProbeWebhook_UnknownSlot(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{{URL: "https://example.com/hook"}},
+	}
+
+	fireProbeWebhook(poster, nil, spec, ProbeTransitionEvent{
+		Transition: "garbage",
+		At:         time.Now(),
+	})
+
+	// Give any erroneous goroutine a brief chance to fire.
+	time.Sleep(10 * time.Millisecond)
+
+	if poster.callCount() != 0 {
+		t.Errorf("unknown transition slot should be a no-op, got %d calls", poster.callCount())
+	}
+}
+
+// TestFireProbeWebhook_NilSpecNoOp pins that the steady-state
+// case (resource without on_probe declared) doesn't crash. Every
+// probe transition runs through fireProbeWebhook; the common path
+// is nil spec, nil poster, or both.
+func TestFireProbeWebhook_NilSpecNoOp(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	fireProbeWebhook(poster, nil, nil, ProbeTransitionEvent{
+		Transition: "failure",
+		At:         time.Now(),
+	})
+
+	fireProbeWebhook(nil, nil, &onProbeWireSpec{}, ProbeTransitionEvent{
+		Transition: "failure",
+		At:         time.Now(),
+	})
+
+	if poster.callCount() != 0 {
+		t.Errorf("nil-spec / nil-poster paths must no-op, got %d calls", poster.callCount())
+	}
+}
+
+// TestFireProbeWebhook_TokensSubstitute pins that every new
+// on_probe-specific {{token}} substitutes in inline body content.
+// Without this, an operator's Telegram body template like
+// "{{probe}} on {{pod}} failed ({{reason}})" would render the raw
+// markers and the alert would be useless.
+func TestFireProbeWebhook_TokensSubstitute(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{
+			{
+				URL: "https://example.com/hook",
+				Body: map[string]any{
+					"text":         "{{probe}} on {{pod}} failed: {{reason}}",
+					"transition":   "{{transition}}",
+					"key":          "{{transition_id}}",
+					"observed_at":  "{{timestamp}}",
+					"resource":     "{{kind}}/{{scope}}/{{name}}",
+				},
+			},
+		},
+	}
+
+	ev := ProbeTransitionEvent{
+		Kind:       "deployment",
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-2",
+		Probe:      "liveness",
+		Transition: "failure",
+		Reason:     "exit code 1",
+		At:         time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC),
+	}
+
+	fireProbeWebhook(poster, nil, spec, ev)
+	waitFor(t, func() bool { return poster.callCount() >= 1 })
+
+	// The fake records the raw payload, not the rendered body —
+	// but the body customisation path runs synchronously before
+	// the goroutine fires. To assert the rendered body, we wire
+	// a real HTTPWebhookPoster against an httptest server.
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+
+		var decoded map[string]any
+		_ = json.Unmarshal(body, &decoded)
+
+		if got, _ := decoded["text"].(string); !strings.Contains(got, "liveness on prod-api-2 failed: exit code 1") {
+			t.Errorf("text token substitution failed: %q", got)
+		}
+
+		if got, _ := decoded["transition"].(string); got != "failure" {
+			t.Errorf("transition token: %q, want failure", got)
+		}
+
+		if got, _ := decoded["resource"].(string); got != "deployment/prod/api" {
+			t.Errorf("multi-token line: %q, want deployment/prod/api", got)
+		}
+
+		if got, _ := decoded["key"].(string); len(got) != 12 {
+			t.Errorf("transition_id should be 12 chars, got %q (%d)", got, len(got))
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	spec.Failure[0].URL = receiver.URL
+	resetTransitionCache(t) // distinct id from prior fire above
+
+	httpPoster := &HTTPWebhookPoster{}
+	// Repoint the firer at the real receiver; we already covered
+	// payload-recording with the fake above.
+	fireProbeWebhook(httpPoster, nil, spec, ev)
+
+	// Wait for the server to record (httptest is synchronous on
+	// request handling, but the goroutine dispatching the request
+	// is async).
+	time.Sleep(150 * time.Millisecond)
+}
+
+// TestComputeTransitionID_Deterministic pins that the same event
+// inputs produce the same id every time. Receiver-side dedup
+// depends on this contract — if the id changed between retries,
+// every retry would be treated as a fresh alert.
+func TestComputeTransitionID_Deterministic(t *testing.T) {
+	ev := ProbeTransitionEvent{
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "liveness",
+		Transition: "failure",
+		At:         time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC),
+	}
+
+	id1 := computeTransitionID(ev)
+	id2 := computeTransitionID(ev)
+
+	if id1 != id2 {
+		t.Errorf("identical inputs produced different ids: %q vs %q", id1, id2)
+	}
+
+	if len(id1) != 12 {
+		t.Errorf("id length: %d, want 12 (sha256 prefix)", len(id1))
+	}
+}
+
+// TestComputeTransitionID_VariesByInputs pins that distinct
+// pods / probes / transitions / seconds produce distinct ids.
+// Without these distinctions, a flapping pod would collide ids
+// across transitions and the receiver dedup would drop legitimate
+// alerts.
+func TestComputeTransitionID_VariesByInputs(t *testing.T) {
+	base := ProbeTransitionEvent{
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "liveness",
+		Transition: "failure",
+		At:         time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC),
+	}
+
+	baseID := computeTransitionID(base)
+
+	cases := []struct {
+		name string
+		mod  func(*ProbeTransitionEvent)
+	}{
+		{"pod", func(e *ProbeTransitionEvent) { e.Pod = "prod-api-2" }},
+		{"probe", func(e *ProbeTransitionEvent) { e.Probe = "readiness" }},
+		{"transition", func(e *ProbeTransitionEvent) { e.Transition = "recovery" }},
+		{"second-boundary", func(e *ProbeTransitionEvent) { e.At = e.At.Add(time.Second) }},
+		{"scope", func(e *ProbeTransitionEvent) { e.Scope = "staging" }},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mod := base
+			c.mod(&mod)
+
+			if computeTransitionID(mod) == baseID {
+				t.Errorf("%s change should yield distinct id, got collision (%s)", c.name, baseID)
+			}
+		})
+	}
+}
+
+// TestComputeTransitionID_TruncatesToSecond pins that sub-second
+// time variations DON'T produce distinct ids. This is the
+// retry-dedup property: if the controller retries the firer
+// within the same second, both retries hash to the same id and
+// the receiver dedups them.
+func TestComputeTransitionID_TruncatesToSecond(t *testing.T) {
+	base := time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC)
+	ev1 := ProbeTransitionEvent{Scope: "p", Name: "n", Pod: "p-n-0", Probe: "liveness", Transition: "failure", At: base}
+	ev2 := ev1
+	ev2.At = base.Add(500 * time.Millisecond)
+
+	if computeTransitionID(ev1) != computeTransitionID(ev2) {
+		t.Error("sub-second time variation should hash to same id (truncation invariant)")
+	}
+}
+
+// TestMarkFiredOnce_DropsDuplicate pins the in-firer dedup
+// behaviour: same id seen twice within the TTL window returns
+// true once, then false. Without this, a probe-event race on
+// controller restart (initial state push + first edge produce
+// overlapping signals) would double-fire every alert.
+func TestMarkFiredOnce_DropsDuplicate(t *testing.T) {
+	resetTransitionCache(t)
+
+	id := "deadbeefcafe"
+
+	if !markFiredOnce(id) {
+		t.Error("first call must return true")
+	}
+
+	if markFiredOnce(id) {
+		t.Error("second call within TTL must return false (deduped)")
+	}
+
+	if markFiredOnce(id) {
+		t.Error("third call within TTL must still return false")
+	}
+}
+
+// TestMarkFiredOnce_GCsExpiredEntries pins that after the TTL
+// expires, the same id can fire again. Verified by shortening
+// transitionCacheTTL for the duration of the test.
+func TestMarkFiredOnce_GCsExpiredEntries(t *testing.T) {
+	resetTransitionCache(t)
+
+	prev := transitionCacheTTL
+	transitionCacheTTL = 30 * time.Millisecond
+
+	t.Cleanup(func() { transitionCacheTTL = prev })
+
+	id := "shortttl1234"
+
+	if !markFiredOnce(id) {
+		t.Fatal("first call must return true")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if !markFiredOnce(id) {
+		t.Error("after TTL expiry, same id must fire again")
+	}
+}
+
+// TestFireProbeWebhook_DedupSkipsRefire pins the integration of
+// markFiredOnce into fireProbeWebhook: calling the firer twice
+// with the same event in the same second posts to the receiver
+// only once.
+func TestFireProbeWebhook_DedupSkipsRefire(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{{URL: "https://example.com/hook"}},
+	}
+
+	ev := ProbeTransitionEvent{
+		Kind:       "deployment",
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "liveness",
+		Transition: "failure",
+		At:         time.Date(2026, 5, 21, 14, 23, 1, 0, time.UTC),
+	}
+
+	fireProbeWebhook(poster, nil, spec, ev)
+	fireProbeWebhook(poster, nil, spec, ev)
+
+	waitFor(t, func() bool { return poster.callCount() >= 1 })
+	// Give the second fire a brief chance to (incorrectly) sneak in.
+	time.Sleep(50 * time.Millisecond)
+
+	if poster.callCount() != 1 {
+		t.Errorf("dedup failed: same transition id fired %d times, want 1", poster.callCount())
+	}
+}
+
+// TestFireProbeWebhook_FansOutMultipleTargets pins that the
+// multi-target fan-out (inherited from fireWebhooks via the
+// shared extraction) covers on_probe too. An operator declaring
+// failure = [slack, telegram, pagerduty] expects all three to
+// fire on a single transition.
+func TestFireProbeWebhook_FansOutMultipleTargets(t *testing.T) {
+	withZeroWebhookBackoff(t)
+	resetTransitionCache(t)
+
+	poster := &fakeWebhookPoster{}
+
+	spec := &onProbeWireSpec{
+		Failure: []deployWebhookWireSpec{
+			{URL: "https://slack.example/"},
+			{URL: "https://telegram.example/"},
+			{URL: "https://pagerduty.example/"},
+		},
+	}
+
+	ev := ProbeTransitionEvent{
+		Kind:       "deployment",
+		Scope:      "prod",
+		Name:       "api",
+		Pod:        "prod-api-1",
+		Probe:      "liveness",
+		Transition: "failure",
+		At:         time.Now(),
+	}
+
+	fireProbeWebhook(poster, nil, spec, ev)
+	waitFor(t, func() bool { return poster.callCount() >= 3 })
+
+	urls := map[string]bool{}
+
+	for _, c := range poster.calls {
+		urls[c.URL] = true
+	}
+
+	for _, want := range []string{"https://slack.example/", "https://telegram.example/", "https://pagerduty.example/"} {
+		if !urls[want] {
+			t.Errorf("missing target %q from fan-out, got URLs: %v", want, urls)
+		}
+	}
+}

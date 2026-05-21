@@ -17,6 +17,7 @@
     "init",
     "autoscale",
     "on-deploy",
+    "on-probe",
     "release",
     "resources",
     "logs",

@@ -40,11 +40,11 @@ const pillars: Pillar[] = [
   },
   {
     tag: 'observe',
-    title: 'See it without a portal.',
+    title: 'See it. Get notified.',
     body: (
       <>
-        Live CPU + memory joined with the limits you declared. <code>vd stats</code> reads the same store the
-        controller wrote — no agent, no Grafana, no second source of truth.
+        Live CPU + memory via <code>vd stats</code>. Per-probe push notifications via <code>on_probe</code> — Telegram,
+        Slack, PagerDuty fire the moment a pod transitions. No agent, no Grafana, no portal in the middle.
       </>
     ),
     lines: [
@@ -54,7 +54,8 @@ const pillars: Pillar[] = [
       { kind: 'out', text: 'myorg/db        180m   512Mi/1Gi     3/3' },
       { kind: 'out', text: 'myorg/cache     12m    64Mi/256Mi    3/3' },
       { kind: 'blank' },
-      { kind: 'dim', text: '✓ all replicas within limits' },
+      { kind: 'dim', text: '# on_probe → Telegram on transition' },
+      { kind: 'dim', text: '🚨 myorg-db-2 liveness failed: HTTP 503' },
     ],
   },
   {
