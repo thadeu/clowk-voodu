@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -281,5 +283,134 @@ func TestConfig_FansOutRestartToStatefulset(t *testing.T) {
 	if post.Metadata.Revision <= preRevision {
 		t.Errorf("statefulset revision didn't bump after config_set (%d → %d) — fan-out missing statefulset?",
 			preRevision, post.Metadata.Revision)
+	}
+}
+
+// TestConfig_PostMaterializesEnvFile pins the env-from gap fix:
+// `vd config <scope>/<name> set K=V` MUST write the .env file on disk
+// at /opt/voodu/apps/<scope>-<name>/shared/.env, NOT only to etcd.
+//
+// Before the fix, a virtual bucket created via `vd config set`
+// without a companion deployment/job/statefulset of the same
+// (scope, name) lived ONLY in etcd. The env_from resolver's
+// os.Stat() on the canonical path would then fail and the
+// reconciler logged "no env files resolved" — silently breaking
+// any deployment that env_from'd the bucket.
+//
+// The materialization is best-effort: failures log but don't fail
+// the request. This test asserts the happy path lands the file
+// at the right path with the right content.
+func TestConfig_PostMaterializesEnvFile(t *testing.T) {
+	// Redirect /opt/voodu to a tmpdir so the test doesn't touch
+	// the real install. paths.Root() honours VOODU_ROOT.
+	tmp := t.TempDir()
+	t.Setenv("VOODU_ROOT", tmp)
+
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=fsw&name=shared&restart=false",
+		`{"DATABASE_URL":"postgres://x","REDIS_URL":"redis://y"}`)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("config POST status=%d", resp.StatusCode)
+	}
+
+	envPath := tmp + "/apps/fsw-shared/shared/.env"
+	body, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("env file not materialized at %s: %v", envPath, err)
+	}
+
+	got := string(body)
+	for _, want := range []string{"DATABASE_URL=postgres://x", "REDIS_URL=redis://y"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("env file missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestConfig_DeleteUpdatesEnvFile pins that deleting a key from a
+// bucket re-materializes the .env without that key. Without this,
+// containers reading the .env (via env_from) would keep seeing
+// stale values for keys the operator just deleted.
+func TestConfig_DeleteUpdatesEnvFile(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("VOODU_ROOT", tmp)
+
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=fsw&name=shared&restart=false",
+		`{"KEEP":"yes","DROPME":"obsolete"}`)
+	resp.Body.Close()
+
+	envPath := tmp + "/apps/fsw-shared/shared/.env"
+
+	// Sanity: both keys land initially.
+	body, _ := os.ReadFile(envPath)
+	if !strings.Contains(string(body), "DROPME=obsolete") {
+		t.Fatalf("setup: DROPME missing from initial materialization:\n%s", body)
+	}
+
+	// Delete DROPME.
+	req, _ := http.NewRequest(http.MethodDelete,
+		ts.URL+"/config?scope=fsw&name=shared&key=DROPME&restart=false", nil)
+
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status=%d", delResp.StatusCode)
+	}
+
+	body, err = os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("env file gone after delete: %v", err)
+	}
+
+	got := string(body)
+
+	if strings.Contains(got, "DROPME") {
+		t.Errorf("DROPME still present after delete, env file:\n%s", got)
+	}
+
+	if !strings.Contains(got, "KEEP=yes") {
+		t.Errorf("KEEP got nuked by delete (should only have removed DROPME):\n%s", got)
+	}
+}
+
+// TestConfig_PostScopeLevelDoesNotMaterializeEnvFile pins the
+// "name is required for materialization" contract. Scope-level
+// configs (name=="") are merge-bases used at apply time by
+// per-resource handlers — they don't map to a single .env file.
+// The handler must skip materialization in that case rather than
+// writing to a malformed path.
+func TestConfig_PostScopeLevelDoesNotMaterializeEnvFile(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("VOODU_ROOT", tmp)
+
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=fsw&restart=false", `{"FOO":"bar"}`)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scope-level config status=%d", resp.StatusCode)
+	}
+
+	// No .env file should exist under /apps for a bare scope —
+	// scope-level configs are merge-bases, not standalone buckets.
+	matches, _ := filepath.Glob(tmp + "/apps/*/shared/.env")
+	if len(matches) != 0 {
+		t.Errorf("scope-level config materialized unexpected env files: %v", matches)
 	}
 }

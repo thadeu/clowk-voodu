@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
+	"go.voodu.clowk.in/internal/secrets"
 	"go.voodu.clowk.in/pkg/plugin"
 )
 
@@ -2434,6 +2436,15 @@ func (a *API) configPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Materialize the bucket as a .env file on disk so resources
+	// referencing it via `env_from = ["<scope>/<name>"]` find a
+	// file at the canonical path. Without this step, virtual buckets
+	// created exclusively via `vd config set` (no companion
+	// deployment / statefulset / job apply ever touching the same
+	// (scope, name) pair) would live ONLY in etcd — and the
+	// env_from resolver's os.Stat would fail.
+	a.materializeBucketEnvFile(r.Context(), scope, name)
+
 	a.maybeRestartAffected(r, scope, name)
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
@@ -2459,9 +2470,71 @@ func (a *API) configDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Re-materialize after the delete so the on-disk .env mirrors
+	// the etcd bucket state (the deleted key is now absent). Without
+	// this, env_from'd containers would still read the stale value
+	// from a never-updated file.
+	a.materializeBucketEnvFile(r.Context(), scope, name)
+
 	a.maybeRestartAffected(r, scope, name)
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+// materializeBucketEnvFile writes the current state of the
+// (scope, name) config bucket to /opt/voodu/apps/<scope-name>/shared/.env
+// using the same secrets.Replace path the deployment / statefulset /
+// job handlers use during reconcile. Idempotent: if the file's
+// content already matches the bucket, secrets.Replace is a no-op on
+// disk (it diffs before writing).
+//
+// Called from configPost / configDelete so the .env mirror stays in
+// sync with the etcd source of truth even when no companion manifest
+// of the same (scope, name) has been applied — the "virtual bucket"
+// pattern shared-config-style: `vd config aws/cli set ...` then
+// `env_from = ["aws/cli"]` from any deployment.
+//
+// name == "" is a scope-level config (merge base across all apps in
+// the scope). Those have no single .env target on disk, so we skip;
+// the per-resource WriteEnv path picks up scope merges at apply time.
+//
+// Best-effort: a write failure is logged but does NOT fail the HTTP
+// request — the etcd write already succeeded; the .env mirror is a
+// derived artifact. Next configPost / configDelete or any apply of a
+// companion deployment will retry the materialization.
+func (a *API) materializeBucketEnvFile(ctx context.Context, scope, name string) {
+	if name == "" {
+		return
+	}
+
+	vars, err := a.Store.GetConfig(ctx, scope, name)
+	if err != nil {
+		log.Printf("config: read bucket %s/%s failed (env file NOT materialized): %v", scope, name, err)
+		return
+	}
+
+	// Convert map → sorted pairs for deterministic on-disk content.
+	// secrets.Replace's atomic-write semantics + identical sorted
+	// input mean the file's content hash is stable across writes —
+	// inotify-style watchers downstream don't see spurious churn.
+	pairs := make([]string, 0, len(vars))
+
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		pairs = append(pairs, k+"="+vars[k])
+	}
+
+	app := AppID(scope, name)
+
+	if _, err := secrets.Replace(app, pairs); err != nil {
+		log.Printf("config: materialize env file for %s/%s failed: %v", scope, name, err)
+	}
 }
 
 // maybeRestartAffected re-emits Apply events for every container-
