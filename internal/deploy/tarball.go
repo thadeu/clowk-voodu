@@ -54,7 +54,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 
 	r := opts.reporter()
 
-	r.StepStart("receive", fmt.Sprintf("Receiving build context for '%s'...", app))
+	r.StepStart("receive", fmt.Sprintf("streaming over ssh — %s", app))
 
 	// A new scope or a renamed deployment produces an AppID the server
 	// has never seen. Materialise the app tree lazily so the operator
@@ -89,7 +89,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return swapCurrentSymlink(app, releaseDir)
 	}
 
-	r.StepStart("create", fmt.Sprintf("Creating release %s", buildID))
+	r.StepStart("create", fmt.Sprintf("extracting release %s", buildID))
 
 	if err := os.MkdirAll(releaseDir, 0755); err != nil {
 		r.StepEnd("create", progress.StatusFail, err)

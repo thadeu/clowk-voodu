@@ -172,6 +172,160 @@ func TestRenderResourceDiffOutput(t *testing.T) {
 	}
 }
 
+// TestRenderResourceDiffCompactOutput pins the compact (one-line)
+// rendering shape used by `voodu apply` previews. Format:
+//
+//	+ kind/scope/name   field1=value1 field2=value2
+//
+// Asserts: header is present, fields appear in `key=value` form,
+// each separated by spaces. No `old → new` arrows (that's the
+// detailed mode's job).
+func TestRenderResourceDiffCompactOutput(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	changes := []fieldChange{
+		{Path: "image", Op: '+', New: "ghcr.io/myorg/api:1.7"},
+		{Path: "replicas", Op: '+', New: float64(3)},
+	}
+
+	var buf bytes.Buffer
+
+	renderResourceDiffCompact(&buf, "deployment/prod/api", changes, newDiffPalette(&buf), '+')
+
+	got := buf.String()
+
+	for _, want := range []string{
+		"+",
+		"deployment/prod/api",
+		"image=ghcr.io/myorg/api:1.7",
+		"replicas=3",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing fragment %q in output:\n%q", want, got)
+		}
+	}
+
+	// Compact mode MUST NOT use the detailed `→` arrow shape — that's
+	// reserved for renderResourceDiff (--verbose mode).
+	if strings.Contains(got, "→") {
+		t.Errorf("compact mode leaked detailed-mode arrow:\n%q", got)
+	}
+}
+
+// TestRenderResourceDiffCompactCapsBody pins the 80-col cap behavior.
+// A resource with many changed fields should surface the first N
+// fitting fields and drop the rest with a "(+N more)" tail rather
+// than wrap or overflow.
+func TestRenderResourceDiffCompactCapsBody(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	// 12 changes × ~15 chars each = ~180 chars body. Way past 80.
+	changes := make([]fieldChange, 0, 12)
+	for i := 0; i < 12; i++ {
+		changes = append(changes, fieldChange{
+			Path: "field_" + string(rune('a'+i)),
+			Op:   '~',
+			New:  "value_" + string(rune('a'+i)),
+		})
+	}
+
+	var buf bytes.Buffer
+
+	renderResourceDiffCompact(&buf, "deployment/prod/api", changes, newDiffPalette(&buf), '~')
+
+	got := buf.String()
+
+	if !strings.Contains(got, "more)") {
+		t.Errorf("expected '(+N more)' tail when fields exceed cap, got:\n%q", got)
+	}
+}
+
+// TestJoinCapped pins the helper used by compact rendering. Cap edge
+// cases (empty input, exactly-at-cap, just-over) drive most of the
+// rendering UX, so they're worth their own pin.
+func TestJoinCapped(t *testing.T) {
+	cases := []struct {
+		name    string
+		parts   []string
+		cap     int
+		wantSub string
+		notSub  string
+	}{
+		{
+			name:    "empty",
+			parts:   []string{},
+			cap:     80,
+			wantSub: "",
+		},
+		{
+			name:    "fits under cap",
+			parts:   []string{"a=1", "b=2"},
+			cap:     80,
+			wantSub: "a=1 b=2",
+			notSub:  "more",
+		},
+		{
+			name:    "exceeds cap → truncation tail",
+			parts:   []string{"first=long_value_here", "second=another_long_value", "third=yet_another"},
+			cap:     20,
+			wantSub: "more)",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := joinCapped(c.parts, c.cap)
+
+			if c.wantSub != "" && !strings.Contains(got, c.wantSub) {
+				t.Errorf("want substring %q in %q", c.wantSub, got)
+			}
+
+			if c.notSub != "" && strings.Contains(got, c.notSub) {
+				t.Errorf("unwanted substring %q in %q", c.notSub, got)
+			}
+		})
+	}
+}
+
+// TestCompactValue pins value formatting for compact diffs. String
+// truncation matters most — long image tags / URLs would blow out the
+// 80-col cap if not clipped.
+func TestCompactValue(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"nil", nil, "(unset)"},
+		{"short string", "hello", "hello"},
+		{"bool", true, "true"},
+		{"number", float64(3), "3"},
+		{"map collapses", map[string]any{"k": "v"}, "{...}"},
+		{"list collapses", []any{1, 2}, "[...]"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := compactValue(c.in); got != c.want {
+				t.Errorf("compactValue(%#v) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// Long string truncation — pinned separately because we want to
+	// check the tail-ellipsis marker, not just the length.
+	long := strings.Repeat("x", 100)
+
+	got := compactValue(long)
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("long string should be ellipsis-truncated, got: %q", got)
+	}
+
+	if len(got) > 60 {
+		t.Errorf("truncated value over cap: len=%d", len(got))
+	}
+}
+
 // TestRenderResourceDiffColor pins the ANSI wrapping behavior: with
 // FORCE_COLOR on, the op markers must carry escape sequences emitted
 // by lipgloss/termenv. Exact wrapping is the library's choice (e.g.

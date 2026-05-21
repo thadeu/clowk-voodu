@@ -198,6 +198,30 @@ func TestEventRendererResultIsStyled(t *testing.T) {
 	}
 }
 
+// TestEventRendererResourceCount pins the counter that drives the
+// aurora `✓ apply complete (N resources)` terminus. The orchestrator
+// reads ResourceCount() after Close() to decide whether to emit the
+// final line and what number to put in parens. Regression here would
+// either drop the terminus entirely or print the wrong count.
+func TestEventRendererResourceCount(t *testing.T) {
+	var buf bytes.Buffer
+
+	r := forceEventRenderer(&buf, false)
+
+	writeEvents(t, r, []progress.Event{
+		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
+		{Type: progress.EventResult, Kind: "deployment", Scope: "app", Name: "web", Action: "applied"},
+		{Type: progress.EventResult, Kind: "ingress", Scope: "app", Name: "web", Action: "applied"},
+		{Type: progress.EventResult, Kind: "service", Name: "router", Action: "unchanged"},
+	})
+
+	_ = r.Close()
+
+	if got := r.ResourceCount(); got != 3 {
+		t.Errorf("ResourceCount() = %d, want 3", got)
+	}
+}
+
 // TestEventRendererWarnEscapesSpinner makes sure warnings always
 // surface even during an active step — the spinner swallows info
 // chatter on purpose, but warnings are specifically what the user

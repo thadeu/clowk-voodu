@@ -145,7 +145,10 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		// right color profile here because the writer *is* the user's
 		// terminal.
 		palette := newDiffPalette(os.Stdout)
-		added, modified := renderApplyPlan(os.Stdout, plan, palette)
+		// `voodu apply` preview defaults to compact one-line summaries
+		// (landing-page mockup). --verbose switches to detailed
+		// field-by-field for review-grade output.
+		added, modified := renderApplyPlan(os.Stdout, plan, palette, flags.verbose)
 		renderPrunePlan(os.Stdout, plan.Data.Pruned, palette)
 		fmt.Fprintf(os.Stdout, "\n%s\n", diffSummary(added, modified, len(plan.Data.Pruned)))
 
@@ -243,6 +246,32 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	})
 
 	_ = resultFilter.Close()
+
+	// Emit the aurora terminus when the apply actually landed cleanly
+	// (no SSH error, server exit 0). Aurora ✓ is the brand-kit's
+	// "everything's done" marker reserved exclusively for this line —
+	// every other ✓ in the output is mint. The renderers themselves
+	// can't paint this: they don't know when the stream is "done", only
+	// that another event might come. The orchestrator does.
+	//
+	// Suppressed on:
+	//   - verbose / non-TTY (passthrough mode, both renderers skipped)
+	//   - apply failure (err or non-zero exit)
+	//   - zero resources processed (apply was a true no-op, e.g. all
+	//     manifests up-to-date and server returned without per-manifest
+	//     lines — emitting a "complete (0 resources)" reads confusing)
+	if err == nil && code == 0 && !flags.verbose && term.IsTerminal(int(os.Stdout.Fd())) {
+		total := nd.ResourceCount() + legacy.ResourceCount()
+		if total > 0 {
+			word := "resources"
+			if total == 1 {
+				word = "resource"
+			}
+
+			fmt.Fprintf(os.Stdout, "%s apply complete (%d %s)\n",
+				checkFinal(), total, word)
+		}
+	}
 
 	return code, err
 }

@@ -133,7 +133,7 @@ func runPipeline(app, releaseDir string, opts *Options) error {
 func buildRelease(appName, releaseDir string, spec *lang.BuildSpec, opts *Options) error {
 	r := opts.reporter()
 
-	r.StepStart("build", "Building release...")
+	r.StepStart("build", "building release")
 
 	handler, err := lang.NewLang(spec, releaseDir)
 	if err != nil {

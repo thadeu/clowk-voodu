@@ -307,3 +307,37 @@ func TestProgressFilterCloseClearsDanglingSpinner(t *testing.T) {
 		t.Error("filter still in active state after Close")
 	}
 }
+
+// TestApplyResultFilterResourceCount pins the counter that drives the
+// aurora `✓ apply complete (N resources)` terminus on the legacy text
+// path. apply_forwarded.go reads ResourceCount() after Close() to
+// decide whether to emit the final line and what number goes in
+// parens. Regression here would either drop the terminus or print the
+// wrong number when the server speaks the legacy text format (older
+// servers that haven't been upgraded to NDJSON yet).
+func TestApplyResultFilterResourceCount(t *testing.T) {
+	var out bytes.Buffer
+
+	a := &applyResultFilter{
+		out: &out,
+		tty: true, // force the styled path; bytes.Buffer isn't a *os.File
+	}
+
+	payload := strings.Join([]string{
+		"deployment/clowk-lp/web applied",
+		"ingress/clowk-lp/web applied",
+		"service/router unchanged",
+		"random non-result line that should not be counted",
+		"",
+	}, "\n")
+
+	if _, err := a.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = a.Close()
+
+	if got := a.ResourceCount(); got != 3 {
+		t.Errorf("ResourceCount() = %d, want 3 (one per result-token line)", got)
+	}
+}

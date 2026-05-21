@@ -310,18 +310,19 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 	// summary regardless of which path the negotiation picks.
 	rememberShippedTag(d.Name)
 
-	// The Shipping banner is a client-only note (the server has not
+	// The packing banner is a client-only note (the server has not
 	// even been contacted yet). Print it straight to stdout, outside
 	// any filter — otherwise it would race with the server's first
 	// line for the negotiator's "line one" peek.
 	//
-	// We commit it as a green ✓ right away instead of opening a spinner:
-	// from the client's point of view Shipping is a one-shot act ("we
-	// kicked off the tar stream"), and visually it now aligns with the
-	// ✓ cascade that follows (Receiving, Creating, Building, Built).
-	// Printing `----->` here would leave an orphan banner without the
-	// leading checkmark, which reads as "this line didn't finish."
-	fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m Shipping %s (scope: %s, context: %s)\n", d.Name, d.Scope, d.Path)
+	// We commit it as a mint ✓ right away instead of opening a spinner:
+	// from the client's point of view packing is a one-shot act ("we
+	// kicked off the tar stream"), and visually it aligns with the ✓
+	// cascade that follows (streaming over ssh, extracting release,
+	// building release, Built X in Ns). Label uses the landing-style
+	// vocabulary — "packing <name>" — and trades the verbose
+	// "(scope: X, context: Y)" suffix for a cleaner one-line.
+	fmt.Fprintf(os.Stdout, "%s packing %s\n", check(), d.Name)
 
 	// Two renderers are pre-built and handed to a negotiatingWriter
 	// that picks between them based on the server's first stdout line.

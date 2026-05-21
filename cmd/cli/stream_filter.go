@@ -62,10 +62,23 @@ var endMarkers = []string{
 // progressFilter should still see the spinner.
 var stepBanners = []string{
 	"Checking ",
+
+	// Legacy labels — kept for older servers that still emit the
+	// pre-rebrand banners. Modern voodu speaks NDJSON and skips this
+	// table entirely; eventRenderer dispatches on event.Label directly.
 	"Shipping ",
 	"Receiving ",
 	"Creating release",
 	"Building release",
+
+	// Current labels — landing-page narrative vocabulary. Used by the
+	// legacy text fallback when a non-NDJSON server emits them via
+	// TextReporter. The two ranges coexist so backward-compat stays
+	// intact through the deploy-the-CLI-first rollout.
+	"packing ",
+	"streaming over ssh",
+	"extracting release",
+	"building release",
 }
 
 // passthroughBanners are `-----> ` phases we want in the scrollback
@@ -78,9 +91,16 @@ var passthroughBanners = []string{
 	"Pruned ",
 }
 
-// spinnerFrames are the classic braille dot rotation. Unicode-safe in
-// every modern terminal we care about. 10 frames × 100ms = full
-// rotation per second, matching the cadence the user's eye expects.
+// spinnerFrames is deprecated — the legacy classic-braille rotation
+// (10 frames × 100ms = ~1 Hz, cyan ANSI). Replaced by brailleFrames in
+// spinner.go (8 frames × 80ms, mint-400 truecolor) so the phase-1
+// "Checking remote state" spinner shares its visual vocabulary with
+// the eventRenderer that handles phases 2/3.
+//
+// Kept here as a const-of-truth for any straggling test reference; the
+// renderSpinnerLocked path below no longer reads it.
+//
+//nolint:unused // historic — see comment above
 const spinnerFrames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 // progressFilter wraps an io.Writer and renders each top-level
@@ -154,6 +174,10 @@ type progressFilter struct {
 // newProgressFilter wires up the filter with sensible defaults. `out`
 // is typically os.Stdout; `verbose` comes from --verbose on the apply
 // command.
+//
+// Both phase-1 (progressFilter) and phase-2/3 (eventRenderer) share
+// the same brand-kit braille spinner — no inline-image fork, no jarring
+// swap between cyan-classic-braille and mint-brand-braille.
 func newProgressFilter(out io.Writer, verbose bool) *progressFilter {
 	return &progressFilter{
 		out:     out,
@@ -234,7 +258,7 @@ func (f *progressFilter) processLineLocked(line string) {
 
 			total := time.Since(f.started).Round(time.Second)
 
-			fmt.Fprintf(f.out, "\x1b[32m✓\x1b[0m Built %s in %s\n", f.tag, total)
+			fmt.Fprintf(f.out, "%s Built %s in %s\n", check(), f.tag, total)
 
 			f.buildClosed = true
 
@@ -279,7 +303,7 @@ func (f *progressFilter) processLineLocked(line string) {
 				fmt.Fprint(f.out, "\r\x1b[2K")
 			}
 
-			fmt.Fprintf(f.out, "\x1b[32m✓\x1b[0m %s\n", msg)
+			fmt.Fprintf(f.out, "%s %s\n", check(), msg)
 
 		default:
 			// Unknown `-----> ` banner — neither in stepBanners nor
@@ -365,11 +389,29 @@ func (f *progressFilter) renderSpinnerLocked() {
 		return
 	}
 
-	frames := []rune(spinnerFrames)
 	elapsed := time.Since(f.stepStarted).Round(time.Second)
 
-	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[36m%c\x1b[0m %s \x1b[2m(%s)\x1b[0m\n\x1b[2K\x1b[1A",
-		frames[f.frame], f.currentStep, elapsed)
+	// Clear line, park cursor at column 0, paint brand braille frame +
+	// label + dim elapsed-time tail. The trailing CR+line-down+clear+up
+	// dance reserves a blank row below so the live spinner never hugs
+	// the bottom edge of the terminal.
+	fmt.Fprint(f.out, "\r\x1b[2K")
+	f.paintBrailleLocked()
+
+	fmt.Fprintf(f.out, " %s %s\n\x1b[2K\x1b[1A",
+		f.currentStep,
+		dim(fmt.Sprintf("(%s)", elapsed)),
+	)
+}
+
+// paintBrailleLocked emits one mint-colored brand braille frame at the
+// cursor's current position. Caller must have cleared the line first
+// (\r\x1b[2K). Matches event_renderer.go's paintBrailleLocked exactly.
+func (f *progressFilter) paintBrailleLocked() {
+	frames := []rune(brailleFrames)
+	frame := frames[f.frame%len(frames)]
+
+	fmt.Fprint(f.out, colorize(cMint400, string(frame)))
 }
 
 // closeCurrentStepLocked commits the currently-open step as a green
@@ -383,7 +425,8 @@ func (f *progressFilter) closeCurrentStepLocked() {
 
 	elapsed := time.Since(f.stepStarted).Round(time.Second)
 
-	fmt.Fprintf(f.out, "\r\x1b[2K\x1b[32m✓\x1b[0m %s \x1b[2m(%s)\x1b[0m\n", f.currentStep, elapsed)
+	fmt.Fprintf(f.out, "\r\x1b[2K%s %s %s\n",
+		check(), f.currentStep, dim(fmt.Sprintf("(%s)", elapsed)))
 
 	f.currentStep = ""
 }
@@ -475,7 +518,10 @@ func (f *progressFilter) startSpinnerLocked() {
 func (f *progressFilter) spinLoop(stop, done chan struct{}) {
 	defer close(done)
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// 80ms/frame matches brand kit spec + eventRenderer's spinLoop.
+	// 8 frames × 80ms = one full rotation in ~640ms — alive without
+	// being distracting.
+	ticker := time.NewTicker(brailleTickMS * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -504,7 +550,7 @@ func (f *progressFilter) advanceAndRenderLocked() {
 		return
 	}
 
-	frames := []rune(spinnerFrames)
+	frames := []rune(brailleFrames)
 	f.frame = (f.frame + 1) % len(frames)
 
 	f.renderSpinnerLocked()
@@ -628,6 +674,14 @@ type applyResultFilter struct {
 
 	mu       sync.Mutex
 	leftover []byte
+
+	// resourceCount tracks how many per-manifest result lines we've
+	// emitted. Read after Close() by the apply orchestrator to render
+	// the aurora `✓ apply complete (N resources)` terminus. Mutually
+	// exclusive with eventRenderer.resourceCount — the negotiatingWriter
+	// only feeds bytes to one of us per run, so the orchestrator can
+	// just sum both counters and one will be zero.
+	resourceCount int
 }
 
 func newApplyResultFilter(out io.Writer, verbose bool) *applyResultFilter {
@@ -658,7 +712,9 @@ func (a *applyResultFilter) Write(p []byte) (int, error) {
 		data = data[idx+1:]
 
 		if isApplyResultLine(line) {
-			fmt.Fprintf(a.out, "\x1b[32m✓\x1b[0m %s\n", line)
+			fmt.Fprintf(a.out, "%s %s\n", check(), line)
+
+			a.resourceCount++
 		} else {
 			fmt.Fprintln(a.out, line)
 		}
@@ -683,6 +739,17 @@ func (a *applyResultFilter) Close() error {
 	}
 
 	return nil
+}
+
+// ResourceCount returns the number of per-manifest ✓ lines this filter
+// emitted. Safe to call after Close. Sibling of eventRenderer's
+// ResourceCount — apply_forwarded.go reads from whichever filter the
+// negotiating writer picked.
+func (a *applyResultFilter) ResourceCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.resourceCount
 }
 
 // isApplyResultLine reports whether s is one of the server's per-

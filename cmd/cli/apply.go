@@ -505,7 +505,11 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 
 	palette := newDiffPalette(out)
 
-	added, modified := renderApplyPlan(out, plan, palette)
+	// `voodu diff` is the dedicated detail-level inspector — operators
+	// reach for it specifically to see field-by-field deltas. Compact
+	// mode would defeat the purpose, so the diff command pins
+	// verbose=true regardless of the apply spinner's --verbose flag.
+	added, modified := renderApplyPlan(out, plan, palette, true)
 	renderPrunePlan(out, plan.Data.Pruned, palette)
 
 	fmt.Fprintf(out, "\n%s\n", diffSummary(added, modified, len(plan.Data.Pruned)))
@@ -561,12 +565,26 @@ func detailedExitcodeFromPlan(enabled bool, plan diffResponse) error {
 var errExitWithChanges = fmt.Errorf("voodu-diff-has-changes")
 
 // renderApplyPlan walks each (applied, current) pair from the dry-run
-// response and prints the resource header plus — for modified and
-// created resources — the field-by-field diff underneath. A blank
-// line separates each resource so two back-to-back kinds
-// (deployment + ingress, say) don't smash into one visual block.
+// response and prints the resource header. Two rendering modes,
+// chosen by the verbose flag:
+//
+//   verbose=true (also used by `voodu diff`):
+//     ~ kind/scope/name              ← header
+//         ~ field.path  "old"  →  "new"
+//         + new.field   "v"
+//     ...
+//
+//   verbose=false (default for `voodu apply` preview):
+//     ~ kind/scope/name   field.path=new, another=v
+//     + kind/scope/name   replicas=3 image=...
+//     - kind/scope/name
+//
+// The compact mode is what the landing page mockup shows — one line
+// per resource, eye scans down a column. Operators reach for verbose
+// when they need exact old/new transitions during code review.
+//
 // Returns counts so the caller can produce the final summary line.
-func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modified int) {
+func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette, verbose bool) (added, modified int) {
 	first := true
 
 	for i, desired := range plan.Data.Applied {
@@ -582,9 +600,11 @@ func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modi
 
 		label := formatRef(desired.Kind, desired.Scope, desired.Name)
 
-		// Blank line between resources. Skipped before the first
-		// printed row so a single-resource diff stays compact.
-		if !first {
+		// Blank line between resources — verbose mode only, where each
+		// resource emits a header + multiple field lines and the gap
+		// helps the eye reset between blocks. Compact mode keeps lines
+		// flush so a stack of one-liners reads as a single table.
+		if verbose && !first {
 			fmt.Fprintln(w)
 		}
 
@@ -620,9 +640,12 @@ func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modi
 		}
 
 		if current == nil {
-			fmt.Fprintf(w, "%s %s (new)\n", p.Add("+"), label)
-
-			renderResourceDiff(w, diffSpec(desiredSpec, nil), p)
+			if verbose {
+				fmt.Fprintf(w, "%s %s (new)\n", p.Add("+"), label)
+				renderResourceDiff(w, diffSpec(desiredSpec, nil), p)
+			} else {
+				renderResourceDiffCompact(w, label, diffSpec(desiredSpec, nil), p, '+')
+			}
 
 			added++
 
@@ -636,9 +659,12 @@ func renderApplyPlan(w io.Writer, plan diffResponse, p diffPalette) (added, modi
 			continue
 		}
 
-		fmt.Fprintf(w, "%s %s\n", p.Mod("~"), label)
-
-		renderResourceDiff(w, changes, p)
+		if verbose {
+			fmt.Fprintf(w, "%s %s\n", p.Mod("~"), label)
+			renderResourceDiff(w, changes, p)
+		} else {
+			renderResourceDiffCompact(w, label, changes, p, '~')
+		}
 
 		modified++
 	}

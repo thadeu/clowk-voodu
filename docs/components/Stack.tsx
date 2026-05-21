@@ -7,7 +7,7 @@ const built = [
 
 const plugins = [
   { tag: 'plugin', h: 'voodu-postgres', p: 'Postgres with backup, replica and test-restore. Declared like an app.' },
-  { tag: 'plugin', h: 'voodu-mongo', p: 'MongoDB service with the same reliability primitives.' },
+  { tag: 'plugin', h: 'voodu-redis', p: 'Redis service with the same reliability primitives.' },
   { tag: 'plugin', h: 'voodu-caddy', p: 'Reference plugin. Read it to write your own.' },
   {
     tag: 'plugin',

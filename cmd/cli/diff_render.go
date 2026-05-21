@@ -28,12 +28,14 @@ type diffPalette struct {
 // default renderer (which snapshots os.Stdout at package init —
 // unreliable when called later from a cobra cmd).
 //
-// Color picks:
-//   - `+` add    → ANSI 2 (green)
-//   - `-` remove → ANSI 1 (red)
-//   - `~` modify → 256-color 208 (orange) — mirrors the Terraform-plan
-//     convention users already recognize. lipgloss auto-downgrades to
-//     a close-enough 16-color fallback on terminals that lack 256.
+// Color picks (brand-exact truecolor — same values as style.go):
+//   - `+` add    → mint-400 #6FE2A6 (Cell, primary brand accent)
+//   - `~` modify → amber   #FFC247 (warm contrast for "modify" weight)
+//   - `-` remove → rose    #B44B4B (dimmed rose, less alarming than full red)
+//
+// lipgloss auto-degrades to the closest indexed color on terminals
+// that lack truecolor support, so the brand intent survives even when
+// the exact hex doesn't render.
 //
 // Override precedence (highest wins):
 //  1. NO_COLOR set (non-empty)           → plain text always
@@ -59,10 +61,13 @@ func newDiffPalette(w io.Writer) diffPalette {
 		r.SetColorProfile(termenv.ANSI256)
 	}
 
+	// Brand palette — values match cMint400 / cAmber / cRoseDim in
+	// style.go. lipgloss downgrades to nearest indexed color on
+	// non-truecolor terminals.
 	return diffPalette{
-		Add: r.NewStyle().Foreground(lipgloss.Color("2")).Render,
-		Del: r.NewStyle().Foreground(lipgloss.Color("1")).Render,
-		Mod: r.NewStyle().Foreground(lipgloss.Color("208")).Render,
+		Add: r.NewStyle().Foreground(lipgloss.Color("#6FE2A6")).Render,
+		Del: r.NewStyle().Foreground(lipgloss.Color("#B44B4B")).Render,
+		Mod: r.NewStyle().Foreground(lipgloss.Color("#FFC247")).Render,
 	}
 }
 
@@ -269,6 +274,147 @@ func renderResourceDiff(w io.Writer, changes []fieldChange, p diffPalette) {
 			fmt.Fprintf(w, "    %s\n", p.Del(line))
 		}
 	}
+}
+
+// renderResourceDiffCompact prints a one-line summary of the changes
+// for one resource. Used by `voodu apply` (default) to keep the
+// output narrative-style, matching the landing page mockup:
+//
+//   + deployment/prod/api  replicas=3 image=ghcr.io/myorg/api:1.7
+//   ~ ingress/prod/api     tls.email=ops@example.com
+//   + redis/clowk-lp/redis-ha sentinel.monitor=clowk-lp/redis
+//
+// The detailed field-by-field path (renderResourceDiff) is reserved
+// for `voodu apply --verbose` and `voodu diff` (where field-level
+// detail is the point of the command).
+//
+// Selection logic for which fields to surface in the compact line:
+//   - For new resources (+): the "headline" declared fields the
+//     operator would expect to see for that kind. Hard-coded per-kind
+//     priority list with fall-through to alphabetical.
+//   - For modified resources (~): the changed field paths, alphabetical.
+//
+// Cap on body width: ~80 columns. Surplus fields are dropped with a
+// trailing `(+N more)` so the line still fits in a normal terminal
+// and a glance is enough to spot the change class.
+func renderResourceDiffCompact(w io.Writer, header string, changes []fieldChange, p diffPalette, op byte) {
+	// Filter to the changes we want to surface on the compact line.
+	// + and ~ both surface "New" value (current state being written).
+	// - surfaces "Old" (what's going away).
+	parts := make([]string, 0, len(changes))
+
+	for _, c := range changes {
+		switch op {
+		case '+', '~':
+			if c.Op == '-' {
+				continue
+			}
+
+			val := c.New
+			if val == nil {
+				val = c.Old
+			}
+
+			parts = append(parts, fmt.Sprintf("%s=%s", c.Path, compactValue(val)))
+
+		case '-':
+			parts = append(parts, fmt.Sprintf("%s=%s", c.Path, compactValue(c.Old)))
+		}
+	}
+
+	body := joinCapped(parts, 80)
+
+	var prefix string
+
+	switch op {
+	case '+':
+		prefix = p.Add("+")
+	case '~':
+		prefix = p.Mod("~")
+	case '-':
+		prefix = p.Del("-")
+	default:
+		prefix = string(op)
+	}
+
+	if body == "" {
+		fmt.Fprintf(w, "%s %s\n", prefix, header)
+	} else {
+		fmt.Fprintf(w, "%s %s  %s\n", prefix, header, body)
+	}
+}
+
+// compactValue is the inline-form of a value for compact diffs. Keeps
+// strings unquoted (the key=value form is unambiguous) and clamps
+// long strings so a 200-char image tag with SHA suffix doesn't blow
+// out the line. Nested objects collapse to `{...}` — the operator who
+// wants the full structure runs `voodu apply --verbose`.
+func compactValue(v any) string {
+	if v == nil {
+		return "(unset)"
+	}
+
+	switch x := v.(type) {
+	case string:
+		if len(x) > 60 {
+			return x[:57] + "..."
+		}
+		return x
+	case bool, float64, int, int64:
+		return fmt.Sprintf("%v", x)
+	case map[string]any:
+		return "{...}"
+	case []any:
+		return "[...]"
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		s := string(b)
+		if len(s) > 60 {
+			return s[:57] + "..."
+		}
+		return s
+	}
+}
+
+// joinCapped joins parts with single spaces, stopping when the
+// running width exceeds cap. A `(+N more)` tail signals truncation
+// so the operator knows there's more behind the curtain.
+func joinCapped(parts []string, cap int) string {
+	if len(parts) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+
+	width := 0
+
+	for i, p := range parts {
+		// +1 for the space between fields (except the first).
+		need := len(p)
+		if i > 0 {
+			need++
+		}
+
+		if width+need > cap {
+			remaining := len(parts) - i
+
+			fmt.Fprintf(&b, " (+%d more)", remaining)
+
+			return b.String()
+		}
+
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+
+		b.WriteString(p)
+		width += need
+	}
+
+	return b.String()
 }
 
 // diffSummary produces the one-liner printed at the end of `voodu
