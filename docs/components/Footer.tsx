@@ -3,13 +3,17 @@ export default function Footer() {
     <footer className="border-t border-voodu-line py-10 pb-14 text-voodu-fg-mute font-mono text-[12.5px]">
       <div className="max-w-[1180px] mx-auto px-5 sm:px-8 md:px-10 lg:px-14 flex flex-wrap justify-between items-center gap-4">
         <div className="flex items-center gap-2.5">
-          <span className="inline-grid place-items-center w-[18px] h-[18px] rounded bg-mint-400 text-[#07140d] font-mono font-extrabold text-[11px] leading-none">
-            V
-          </span>
+          <img src="icons/mono-white-512.png" alt="Voodu icon" className="w-10 h-10" />
+
           <span>voodu — self-hosted deploys, MIT.</span>
         </div>
         <div className="flex gap-5">
-          <a href="https://github.com/thadeu/clowk-voodu" target="_blank" rel="noreferrer" className="hover:text-voodu-fg transition-colors">
+          <a
+            href="https://github.com/thadeu/clowk-voodu"
+            target="_blank"
+            rel="noreferrer"
+            className="hover:text-voodu-fg transition-colors"
+          >
             GitHub
           </a>
           <a

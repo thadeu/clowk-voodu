@@ -51,9 +51,7 @@ export default function Header() {
       >
         <div className="max-w-[1180px] mx-auto px-5 sm:px-8 md:px-10 lg:px-14 h-15 flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2.5 font-bold tracking-tight text-[17px]">
-            <span className="inline-grid place-items-center w-[18px] h-[18px] rounded bg-mint-400 text-[#07140d] font-mono font-extrabold text-[11px] leading-none">
-              V
-            </span>
+            <img src="icon.svg" alt="Voodu icon" className="w-10 h-10" />
             <span className="text-white">voodu</span>
           </Link>
 
@@ -88,9 +86,7 @@ export default function Header() {
               }`}
             />
             <span
-              className={`block w-5 h-0.5 bg-white transition-all duration-300 ${
-                menuOpen ? 'opacity-0 scale-0' : ''
-              }`}
+              className={`block w-5 h-0.5 bg-white transition-all duration-300 ${menuOpen ? 'opacity-0 scale-0' : ''}`}
             />
             <span
               className={`block w-5 h-0.5 bg-white transition-all duration-300 origin-center ${

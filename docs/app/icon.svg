@@ -1,4 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="6" fill="#7df9c1"/>
-  <path d="M9 9 L16 23 L23 9" stroke="#07140d" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" fill="none">
+  <circle cx="100" cy="100" r="56" fill="none" stroke="#185C3F" stroke-width="1.2" stroke-dasharray="3 4" opacity="0.5"></circle>
+  <circle cx="100" cy="100" r="36" fill="none" stroke="#185C3F" stroke-width="1.2" stroke-dasharray="3 4" opacity="0.4"></circle>
+  
+  <g stroke="#185C3F" stroke-width="1.5" opacity="0.5">
+    <line x1="100" y1="100" x2="100" y2="44"></line>
+    <line x1="100" y1="100" x2="148.5" y2="72"></line>
+    <line x1="100" y1="100" x2="148.5" y2="128"></line>
+    <line x1="100" y1="100" x2="100" y2="156"></line>
+    <line x1="100" y1="100" x2="51.5" y2="128"></line>
+    <line x1="100" y1="100" x2="51.5" y2="72"></line>
+  </g>
+  
+  <polygon points="100,30 112.12,37 112.12,51 100,58 87.88,51 87.88,37" fill="#2A9E6A"></polygon>
+  <polygon points="100,34 108.66,39 108.66,49 100,54 91.34,49 91.34,39" fill="#4FCC8C"></polygon>
+  <polygon points="148.5,58 160.62,65 160.62,79 148.5,86 136.37,79 136.37,65" fill="#3DBE85"></polygon>
+  <polygon points="148.5,62 157.16,67 157.16,77 148.5,82 139.84,77 139.84,67" fill="#6FE2A6"></polygon>
+  <polygon points="148.5,114 160.62,121 160.62,135 148.5,142 136.37,135 136.37,121" fill="#2A9E6A"></polygon>
+  <polygon points="148.5,118 157.16,123 157.16,133 148.5,138 139.84,133 139.84,123" fill="#4FCC8C"></polygon>
+  <polygon points="100,142 112.12,149 112.12,163 100,170 87.88,163 87.88,149" fill="#3DBE85"></polygon>
+  <polygon points="100,146 108.66,151 108.66,161 100,166 91.34,161 91.34,151" fill="#6FE2A6"></polygon>
+  <polygon points="51.5,114 63.63,121 63.63,135 51.5,142 39.38,135 39.38,121" fill="#2A9E6A"></polygon>
+  <polygon points="51.5,118 60.16,123 60.16,133 51.5,138 42.84,133 42.84,123" fill="#4FCC8C"></polygon>
+  <polygon points="51.5,58 63.63,65 63.63,79 51.5,86 39.38,79 39.38,65" fill="#3DBE85"></polygon>
+  <polygon points="51.5,62 60.16,67 60.16,77 51.5,82 42.84,77 42.84,67" fill="#6FE2A6"></polygon>
+  
+  <polygon points="100,64 131.18,82 131.18,118 100,136 68.82,118 68.82,82" fill="#2A9E6A"></polygon>
+  <polygon points="100,68 127.71,84 127.71,116 100,132 72.29,116 72.29,84" fill="#4FCC8C"></polygon>
+  <polygon points="100,74 122.52,87 122.52,113 100,126 77.48,113 77.48,87" fill="#6FE2A6"></polygon>
+  <rect x="82" y="97" width="14" height="5" fill="#C7F5DD" rx="1"></rect>
+  <rect x="104" y="97" width="14" height="5" fill="#C7F5DD" rx="1"></rect>
 </svg>

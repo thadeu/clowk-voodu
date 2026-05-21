@@ -52,12 +52,9 @@ export function DocsSidebar() {
         }`}
       >
         <div className="flex items-center justify-between px-5 h-14 border-b border-white/5 shrink-0">
-          <Link href="/docs" className="flex items-center gap-2">
-            <span className="inline-grid place-items-center w-5 h-5 rounded bg-mint-400 text-[#07140d] font-mono font-extrabold text-[11px]">
-              V
-            </span>
+          <Link href="/docs" className="flex items-center gap-1.5">
+            <img src="/icons/mono-white-512.png" alt="Voodu icon" className="w-10 h-10" />
             <span className="text-lg font-bold tracking-tight text-white">voodu</span>
-            <span className="text-[10px] font-medium text-white/30 bg-white/5 px-1.5 py-0.5 rounded">Docs</span>
           </Link>
 
           <button
@@ -118,17 +115,25 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
   }, []);
 
   return (
-    <div className="mb-1">
+    <div className="mt-5 first:mt-0">
       <button
         onClick={toggleOpen}
-        className="border-b border-white/6 w-full text-left flex gap-2 items-center px-4 py-2.5 transition-colors font-medium text-sm tracking-wider text-white bg-white/3"
+        className="w-full text-left flex items-center gap-2 px-4 py-2 transition-colors text-[11px] uppercase tracking-[0.1em] font-medium text-white/50 hover:text-white/75"
       >
-        <Icon size={16} className="opacity-50" />
+        <Icon size={13} className="opacity-60" />
         <span>{section.title}</span>
-        <ChevronDown
-          size={12}
-          className={`ml-auto opacity-40 transition-transform duration-200 ${open ? 'rotate-0' : '-rotate-90'}`}
-        />
+        <div className="ml-auto flex items-center gap-1.5">
+          {!open && isActive && (
+            <span
+              className="w-1.5 h-1.5 rounded-full bg-mint-400 shadow-[0_0_0_3px_rgba(125,249,193,0.15)]"
+              aria-label="contains active page"
+            />
+          )}
+          <ChevronDown
+            size={11}
+            className={`opacity-40 transition-transform duration-200 ${open ? 'rotate-0' : '-rotate-90'}`}
+          />
+        </div>
       </button>
 
       <div
@@ -138,7 +143,7 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
         }`}
       >
         <div className="overflow-hidden">
-          <div className="pb-1">
+          <div className="pt-1">
             {section.list.map(item => {
               const active = pathname === item.href;
               const ItemIcon = item.icon;
@@ -148,13 +153,13 @@ function SidebarSectionItem({ section, pathname }: { section: SidebarSection; pa
                   key={item.href}
                   href={item.href}
                   ref={active ? activeRef : undefined}
-                  className={`relative flex items-center gap-2.5 px-4 py-1 text-[14px] transition-all duration-150 ${
+                  className={`relative flex items-center gap-2.5 pl-[14px] pr-4 py-1.5 text-[14px] border-l-2 transition-colors duration-150 ${
                     active
-                      ? 'text-mint-400 font-medium bg-mint-400/5'
-                      : 'text-white/65 hover:text-white/90 hover:bg-white/3'
+                      ? 'text-mint-400 font-medium bg-mint-400/[0.06] border-mint-400'
+                      : 'text-white/70 hover:text-white/95 hover:bg-white/[0.04] border-transparent'
                   }`}
                 >
-                  {ItemIcon && <ItemIcon size={16} className={active ? 'opacity-80' : 'opacity-35'} />}
+                  {ItemIcon && <ItemIcon size={16} className={active ? 'opacity-80' : 'opacity-45'} />}
                   {item.title}
                 </Link>
               );

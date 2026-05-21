@@ -14,8 +14,8 @@ export default function Hero() {
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] gap-12 items-end">
         <div>
           <span className="inline-flex items-center gap-2 font-mono text-[12px] tracking-[0.04em] text-voodu-fg-dim mb-6 py-1 pl-1.5 pr-2.5 border border-voodu-line rounded-full whitespace-nowrap">
-            <span className="w-1.5 h-1.5 rounded-full bg-mint-400 shadow-[0_0_0_4px_rgba(125,249,193,0.22)]" />
-            {VOODU_VERSION} · <code className="font-mono text-voodu-fg ml-1">voodu apply</code>, no git push
+            <img src="icons/loading-64.gif" alt="Voodu icon" className="w-4 h-4" />
+            {VOODU_VERSION} · <code className="font-mono text-voodu-fg ml-2">voodu apply</code>, no git push
           </span>
 
           <h1 className="font-sans font-semibold text-[clamp(40px,7vw,88px)] leading-[0.98] tracking-[-0.035em] mb-6 text-balance text-white">
@@ -68,9 +68,7 @@ function Pill({ children, accent = false }: { children: React.ReactNode; accent?
   return (
     <span
       className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-mono text-[11px] whitespace-nowrap border ${
-        accent
-          ? 'text-mint-400 border-mint-400/50 bg-mint-400/10'
-          : 'text-voodu-fg-dim border-voodu-line'
+        accent ? 'text-mint-400 border-mint-400/50 bg-mint-400/10' : 'text-voodu-fg-dim border-voodu-line'
       }`}
     >
       {children}
