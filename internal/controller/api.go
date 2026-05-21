@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/paths"
@@ -1385,10 +1386,140 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 		pods = filtered
 	}
 
+	// Enumerate degraded resources (pod-bearing kinds with a
+	// persisted LastReconcileError) so operators see "deployment
+	// exists in etcd but didn't come up" alongside the normal
+	// running pods. Honours the same filters as the pods list so
+	// `vd get pods -s fsw` scopes both halves of the response.
+	degraded := a.collectDegradedResources(r.Context(), pods, wantKind, wantScope, wantName)
+
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data:   map[string]any{"pods": pods},
+		Data:   map[string]any{"pods": pods, "degraded": degraded},
 	})
+}
+
+// collectDegradedResources walks the store for kinds whose status
+// blob carries LastReconcileError (deployment, statefulset today)
+// and returns those with a non-empty error. The pods list is passed
+// in so the caller can correlate running replicas to degraded
+// resources — used by the CLI renderer to show "1/3 replicas
+// running, reconcile error: ..." rather than the binary
+// "running OR degraded" view.
+//
+// Filters mirror handlePods's so `vd get pods -k deployment -s fsw`
+// narrows both lists consistently. wantKind == "" matches all
+// pod-bearing kinds.
+//
+// Best-effort: store enumeration / status read failures log to the
+// global logger but don't fail the /pods response — the pods list
+// is the primary deliverable; degraded is supplemental.
+func (a *API) collectDegradedResources(ctx context.Context, pods []Pod, wantKind, wantScope, wantName string) []DegradedResource {
+	kinds := []Kind{KindDeployment, KindStatefulset}
+
+	// Honor the kind filter if set — skip kinds that don't match.
+	if wantKind != "" {
+		filtered := kinds[:0]
+
+		for _, k := range kinds {
+			if string(k) == wantKind {
+				filtered = append(filtered, k)
+			}
+		}
+
+		kinds = filtered
+	}
+
+	var out []DegradedResource
+
+	for _, kind := range kinds {
+		// ListByScope("") returns nothing because the etcd prefix
+		// has a trailing slash that requires a non-empty scope
+		// segment. Cross-scope enumeration uses List(kind) instead,
+		// then we filter post-hoc when wantScope is set.
+		var (
+			mans []*Manifest
+			err  error
+		)
+
+		if wantScope == "" {
+			mans, err = a.Store.List(ctx, kind)
+		} else {
+			mans, err = a.Store.ListByScope(ctx, kind, wantScope)
+		}
+
+		if err != nil {
+			log.Printf("collectDegradedResources: list %s scope=%q: %v", kind, wantScope, err)
+			continue
+		}
+
+		for _, m := range mans {
+			if wantName != "" && m.Name != wantName {
+				continue
+			}
+
+			app := AppID(m.Scope, m.Name)
+
+			raw, err := a.Store.GetStatus(ctx, kind, app)
+			if err != nil || raw == nil {
+				continue
+			}
+
+			var st DeploymentStatus
+
+			if err := json.Unmarshal(raw, &st); err != nil {
+				continue
+			}
+
+			if st.LastReconcileError == "" {
+				continue
+			}
+
+			out = append(out, DegradedResource{
+				Kind:       string(kind),
+				Scope:      m.Scope,
+				Name:       m.Name,
+				Reason:     st.LastReconcileError,
+				At:         st.LastReconcileAt.UTC().Format(time.RFC3339),
+				ReplicaIDs: collectReplicaIDsForResource(pods, string(kind), m.Scope, m.Name),
+			})
+		}
+	}
+
+	// Sort for stable output regardless of store iteration order —
+	// the renderer's row alignment looks janky otherwise across
+	// consecutive `vd get pods` calls.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+
+		return out[i].Name < out[j].Name
+	})
+
+	return out
+}
+
+// collectReplicaIDsForResource scans the pods list for any
+// containers belonging to (kind, scope, name) and returns their
+// ReplicaIDs. Used in DegradedResource so the operator sees
+// "1/3 replicas running with reconcile error" (the running 1 may
+// still be on an old release that doesn't know about the bad
+// reconcile).
+func collectReplicaIDsForResource(pods []Pod, kind, scope, name string) []string {
+	var ids []string
+
+	for _, p := range pods {
+		if p.Kind == kind && p.Scope == scope && p.ResourceName == name && p.ReplicaID != "" {
+			ids = append(ids, p.ReplicaID)
+		}
+	}
+
+	return ids
 }
 
 // handlePodDescribe returns the rich `docker inspect` view of one

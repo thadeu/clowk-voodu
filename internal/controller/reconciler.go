@@ -20,6 +20,21 @@ type Reconciler struct {
 	// (event still logged). Tests plug in handlers to assert behaviour.
 	Handlers map[Kind]HandlerFunc
 
+	// OnReconcile fires after every TERMINAL handle attempt — success,
+	// non-transient failure, or transient-retries-exhausted. Transient
+	// failures with retry budget remaining do NOT fire (the next attempt
+	// will, or success will clear).
+	//
+	// Production wiring in server.go uses this to persist
+	// LastReconcileError + LastReconcileAt on the per-kind status blob,
+	// so `vd describe` and `vd apply`'s post-apply polling can surface
+	// reconcile failures without operators having to dig through journald.
+	// Nil-tolerant (tests skip it).
+	//
+	// Called synchronously from the handle goroutine — keep it cheap or
+	// fan-out internally; long work here back-pressures the watch stream.
+	OnReconcile func(ev WatchEvent, err error)
+
 	// now/sleep are test seams — the retry goroutine uses sleep so
 	// tests can advance time deterministically. Defaults to time.Sleep.
 	sleep func(time.Duration)
@@ -98,22 +113,46 @@ func (r *Reconciler) handle(ctx context.Context, ev WatchEvent, attempt int) {
 
 	err := h(ctx, ev)
 	if err == nil {
+		r.fireOnReconcile(ev, nil)
+
 		return
 	}
 
 	if !isTransient(err) {
 		r.Logger.Printf("reconcile %s/%s failed: %v", ev.Kind, ev.Name, err)
+		r.fireOnReconcile(ev, err)
+
 		return
 	}
 
 	if attempt >= maxRetryAttempts {
 		r.Logger.Printf("reconcile %s/%s gave up after %d attempts: %v", ev.Kind, ev.Name, attempt, err)
+		r.fireOnReconcile(ev, err)
+
 		return
 	}
 
 	r.Logger.Printf("reconcile %s/%s transient (%v), retry %d/%d", ev.Kind, ev.Name, err, attempt+1, maxRetryAttempts)
 
 	r.scheduleRetry(ctx, ev, attempt+1)
+}
+
+// fireOnReconcile is the nil-safe dispatch into the operator-supplied
+// callback. Wraps the existence check so the three call sites in
+// handle() stay terse. Recovers from panics so a buggy callback
+// doesn't crash the reconciler loop.
+func (r *Reconciler) fireOnReconcile(ev WatchEvent, err error) {
+	if r.OnReconcile == nil {
+		return
+	}
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			r.Logger.Printf("OnReconcile panic for %s/%s: %v", ev.Kind, ev.Name, rec)
+		}
+	}()
+
+	r.OnReconcile(ev, err)
 }
 
 // scheduleRetry sleeps the backoff for `attempt`, then re-reads the

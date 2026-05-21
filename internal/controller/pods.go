@@ -57,6 +57,25 @@ type PodsLister interface {
 	ListPods() ([]Pod, error)
 }
 
+// DegradedResource is a deployment / statefulset whose latest
+// reconcile attempt failed. Surfaced alongside the pods list so
+// operators see "this resource exists in the manifest but isn't
+// running because of X" without having to cross-reference describe
+// for every kind they applied.
+//
+// Populated server-side from DeploymentStatus.LastReconcileError —
+// only kinds that share DeploymentStatus participate today
+// (deployment, statefulset). When the error clears on the next
+// successful reconcile, the entry drops from the next /pods response.
+type DegradedResource struct {
+	Kind       string `json:"kind"`
+	Scope      string `json:"scope,omitempty"`
+	Name       string `json:"name"`
+	Reason     string `json:"reason"`
+	At         string `json:"at,omitempty"`         // RFC3339 timestamp of the reconcile attempt
+	ReplicaIDs []string `json:"replica_ids,omitempty"` // running replicas of this resource (may be empty)
+}
+
 // DockerPodsLister is the production implementation. Lists every
 // container labeled createdby=voodu, then re-inspects each one to
 // recover its structured identity. Pre-M0 containers (umbrella label

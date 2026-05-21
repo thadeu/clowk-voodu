@@ -340,6 +340,14 @@ func (s *Server) Start(ctx context.Context) error {
 			KindAsset:       assetHandler.Handle,
 			KindRegistry:    registryHandler.Handle,
 		},
+		// Persist reconcile errors on the per-kind status blob so
+		// `vd describe` shows WHY a deployment is stuck (and
+		// `vd apply`'s post-apply polling can surface it). Only
+		// kinds that carry a DeploymentStatus blob participate;
+		// for other kinds the call is a no-op.
+		OnReconcile: func(ev WatchEvent, reconcileErr error) {
+			recordReconcileResult(context.Background(), store, ev, reconcileErr, s.cfg.Logger)
+		},
 	}
 
 	// Wall-clock dispatcher. Lives on its own goroutine so a slow tick

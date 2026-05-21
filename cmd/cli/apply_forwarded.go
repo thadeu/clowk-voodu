@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 
@@ -238,6 +239,13 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	nd := newEventRenderer(os.Stdout, flags.verbose)
 	resultFilter := newNegotiatingWriter(legacy, nd)
 
+	// Capture apply-start wall-clock BEFORE the SSH forward so the
+	// post-apply reconcile poll can distinguish fresh reconciler
+	// results from stale LastReconcileAt timestamps left by previous
+	// applies. Reconciler updates At on EVERY attempt (success or
+	// fail); we only treat At > applyStartedAt as fire-worthy.
+	applyStartedAt := time.Now().UTC()
+
 	code, err = remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    bytes.NewReader(body),
@@ -270,6 +278,16 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 
 			fmt.Fprintf(os.Stdout, "%s apply complete (%d %s)\n",
 				checkFinal(), total, word)
+		}
+
+		// Post-apply reconcile visibility — see apply_poll_reconcile.go.
+		// Polls `vd describe` over the same SSH connection for every
+		// pod-bearing applied resource, surfaces reconciler errors
+		// that would otherwise live only in journald. Best-effort:
+		// any failure path silently degrades to no warning. Skipped
+		// for verbose / non-TTY (same posture as the aurora terminus).
+		if warnings := pollReconcileErrors(info, identity, plan.Data.Applied, applyStartedAt); len(warnings) > 0 {
+			renderReconcileWarnings(os.Stdout, warnings)
 		}
 	}
 

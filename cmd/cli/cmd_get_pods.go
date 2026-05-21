@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -56,10 +57,15 @@ still needs a re-apply to migrate to structured labels.`,
 // podsResponse mirrors the /pods envelope. Kept local so the CLI
 // only depends on the Pod struct's wire shape, not on internal
 // controller types beyond that.
+//
+// Degraded surfaces deployments / statefulsets with persisted
+// reconcile errors — populated server-side from LastReconcileError
+// on the status blob. May be nil/empty in the happy path.
 type podsResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Pods []controller.Pod `json:"pods"`
+		Pods     []controller.Pod              `json:"pods"`
+		Degraded []controller.DegradedResource `json:"degraded,omitempty"`
 	} `json:"data"`
 	Error string `json:"error,omitempty"`
 }
@@ -114,7 +120,74 @@ func runGetPods(cmd *cobra.Command, f getPodsFlags) error {
 		return yaml.NewEncoder(os.Stdout).Encode(env.Data)
 	}
 
-	return renderPodsTable(os.Stdout, env.Data.Pods)
+	if err := renderPodsTable(os.Stdout, env.Data.Pods); err != nil {
+		return err
+	}
+
+	renderDegradedSection(os.Stdout, env.Data.Degraded)
+
+	return nil
+}
+
+// renderDegradedSection prints the "DEGRADED" block under the pods
+// table when the controller reports deployments / statefulsets with
+// reconcile errors. Skipped when the slice is empty (the steady
+// state — happy fleet has no degraded section, keeping the output
+// quiet).
+//
+// Shape:
+//
+//	=== DEGRADED (1) ===
+//	deployment/fsw/adapter   1/3 replicas   12s ago
+//	  reconcile error: env_from [fsw/shared]: no env files resolved
+//	  Hint: vd describe deployment fsw/adapter
+//
+// The replica count is "running/desired"-style based on how many
+// pods we observed matching the resource. Zero running pods reads
+// as "0/?" — desired isn't surfaced here (the operator has it in
+// the manifest; we don't want to fan out a describe per row just
+// to render this).
+func renderDegradedSection(w io.Writer, degraded []controller.DegradedResource) {
+	if len(degraded) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "=== DEGRADED (%d) ===\n", len(degraded))
+
+	for _, d := range degraded {
+		ref := d.Kind + "/" + d.Scope + "/" + d.Name
+		if d.Scope == "" {
+			ref = d.Kind + "/" + d.Name
+		}
+
+		replicasNote := fmt.Sprintf("%d running", len(d.ReplicaIDs))
+
+		atRel := formatDegradedAt(d.At)
+
+		fmt.Fprintf(w, "%s %s   %s\n",
+			colorize(cRose, ref),
+			dim(replicasNote),
+			dim(atRel))
+		fmt.Fprintf(w, "  %s\n", colorize(cRose, "reconcile error: "+d.Reason))
+		fmt.Fprintf(w, "  %s vd describe %s %s/%s\n", dim("Hint:"), d.Kind, d.Scope, d.Name)
+	}
+}
+
+// formatDegradedAt converts the RFC3339 At timestamp to a human
+// relative ("12s ago"). Empty input → empty output so the caller's
+// format string degrades gracefully on the rare zero-value path.
+func formatDegradedAt(rfc3339 string) string {
+	if rfc3339 == "" {
+		return ""
+	}
+
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return ""
+	}
+
+	return formatRelativeTimeShort(t)
 }
 
 // renderPodsTable groups pods by voodu.role label and prints each

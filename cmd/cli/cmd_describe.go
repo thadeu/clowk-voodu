@@ -394,6 +394,13 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage, pods []controlle
 	fmt.Fprintf(w, "  image:     %s\n", dashIfEmpty(st.Image))
 	fmt.Fprintf(w, "  spec_hash: %s\n", dashIfEmpty(st.SpecHash))
 
+	// Surface the reconciler's last outcome — the bridge between
+	// "I applied this and nothing happened" and the journald error
+	// that explained why. Rendered first among the dynamic blocks
+	// so it's the first thing operators see when scanning the
+	// describe output for a stuck deployment.
+	renderReconcileInline(w, st)
+
 	if len(st.Releases) > 0 {
 		renderReleaseSummaryInline(w, st.Releases, pods)
 	}
@@ -404,6 +411,57 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage, pods []controlle
 
 	if len(st.InitFailures) > 0 {
 		renderInitFailuresInline(w, st.InitFailures)
+	}
+}
+
+// renderReconcileInline surfaces LastReconcileError + LastReconcileAt
+// on the describe output. Three states:
+//
+//   - Healthy (no error, recent at): omit entirely. Quiet success
+//     beats reassurance noise on every describe.
+//   - Failed (error set): show in rose-dim with a relative timestamp
+//     so operators see "5m ago" not a raw RFC3339. Errors typically
+//     point at fixable HCL or missing dependencies; surfacing the
+//     reason inline lets the operator act without running journalctl.
+//   - Never reconciled (no At): omit. The deployment hasn't been
+//     processed by the reconciler yet; transient first-apply state.
+//
+// Lives separately from renderReadinessInline / renderInitFailures
+// because the failure semantic is the orthogonal "reconciler couldn't
+// even act" tier — distinct from "probes say a replica is unhealthy"
+// (readiness) and "an init container blew up" (init failure).
+func renderReconcileInline(w io.Writer, st controller.DeploymentStatus) {
+	if st.LastReconcileError == "" {
+		return
+	}
+
+	rel := formatRelativeTime(st.LastReconcileAt)
+
+	fmt.Fprintf(w, "\n  %s reconcile error %s\n", colorize(cRose, "✗"), dim(rel))
+	fmt.Fprintf(w, "    %s\n", colorize(cRose, st.LastReconcileError))
+}
+
+// formatRelativeTime returns "(5m ago)" / "(just now)" / "(2h ago)"
+// shapes. Empty string when t is the zero value — caller treats
+// that as "no recent activity" and omits the line entirely.
+func formatRelativeTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+
+	d := time.Since(t).Round(time.Second)
+
+	switch {
+	case d < 10*time.Second:
+		return "(just now)"
+	case d < time.Minute:
+		return fmt.Sprintf("(%ds ago)", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("(%dm ago)", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("(%dh ago)", int(d.Hours()))
+	default:
+		return fmt.Sprintf("(%dd ago)", int(d.Hours()/24))
 	}
 }
 

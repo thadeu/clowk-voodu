@@ -1876,6 +1876,23 @@ type DeploymentStatus struct {
 	// LRU-capped at maxReplicaReadiness — a chronically broken
 	// fleet shouldn't bloat etcd.
 	ReplicaReadiness map[string]ReplicaReadinessStatus `json:"replica_readiness,omitempty"`
+
+	// LastReconcileError surfaces the most recent reconciler failure
+	// so `vd describe` (and the post-apply polling in `vd apply`)
+	// can show operators WHY a deployment isn't progressing. Cleared
+	// on the next successful reconcile. Empty = healthy or never
+	// reconciled (use LastReconcileAt to distinguish).
+	//
+	// The reconciler logs the same message to journald; this field
+	// makes it queryable without journal access — the gap the
+	// env_from-bucket-not-materialised bug exposed.
+	LastReconcileError string `json:"last_reconcile_error,omitempty"`
+
+	// LastReconcileAt is the wall-clock of the most recent reconcile
+	// attempt — success OR failure. RFC3339-shaped via JSON. Used by
+	// `vd apply`'s post-apply polling to detect "a reconcile event
+	// fired since I submitted" without depending on log timing.
+	LastReconcileAt time.Time `json:"last_reconcile_at,omitempty"`
 }
 
 // maxInitFailures caps the number of init-failure records retained

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"go.voodu.clowk.in/internal/docker"
 )
@@ -480,5 +481,197 @@ func TestSortPodsScopedFirst(t *testing.T) {
 
 	if pods[4].Name != "legacy-1" {
 		t.Errorf("pods[4]=%q want legacy-1 (legacy last)", pods[4].Name)
+	}
+}
+
+// TestPods_DegradedSurfacesReconcileError pins Phase C: a deployment
+// whose status carries LastReconcileError shows up in the /pods
+// response's `degraded` array, even when zero containers exist for
+// it. This is the operator-facing fix for "I applied this and
+// nothing happened" — without the degraded surface, `vd get pods`
+// would return an empty list and the error would only be visible
+// via journald or `vd describe`.
+func TestPods_DegradedSurfacesReconcileError(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	// Pre-populate a deployment manifest + status with a reconcile
+	// error. No matching docker container exists (default
+	// fakePodsLister returns nil pods).
+	ctx := t.Context()
+
+	mani := &Manifest{
+		Kind:  KindDeployment,
+		Scope: "fsw",
+		Name:  "adapter",
+		Spec:  json.RawMessage(`{"image":"adapter:1"}`),
+	}
+
+	if _, err := store.Put(ctx, mani); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	st := DeploymentStatus{
+		LastReconcileError: "env_from [fsw/shared]: no env files resolved",
+		LastReconcileAt:    time.Now().UTC(),
+	}
+
+	statusBlob, _ := json.Marshal(st)
+	if err := store.PutStatus(ctx, KindDeployment, AppID("fsw", "adapter"), statusBlob); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+
+	api.Pods = &fakePodsLister{} // no pods
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var env struct {
+		Status string `json:"status"`
+		Data   struct {
+			Pods     []Pod              `json:"pods"`
+			Degraded []DegradedResource `json:"degraded"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(env.Data.Pods) != 0 {
+		t.Errorf("pods: got %d, want 0 (no containers seeded)", len(env.Data.Pods))
+	}
+
+	if len(env.Data.Degraded) != 1 {
+		t.Fatalf("degraded: got %d entries, want 1", len(env.Data.Degraded))
+	}
+
+	d := env.Data.Degraded[0]
+
+	if d.Kind != "deployment" || d.Scope != "fsw" || d.Name != "adapter" {
+		t.Errorf("degraded identity: kind=%q scope=%q name=%q", d.Kind, d.Scope, d.Name)
+	}
+
+	if !strings.Contains(d.Reason, "env_from") {
+		t.Errorf("degraded reason missing env_from context: %q", d.Reason)
+	}
+
+	if d.At == "" {
+		t.Error("degraded At should be set from LastReconcileAt")
+	}
+}
+
+// TestPods_DegradedExcludesClearedErrors pins the corollary: a
+// deployment whose LastReconcileError has been cleared (the next
+// reconcile after the operator's fix landed) does NOT appear in the
+// degraded list. The CLI's empty-list path keeps `vd get pods` clean
+// when everything is healthy.
+func TestPods_DegradedExcludesClearedErrors(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	ctx := t.Context()
+
+	mani := &Manifest{
+		Kind:  KindDeployment,
+		Scope: "fsw",
+		Name:  "adapter",
+		Spec:  json.RawMessage(`{"image":"adapter:1"}`),
+	}
+	_, _ = store.Put(ctx, mani)
+
+	// Cleared error — empty string indicates a successful reconcile
+	// erased the previous failure. LastReconcileAt still set so we
+	// can confirm the timestamp alone doesn't trigger a degraded
+	// entry — only a non-empty Error does.
+	st := DeploymentStatus{
+		LastReconcileError: "",
+		LastReconcileAt:    time.Now().UTC(),
+	}
+
+	statusBlob, _ := json.Marshal(st)
+	_ = store.PutStatus(ctx, KindDeployment, AppID("fsw", "adapter"), statusBlob)
+
+	api.Pods = &fakePodsLister{}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, _ := http.Get(ts.URL + "/pods")
+	defer resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Degraded []DegradedResource `json:"degraded"`
+		} `json:"data"`
+	}
+
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+
+	if len(env.Data.Degraded) != 0 {
+		t.Errorf("cleared LastReconcileError should not surface in degraded, got %d entries", len(env.Data.Degraded))
+	}
+}
+
+// TestPods_DegradedReportsRunningReplicas pins the count line on
+// the degraded entry: when SOME replicas are running but the
+// reconciler is reporting an error (e.g. autoscale up failed
+// because env_from broke after some replicas were already up), the
+// CLI renderer needs `ReplicaIDs` so it can show "2 running" next
+// to the error. Without this, operators would think the deployment
+// is fully down.
+func TestPods_DegradedReportsRunningReplicas(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	ctx := t.Context()
+
+	_, _ = store.Put(ctx, &Manifest{
+		Kind: KindDeployment, Scope: "fsw", Name: "adapter",
+		Spec: json.RawMessage(`{"image":"adapter:1"}`),
+	})
+
+	st := DeploymentStatus{
+		LastReconcileError: "scale up: env_from missing",
+		LastReconcileAt:    time.Now().UTC(),
+	}
+
+	blob, _ := json.Marshal(st)
+	_ = store.PutStatus(ctx, KindDeployment, AppID("fsw", "adapter"), blob)
+
+	// Two replicas STILL running despite the reconcile error —
+	// reconcile error scenarios often leave some replicas up.
+	api.Pods = &fakePodsLister{
+		pods: []Pod{
+			{Name: "fsw-adapter.a1", Kind: "deployment", Scope: "fsw", ResourceName: "adapter", ReplicaID: "a1"},
+			{Name: "fsw-adapter.b2", Kind: "deployment", Scope: "fsw", ResourceName: "adapter", ReplicaID: "b2"},
+		},
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, _ := http.Get(ts.URL + "/pods")
+	defer resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Degraded []DegradedResource `json:"degraded"`
+		} `json:"data"`
+	}
+
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+
+	if len(env.Data.Degraded) != 1 {
+		t.Fatalf("expected 1 degraded entry, got %d", len(env.Data.Degraded))
+	}
+
+	d := env.Data.Degraded[0]
+
+	if len(d.ReplicaIDs) != 2 {
+		t.Errorf("ReplicaIDs: got %d (%v), want 2 (a1, b2)", len(d.ReplicaIDs), d.ReplicaIDs)
 	}
 }
