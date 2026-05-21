@@ -16,13 +16,22 @@ import (
 
 // localOnlyCommands never forward over SSH — they manage client-side
 // state (git remotes, --version) or are purely informational.
+//
+// `self-update` belongs here too: it's a CLI-driven orchestrator that
+// internally decides when to SSH (for the server upgrade leg) and when
+// to stay local (for the client upgrade leg). Forwarding the bare
+// `self-update` argv to the remote would hit the OLD binary on the
+// server — which doesn't know about the command at all, surfacing the
+// confusing "unknown command 'self-update'" error from the remote
+// dispatcher even though help shows it locally.
 var localOnlyCommands = map[string]bool{
-	"version":   true,
-	"help":      true,
-	"--help":    true,
-	"-h":        true,
-	"--version": true,
-	"remote":    true,
+	"version":     true,
+	"help":        true,
+	"--help":      true,
+	"-h":          true,
+	"--version":   true,
+	"remote":      true,
+	"self-update": true,
 }
 
 // maybeForwardRemote is the M5.5 dispatch hook. In client mode, if the

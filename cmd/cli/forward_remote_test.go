@@ -14,6 +14,13 @@ func TestIsLocalOnly(t *testing.T) {
 		{"version", []string{"version"}, true},
 		{"help flag", []string{"--help"}, true},
 		{"remote subtree", []string{"remote", "add", "api", "u@h:api"}, true},
+		// self-update orchestrates SSH internally; the root dispatch
+		// itself MUST stay local — otherwise the server's old binary
+		// (which is what self-update is supposed to fix!) fails with
+		// "unknown command".
+		{"self-update", []string{"self-update"}, true},
+		{"self-update with flags", []string{"self-update", "--yes"}, true},
+		{"self-update with version pin", []string{"self-update", "--version=v0.10.0"}, true},
 
 		{"apply forwards", []string{"apply", "-f", "stack.hcl"}, false},
 		{"diff forwards", []string{"diff", "-f", "stack.hcl"}, false},
