@@ -6,7 +6,7 @@ description: Stream context, plan, reconcile.
 ## Synopsis
 
 ```bash
-voodu apply -f voodu.hcl -r prod-1 [flags]
+voodu apply -f voodu -r prod-1 [flags]
 ```
 
 ## What it does
@@ -33,7 +33,7 @@ voodu apply -f voodu.hcl -r prod-1 [flags]
 
 ```bash
 # Standard apply
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 
 # Multi-file
 voodu apply -f infra/web.voodu -f infra/redis.voodu -r prod-1

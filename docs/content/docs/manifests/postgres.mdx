@@ -157,7 +157,7 @@ deployment "clowk-lp" "web" {
 ```
 
 ```bash
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 voodu pg:link clowk-lp/db clowk-lp/web
 # clowk-lp/web bucket now has DATABASE_URL pointing at the primary
 ```

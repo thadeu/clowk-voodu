@@ -17,7 +17,7 @@ const COLOR_CLASS: Record<'add' | 'warn' | 'rm', string> = {
 export default function HeroTerminal() {
   const lines = useMemo<Line[]>(
     () => [
-      { kind: 'cmd', text: 'voodu apply -f voodu.hcl -r prod-1' },
+      { kind: 'cmd', text: 'voodu apply -f voodu -r prod-1' },
       { kind: 'out', text: '→ packing context (1.4 MB)' },
       { kind: 'out', text: '→ streaming over ssh ubuntu@prod-1' },
       { kind: 'out', text: '→ controller: planning ...' },

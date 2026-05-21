@@ -102,7 +102,7 @@ To keep siblings of the same kind around, declare them in the apply (or split yo
 
 ```bash
 # Standard apply — upsert-only, safe for multi-repo / multi-file workflows
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 
 # Explicit opt-in to clean up siblings
 voodu apply -f voodu.hcl --prune -r prod-1

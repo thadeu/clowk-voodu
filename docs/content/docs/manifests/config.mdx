@@ -75,7 +75,7 @@ deployment "prod" "api" {
 
 ```bash
 voodu config prod/shared set SLACK_WEBHOOK_URL=https://hooks.slack.com/...
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 ```
 
 **Precedence on collision:** shell env wins over bucket. So `SLACK_WEBHOOK_URL=https://test ./bin/voodu apply ...` overrides without touching the bucket — handy for testing.

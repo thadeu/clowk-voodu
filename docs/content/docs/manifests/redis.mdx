@@ -173,7 +173,7 @@ deployment "clowk-lp" "web" {
 ```
 
 ```bash
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 voodu redis:link clowk-lp/redis clowk-lp/web
 # web bucket now has REDIS_URL = redis://default:<pwd>@redis.clowk-lp.voodu:6379
 # (shared round-robin alias — there's only one pod, so it points there)

@@ -10,7 +10,7 @@ Voodu is a **Heroku-shaped, Kubernetes-honest** deploy tool you run on your own 
 One HCL file describes the running system. `voodu apply` reconciles it: builds, ships, routes, swaps. No bare repo, no `git push`, no plugin sprawl — apps, ingress with TLS, and stateful services (Postgres, Redis, Mongo) that actually back themselves up.
 
 ```
-voodu apply -f voodu.hcl -r prod-1
+voodu apply -f voodu -r prod-1
 → packing context (1.4 MB)
 → streaming over ssh ubuntu@prod-1
 → controller: planning ...
@@ -61,7 +61,7 @@ redis "clowk-lp" "redis-ha" {
 
 | Command | Purpose |
 |---|---|
-| `voodu apply -f voodu.hcl -r prod-1` | Stream context, plan, reconcile |
+| `voodu apply -f voodu -r prod-1` | Stream context, plan, reconcile |
 | `voodu diff -f voodu.hcl --detailed-exitcode` | Plan-style dry run (CI gate) |
 | `voodu logs <target> -f` | Tail logs — pod, app, scope |
 | `voodu config set KEY=VALUE -a prod` | Out-of-band env (always wins) |

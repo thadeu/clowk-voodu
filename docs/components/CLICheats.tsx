@@ -11,7 +11,7 @@ const items = [
   },
   {
     label: 'Apply a manifest',
-    cmd: 'voodu apply -f voodu.hcl -r prod-1',
+    cmd: 'voodu apply -f voodu -r prod-1',
     desc: 'Streams context over SSH, reconciles, swaps containers.',
   },
   {
