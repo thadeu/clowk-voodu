@@ -1,3 +1,6 @@
+'use client';
+
+import { Fragment, useState } from 'react';
 import type { ReactNode } from 'react';
 
 const annotations: { tag: string; h: string; body: ReactNode }[] = [
@@ -12,22 +15,22 @@ const annotations: { tag: string; h: string; body: ReactNode }[] = [
     ),
   },
   {
-    tag: 'Out of the box',
-    h: 'TLS, health, ingress — no plugins',
+    tag: "Provision, don't orchestrate",
+    h: 'Databases ship as first-class kinds',
     body: (
       <>
-        Add <code>tls{'{}'}</code> and Voodu cuts a Let&apos;s Encrypt cert via Caddy. Add <code>host</code> and routing
-        reconciles automatically. No Helm, no sidecars, no YAML blast radius.
+        Postgres with replicas + nightly backup, Redis with Sentinel — declared in the same file as your app. Mongo,
+        RabbitMQ, Kafka land via the plugin model; <code>/opt/voodu/plugins</code> is where new kinds appear.
       </>
     ),
   },
   {
-    tag: 'Stateful, first-class',
-    h: 'Postgres, Mongo, Redis declared like apps',
+    tag: 'Out of the box',
+    h: 'TLS, health, ingress — no chart',
     body: (
       <>
-        HA Redis with a sentinel cluster is six lines. Postgres and Mongo plugins ship backup, replicas, and
-        test-restore — the parts every PaaS leaves to you.
+        Add <code>tls{'{}'}</code> and voodu cuts a Let&apos;s Encrypt cert via Caddy. <code>host</code> wires ingress.
+        No Helm, no sidecars, no YAML blast radius.
       </>
     ),
   },
@@ -36,15 +39,120 @@ const annotations: { tag: string; h: string; body: ReactNode }[] = [
     h: 'No accidental deletions',
     body: (
       <>
-        <code>apply</code> only creates and updates. Resources missing from the file stay put. Want to clean up?{' '}
-        <code>--prune</code> is the explicit opt-in, scoped per <code>(scope, kind)</code> so siblings of other types
-        aren&apos;t touched.
+        <code>apply</code> only creates and updates. Resources missing from the file stay put. <code>--prune</code>{' '}
+        is the explicit opt-in, scoped per <code>(scope, kind)</code> so siblings of other types aren&apos;t touched.
       </>
     ),
   },
 ];
 
+type Tab = { id: string; label: string; code: string };
+
+const tabs: Tab[] = [
+  {
+    id: 'ha',
+    label: 'HA stack',
+    code: `// Production stack: HA postgres + HA redis behind the app.
+app "myorg" "web" {
+  image    = "ghcr.io/myorg/web:latest"
+  replicas = 3
+  host     = "app.example.com"
+
+  env = {
+    DATABASE_URL = "postgres://myorg/db"
+    REDIS_URL    = "redis://myorg/cache"
+  }
+  tls { email = "ops@example.com" }
+}
+
+postgres "myorg" "db" {
+  image    = "postgres:16"
+  replicas = 3            // 1 primary + 2 standbys
+  database = "myapp"
+}
+
+redis "myorg" "cache" {
+  replicas = 3
+}
+
+redis "myorg" "cache-ha" {
+  sentinel { monitor = "myorg/cache" }
+}`,
+  },
+  {
+    id: 'db',
+    label: 'App + Postgres',
+    code: `// Web app backed by managed Postgres with streaming replication.
+app "myorg" "web" {
+  image    = "ghcr.io/myorg/web:latest"
+  replicas = 3
+  host     = "app.example.com"
+
+  env = {
+    DATABASE_URL = "postgres://myorg/db"
+  }
+  tls { email = "ops@example.com" }
+}
+
+postgres "myorg" "db" {
+  image    = "postgres:16"
+  replicas = 2            // 1 primary + 1 standby
+  database = "myapp"
+
+  pg_config = {
+    max_connections = 200
+    shared_buffers  = "1GB"
+  }
+}`,
+  },
+  {
+    id: 'web',
+    label: 'Web app',
+    code: `// Ship a web app with TLS + 3 replicas behind a load balancer.
+app "myorg" "web" {
+  image    = "ghcr.io/myorg/web:latest"
+  replicas = 3
+  host     = "app.example.com"
+
+  env = {
+    PORT     = "8080"
+    NODE_ENV = "production"
+  }
+
+  health_check = "/healthz"
+  tls { email = "ops@example.com" }
+}`,
+  },
+  {
+    id: 'jobs',
+    label: 'Jobs',
+    code: `// On-deploy migrations + nightly Postgres backup to S3.
+// Backups live as cronjobs, not a magic block on the postgres resource.
+job "myorg" "migrate" {
+  image    = "ghcr.io/myorg/web:latest"
+  command  = ["bin/rails", "db:migrate"]
+  env_from = ["myorg/shared"]
+  timeout  = "5m"
+}
+
+cronjob "myorg" "pg-backup" {
+  schedule = "0 3 * * *"
+  timezone = "America/Sao_Paulo"
+
+  image    = "amazon/aws-cli:latest"
+  command  = ["s3", "sync", "/backups/", "s3://my-bucket/myapp/"]
+
+  env_from = ["myorg/shared"]
+}`,
+  },
+];
+
 export default function HCLBlock() {
+  const [activeId, setActiveId] = useState(tabs[0].id);
+
+  const active = tabs.find(t => t.id === activeId) ?? tabs[0];
+  const lineCount = active.code.split('\n').length;
+
   return (
     <section id="hcl" className="py-24 border-t border-voodu-line">
       <div className="max-w-[1180px] mx-auto px-5 sm:px-8 md:px-10 lg:px-14">
@@ -53,93 +161,45 @@ export default function HCLBlock() {
           One file describes the running system.
         </h2>
         <p className="text-voodu-fg-dim max-w-[60ch] text-[17px] mb-10">
-          HCL out-of-the-box. No YAML to coerce, no Compose tricks, no chart-of-charts. Apps, ingress, and stateful
-          services share the same shape — and the same blast radius.
+          HCL out-of-the-box. No YAML to coerce, no Compose tricks, no chart-of-charts. Apps, ingress, databases,
+          jobs — every kind shares the same shape and the same blast radius.
         </p>
 
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] gap-8 items-stretch">
-          <div className="bg-voodu-code border border-voodu-line-strong rounded-2xl overflow-hidden font-mono text-[13px] leading-[1.65]">
-            <div className="flex items-center justify-between gap-3 px-3.5 py-2.5 border-b border-voodu-line text-voodu-fg-mute text-[11px] font-mono whitespace-nowrap">
-              <span className="text-voodu-fg whitespace-nowrap">voodu.hcl</span>
-              <span className="whitespace-nowrap">HCL · 22 lines</span>
+          <div className="bg-voodu-code border border-voodu-line-strong rounded-2xl overflow-hidden font-mono text-[13px] leading-[1.65] flex flex-col">
+            <div
+              role="tablist"
+              aria-label="Manifest shapes"
+              className="flex items-center gap-1 px-2 pt-2 border-b border-voodu-line overflow-x-auto"
+            >
+              {tabs.map(t => {
+                const isActive = t.id === activeId;
+
+                return (
+                  <button
+                    key={t.id}
+                    role="tab"
+                    aria-selected={isActive}
+                    onClick={() => setActiveId(t.id)}
+                    className={
+                      'px-3 py-1.5 rounded-t-lg text-[12px] font-mono tracking-[0.02em] whitespace-nowrap transition-colors ' +
+                      (isActive
+                        ? 'text-mint-400 bg-voodu-bg-elev border border-voodu-line border-b-voodu-code -mb-px'
+                        : 'text-voodu-fg-mute hover:text-voodu-fg')
+                    }
+                  >
+                    {t.label}
+                  </button>
+                );
+              })}
+
+              <span className="ml-auto pr-2 text-voodu-fg-mute text-[11px] whitespace-nowrap">
+                voodu.hcl · HCL · {lineCount} lines
+              </span>
             </div>
+
             <pre className="m-0 px-5 py-4.5 text-voodu-fg overflow-x-auto whitespace-pre">
-              <code>
-                <span className="text-tk-com italic">
-                  {`// Ship a web app with TLS + 3 replicas behind a load balancer.\n`}
-                </span>
-                <span className="text-tk-block">app</span> <span className="text-tk-str">&quot;myapp&quot;</span>{' '}
-                <span className="text-tk-str">&quot;web&quot;</span> <span className="text-tk-pun">{'{\n'}</span>
-                {'  '}
-                <span className="text-tk-key">image</span>
-                {'    = '}
-                <span className="text-tk-str">&quot;ghcr.io/myorg/myapp:latest&quot;</span>
-                {'\n'}
-                {'  '}
-                <span className="text-tk-key">replicas</span>
-                {' = '}
-                <span className="text-tk-num">3</span>
-                {'\n\n'}
-                {'  '}
-                <span className="text-tk-key">env</span>
-                {' = '}
-                <span className="text-tk-pun">{'{\n'}</span>
-                {'    '}
-                <span className="text-tk-key">PORT</span>
-                {'     = '}
-                <span className="text-tk-str">&quot;8080&quot;</span>
-                {'\n'}
-                {'    '}
-                <span className="text-tk-key">NODE_ENV</span>
-                {' = '}
-                <span className="text-tk-str">&quot;production&quot;</span>
-                {'\n'}
-                {'  '}
-                <span className="text-tk-pun">{'}\n\n'}</span>
-                {'  '}
-                <span className="text-tk-key">health_check</span>
-                {' = '}
-                <span className="text-tk-str">&quot;/healthz&quot;</span>
-                {'\n'}
-                {'  '}
-                <span className="text-tk-key">host</span>
-                {'         = '}
-                <span className="text-tk-str">&quot;myapp.example.com&quot;</span>
-                {'\n\n'}
-                {'  '}
-                <span className="text-tk-block">tls</span> <span className="text-tk-pun">{'{\n'}</span>
-                {'    '}
-                <span className="text-tk-key">email</span>
-                {' = '}
-                <span className="text-tk-str">&quot;ops@example.com&quot;</span>
-                {'\n'}
-                {'  '}
-                <span className="text-tk-pun">{'}\n'}</span>
-                <span className="text-tk-pun">{'}\n\n'}</span>
-                <span className="text-tk-com italic">
-                  {`// HA Redis: primary + sentinel cluster, declared, not orchestrated.\n`}
-                </span>
-                <span className="text-tk-block">redis</span> <span className="text-tk-str">&quot;clowk-lp&quot;</span>{' '}
-                <span className="text-tk-str">&quot;redis&quot;</span> <span className="text-tk-pun">{'{\n'}</span>
-                {'  '}
-                <span className="text-tk-key">replicas</span>
-                {' = '}
-                <span className="text-tk-num">3</span>
-                {'\n'}
-                <span className="text-tk-pun">{'}\n\n'}</span>
-                <span className="text-tk-block">redis</span> <span className="text-tk-str">&quot;clowk-lp&quot;</span>{' '}
-                <span className="text-tk-str">&quot;redis-ha&quot;</span> <span className="text-tk-pun">{'{\n'}</span>
-                {'  '}
-                <span className="text-tk-block">sentinel</span> <span className="text-tk-pun">{'{\n'}</span>
-                {'    '}
-                <span className="text-tk-key">monitor</span>
-                {' = '}
-                <span className="text-tk-str">&quot;clowk-lp/redis&quot;</span>
-                {'\n'}
-                {'  '}
-                <span className="text-tk-pun">{'}\n'}</span>
-                <span className="text-tk-pun">{'}'}</span>
-              </code>
+              <code>{highlightHCL(active.code)}</code>
             </pre>
           </div>
 
@@ -158,4 +218,145 @@ export default function HCLBlock() {
       </div>
     </section>
   );
+}
+
+function highlightHCL(code: string): ReactNode {
+  const lines = code.split('\n');
+
+  return lines.map((line, i) => (
+    <Fragment key={i}>
+      {renderLine(line)}
+      {i < lines.length - 1 ? '\n' : ''}
+    </Fragment>
+  ));
+}
+
+function renderLine(line: string): ReactNode {
+  const trimmed = line.trimStart();
+  const indent = line.slice(0, line.length - trimmed.length);
+
+  if (trimmed.startsWith('//')) {
+    return (
+      <>
+        {indent}
+        <span className="text-tk-com italic">{trimmed}</span>
+      </>
+    );
+  }
+
+  if (trimmed === '') return line;
+
+  const commentIdx = findInlineCommentIdx(trimmed);
+
+  if (commentIdx >= 0) {
+    const codePart = trimmed.slice(0, commentIdx);
+    const commentPart = trimmed.slice(commentIdx);
+
+    return (
+      <>
+        {indent}
+        {tokenize(codePart)}
+        <span className="text-tk-com italic">{commentPart}</span>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {indent}
+      {tokenize(trimmed)}
+    </>
+  );
+}
+
+function findInlineCommentIdx(s: string): number {
+  let inString = false;
+
+  for (let i = 0; i < s.length - 1; i++) {
+    if (s[i] === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString && s[i] === '/' && s[i + 1] === '/') return i;
+  }
+
+  return -1;
+}
+
+function tokenize(content: string): ReactNode[] {
+  const tokens: ReactNode[] = [];
+  const firstIdentRole = classifyFirstIdent(content);
+  let firstIdentConsumed = false;
+  let key = 0;
+
+  const re = /\s+|"[^"]*"|\d+(?:\.\d+)?|[{}[\],=]|[A-Za-z_][A-Za-z0-9_]*|./g;
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(content)) !== null) {
+    const tok = match[0];
+
+    if (/^\s+$/.test(tok)) {
+      tokens.push(tok);
+      continue;
+    }
+
+    if (/^"[^"]*"$/.test(tok)) {
+      tokens.push(
+        <span key={key++} className="text-tk-str">
+          {tok}
+        </span>
+      );
+      continue;
+    }
+
+    if (/^\d/.test(tok)) {
+      tokens.push(
+        <span key={key++} className="text-tk-num">
+          {tok}
+        </span>
+      );
+      continue;
+    }
+
+    if (/^[{}[\],=]$/.test(tok)) {
+      tokens.push(
+        <span key={key++} className="text-tk-pun">
+          {tok}
+        </span>
+      );
+      continue;
+    }
+
+    if (/^[A-Za-z_]/.test(tok)) {
+      if (!firstIdentConsumed) {
+        firstIdentConsumed = true;
+        const cls = firstIdentRole === 'block' ? 'text-tk-block' : 'text-tk-key';
+
+        tokens.push(
+          <span key={key++} className={cls}>
+            {tok}
+          </span>
+        );
+
+        continue;
+      }
+    }
+
+    tokens.push(tok);
+  }
+
+  return tokens;
+}
+
+function classifyFirstIdent(content: string): 'block' | 'key' {
+  const m = content.match(/^[a-z_][a-z0-9_]*/);
+
+  if (!m) return 'key';
+
+  const after = content.slice(m[0].length).trimStart();
+
+  if (after.startsWith('"') || after.startsWith('{')) return 'block';
+
+  return 'key';
 }

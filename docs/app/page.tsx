@@ -4,6 +4,7 @@ import Strip from '@/components/Strip';
 import HCLBlock from '@/components/HCLBlock';
 import HowItWorks from '@/components/HowItWorks';
 import CLICheats from '@/components/CLICheats';
+import Lifecycle from '@/components/Lifecycle';
 import Stack from '@/components/Stack';
 import FAQ from '@/components/FAQ';
 import EndCTA from '@/components/EndCTA';
@@ -20,6 +21,7 @@ export default function Home() {
         <HCLBlock />
         <HowItWorks />
         <CLICheats />
+        <Lifecycle />
         <Stack />
         <FAQ />
         <EndCTA />
