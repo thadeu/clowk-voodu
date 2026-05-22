@@ -3,7 +3,12 @@ title: HTTP API
 description: Endpoints, query parameters, payloads.
 ---
 
-The controller listens on TCP `:8686`. One `http.ServeMux`, wrapped in a request-logging middleware. Bodies cap at **1 MiB**. Responses use a consistent envelope:
+The controller exposes **two HTTP listeners**:
+
+- **Orchestration plane** (`127.0.0.1:8686` by default) — the routes documented on this page. Loopback-only; CLI clients reach it via SSH tunnel. No HTTP-level authentication on these routes; the SSH layer is the trust boundary.
+- **Observability plane** (`0.0.0.0:8687` by default, PAT-authenticated) — `/api/pat/v1/*`, consumed by the WebUI. See [Observability API (PAT v1)](/docs/architecture/api-pat-v1).
+
+This page covers the orchestration plane. One `http.ServeMux`, wrapped in a request-logging middleware. Bodies cap at **1 MiB**. Responses use a consistent envelope:
 
 ```json
 {

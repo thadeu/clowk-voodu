@@ -1,0 +1,169 @@
+---
+title: Observability API (PAT v1)
+description: PAT-authenticated HTTP surface consumed by the WebUI and any third-party observability tooling.
+---
+
+The controller ships **two HTTP listeners** — a deliberate separation between the *orchestration plane* and the *observability plane*.
+
+| Plane | Default bind | Auth | Routes | Consumer |
+|---|---|---|---|---|
+| Orchestration | `127.0.0.1:8686` | none (loopback trust) | `/apply`, `/diff`, `/pods`, `/pats`, … | CLI over SSH tunnel |
+| **Observability** | `0.0.0.0:8687` | **PAT (Bearer token)** | `/api/pat/v1/*` | WebUI, third-party tooling |
+
+The PAT plane is the only network-exposable surface. The orchestration plane is loopback-only on a fresh install; operators reach it via the same SSH tunnel `voodu` (the CLI) already uses for `voodu apply`.
+
+## URL versioning
+
+All PAT routes live under `/api/pat/v1/`. The `v1` prefix is **part of the contract** — a future shape change ships as `v2` without breaking existing WebUI deployments. Clients should treat `v1` as a fixed wire format for the lifetime of the WebUI's `v0.*` series.
+
+## Authentication
+
+Every request must include:
+
+```
+Authorization: Bearer pat_<26-char base32>
+```
+
+- Token format: `pat_` prefix + 8-char ID + 18-char secret (base32, ~130 bits entropy).
+- Scheme name is case-insensitive (`bearer`, `BEARER` all accepted).
+- Tokens are minted via the orchestration plane (`vd pat create`) and shown **exactly once** — operators paste them into the WebUI's "Add island" form.
+- The controller stores `sha256(token)` hex, compared in constant time.
+
+### Scopes
+
+| Scope | Grants |
+|---|---|
+| `read` | `GET` endpoints (`/stats`, `/pods`, `/pods/{name}`, `/pods/{name}/logs`) |
+| `actions` | mutation endpoints (currently just `/pods/{name}/restart`) |
+
+A PAT can carry both. Read-only PATs requested by an `actions` endpoint receive `403 Forbidden`. Operators typically mint a single `read,actions` PAT per WebUI island; a `read`-only PAT is appropriate for view-only operator roles or external dashboards.
+
+### Failure modes
+
+| Status | Meaning |
+|---|---|
+| `401 Unauthorized` | Missing / malformed Bearer header, unknown PAT ID, or hash mismatch. Body is `{"status":"error","error":"authentication required"}` — generic to avoid information disclosure (which PAT IDs exist). |
+| `403 Forbidden` | Valid PAT but insufficient scope for the endpoint. Body specifies the missing scope: `insufficient scope (requires "actions")`. |
+| `429 Too Many Requests` | Action-endpoint rate limit exceeded for *this* PAT. Read endpoints are not rate-limited. |
+
+## Rate limiting
+
+Action endpoints (currently `POST /api/pat/v1/pods/{name}/restart`) are rate-limited per PAT — not per IP, not globally. Defaults:
+
+- Steady rate: **10 requests / minute** (≈ 0.167 RPS).
+- Burst: **3** requests instantly available.
+
+Configurable via the controller's `--pat-action-rate` (RPS) and `--pat-action-burst` flags. A misbehaving WebUI cannot starve other PATs because each token has its own bucket. The bucket map is LRU-capped at 1000 entries — operators with more than 1000 concurrent active PATs will see oldest-evicted limiters reset (no practical concern for the WebUI deployment topology).
+
+## Endpoints
+
+All responses use the standard envelope:
+
+```json
+{ "status": "ok" | "error", "data": { ... }, "error": "..." }
+```
+
+### `GET /api/pat/v1/stats`
+
+Host + per-pod resource usage. Identical shape to the orchestration plane's `GET /stats`.
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "host":  { "cpu_percent": 12.4, "mem_used_bytes": ..., "mem_total_bytes": ... },
+    "pods":  [ { "name": "myapp-web.a3f9", "cpu_percent": 1.2, "mem_used_bytes": ... }, ... ]
+  }
+}
+```
+
+### `GET /api/pat/v1/pods`
+
+All voodu-managed containers on the host.
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "pods": [
+      {
+        "name":          "myapp-web.a3f9",
+        "kind":          "deployment",
+        "scope":         "myapp",
+        "resource_name": "web",
+        "replica_id":    "a3f9",
+        "image":         "myapp:latest",
+        "status":        "Up 2 hours",
+        "running":       true,
+        "created_at":    "2026-05-22T10:30:00Z"
+      }
+    ],
+    "degraded": [
+      {
+        "kind":  "deployment",
+        "scope": "myapp",
+        "name":  "broken",
+        "error": "image pull failed: ..."
+      }
+    ]
+  }
+}
+```
+
+The `degraded` array lists deployments/statefulsets whose latest reconcile attempt failed. It's how the WebUI surfaces "this resource exists but isn't running" without the operator having to dig.
+
+### `GET /api/pat/v1/pods/{name}`
+
+Per-pod detail: env vars (redacted), ports, mounts, network aliases, last 100 log lines, recent state transitions. `{name}` is the container name from `/pods`.
+
+Returns `404` if no container with that name exists (most commonly: stale WebUI cache after a rolling restart changed replica IDs).
+
+### `GET /api/pat/v1/pods/{name}/logs`
+
+Streams container logs. Query parameters:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `follow` | `false` | `true` keeps the connection open + streams new lines |
+| `tail` | `100` | last N lines to emit before live stream begins |
+
+Response is chunked-transfer (`Transfer-Encoding: chunked`) with `Content-Type: text/plain; charset=utf-8`. Each line is a single log record. The connection stays open until the client disconnects or the container exits.
+
+### `POST /api/pat/v1/pods/{name}/restart`
+
+Triggers a rolling restart of the deployment / statefulset that owns the named container. The WebUI passes the container name from `/pods`; the controller resolves it to `(kind, scope, resource-name)` and dispatches to the existing restart machinery.
+
+Requires `actions` scope. Subject to per-PAT rate limiting.
+
+| Status | Meaning |
+|---|---|
+| `200` | restart accepted; the rollout proceeds asynchronously |
+| `400` | container's kind is not restartable (job / cronjob have no rolling-restart semantics) |
+| `404` | no container with that name |
+| `429` | rate limit exceeded |
+
+## Defense in depth
+
+The split-listener architecture is not auth; it's *another* layer underneath auth. Even with a leaked PAT, an attacker reaches only the observability plane — never `/apply`, `/diff`, `/secrets`, or any mutation surface beyond rolling restarts. The orchestration plane refuses connections from non-loopback IPs by default.
+
+Threat model for operators:
+
+- **Lost laptop with SSH key** → still need a PAT for the WebUI; revoke via `vd pat revoke <id>`.
+- **Leaked PAT** → bounded blast radius (restart-only mutations, rate-limited). Revoke + rotate.
+- **WebUI host compromised** → attacker has read access + restart-only actions across every registered island. Mitigate by minting separate PATs per WebUI deployment and firewalling :8687 to the WebUI host's IP.
+
+## Lifecycle
+
+```bash
+# Mint a PAT (orchestration plane, via CLI)
+vd pat create --name="webui-staging" --scope="read,actions"
+# → pat_7K2N4QQ5PHJX9VMRWN8B3CTKZE   (shown ONCE)
+
+# List existing PATs (hashes never returned)
+vd pat list
+
+# Revoke
+vd pat revoke <id>
+```
+
+The token appears only in the create response. The `list` endpoint returns the redacted record (ID, scopes, name, timestamps) — never the hash, never the plain token. If you lose the plain, mint a new one and revoke the old.

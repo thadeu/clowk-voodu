@@ -74,6 +74,24 @@ type Store interface {
 	// when the bucket is empty.
 	DeleteConfig(ctx context.Context, scope, name string) error
 
+	// PAT (Personal Access Token) lifecycle. Tokens authorise the
+	// WebUI's `/api/pat/v1/*` plane; the plain token is shown ONCE
+	// at creation and only the sha256 hash lives on disk (see pat.go).
+	//
+	// Lookup is by ID — the 8-char public prefix of the plain token,
+	// indexable in O(1) without scanning every PAT. Auth middleware
+	// extracts the ID from the Bearer, calls GetPAT, then constant-
+	// time compares the request token's hash to the stored HashHex.
+	//
+	// TouchPAT is best-effort — called by the auth middleware on
+	// each authenticated request, but coalesced upstream so a
+	// WebUI polling 5x/sec doesn't write to etcd 5x/sec.
+	PutPAT(ctx context.Context, p PAT) error
+	GetPAT(ctx context.Context, id string) (*PAT, error)
+	ListPATs(ctx context.Context) ([]PAT, error)
+	DeletePAT(ctx context.Context, id string) (bool, error)
+	TouchPAT(ctx context.Context, id string, at time.Time) error
+
 	// Frozen replica-ID annotation. Records which replicas of a
 	// resource are intentionally stopped — the handler skips them
 	// in spawn / rolling-restart paths so a `vd stop --freeze`

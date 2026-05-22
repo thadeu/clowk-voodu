@@ -23,7 +23,7 @@ import (
 // directory (normally /opt/voodu/state).
 type Config struct {
 	DataDir      string
-	HTTPAddr     string // :8686
+	HTTPAddr     string // 127.0.0.1:8686 — orchestration plane (CLI via SSH)
 	EtcdClient   string // http://127.0.0.1:2379
 	EtcdPeer     string // http://127.0.0.1:2380
 	NodeName     string // voodu-0
@@ -32,6 +32,24 @@ type Config struct {
 	Logger       *log.Logger
 	QuietEtcd    bool
 	ReadyTimeout time.Duration // default 30s
+
+	// PATAddr is the bind address for the PAT-authenticated
+	// observability plane (`/api/pat/v1/*`). Defaults to
+	// `0.0.0.0:8687` — operator firewalls this port to the WebUI
+	// host IP. Empty string disables the plane entirely (no second
+	// listener spawned, no PAT routes exposed).
+	PATAddr string
+
+	// PATActionRate is the per-PAT refill rate (tokens per second)
+	// for action endpoints (today: restart). Default 10/60 = ~0.166
+	// tokens/sec = 10 actions/min steady-state. Zero/negative
+	// disables rate limiting entirely (escape hatch for dev envs).
+	PATActionRate float64
+
+	// PATActionBurst is the per-PAT bucket capacity for action
+	// endpoints. Default 3 — operator can quickly chain up to 3
+	// restarts before steady-state kicks in.
+	PATActionBurst int
 }
 
 // Server composes embedded etcd + HTTP API + reconciler into a single
@@ -43,6 +61,10 @@ type Server struct {
 	api  *API
 	rec  *Reconciler
 	http *http.Server
+
+	// httpPAT is the second HTTP listener serving `/api/pat/v1/*`.
+	// nil when Config.PATAddr is empty (PAT plane disabled).
+	httpPAT *http.Server
 
 	cancelRec context.CancelFunc
 	recDone   chan struct{}
@@ -62,7 +84,20 @@ type Server struct {
 
 func NewServer(cfg Config) *Server {
 	if cfg.HTTPAddr == "" {
-		cfg.HTTPAddr = ":8686"
+		// Default narrowed to 127.0.0.1 in C5 of the PAT plan —
+		// orchestration plane is localhost-only by default; the
+		// observability plane (PATAddr) carries the network-
+		// exposable surface.
+		cfg.HTTPAddr = "127.0.0.1:8686"
+	}
+
+	if cfg.PATActionRate == 0 {
+		// 10 actions per minute = 1/6 tokens/sec.
+		cfg.PATActionRate = 10.0 / 60.0
+	}
+
+	if cfg.PATActionBurst == 0 {
+		cfg.PATActionBurst = 3
 	}
 
 	if cfg.NodeName == "" {
@@ -425,6 +460,33 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
+	// PAT (observability) plane — second listener on a separate
+	// port. Network-exposable; gated by PAT auth + rate limit.
+	// Empty PATAddr disables the plane entirely (no second
+	// listener, no PAT routes).
+	if s.cfg.PATAddr != "" {
+		patListener, perr := listenOn(s.cfg.PATAddr)
+		if perr != nil {
+			s.teardown()
+			return fmt.Errorf("listen PAT %s: %w", s.cfg.PATAddr, perr)
+		}
+
+		s.httpPAT = &http.Server{
+			Addr:              patListener.Addr().String(),
+			Handler:           s.api.PATHandler(s.cfg.Logger, s.cfg.PATActionRate, s.cfg.PATActionBurst),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		s.cfg.Logger.Printf("PAT plane listening on %s (rate=%.3f/sec, burst=%d)",
+			s.httpPAT.Addr, s.cfg.PATActionRate, s.cfg.PATActionBurst)
+
+		go func() {
+			if err := s.httpPAT.Serve(patListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.cfg.Logger.Printf("PAT http server exited: %v", err)
+			}
+		}()
+	}
+
 	return nil
 }
 
@@ -448,19 +510,34 @@ func (s *Server) Store() Store {
 	return s.api.Store
 }
 
-// Stop shuts down the HTTP listener, stops the reconciler, and closes
-// etcd. Blocks until all goroutines exit or timeout elapses.
+// Stop shuts down the HTTP listener(s), stops the reconciler, and
+// closes etcd. Blocks until all goroutines exit or timeout elapses.
 func (s *Server) Stop(timeout time.Duration) error {
-	if s.http != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
+	if s.http != nil {
 		_ = s.http.Shutdown(shutdownCtx)
+	}
+
+	if s.httpPAT != nil {
+		_ = s.httpPAT.Shutdown(shutdownCtx)
 	}
 
 	s.teardown()
 
 	return nil
+}
+
+// PATAddr returns the actual PAT-plane listen address (useful in
+// tests where the caller asked for :0 to pick a free port).
+// Empty when the PAT plane is disabled.
+func (s *Server) PATAddr() string {
+	if s.httpPAT == nil {
+		return ""
+	}
+
+	return s.httpPAT.Addr
 }
 
 func (s *Server) teardown() {

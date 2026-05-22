@@ -24,6 +24,12 @@ const (
 	prefixPlugins = "/plugins/"
 	prefixStatus  = "/status/"
 	prefixFrozen  = "/frozen/"
+	// prefixPATs holds per-PAT records (Personal Access Tokens used
+	// by the WebUI observability plane). One key per PAT under
+	// `/pats/<id>`. The PAT ID is the 8-char public prefix of the
+	// plain token; the value is a JSON-encoded `PAT` record with
+	// sha256(plain) as `HashHex` — the plain token is never stored.
+	prefixPATs = "/pats/"
 )
 
 // Kind is the type of a declared resource. New kinds added in later
@@ -195,3 +201,15 @@ func FrozenKey(kind Kind, scope, name string) string {
 func FrozenScopeRoot(scope string) string {
 	return prefixFrozen + scope + "/"
 }
+
+// PATKey returns "/pats/<id>" — the etcd key for one PAT record.
+// IDs are the 8-char public prefix of the plain token; collisions
+// are negligible at 40 bits of entropy for realistic PAT counts.
+func PATKey(id string) string {
+	return prefixPATs + id
+}
+
+// PATsPrefix returns "/pats/" — the listing prefix for enumerating
+// every PAT on the host. Used by `vd pat list` and any future
+// audit / bulk-revoke tooling.
+func PATsPrefix() string { return prefixPATs }

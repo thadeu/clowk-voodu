@@ -307,6 +307,14 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /scope", a.handleScopeWipe)
 	mux.HandleFunc("DELETE /resource", a.handleResourceDelete)
 
+	// PAT lifecycle — orchestration plane only (localhost). The
+	// WebUI plane (`/api/pat/v1/*`) consumes PATs but never
+	// creates/lists/revokes them; that responsibility stays with
+	// the CLI over SSH (same trust posture as /apply).
+	mux.HandleFunc("POST /pats", a.handlePATCreate)
+	mux.HandleFunc("GET /pats", a.handlePATList)
+	mux.HandleFunc("DELETE /pats/{id}", a.handlePATRevoke)
+
 	return logRequests(mux)
 }
 

@@ -32,6 +32,14 @@ var localOnlyCommands = map[string]bool{
 	"--version":   true,
 	"remote":      true,
 	"self-update": true,
+	// `vd pat *` manages PATs on the LOCAL controller (or, when a
+	// remote is configured, the operator wants the PAT created on
+	// the LOCAL controller for their own use — the SSH-forwarded
+	// case here doesn't make sense since the operator is the only
+	// consumer of their own PAT). Keep local-only; operators
+	// managing PATs on a remote VM should SSH in or use
+	// `VOODU_CONTROLLER_URL` explicitly.
+	"pat": true,
 }
 
 // maybeForwardRemote is the M5.5 dispatch hook. In client mode, if the

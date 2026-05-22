@@ -1,5 +1,5 @@
 {
   "title": "Architecture",
   "icon": "Cpu",
-  "pages": ["overview", "controller", "reconciler", "api"]
+  "pages": ["overview", "controller", "reconciler", "api", "api-pat-v1"]
 }
