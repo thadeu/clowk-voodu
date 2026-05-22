@@ -198,6 +198,101 @@ func TestFetchSpec_EmptyControllerURLReturnsNil(t *testing.T) {
 	}
 }
 
+// TestSpecFromCLIJSON_DeploymentShape pins the happy path: the CLI's
+// parsed manifest.DeploymentSpec JSON round-trips into the same Spec
+// FetchSpec would have produced via the controller — same Context,
+// Dockerfile, BuildArgs. The "all pods point at api" bug existed
+// precisely because this round-trip didn't exist; the build never saw
+// the spec on the first apply.
+func TestSpecFromCLIJSON_DeploymentShape(t *testing.T) {
+	raw, err := json.Marshal(wireDeploymentSpec{
+		Image: "",
+		Build: &wireBuildSpec{
+			Context:    "./apps/esl",
+			Dockerfile: "Dockerfile",
+			Args: map[string]string{
+				"SERVICE": "adapter",
+			},
+			Lang: &wireLangSpec{Name: "go", Version: "1.26"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := SpecFromCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if spec.Build == nil {
+		t.Fatal("build block lost in roundtrip")
+	}
+
+	if spec.Build.Context != "./apps/esl" {
+		t.Errorf("context = %q, want %q", spec.Build.Context, "./apps/esl")
+	}
+
+	if spec.Build.Args["SERVICE"] != "adapter" {
+		t.Errorf("SERVICE arg = %q, want %q (regression of the per-resource override bug)",
+			spec.Build.Args["SERVICE"], "adapter")
+	}
+
+	if spec.Build.Lang == nil || spec.Build.Lang.Version != "1.26" {
+		t.Errorf("lang lost: %+v", spec.Build.Lang)
+	}
+}
+
+// TestSpecFromCLIJSON_StatefulsetShape covers the statefulset case.
+// Statefulset spec is a strict subset of deployment spec for the
+// build-relevant fields, so the same decoder works — verify nothing
+// crashes when PostDeploy/KeepReleases are absent.
+func TestSpecFromCLIJSON_StatefulsetShape(t *testing.T) {
+	raw, err := json.Marshal(wireStatefulsetSpec{
+		Image: "",
+		Build: &wireBuildSpec{
+			Context:    "infra/postgres",
+			Dockerfile: "Dockerfile.pg",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := SpecFromCLIJSON(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if spec.Build == nil {
+		t.Fatal("build block lost")
+	}
+
+	if spec.Build.Context != "infra/postgres" {
+		t.Errorf("context = %q", spec.Build.Context)
+	}
+
+	if spec.Build.Dockerfile != "Dockerfile.pg" {
+		t.Errorf("dockerfile = %q", spec.Build.Dockerfile)
+	}
+}
+
+func TestSpecFromCLIJSON_EmptyErrors(t *testing.T) {
+	if _, err := SpecFromCLIJSON(nil); err == nil {
+		t.Error("nil bytes must error")
+	}
+
+	if _, err := SpecFromCLIJSON([]byte{}); err == nil {
+		t.Error("empty bytes must error")
+	}
+}
+
+func TestSpecFromCLIJSON_MalformedErrors(t *testing.T) {
+	if _, err := SpecFromCLIJSON([]byte("not json")); err == nil {
+		t.Error("garbage payload must error instead of silently falling back to zero-value")
+	}
+}
+
 func TestSpecFromStatefulsetWire_PreservesAllFields(t *testing.T) {
 	w := wireStatefulsetSpec{
 		Image:       "",

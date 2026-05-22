@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -379,6 +380,14 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 	args := []string{"receive-pack", ref}
 	if force || os.Getenv("VOODU_FORCE_REBUILD") == "1" {
 		args = append(args, "--force")
+	}
+
+	// Ship the parsed manifest's spec inline so receive-pack picks up
+	// BuildArgs / Dockerfile / Context without a controller round-trip
+	// — see deploy.SpecFromCLIJSON for why this lifts the chicken-and-
+	// egg between Phase 2 (build) and Phase 3 (apply persists).
+	if len(d.SpecJSON) > 0 {
+		args = append(args, "--spec="+base64.StdEncoding.EncodeToString(d.SpecJSON))
 	}
 
 	// Both streams feed the filter. docker buildx writes its progress

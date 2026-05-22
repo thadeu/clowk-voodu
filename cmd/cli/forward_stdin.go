@@ -22,14 +22,18 @@ var manifestStreamCmds = map[string]bool{
 }
 
 // buildModeDep captures the minimum a source-push step needs: which
-// scope/name the server stores this deployment under, and which
-// directory on the dev machine is the build context. Populated from
-// the parsed manifest on the client side — that way ${VAR} expansion
+// scope/name the server stores this deployment under, which directory
+// on the dev machine is the build context, and the parsed manifest's
+// spec JSON (shipped to receive-pack via --spec so the build sees
+// the right BuildArgs / Dockerfile / Context BEFORE Phase 3 has
+// persisted the manifest in the controller). Populated from the
+// parsed manifest on the client side — that way ${VAR} expansion
 // happens before scope/name reach the server.
 type buildModeDep struct {
-	Scope string
-	Name  string
-	Path  string
+	Scope    string
+	Name     string
+	Path     string
+	SpecJSON json.RawMessage
 }
 
 // streamResult is what rewriteForStdinStream returns: the rewritten
@@ -188,9 +192,10 @@ func extractBuildModeDeploys(mans []controller.Manifest) []buildModeDep {
 		}
 
 		out = append(out, buildModeDep{
-			Scope: m.Scope,
-			Name:  m.Name,
-			Path:  path,
+			Scope:    m.Scope,
+			Name:     m.Name,
+			Path:     path,
+			SpecJSON: m.Spec,
 		})
 	}
 

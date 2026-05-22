@@ -157,6 +157,38 @@ type wireLangSpec struct {
 // instead of silently picking one.
 var ErrSpecAmbiguous = fmt.Errorf("ambiguous build target: both deployment and statefulset exist with this scope/name")
 
+// SpecFromCLIJSON decodes a Spec from JSON bytes shipped by the CLI
+// alongside the build tarball — see receive-pack's --spec flag for the
+// wire entry point. Wire shape matches wireDeploymentSpec, which is
+// JSON-compatible with both manifest.DeploymentSpec and
+// manifest.StatefulsetSpec for the build-relevant subset of fields
+// (statefulset doesn't carry PostDeploy/KeepReleases — those decode
+// to zero-value and are unused for that kind).
+//
+// Why this exists: receive-pack used to resolve build config by hitting
+// the controller via FetchSpec, but runApplyForwarded fires receive-pack
+// in Phase 2 (build) BEFORE Phase 3 (apply) persists the spec. On the
+// first apply FetchSpec returned (nil, nil) — the well-known
+// "controller doesn't know this resource yet" path — and the build ran
+// with zero-value BuildArgs/Dockerfile/Context. Operators saw silent
+// fallback to Dockerfile defaults (e.g. `ARG SERVICE=api` shadowing
+// every per-resource override). The CLI ships the spec inline now so
+// receive-pack has authoritative build config without a controller
+// round-trip.
+func SpecFromCLIJSON(raw []byte) (*Spec, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty spec JSON")
+	}
+
+	var wire wireDeploymentSpec
+
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, fmt.Errorf("decode CLI spec: %w", err)
+	}
+
+	return specFromWire(wire), nil
+}
+
 // FetchSpec queries the local controller HTTP API for the build manifest
 // of <scope>/<name> and returns the unmarshalled Spec. Searches across
 // the two build-capable kinds (deployment + statefulset) and returns

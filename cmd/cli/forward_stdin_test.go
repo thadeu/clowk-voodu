@@ -181,6 +181,63 @@ deployment "prod" "api" {
 	}
 }
 
+// TestRewriteForStdinStream_BuildModeShipsSpecJSON pins the fix for the
+// "all pods point at api" bug: every build-mode entry must carry the
+// parsed spec inline so receive-pack can pass --build-arg SERVICE=...
+// to docker without depending on the controller having persisted the
+// manifest yet (Phase 3 of runApplyForwarded runs AFTER Phase 2 fires
+// receive-pack). Without this, the Dockerfile's `ARG SERVICE=api`
+// default silently wins for every per-resource build.
+func TestRewriteForStdinStream_BuildModeShipsSpecJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "adapter.hcl")
+
+	src := `deployment "fsw" "adapter" {
+  build {
+    context    = "./apps/esl"
+    dockerfile = "Dockerfile"
+
+    args = {
+      SERVICE = "adapter"
+    }
+  }
+}
+`
+
+	if err := os.WriteFile(path, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.buildModeDeploys) != 1 {
+		t.Fatalf("expected 1 build-mode deploy, got %d", len(got.buildModeDeploys))
+	}
+
+	bm := got.buildModeDeploys[0]
+
+	if len(bm.SpecJSON) == 0 {
+		t.Fatal("SpecJSON empty — receive-pack would fall back to (nil, nil) FetchSpec on first apply")
+	}
+
+	var probe struct {
+		Build *struct {
+			Args map[string]string `json:"args"`
+		} `json:"build"`
+	}
+
+	if err := json.Unmarshal(bm.SpecJSON, &probe); err != nil {
+		t.Fatalf("SpecJSON not valid JSON: %v", err)
+	}
+
+	if probe.Build == nil || probe.Build.Args["SERVICE"] != "adapter" {
+		t.Errorf("SpecJSON lost build args: %+v", probe.Build)
+	}
+}
+
 func TestRewriteForStdinStream_BuildModeStatefulset(t *testing.T) {
 	// Statefulset with no Image triggers the same source-push pipeline
 	// as a build-mode deployment. Use case: postgres + pgvector built

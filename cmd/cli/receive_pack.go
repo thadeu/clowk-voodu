@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -30,7 +31,10 @@ import (
 // `voodu --help` because normal users never invoke it by hand — the
 // CLI drives it via SSH from `voodu apply`.
 func newReceivePackCmd() *cobra.Command {
-	var force bool
+	var (
+		force      bool
+		specBase64 string
+	)
 
 	cmd := &cobra.Command{
 		Use:    "receive-pack <scope>/<name>",
@@ -50,11 +54,14 @@ Dedup: the build-id is the sha256 of the tarball content. A second
 invocation with an identical tree skips rebuild and just repoints
 'current'. Pass --force to rebuild anyway.
 
-Build configuration (lang, go_version, dockerfile, post_deploy, …)
-is pulled from the local controller at VOODU_CONTROLLER_URL — the
-source of truth is whatever 'voodu apply' persisted for this
-deployment. When the controller has no manifest yet (first receive
-for a brand-new app) the pipeline falls back to auto-detection.`,
+Build configuration (lang, go_version, dockerfile, build args, …)
+arrives via --spec (base64-encoded JSON of the build-mode subset of
+the deployment/statefulset spec). The CLI ships it inline so the
+build pipeline doesn't need a controller round-trip to learn what
+--build-arg values to pass docker. When --spec is absent (older
+CLIs, manual receive-pack invocations), the pipeline falls back to
+fetching the spec from the local controller and finally to
+auto-detection if neither resolves.`,
 		Hidden: true,
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -63,11 +70,9 @@ for a brand-new app) the pipeline falls back to auto-detection.`,
 				return err
 			}
 
-			spec, err := deploy.FetchSpec(controllerURL(cmd.Root()), scope, name)
+			spec, err := resolveReceivePackSpec(cmd, scope, name, specBase64)
 			if err != nil {
-				// Don't fall back silently — the operator needs to see
-				// that the build-config source of truth is broken.
-				return fmt.Errorf("fetch deployment spec from controller: %w", err)
+				return err
 			}
 
 			// Reporter picks JSON iff the client set VOODU_PROTOCOL to
@@ -90,8 +95,48 @@ for a brand-new app) the pipeline falls back to auto-detection.`,
 	}
 
 	cmd.Flags().BoolVar(&force, "force", false, "rebuild even if a release with the same content hash already exists")
+	cmd.Flags().StringVar(&specBase64, "spec", "", "base64-encoded JSON of the deployment build spec (CLI-driven; skips controller FetchSpec)")
 
 	return cmd
+}
+
+// resolveReceivePackSpec picks the build spec for this receive-pack
+// invocation. Precedence:
+//
+//  1. --spec (inline JSON shipped by the CLI alongside the tarball) —
+//     authoritative when present. Lifts the chicken-and-egg between
+//     Phase 2 (build) and Phase 3 (apply) in runApplyForwarded: the
+//     CLI already has the parsed manifest in hand, so it ships it
+//     directly instead of relying on a controller round-trip.
+//
+//  2. FetchSpec against the local controller — back-compat for older
+//     CLIs that don't pass --spec, and for direct receive-pack
+//     invocations during debugging. Still returns (nil, nil) when
+//     nothing is stored yet, which the build pipeline treats as
+//     "auto-detect from release contents".
+func resolveReceivePackSpec(cmd *cobra.Command, scope, name, specBase64 string) (*deploy.Spec, error) {
+	if specBase64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(specBase64)
+		if err != nil {
+			return nil, fmt.Errorf("decode --spec: %w", err)
+		}
+
+		spec, err := deploy.SpecFromCLIJSON(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		return spec, nil
+	}
+
+	spec, err := deploy.FetchSpec(controllerURL(cmd.Root()), scope, name)
+	if err != nil {
+		// Don't fall back silently — the operator needs to see
+		// that the build-config source of truth is broken.
+		return nil, fmt.Errorf("fetch deployment spec from controller: %w", err)
+	}
+
+	return spec, nil
 }
 
 // parseScopedRef splits "<scope>/<name>" into its two parts. A bare
