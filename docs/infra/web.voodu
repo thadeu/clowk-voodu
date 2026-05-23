@@ -1,5 +1,6 @@
 app "clowk-vd" "docs" {
   host = "voodu-lp.lvh.me"
+  replicas = 2
   command = ["bunx", "serve", "/app/out", "-l", "80"]
 
   build {

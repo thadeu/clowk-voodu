@@ -208,18 +208,19 @@ func TestStatsCmd_RendersJSON(t *testing.T) {
 
 // TestRenderStatsTable covers the text-mode columns: header
 // labels, value formatting per column, empty result, orphan row
-// decoration.
+// decoration. One row per replica — the replica suffix is in the
+// NAME column.
 func TestRenderStatsTable_HappyPath(t *testing.T) {
 	pods := []controller.PodStats{
 		{
 			Identity:      controller.StatsIdentity{Kind: "deployment", Scope: "clowk-lp", Name: "web", ReplicaID: "a3f9"},
 			ContainerName: "voodu-clowk-lp-web.a3f9",
 			Usage: controller.UsageStats{
-				CPUPercent:       47.5,
-				MemoryUsageBytes: 120 * 1024 * 1024,
+				CPUPercent:       4.5,
+				MemoryUsageBytes: 128 * 1024 * 1024,
 				MemoryPercent:    47.2,
 			},
-			Limits: controller.LimitStats{CPU: "0.4", Memory: "254Mi"},
+			Limits: controller.LimitStats{CPU: "0.4", Memory: "512Mi"},
 		},
 	}
 
@@ -231,12 +232,54 @@ func TestRenderStatsTable_HappyPath(t *testing.T) {
 	out := buf.String()
 
 	for _, want := range []string{
-		"KIND", "REF", "CPU%", "MEM USED", "MEM LIMIT", "MEM%", "CPU LIMIT",
-		"deployment", "clowk-lp/web.a3f9", "47.5%", "120.0MiB", "254Mi", "47.2%", "0.4",
+		"KIND", "NAME", "CPU", "MEMORY",
+		"deployment", "clowk-lp/web.a3f9", "0.05/0.4", "128Mi/512Mi",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q\noutput:\n%s", want, out)
 		}
+	}
+
+	for _, gone := range []string{"CPU%", "MEM USED", "MEM LIMIT", "MEM%", "CPU LIMIT", "REPLICAS"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("unwanted column/label %q still present\noutput:\n%s", gone, out)
+		}
+	}
+}
+
+// TestRenderStatsTable_PerReplicaRows pins that two siblings of one
+// resource render as two distinct rows — the whole point of going
+// per-pod (so a leaky replica stands out against its siblings).
+func TestRenderStatsTable_PerReplicaRows(t *testing.T) {
+	pods := []controller.PodStats{
+		{
+			Identity:      controller.StatsIdentity{Kind: "deployment", Scope: "clowk-vd", Name: "docs", ReplicaID: "35a3"},
+			ContainerName: "voodu-clowk-vd-docs.35a3",
+			Usage:         controller.UsageStats{CPUPercent: 1.5, MemoryUsageBytes: 40 * 1024 * 1024},
+			Limits:        controller.LimitStats{CPU: "0.5", Memory: "100Mi"},
+		},
+		{
+			Identity:      controller.StatsIdentity{Kind: "deployment", Scope: "clowk-vd", Name: "docs", ReplicaID: "8f4c"},
+			ContainerName: "voodu-clowk-vd-docs.8f4c",
+			Usage:         controller.UsageStats{CPUPercent: 0.1, MemoryUsageBytes: 42 * 1024 * 1024},
+			Limits:        controller.LimitStats{CPU: "0.5", Memory: "100Mi"},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := renderStatsTable(&buf, pods); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+
+	if len(lines) != 3 {
+		t.Fatalf("expected header + 2 per-replica rows, got %d lines:\n%s", len(lines), out)
+	}
+
+	if !strings.Contains(out, "clowk-vd/docs.35a3") || !strings.Contains(out, "clowk-vd/docs.8f4c") {
+		t.Errorf("both replica refs should appear verbatim; got:\n%s", out)
 	}
 }
 
@@ -286,9 +329,10 @@ func TestRenderStatsTable_OrphanDecoration(t *testing.T) {
 	}
 }
 
-// TestFormatBytes pins the unit ladder — KiB / MiB / GiB choice
-// at the boundary values plus the "—" sentinel for zero.
-func TestFormatBytes(t *testing.T) {
+// TestFormatMemoryShort pins the k8s-style unit ladder — integer
+// rendering when the value divides cleanly into the unit, one
+// decimal otherwise, "—" sentinel for zero.
+func TestFormatMemoryShort(t *testing.T) {
 	cases := []struct {
 		in   uint64
 		want string
@@ -296,34 +340,116 @@ func TestFormatBytes(t *testing.T) {
 		{0, "—"},
 		{1, "1B"},
 		{1023, "1023B"},
-		{1024, "1.0KiB"},
-		{1024 * 1024, "1.0MiB"},
-		{120 * 1024 * 1024, "120.0MiB"},
-		{1024 * 1024 * 1024, "1.0GiB"},
-		{2 * 1024 * 1024 * 1024, "2.0GiB"},
+		{1024, "1Ki"},
+		{1536, "1.5Ki"},
+		{1024 * 1024, "1Mi"},
+		{128 * 1024 * 1024, "128Mi"},
+		{512 * 1024 * 1024, "512Mi"},
+		{1024 * 1024 * 1024, "1Gi"},
+		{1536 * 1024 * 1024, "1.5Gi"},
+		{2 * 1024 * 1024 * 1024, "2Gi"},
 	}
 
 	for _, c := range cases {
-		if got := formatBytes(c.in); got != c.want {
-			t.Errorf("formatBytes(%d): got %q, want %q", c.in, got, c.want)
+		if got := formatMemoryShort(c.in); got != c.want {
+			t.Errorf("formatMemoryShort(%d): got %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
-func TestFormatPercent(t *testing.T) {
+// TestFormatMemoryCell pins the "used/limit" shape, including
+// the dash on the right when no limit is declared.
+func TestFormatMemoryCell(t *testing.T) {
+	cases := []struct {
+		used  uint64
+		limit string
+		want  string
+	}{
+		{128 * 1024 * 1024, "512Mi", "128Mi/512Mi"},
+		{512 * 1024 * 1024, "1Gi", "512Mi/1Gi"},
+		{64 * 1024 * 1024, "256Mi", "64Mi/256Mi"},
+		{128 * 1024 * 1024, "", "128Mi/—"},
+		{0, "512Mi", "—/512Mi"},
+	}
+
+	for _, c := range cases {
+		if got := formatMemoryCell(c.used, c.limit); got != c.want {
+			t.Errorf("formatMemoryCell(%d, %q): got %q, want %q", c.used, c.limit, got, c.want)
+		}
+	}
+}
+
+// TestFormatMilliCPU pins the percent-to-millicores conversion:
+// 100% = 1000m, 4.5% = 45m, zero → "—", tiny non-zero rounds up.
+func TestFormatMilliCPU(t *testing.T) {
 	cases := []struct {
 		in   float64
 		want string
 	}{
 		{0, "—"},
-		{0.14, "0.1%"},
-		{47.5, "47.5%"},
-		{100, "100.0%"},
+		{0.01, "1m"},
+		{4.5, "45m"},
+		{18, "180m"},
+		{1.2, "12m"},
+		{100, "1000m"},
 	}
 
 	for _, c := range cases {
-		if got := formatPercent(c.in); got != c.want {
-			t.Errorf("formatPercent(%v): got %q, want %q", c.in, got, c.want)
+		if got := formatMilliCPU(c.in); got != c.want {
+			t.Errorf("formatMilliCPU(%v): got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestFormatCPUCell pins the unit pairing logic — cores limit
+// renders cores used, milli limit renders milli used, empty limit
+// falls back to plain millicores.
+func TestFormatCPUCell(t *testing.T) {
+	cases := []struct {
+		pct   float64
+		limit string
+		want  string
+	}{
+		{45, "0.5", "0.45/0.5"},
+		{60, "2", "0.6/2"},
+		{20, "0.5", "0.2/0.5"},
+		{45, "500m", "450m/500m"},
+		{4.5, "100m", "45m/100m"},
+		{0.1, "0.5", "0.001/0.5"},
+		{4.5, "", "45m"},
+		{0, "0.5", "0/0.5"},
+		{0, "", "—"},
+		{100, "1", "1/1"},
+	}
+
+	for _, c := range cases {
+		if got := formatCPUCell(c.pct, c.limit); got != c.want {
+			t.Errorf("formatCPUCell(%v, %q): got %q, want %q", c.pct, c.limit, got, c.want)
+		}
+	}
+}
+
+// TestFormatCores pins the cores-notation rendering: trailing
+// zeros stripped, ultra-low values get extra precision so they
+// don't collapse to "0".
+func TestFormatCores(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "0"},
+		{2, "2"},
+		{0.5, "0.5"},
+		{0.6, "0.6"},
+		{0.45, "0.45"},
+		{0.045, "0.05"},
+		{0.001, "0.001"},
+		{1.5, "1.5"},
+	}
+
+	for _, c := range cases {
+		if got := formatCores(c.in); got != c.want {
+			t.Errorf("formatCores(%v): got %q, want %q", c.in, got, c.want)
 		}
 	}
 }

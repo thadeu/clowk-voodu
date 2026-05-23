@@ -50,6 +50,14 @@ type PodStats struct {
 	// declared, or when this pod is an orphan (no manifest).
 	Limits LimitStats `json:"limits"`
 
+	// DesiredReplicas mirrors the manifest's replicas field at the
+	// time of the call. Zero when the kind doesn't model replicas
+	// (job, cronjob, asset, ingress) or the pod is orphan (no
+	// manifest to read from). Same value across siblings of one
+	// resource — callers aggregating per (kind, scope, name) can
+	// trust any pod in the group to carry the right number.
+	DesiredReplicas int `json:"desired_replicas,omitempty"`
+
 	// Orphan is true when this pod can't be joined back to a manifest
 	// — either it lacks voodu identity labels (pre-M0 legacy) or the
 	// manifest was deleted while the container kept running (leak).
@@ -202,7 +210,7 @@ func (c *StatsCollector) Collect(ctx context.Context, filter StatsFilter) ([]Pod
 			continue
 		}
 
-		limits, manifestFound := c.lookupLimits(ctx, p)
+		meta, manifestFound := c.lookupManifestMeta(ctx, p)
 
 		// Orphan = container lacks structured identity OR the
 		// referenced manifest was deleted. Both are conditions an
@@ -229,8 +237,9 @@ func (c *StatsCollector) Collect(ctx context.Context, filter StatsFilter) ([]Pod
 				MemoryPercent:    runtime.MemPercent,
 				PIDs:             runtime.PIDs,
 			},
-			Limits: limits,
-			Orphan: orphan,
+			Limits:          meta.Limits,
+			DesiredReplicas: meta.Desired,
+			Orphan:          orphan,
 		})
 	}
 
@@ -276,35 +285,67 @@ func filterPods(pods []Pod, f StatsFilter) []Pod {
 	return out
 }
 
-// lookupLimits fetches the manifest for one pod and extracts its
-// resources.limits block. Returns (zero, false) when:
+// manifestMeta packs the fields lookupManifestMeta extracts from the
+// manifest in one call — avoids two store roundtrips and keeps the
+// "what does the manifest declare for this pod?" question on a
+// single seam.
+type manifestMeta struct {
+	Limits  LimitStats
+	Desired int
+}
+
+// lookupManifestMeta fetches the manifest for one pod and extracts
+// its resources.limits + replicas count. Returns (zero, false) when:
 //
 //   - Store is nil (test wiring without a store)
 //   - Pod has no kind label (legacy / orphan)
 //   - Manifest not found (deleted while container kept running)
-//   - Manifest exists but has no resources block
+//   - Manifest exists but has no resources block (Limits empty; the
+//     bool is still true so the pod isn't flagged orphan)
 //
 // The bool signals "we found a manifest" specifically — empty
 // limits with a found manifest is NOT an orphan, it's a valid
 // "operator declared no caps" state.
-func (c *StatsCollector) lookupLimits(ctx context.Context, p Pod) (LimitStats, bool) {
+func (c *StatsCollector) lookupManifestMeta(ctx context.Context, p Pod) (manifestMeta, bool) {
 	if c.Store == nil || p.Kind == "" {
-		return LimitStats{}, false
+		return manifestMeta{}, false
 	}
 
 	kind, err := ParseKind(p.Kind)
 	if err != nil {
-		return LimitStats{}, false
+		return manifestMeta{}, false
 	}
 
 	m, err := c.Store.Get(ctx, kind, p.Scope, p.ResourceName)
 	if err != nil || m == nil {
-		return LimitStats{}, false
+		return manifestMeta{}, false
 	}
 
-	limits := extractLimits(kind, m.Spec)
+	return manifestMeta{
+		Limits:  extractLimits(kind, m.Spec),
+		Desired: extractDesiredReplicas(kind, m.Spec),
+	}, true
+}
 
-	return limits, true
+// extractDesiredReplicas reads the manifest's `replicas` field for
+// kinds that model it (deployment, statefulset). Returns 0 for
+// kinds without a replicas concept (job, cronjob, asset, ingress) —
+// the CLI uses that to decide whether to render "running/desired"
+// or just "running" in the REPLICAS column.
+func extractDesiredReplicas(kind Kind, spec json.RawMessage) int {
+	if kind != KindDeployment && kind != KindStatefulset {
+		return 0
+	}
+
+	var r struct {
+		Replicas int `json:"replicas,omitempty"`
+	}
+
+	if err := json.Unmarshal(spec, &r); err != nil {
+		return 0
+	}
+
+	return r.Replicas
 }
 
 // extractLimits decodes the manifest spec just deep enough to find

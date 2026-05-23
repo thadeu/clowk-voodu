@@ -25,9 +25,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -73,14 +75,17 @@ and memory usage alongside the limits declared in its manifest's
 resources block. Single-shot (` + "`docker stats --no-stream`" + `
 semantics); pipe to ` + "`watch`" + ` if you want a refresh loop.
 
+One row per replica — comparing siblings side by side is the
+fastest way to spot a leaky pod or an unbalanced load.
+
 Output columns:
-  KIND          deployment | statefulset | job | cronjob
-  REF           scope/name.replica
-  CPU%          host-relative (matches docker stats — 100% = one full core)
-  MEM USED      bytes consumed (RSS, excludes page cache)
-  MEM LIMIT     manifest's resources.limits.memory (— = unbounded)
-  MEM%          USED / LIMIT * 100 (the docker-reported value)
-  CPU LIMIT     manifest's resources.limits.cpu (— = unbounded)
+  KIND    deployment | statefulset | job | cronjob
+  NAME    scope/name.replica
+  CPU     used/limit, paired in the manifest's unit:
+          limit "0.5"   → "0.45/0.5"   (cores)
+          limit "500m"  → "450m/500m"  (millicores)
+          no limit      → "450m"       (millicores fallback)
+  MEMORY  used/limit (limit echoes the manifest's verbatim string)
 
 Filtering:
 
@@ -254,14 +259,18 @@ func runStats(cmd *cobra.Command, f statsFlags) error {
 }
 
 // renderStatsTable prints the operator-facing view: one row per
-// pod, columns aligned via tabwriter so the numbers line up.
+// running replica, columns aligned via tabwriter. Per-pod rows
+// (instead of resource-level aggregation) make it easy to spot a
+// drifting sibling — replica .a using 2× the memory of .b is the
+// classic leak signature, and that signal vanishes the moment you
+// average them together.
+//
 // Orphan rows are marked with "(orphan)" in the KIND column so
 // they're scannable without breaking the column structure.
 //
-// "—" in a column means "no data" (no limit configured for that
-// dimension, or stats unavailable). Using a dash rather than "N/A"
-// or "-" keeps the eye flowing past unset cells instead of
-// pausing on them.
+// "—" in a column means "no data" (zero usage, no limit
+// configured). A dash, not "N/A" or "-", keeps the eye flowing
+// past unset cells.
 func renderStatsTable(w io.Writer, pods []controller.PodStats) error {
 	if len(pods) == 0 {
 		fmt.Fprintln(w, "No running pods matched the filter.")
@@ -270,7 +279,7 @@ func renderStatsTable(w io.Writer, pods []controller.PodStats) error {
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(tw, "KIND\tREF\tCPU%\tMEM USED\tMEM LIMIT\tMEM%\tCPU LIMIT")
+	fmt.Fprintln(tw, "KIND\tNAME\tCPU\tMEMORY")
 
 	for _, p := range pods {
 		kind := p.Identity.Kind
@@ -280,25 +289,21 @@ func renderStatsTable(w io.Writer, pods []controller.PodStats) error {
 			kind = kind + " (orphan)"
 		}
 
-		ref := formatStatsRef(p)
-
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
 			kind,
-			ref,
-			formatPercent(p.Usage.CPUPercent),
-			formatBytes(p.Usage.MemoryUsageBytes),
-			formatLimitMemory(p.Limits),
-			formatPercent(p.Usage.MemoryPercent),
-			formatLimitCPU(p.Limits),
+			formatStatsRef(p),
+			formatCPUCell(p.Usage.CPUPercent, p.Limits.CPU),
+			formatMemoryCell(p.Usage.MemoryUsageBytes, p.Limits.Memory),
 		)
 	}
 
 	return tw.Flush()
 }
 
-// formatStatsRef builds the visible "scope/name.replica" reference.
-// Falls back to the container name when identity is incomplete
-// (orphan case) — the operator can still grep for the row.
+// formatStatsRef builds the visible "scope/name.replica"
+// reference. Falls back to the container name when identity is
+// incomplete (orphan case) — the operator can still grep for the
+// row.
 func formatStatsRef(p controller.PodStats) string {
 	if p.Identity.Name == "" {
 		return p.ContainerName
@@ -317,63 +322,121 @@ func formatStatsRef(p controller.PodStats) string {
 	return ref
 }
 
-// formatPercent emits "47.5%" or "—" for unset. One decimal place
-// matches docker stats output; more is noise for an eyeball
-// reading.
-func formatPercent(v float64) string {
-	if v == 0 {
+// formatCPUCell renders the CPU column as "used/limit", matching
+// the unit grammar of the manifest's verbatim limit string so the
+// pair reads as one consistent thing:
+//
+//   limit "0.5"  + 45% used  → "0.45/0.5"   (cores)
+//   limit "2"    + 60% used  → "0.6/2"      (cores)
+//   limit "500m" + 45% used  → "450m/500m"  (millicores)
+//   limit ""     + 4.5% used → "45m"        (no limit: millicores)
+//
+// Pairing matters because operators read the cell as "is this pod
+// near its cap?" — mixing units (250m used vs 0.5 limit) breaks
+// that scan even though the values are equivalent.
+func formatCPUCell(pct float64, limit string) string {
+	limit = strings.TrimSpace(limit)
+	if limit == "" {
+		return formatMilliCPU(pct)
+	}
+
+	if strings.HasSuffix(limit, "m") {
+		return formatMilliCPU(pct) + "/" + limit
+	}
+
+	return formatCores(pct/100) + "/" + limit
+}
+
+// formatMilliCPU translates docker's host-relative CPU% (100% =
+// one full core) into k8s-style millicores: 100% → 1000m, 4.5% →
+// 45m. Rounded to the nearest integer because sub-millicore
+// precision is noise for an eyeball reading. Tiny non-zero usages
+// round up to "1m" so a barely-active pod doesn't render as "—".
+func formatMilliCPU(pct float64) string {
+	if pct == 0 {
 		return "—"
 	}
 
-	return fmt.Sprintf("%.1f%%", v)
+	m := int(pct*10 + 0.5)
+	if m == 0 {
+		m = 1
+	}
+
+	return fmt.Sprintf("%dm", m)
 }
 
-// formatBytes emits "120MiB" / "1.5GiB" etc — same scale ladder
-// docker uses for readability. Stops at GiB (anything past that
-// is unusual for a single container and the precision drop helps
-// the table fit narrower terminals).
-func formatBytes(b uint64) string {
+// formatCores renders a CPU value in cores notation, matching the
+// way operators write the limit in HCL ("0.5", "2", "1.5").
+// Strategy: round to 2 decimals, strip trailing zeros so 2.0 → "2"
+// and 0.50 → "0.5". For ultra-low values (< 0.005) we drop to 3
+// decimals so a barely-active pod doesn't collapse to "0".
+func formatCores(c float64) string {
+	if c == 0 {
+		return "0"
+	}
+
+	if c < 0.005 {
+		return strconv.FormatFloat(c, 'f', 3, 64)
+	}
+
+	rounded := math.Round(c*100) / 100
+
+	return strconv.FormatFloat(rounded, 'f', -1, 64)
+}
+
+// formatMemoryCell renders the MEMORY column as "used/limit",
+// matching the manifest's unit grammar (Mi, Gi) so the pair reads
+// as one consistent thing — not "120.0MiB / 254Mi". Empty limit
+// (no resources block declared) renders "—" on the right so the
+// shape stays uniform.
+func formatMemoryCell(usedBytes uint64, limit string) string {
+	used := formatMemoryShort(usedBytes)
+	if limit == "" {
+		return used + "/—"
+	}
+
+	return used + "/" + limit
+}
+
+// formatMemoryShort emits "128Mi" / "1.5Gi" / "1Gi" — k8s-style
+// short units, integer when the value divides cleanly, one
+// decimal otherwise. Stops at Gi (anything past that is unusual
+// for a single container and the precision drop helps the table
+// fit narrower terminals).
+func formatMemoryShort(b uint64) string {
 	if b == 0 {
 		return "—"
 	}
 
 	const (
-		KiB = 1024
-		MiB = 1024 * KiB
-		GiB = 1024 * MiB
+		KiB uint64 = 1024
+		MiB uint64 = 1024 * KiB
+		GiB uint64 = 1024 * MiB
 	)
 
 	switch {
 	case b >= GiB:
-		return fmt.Sprintf("%.1fGiB", float64(b)/float64(GiB))
+		if b%GiB == 0 {
+			return fmt.Sprintf("%dGi", b/GiB)
+		}
+
+		return fmt.Sprintf("%.1fGi", float64(b)/float64(GiB))
+
 	case b >= MiB:
-		return fmt.Sprintf("%.1fMiB", float64(b)/float64(MiB))
+		if b%MiB == 0 {
+			return fmt.Sprintf("%dMi", b/MiB)
+		}
+
+		return fmt.Sprintf("%.1fMi", float64(b)/float64(MiB))
+
 	case b >= KiB:
-		return fmt.Sprintf("%.1fKiB", float64(b)/float64(KiB))
+		if b%KiB == 0 {
+			return fmt.Sprintf("%dKi", b/KiB)
+		}
+
+		return fmt.Sprintf("%.1fKi", float64(b)/float64(KiB))
+
 	default:
 		return fmt.Sprintf("%dB", b)
 	}
-}
-
-// formatLimitMemory echoes the operator's verbatim string (e.g.
-// "254Mi") when available. Empty → "—" (no limit declared).
-// Showing the manifest text rather than reformatting it to bytes
-// reinforces "this is what YOU wrote" — operators recognise their
-// own units faster than a recomputed number.
-func formatLimitMemory(l controller.LimitStats) string {
-	if l.Memory == "" {
-		return "—"
-	}
-
-	return l.Memory
-}
-
-// formatLimitCPU mirrors formatLimitMemory for the CPU field.
-// Echoes the operator's input ("0.4", "500m") verbatim.
-func formatLimitCPU(l controller.LimitStats) string {
-	if l.CPU == "" {
-		return "—"
-	}
-
-	return l.CPU
 }
