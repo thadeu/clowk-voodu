@@ -16,6 +16,7 @@ type memStore struct {
 	status map[string][]byte
 	config map[string]map[string]string // bucket → key:value
 	frozen map[string][]string          // FrozenKey(kind, scope, name) → replica IDs
+	pats   map[string]*PAT              // ID → PAT (in-memory mirror of /pats/<id>)
 	rev    int64
 
 	watchers []chan WatchEvent
@@ -27,6 +28,7 @@ func newMemStore() *memStore {
 		status: map[string][]byte{},
 		config: map[string]map[string]string{},
 		frozen: map[string][]string{},
+		pats:   map[string]*PAT{},
 	}
 }
 
@@ -176,6 +178,78 @@ func (m *memStore) DeleteFrozenReplicaIDs(_ context.Context, kind Kind, scope, n
 	defer m.mu.Unlock()
 
 	delete(m.frozen, FrozenKey(kind, scope, name))
+
+	return nil
+}
+
+// PAT methods — mirror the EtcdStore impl in pat_store.go.
+// Defensive copies on Put/Get so test code can mutate returned
+// values without back-channel effects (the etcd impl is naturally
+// immune since values round-trip through JSON marshaling).
+
+func (m *memStore) PutPAT(_ context.Context, p PAT) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p.ID == "" {
+		return nil
+	}
+
+	cp := p
+	m.pats[p.ID] = &cp
+
+	return nil
+}
+
+func (m *memStore) GetPAT(_ context.Context, id string) (*PAT, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	p, ok := m.pats[id]
+	if !ok {
+		return nil, nil
+	}
+
+	cp := *p
+
+	return &cp, nil
+}
+
+func (m *memStore) ListPATs(_ context.Context) ([]PAT, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]PAT, 0, len(m.pats))
+	for _, p := range m.pats {
+		out = append(out, *p)
+	}
+
+	return out, nil
+}
+
+func (m *memStore) DeletePAT(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.pats[id]; !ok {
+		return false, nil
+	}
+
+	delete(m.pats, id)
+
+	return true, nil
+}
+
+func (m *memStore) TouchPAT(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	p, ok := m.pats[id]
+	if !ok {
+		return nil
+	}
+
+	p.LastUsedAt = at.UTC()
 
 	return nil
 }

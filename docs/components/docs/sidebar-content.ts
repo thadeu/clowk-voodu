@@ -79,6 +79,7 @@ export const contents: SidebarSection[] = [
       { title: 'Controller', href: '/docs/architecture/controller', icon: Server },
       { title: 'Reconciler', href: '/docs/architecture/reconciler', icon: GitMerge },
       { title: 'HTTP API', href: '/docs/architecture/api', icon: Webhook },
+      { title: 'Observability API (PAT v1)', href: '/docs/architecture/api-pat-v1', icon: KeyRound },
     ],
   },
   {

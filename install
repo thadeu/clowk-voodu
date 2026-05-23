@@ -20,7 +20,13 @@
 #   VERSION                 pin a release (default: latest from GitHub)
 #   VOODU_INSTALL_REPO      source repo (default: thadeu/clowk-voodu)
 #   VOODU_ROOT              server state dir (default: /opt/voodu)
-#   VOODU_HTTP_ADDR         controller HTTP bind (default: 127.0.0.1:8686)
+#   VOODU_HTTP_ADDR         orchestration plane bind, loopback-only by
+#                           default (default: 127.0.0.1:8686). CLI reaches
+#                           this via SSH tunnel.
+#   VOODU_PAT_ADDR          PAT-authenticated observability plane bind
+#                           (default: 0.0.0.0:8687). Reachable from the
+#                           Rails WebUI — FIREWALL TO YOUR WEBUI HOST IP.
+#                           Empty disables the plane entirely.
 #   VOODU_DEFAULT_PLUGINS   space-separated plugins to install on first
 #                           boot (default: thadeu/voodu-caddy)
 #   SKIP_DOCKER=1           skip Docker install (server mode only)
@@ -31,7 +37,8 @@ set -euo pipefail
 REPO="${VOODU_INSTALL_REPO:-thadeu/clowk-voodu}"
 VERSION="${VERSION:-}"
 VOODU_ROOT="${VOODU_ROOT:-/opt/voodu}"
-VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-0.0.0.0:8686}"
+VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-127.0.0.1:8686}"
+VOODU_PAT_ADDR="${VOODU_PAT_ADDR:-0.0.0.0:8687}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 BIN_DIR="/usr/local/bin"
 UNIT_PATH="/etc/systemd/system/voodu-controller.service"
@@ -79,7 +86,8 @@ Environment:
   VERSION               pin a release, e.g. v0.1.0 (default: latest)
   VOODU_INSTALL_REPO    default thadeu/clowk-voodu
   VOODU_ROOT            default /opt/voodu
-  VOODU_HTTP_ADDR       controller bind, default 127.0.0.1:8686
+  VOODU_HTTP_ADDR       orchestration plane bind (default 127.0.0.1:8686)
+  VOODU_PAT_ADDR        observability plane bind (default 0.0.0.0:8687)
   SKIP_DOCKER=1         skip Docker install (server mode only)
 EOF
         exit 0
@@ -460,7 +468,9 @@ Requires=docker.service
 [Service]
 Type=simple
 Environment=VOODU_ROOT=${VOODU_ROOT}
-ExecStart=${BIN_DIR}/voodu-controller -http ${VOODU_HTTP_ADDR}
+Environment=VOODU_HTTP_ADDR=${VOODU_HTTP_ADDR}
+Environment=VOODU_PAT_ADDR=${VOODU_PAT_ADDR}
+ExecStart=${BIN_DIR}/voodu-controller
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -481,7 +491,7 @@ enable_controller() {
   sleep 1
 
   if sudo_ systemctl is-active --quiet voodu-controller.service; then
-    success "voodu-controller running (HTTP ${VOODU_HTTP_ADDR})"
+    success "voodu-controller running (orchestration ${VOODU_HTTP_ADDR}, observability ${VOODU_PAT_ADDR})"
   else
     warn "voodu-controller failed to start — inspect: sudo journalctl -u voodu-controller -n 50"
   fi
@@ -554,9 +564,21 @@ print_next_steps() {
   if [ "$MODE" = "server" ]; then
     cat <<EOF
   State:        $VOODU_ROOT (owned by $TARGET_USER)
-  Controller:   http://${VOODU_HTTP_ADDR}   (unit: voodu-controller.service)
+  Orchestration:  http://${VOODU_HTTP_ADDR}   (loopback — CLI reaches via SSH)
+  Observability:  http://${VOODU_PAT_ADDR}   (PAT-authenticated; firewall to WebUI host IP)
+  Systemd unit:   voodu-controller.service
   Binaries:     $BIN_DIR/voodu, $BIN_DIR/voodu-controller (alias: $BIN_DIR/vd)
   Docker:       $(docker --version 2>/dev/null || echo "not installed")
+
+  Mint a PAT for the WebUI:
+    voodu pat create --name=webui --scope=read,actions
+
+  ${YELLOW}Heads up${NC}: the observability plane on :8687 is reachable from the
+  network by default. Restrict it to your WebUI host before exposing
+  any data:
+    sudo ufw allow from WEBUI_HOST_IP to any port 8687 proto tcp
+    sudo ufw deny  8687/tcp
+
 
   To uninstall (local — stamped at install time):
     sudo $VOODU_ROOT/scripts/uninstall

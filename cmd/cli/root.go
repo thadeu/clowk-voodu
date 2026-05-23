@@ -59,6 +59,7 @@ Use ":" syntax as shorthand for subcommands:
 		newPluginsCmd(),
 		newStatsCmd(),
 		newSelfUpdateCmd(),
+		newPATCmd(),
 	)
 
 	return root
