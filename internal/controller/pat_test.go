@@ -276,3 +276,129 @@ func TestGeneratePAT_TrimsName(t *testing.T) {
 		t.Errorf("Name not trimmed: %q", rec.Name)
 	}
 }
+
+// TestGeneratePAT_AlphabetIsBase64URL pins the visual character set.
+// If someone reverts to base32 or swaps to StdEncoding (which would
+// emit `+` `/` `=`) the test screams loud — the difference would be
+// invisible at runtime (tokens still work) but immediately regress
+// the UX win operators noticed.
+func TestGeneratePAT_AlphabetIsBase64URL(t *testing.T) {
+	// Generate a handful so we have a meaningful sample of chars.
+	for i := 0; i < 50; i++ {
+		plain, _, err := GeneratePAT([]Scope{ScopeRead}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		body := strings.TrimPrefix(plain, "pat_")
+		for j := 0; j < len(body); j++ {
+			c := body[j]
+			if !isPATChar(c) {
+				t.Errorf("token char %q at body[%d] not in base64url alphabet: token=%q", c, j, plain)
+			}
+		}
+	}
+}
+
+// TestGeneratePAT_NoPaddingChar pins that no `=` (base64 padding)
+// ever appears. We use RawURLEncoding specifically to avoid padding;
+// a regression to StdEncoding would emit `=` and break URL embedding
+// (and look ugly).
+func TestGeneratePAT_NoPaddingChar(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		plain, _, _ := GeneratePAT([]Scope{ScopeRead}, "")
+		if strings.ContainsRune(plain, '=') {
+			t.Errorf("token contains padding char `=`: %q", plain)
+		}
+
+		if strings.ContainsAny(plain, "+/") {
+			t.Errorf("token contains non-URL-safe chars `+` or `/`: %q", plain)
+		}
+	}
+}
+
+// TestGeneratePAT_HasMixedCase is a probabilistic check that the
+// alphabet really spans upper + lower + digits, not just one shard.
+// Across 200 generated bodies (≈5,600 chars) we expect every category
+// represented; the chance of any category being absent is 1 in ~10^30.
+func TestGeneratePAT_HasMixedCase(t *testing.T) {
+	var hasLower, hasUpper, hasDigit bool
+
+	for i := 0; i < 200 && !(hasLower && hasUpper && hasDigit); i++ {
+		plain, _, _ := GeneratePAT([]Scope{ScopeRead}, "")
+
+		body := strings.TrimPrefix(plain, "pat_")
+		for j := 0; j < len(body); j++ {
+			c := body[j]
+			switch {
+			case c >= 'a' && c <= 'z':
+				hasLower = true
+			case c >= 'A' && c <= 'Z':
+				hasUpper = true
+			case c >= '0' && c <= '9':
+				hasDigit = true
+			}
+		}
+	}
+
+	if !hasLower {
+		t.Error("no lowercase letters across 200 tokens — alphabet may have regressed to upper-only base32")
+	}
+
+	if !hasUpper {
+		t.Error("no uppercase letters across 200 tokens")
+	}
+
+	if !hasDigit {
+		t.Error("no digits across 200 tokens")
+	}
+}
+
+// TestParsePATToken_RejectsOutOfAlphabet pins that chars outside the
+// base64url alphabet (whitespace, punctuation, non-ASCII) get rejected
+// at parse time — before any hashing / etcd lookup. Cheap defense
+// against log injection or accidental URL-encoding leaks.
+func TestParsePATToken_RejectsOutOfAlphabet(t *testing.T) {
+	cases := []struct {
+		name string
+		ch   string
+	}{
+		{"exclamation", "!"},
+		{"plus (base64 std but not url)", "+"},
+		{"slash (base64 std but not url)", "/"},
+		{"equals (padding char)", "="},
+		{"space", " "},
+		{"dot", "."},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			bad := "pat_" + strings.Repeat("a", patTokenBodyLen-1) + c.ch
+
+			if _, ok := ParsePATToken(bad); ok {
+				t.Errorf("ParsePATToken accepted %q char: token=%q", c.ch, bad)
+			}
+		})
+	}
+}
+
+// TestParsePATToken_AcceptsHyphenAndUnderscore pins the inverse:
+// `-` and `_` are part of the base64url alphabet and MUST be accepted
+// (they appear in roughly 3% of generated tokens). Without this,
+// the parser would reject ~half of all minted PATs after the alphabet
+// switch.
+func TestParsePATToken_AcceptsHyphenAndUnderscore(t *testing.T) {
+	// Construct a synthetic but well-formed token where both `-`
+	// and `_` appear in the body.
+	body := strings.Repeat("a", patTokenBodyLen-2) + "-_"
+	plain := "pat_" + body
+
+	id, ok := ParsePATToken(plain)
+	if !ok {
+		t.Fatalf("ParsePATToken rejected a token containing `-` and `_`: %q", plain)
+	}
+
+	if id != body[:patTokenIDLen] {
+		t.Errorf("ID = %q, want %q", id, body[:patTokenIDLen])
+	}
+}

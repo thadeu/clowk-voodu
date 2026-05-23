@@ -54,8 +54,9 @@ func TestHandlePATCreate_HappyPath(t *testing.T) {
 		t.Errorf("token missing pat_ prefix: %q", env.Data.Token)
 	}
 
-	if len(env.Data.Token) != 30 {
-		t.Errorf("token length: %d, want 30", len(env.Data.Token))
+	// pat_ (4) + 6-char ID + 22-char secret = 32.
+	if len(env.Data.Token) != 32 {
+		t.Errorf("token length: %d, want 32", len(env.Data.Token))
 	}
 
 	if env.Data.Record.Name != "webui-staging" {

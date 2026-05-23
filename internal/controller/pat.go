@@ -4,8 +4,9 @@
 //
 // Three responsibilities, all I/O-free:
 //
-//  1. Token shape: prefix + ID + secret, encoded as base32 so it's
-//     copy-paste safe in a terminal or a Rails env var.
+//  1. Token shape: prefix + ID + secret, base62-encoded so it's
+//     copy-paste safe in a terminal or a Rails env var and visually
+//     matches the GitHub-family token convention operators already know.
 //  2. Hashing: sha256(plain) hex. We store the hash, never the plain
 //     token. The plain is shown ONCE at creation time, by the CLI.
 //  3. Scope vocabulary: `read` (GET endpoints) vs `actions` (POST
@@ -22,7 +23,7 @@ package controller
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base32"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -67,41 +68,44 @@ const (
 const patTokenPrefix = "pat_"
 
 // patTokenIDLen is the length of the ID segment (first chars after
-// the prefix). 8 chars × 5 bits/char = 40 bits — collision probability
-// stays negligible (~birthday-bound 10^6 PATs before 1-in-a-billion
-// collision), and 8 chars renders cleanly in CLI tables.
+// the prefix). 6 chars × 6 bits/char = 36 bits — collision probability
+// stays comfortable (~birthday-bound 300k PATs before 1-in-a-billion
+// collision), and 6 chars renders cleanly in CLI tables.
 //
 // The ID is the "username half" of the token: public, indexable,
 // safe to log. We use it as the etcd key (see PATKey in keys.go) so
 // lookup is a single Get rather than a brute-force scan.
-const patTokenIDLen = 8
+const patTokenIDLen = 6
 
 // patTokenSecretLen is the length of the secret segment (everything
-// after the ID). 18 chars × 5 bits = 90 bits of entropy. Brute force
-// at 10^9 attempts/sec = ~10^19 seconds = ~30 billion years —
-// computationally infeasible for the lifetime of the protocol.
-const patTokenSecretLen = 18
+// after the ID). 22 chars × 6 bits/char = 132 bits of entropy. Brute
+// force at 10^9 attempts/sec = ~10^31 seconds — computationally
+// infeasible for the lifetime of the protocol.
+const patTokenSecretLen = 22
 
 // patTokenBodyLen is the total length of the random tail (ID + secret)
-// in chars. Total token length = len(prefix) + patTokenBodyLen.
+// in chars. Total token length = len(prefix) + patTokenBodyLen = 32.
 const patTokenBodyLen = patTokenIDLen + patTokenSecretLen
 
-// patEncoder picks the base32 variant we encode random bytes with.
-//
-// RFC 4648 (stdlib's `base32.StdEncoding`) uses A-Z2-7 — uppercase,
-// alphabet-only, copy-paste safe. We skip padding because the token
-// is a fixed-length opaque string, never length-recovered from the
-// encoded form. Crockford base32 would avoid I/L/O/1 confusion but
-// isn't in stdlib; operators copy-paste tokens anyway (never type),
-// so RFC 4648 is the right cost/benefit.
-var patEncoder = base32.StdEncoding.WithPadding(base32.NoPadding)
+// patRandomBytes is the number of cryptographic random bytes we draw
+// before encoding. base64 packs 3 bytes into 4 chars perfectly aligned,
+// so 21 bytes → exactly 28 chars (= patTokenBodyLen), no padding, no
+// truncation, no rejection sampling. Any change to patTokenBodyLen
+// must keep the multiple-of-4 alignment or the encoded body length
+// will drift.
+const patRandomBytes = patTokenBodyLen / 4 * 3
 
-// patRandomBytes is the number of raw bytes we draw before encoding.
-// 26 chars × 5 bits = 130 bits of payload; to produce ≥130 bits we
-// need 17 bytes (= 136 bits). We then truncate the encoded string
-// to patTokenBodyLen chars — truncation preserves the uniform
-// distribution of the underlying random bytes.
-const patRandomBytes = 17
+// patEncoder is the stdlib base64 URL-safe encoding without padding —
+// RFC 4648 §5. Alphabet: A-Z a-z 0-9 - _ (64 chars), which gives the
+// same mixed-case visual style as JWT tokens, GitHub PATs, and other
+// modern API credentials. URL-safe (no `+` `/` `=` to escape) so the
+// raw token can sit inside a URL, env var, or shell arg without
+// quoting trouble.
+//
+// Using the stdlib directly keeps the encoder side trivial — no
+// custom alphabet, no rejection-sampling loop. The whole "what does
+// a token look like" decision compresses to this single var.
+var patEncoder = base64.RawURLEncoding
 
 // PAT is one stored token record. The plain token is NEVER stored —
 // only HashHex is on disk. Middleware verifies by sha256-ing the
@@ -165,7 +169,7 @@ func (p *PAT) HasScope(want Scope) bool {
 
 // GeneratePAT mints a fresh token. Returns:
 //
-//   - plainToken: the full `pat_<26 chars>` string. The operator
+//   - plainToken: the full `pat_<28 chars>` string. The operator
 //     sees this exactly ONCE — in the response to `vd pat create`.
 //     Lost = revoke + remint.
 //   - record: the persistable PAT shape, ready for store.PutPAT.
@@ -191,15 +195,14 @@ func GeneratePAT(scopes []Scope, name string) (plainToken string, record PAT, er
 		return "", PAT{}, fmt.Errorf("pat: read random: %w", rerr)
 	}
 
-	encoded := patEncoder.EncodeToString(raw)
-	if len(encoded) < patTokenBodyLen {
-		// Defensive — math says 17 bytes → 28 base32 chars (no pad),
-		// well above our 26-char target. If this ever trips, the
-		// encoder broke or someone changed patRandomBytes.
-		return "", PAT{}, fmt.Errorf("pat: encoded body too short (%d < %d)", len(encoded), patTokenBodyLen)
+	body := patEncoder.EncodeToString(raw)
+	// Defensive — 21 raw bytes always encode to exactly 28 chars
+	// (base64 packs 3:4, no padding requested). If this trips,
+	// patRandomBytes or patTokenBodyLen drifted out of sync.
+	if len(body) != patTokenBodyLen {
+		return "", PAT{}, fmt.Errorf("pat: encoded body length %d, want %d", len(body), patTokenBodyLen)
 	}
 
-	body := encoded[:patTokenBodyLen]
 	plain := patTokenPrefix + body
 
 	return plain, PAT{
@@ -227,9 +230,10 @@ func HashPAT(plain string) string {
 }
 
 // ParsePATToken extracts the ID from a plain token string. Returns
-// ok=false on malformed input (wrong prefix, wrong total length).
-// Caller (auth middleware) does the etcd lookup with `id`, then
-// hashes the full `plain` and constant-time compares.
+// ok=false on malformed input (wrong prefix, wrong total length, or
+// any character outside the base64url alphabet). Caller (auth
+// middleware) does the etcd lookup with `id`, then hashes the full
+// `plain` and constant-time compares.
 //
 // Cheap (no allocations beyond the substring slice) so it's safe to
 // call on every request without amortisation.
@@ -243,7 +247,34 @@ func ParsePATToken(plain string) (id string, ok bool) {
 		return "", false
 	}
 
+	// Reject anything outside the base64url alphabet up front —
+	// keeps log injection / weird-byte garbage from ever reaching
+	// the hash + etcd lookup path.
+	for i := 0; i < len(body); i++ {
+		if !isPATChar(body[i]) {
+			return "", false
+		}
+	}
+
 	return body[:patTokenIDLen], true
+}
+
+// isPATChar returns true for chars in the base64url alphabet:
+// digits, uppercase letters, lowercase letters, `-`, `_`. Mirror of
+// what patEncoder (base64.RawURLEncoding) emits.
+func isPATChar(c byte) bool {
+	switch {
+	case c >= '0' && c <= '9':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c == '-' || c == '_':
+		return true
+	default:
+		return false
+	}
 }
 
 // ParseScopes parses a comma-separated scope list ("read,actions" or

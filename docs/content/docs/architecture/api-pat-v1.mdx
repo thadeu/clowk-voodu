@@ -21,11 +21,12 @@ All PAT routes live under `/api/pat/v1/`. The `v1` prefix is **part of the contr
 Every request must include:
 
 ```
-Authorization: Bearer pat_<26-char base32>
+Authorization: Bearer pat_<28-char base64url>
 ```
 
-- Token format: `pat_` prefix + 8-char ID + 18-char secret (base32, ~130 bits entropy).
-- Scheme name is case-insensitive (`bearer`, `BEARER` all accepted).
+- Token format: `pat_` prefix + 6-char ID + 22-char secret (base64 URL-safe alphabet `A-Z a-z 0-9 - _`, ~132 bits entropy in the secret). Same shape family as JWT tokens — URL-safe, no padding, copy-paste safe.
+- The token is **case-sensitive** — `pat_aB` and `pat_AB` are distinct credentials.
+- Scheme name on the Authorization header is case-insensitive (`bearer`, `BEARER` all accepted).
 - Tokens are minted via the orchestration plane (`vd pat create`) and shown **exactly once** — operators paste them into the WebUI's "Add island" form.
 - The controller stores `sha256(token)` hex, compared in constant time.
 
@@ -157,7 +158,7 @@ Threat model for operators:
 ```bash
 # Mint a PAT (orchestration plane, via CLI)
 vd pat create --name="webui-staging" --scope="read,actions"
-# → pat_7K2N4QQ5PHJX9VMRWN8B3CTKZE   (shown ONCE)
+# → pat_a3F9bZ2k7Qm9pNvX4tCfH5d8yL2eRw   (shown ONCE)
 
 # List existing PATs (hashes never returned)
 vd pat list

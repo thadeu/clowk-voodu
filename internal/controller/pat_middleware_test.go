@@ -73,8 +73,10 @@ func TestAuthPAT_Matrix(t *testing.T) {
 		{"missing prefix", "Bearer DEADBEEF12345678901234567890", ScopeRead, http.StatusUnauthorized, false},
 		{"wrong prefix family", "Bearer ghp_DEADBEEF12345678901234567890", ScopeRead, http.StatusUnauthorized, false},
 		{"too short", "Bearer pat_SHORT", ScopeRead, http.StatusUnauthorized, false},
-		{"unknown id", "Bearer pat_ZZZZZZZZZZZZZZZZZZZZZZZZZZ", ScopeRead, http.StatusUnauthorized, false},
-		{"wrong hash (same prefix as real, garbled body)", "Bearer pat_" + plainRead[len("pat_"):len("pat_")+patTokenIDLen] + "WRONGWRONGWRONGWRONG", ScopeRead, http.StatusUnauthorized, false},
+		// 28 valid-alphabet chars but the ID prefix doesn't exist in store.
+		{"unknown id", "Bearer pat_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", ScopeRead, http.StatusUnauthorized, false},
+		// Real ID + garbled-but-base62 secret tail. Length matches; hash compare fails.
+		{"wrong hash (same prefix as real, garbled body)", "Bearer pat_" + plainRead[len("pat_"):len("pat_")+patTokenIDLen] + "WrongWrongWrongWrongWr", ScopeRead, http.StatusUnauthorized, false},
 
 		// Real valid path: read PAT on read route → 200.
 		{"valid read PAT on read route", "Bearer " + plainRead, ScopeRead, http.StatusOK, true},
