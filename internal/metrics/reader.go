@@ -46,6 +46,19 @@ type QueryResult struct {
 	AvailableFrom   time.Time `json:"available_from"`
 	Truncated       bool      `json:"truncated"`
 	Series          []Point   `json:"series"`
+
+	// Latest is the SINGLE most recent unaggregated sample inside
+	// the query window. Distinct from `Series[len-1]` because the
+	// series points are bucket aggregates (avg across an interval),
+	// so on long ranges (6h, 24h, 7d) the last bucket smooths the
+	// real current value with N preceding samples.
+	//
+	// Callers (WebUI headline, CLI `vd metrics --current`) read
+	// `Latest` to get a value that's stable across ranges — picking
+	// 1h vs 6h vs 7d shouldn't change "what's CPU right now".
+	//
+	// nil when the query window has zero samples.
+	Latest *Point `json:"latest,omitempty"`
 }
 
 // Point is one chart point — the bucket midpoint timestamp and the
@@ -172,6 +185,15 @@ func Query(opts QueryOpts) (QueryResult, error) {
 
 	buckets := make([]bucket, bucketCount)
 
+	// latest tracks the single most recent sample in the window so
+	// the response can carry a "current value" that's stable across
+	// range choices. See QueryResult.Latest doc.
+	var (
+		latestTs    time.Time
+		latestVal   float64
+		latestSeen  bool
+	)
+
 	files, available, err := listFiles(opts.Dir, opts.Start, opts.End)
 	if err != nil {
 		return QueryResult{}, err
@@ -181,6 +203,15 @@ func Query(opts QueryOpts) (QueryResult, error) {
 	// (most queries hit yesterday + today only).
 	for _, path := range files {
 		if err := streamFile(path, opts, extractor, func(ts time.Time, val float64) {
+			// Track the latest sample regardless of bucket bounds
+			// — but only within the query window (extractor + ts
+			// filter in streamFile already guarantees that).
+			if !latestSeen || ts.After(latestTs) {
+				latestTs = ts
+				latestVal = val
+				latestSeen = true
+			}
+
 			idx := int(ts.Sub(opts.Start) / opts.Interval)
 			// Bucket-bounds guard — clock skew (NTP step) could
 			// produce ts < start or ts > end. Drop those points
@@ -214,13 +245,19 @@ func Query(opts QueryOpts) (QueryResult, error) {
 
 	truncated := !available.IsZero() && available.After(opts.Start)
 
-	return QueryResult{
+	result := QueryResult{
 		Metric:          opts.Metric,
 		IntervalSeconds: int(opts.Interval / time.Second),
 		AvailableFrom:   available,
 		Truncated:       truncated,
 		Series:          series,
-	}, nil
+	}
+
+	if latestSeen {
+		result.Latest = &Point{Ts: latestTs, Value: latestVal}
+	}
+
+	return result, nil
 }
 
 // listFiles returns the metrics files whose UTC date overlaps
