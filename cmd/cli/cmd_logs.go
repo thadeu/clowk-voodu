@@ -89,6 +89,22 @@ Examples:
 	return cmd
 }
 
+// runLogs — dispatch based on ref shape:
+//
+//   - per-replica  (scope/name.replica)  → /pods/{name}/logs  (single, no prefix)
+//   - container    (name.replica)        → /pods/{name}/logs  (single, no prefix)
+//   - scope/name   (multi-replica)       → /logs?scope=&name=&follow=&tail=
+//   - bare scope                         → /logs?scope=&follow=&tail=
+//
+// The multi-shape paths use the server-side multiplexed endpoint
+// (handleLogsMulti): one HTTP round-trip, server fans out across
+// every matching pod, prefixes each line with `[pod-name] `, the
+// CLI colourises per pod and prints.
+//
+// Historical note: the CLI used to fan-out N HTTP streams client-
+// side (one per matching pod). That logic moved to the server so
+// the WebUI, the CLI, and any future Go consumer share one
+// implementation of "tail N pods, attributed per line."
 func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 	ref = strings.TrimSpace(ref)
 
@@ -96,91 +112,131 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 		return fmt.Errorf("logs ref is empty")
 	}
 
-	containers, err := resolveLogsTargets(cmd, ref)
+	// Per-replica → exactly one container, name is deterministic.
+	if scope, name, replica, ok := splitReplicaRef(ref); ok {
+		return streamOneLog(cmd.Context(), cmd, containers.ContainerName(scope, name, replica), follow, tail, os.Stdout, "" /* no prefix */)
+	}
+
+	// Bare container name with a dot — already a docker name.
+	if strings.Contains(ref, ".") && !strings.Contains(ref, "/") {
+		return streamOneLog(cmd.Context(), cmd, ref, follow, tail, os.Stdout, "" /* no prefix */)
+	}
+
+	// Multi-shape (scope/name OR bare scope). Server multiplexes.
+	q := url.Values{}
+
+	if strings.Contains(ref, "/") {
+		scope, name := splitJobRef(ref)
+		if name == "" {
+			return fmt.Errorf("ref %q: name is empty", ref)
+		}
+
+		if scope != "" {
+			q.Set("scope", scope)
+		}
+
+		q.Set("name", name)
+	} else {
+		q.Set("scope", ref)
+	}
+
+	if follow {
+		q.Set("follow", "true")
+	}
+
+	if tail > 0 {
+		q.Set("tail", strconv.Itoa(tail))
+	}
+
+	return streamMultiLogs(cmd, ref, q)
+}
+
+// streamMultiLogs opens GET /logs?... and copies the multiplexed
+// body into stdout, parsing the `[pod-name] ` prefix the server
+// emits to colourise the pod marker per-line. The colour assignment
+// is deterministic (hash of name → palette slot), so a given pod's
+// lines stay the same colour across runs and modes.
+//
+// X-Voodu-Containers header is read up-front to print the
+// "==> tailing N container(s) for <ref>" banner on stderr, matching
+// the UX of the old client-side fan-out.
+func streamMultiLogs(cmd *cobra.Command, ref string, q url.Values) error {
+	ctx := cmd.Context()
+
+	resp, err := controllerDo(cmd.Root(), http.MethodGet, "/logs", q.Encode(), nil)
 	if err != nil {
 		return err
 	}
 
-	if len(containers) == 0 {
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(resp.Body)
+		return formatControllerError(resp.StatusCode, raw)
+	}
+
+	matches := strings.Split(resp.Header.Get("X-Voodu-Containers"), ",")
+	// Strip the empty-string artifact Split("") returns.
+	if len(matches) == 1 && matches[0] == "" {
+		matches = nil
+	}
+
+	if len(matches) == 0 {
 		return fmt.Errorf("no containers match %q", ref)
 	}
 
-	// Single container: copy verbatim, no prefix. The header banner on
-	// stderr surfaces which container produced the stream so an operator
-	// who passed a scope/name and got a single hit can still confirm.
-	if len(containers) == 1 {
-		return streamOneLog(cmd.Context(), cmd, containers[0], follow, tail, os.Stdout, "" /* no prefix */)
-	}
+	fmt.Fprintf(os.Stderr, "==> tailing %d container(s) for %q\n", len(matches), ref)
 
-	// Multi-container splits into two paths based on follow mode:
-	//
-	//   - Non-follow (historical dump): stream pods sequentially
-	//     in the chronologically-sorted order from
-	//     resolveLogsTargets. Oldest pod's logs print first,
-	//     newest last. Operator reads top-to-bottom, latest output
-	//     lands at the bottom near the cursor — no scroll-up
-	//     needed. Concurrent fan-out would race and produce
-	//     non-deterministic ordering between pods (lines from
-	//     each pod still atomic, but pod-A's chunk could land
-	//     before or after pod-B's depending on goroutine timing).
-	//
-	//   - Follow mode (-f): concurrent fan-out IS the right
-	//     behaviour. Operator wants live updates from every pod
-	//     interleaved as events happen; they don't care about
-	//     "show pod-A's history fully before pod-B starts."
-	//     Per-line prefix + locked writer guarantees lines stay
-	//     attributable.
-	fmt.Fprintf(os.Stderr, "==> tailing %d container(s) for %q\n", len(containers), ref)
+	palette := newPodPalette(os.Stdout)
+	stdout := bufio.NewWriter(os.Stdout)
+	defer stdout.Flush()
 
-	ctx, cancel := context.WithCancel(cmd.Context())
-	defer cancel()
+	// Read line-by-line so we can colourise the per-line `[pod] `
+	// prefix the server emits without buffering the whole stream.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	if !follow {
-		return streamSequentialLogs(ctx, cmd, containers, tail)
-	}
-
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
-
-	// Per-pod color — same hash-based assignment as sequential
-	// mode so the SAME pod has the SAME color whether the
-	// operator runs `vd logs` or `vd logs -f`. Eye trains once,
-	// applies everywhere.
-	prefixPalette := newPodPalette(os.Stdout)
-
-	errs := make(chan error, len(containers))
-
-	for _, name := range containers {
-		wg.Add(1)
-
-		go func(name string) {
-			defer wg.Done()
-
-			prefix := prefixPalette.ColorFor(name)("["+name+"]") + " "
-			writer := &lockedPrefixWriter{w: os.Stdout, mu: &mu, prefix: prefix}
-
-			if err := streamOneLog(ctx, cmd, name, follow, tail, writer, prefix); err != nil {
-				errs <- fmt.Errorf("%s: %w", name, err)
-			}
-		}(name)
-	}
-
-	wg.Wait()
-	close(errs)
-
-	// Collect non-cancellation errors. Cancellation (the parent ctx
-	// firing) is the normal Ctrl-C exit and should not be surfaced as
-	// a failure of the command.
-	var firstErr error
-	for e := range errs {
-		if firstErr == nil && !errors.Is(e, context.Canceled) {
-			firstErr = e
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return nil
 		}
+
+		line := scanner.Text()
+		if pod, rest, ok := stripPodPrefix(line); ok {
+			fmt.Fprintf(stdout, "%s %s\n", palette.ColorFor(pod)("["+pod+"]"), rest)
+		} else {
+			// Server is supposed to always prefix; surface unprefixed
+			// lines verbatim rather than swallowing them.
+			fmt.Fprintln(stdout, line)
+		}
+
+		// Flush after each line so `-f` feels live in the terminal —
+		// the bufio.Writer would otherwise hold lines until its
+		// internal buffer fills.
+		stdout.Flush()
 	}
 
-	return firstErr
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+
+	return nil
+}
+
+// stripPodPrefix peels `[pod-name] ` off the start of a multiplexed
+// line. Returns (pod, rest, true) on match, (line, "", false)
+// otherwise — keeping the call site's branch small.
+func stripPodPrefix(line string) (pod, rest string, ok bool) {
+	if !strings.HasPrefix(line, "[") {
+		return line, "", false
+	}
+
+	end := strings.Index(line, "] ")
+	if end < 0 {
+		return line, "", false
+	}
+
+	return line[1:end], line[end+2:], true
 }
 
 // streamSequentialLogs walks the (already chronologically-sorted)

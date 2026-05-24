@@ -106,15 +106,16 @@ func TestLogsReplicaRefRoutesDirectly(t *testing.T) {
 	}
 }
 
-// TestLogsScopeNameResolvesViaPodsList confirms the scope/name path:
-// the CLI lists matching pods first via /pods?scope=&name=, then
-// streams /pods/{name}/logs for each. Two replicas → two stream
-// fetches.
-func TestLogsScopeNameResolvesViaPodsList(t *testing.T) {
+// TestLogsScopeNameUsesMultiplexedEndpoint pins the scope/name path:
+// the CLI issues ONE request to /logs?scope=&name= and the server
+// returns the multiplexed stream (each line prefixed with
+// `[pod-name] `). The N+1 client-side fan-out is gone; this test
+// catches a regression where someone reintroduces a per-pod loop.
+func TestLogsScopeNameUsesMultiplexedEndpoint(t *testing.T) {
 	var (
-		mu          sync.Mutex
-		listQuery   string
-		streamPaths []string
+		mu             sync.Mutex
+		logsQuery      string
+		perPodFetchHit []string
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -122,23 +123,14 @@ func TestLogsScopeNameResolvesViaPodsList(t *testing.T) {
 		defer mu.Unlock()
 
 		switch {
-		case r.URL.Path == "/pods":
-			listQuery = r.URL.RawQuery
-
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data": map[string]any{
-					"pods": []controller.Pod{
-						{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web"},
-						{Name: "clowk-lp-web.bbbb", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web"},
-					},
-				},
-			})
-
-		case strings.HasSuffix(r.URL.Path, "/logs"):
-			streamPaths = append(streamPaths, r.URL.Path)
+		case r.URL.Path == "/logs":
+			logsQuery = r.URL.RawQuery
+			w.Header().Set("X-Voodu-Containers", "clowk-lp-web.aaaa,clowk-lp-web.bbbb")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("line\n"))
+			_, _ = w.Write([]byte("[clowk-lp-web.aaaa] alpha\n[clowk-lp-web.bbbb] beta\n"))
+
+		case strings.HasPrefix(r.URL.Path, "/pods/") && strings.HasSuffix(r.URL.Path, "/logs"):
+			perPodFetchHit = append(perPodFetchHit, r.URL.Path)
 
 		default:
 			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
@@ -162,128 +154,33 @@ func TestLogsScopeNameResolvesViaPodsList(t *testing.T) {
 	defer mu.Unlock()
 
 	for _, want := range []string{"scope=clowk-lp", "name=web"} {
-		if !strings.Contains(listQuery, want) {
-			t.Errorf("list query missing %q: %q", want, listQuery)
+		if !strings.Contains(logsQuery, want) {
+			t.Errorf("logs query missing %q: %q", want, logsQuery)
 		}
 	}
 
-	wantPaths := map[string]bool{
-		"/pods/clowk-lp-web.aaaa/logs": true,
-		"/pods/clowk-lp-web.bbbb/logs": true,
-	}
-
-	if len(streamPaths) != 2 {
-		t.Fatalf("expected 2 stream paths, got %d: %v", len(streamPaths), streamPaths)
-	}
-
-	for _, p := range streamPaths {
-		if !wantPaths[p] {
-			t.Errorf("unexpected stream path %q", p)
-		}
+	if len(perPodFetchHit) > 0 {
+		t.Errorf("CLI must not fan-out per pod; saw %v", perPodFetchHit)
 	}
 }
 
-// TestLogsMultiPodChronologicalOrder pins the "oldest pod's logs
-// first, newest last" output order. Operator reads top-to-bottom
-// in a terminal; latest output should land at the bottom near
-// the cursor without scroll-up.
-//
-// The non-follow path streams sequentially in CreatedAt-asc order
-// to avoid races between goroutines that would shuffle the
-// per-pod sections non-deterministically.
-func TestLogsMultiPodChronologicalOrder(t *testing.T) {
-	var (
-		mu          sync.Mutex
-		streamPaths []string
-	)
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		switch {
-		case r.URL.Path == "/pods":
-			// Server returns pods in arbitrary order — CLI is
-			// responsible for the chronological sort.
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data": map[string]any{
-					"pods": []controller.Pod{
-						// Newer first to prove the CLI re-sorts.
-						{Name: "test-job.bbbb", CreatedAt: "2026-05-02T12:00:00Z"},
-						{Name: "test-job.aaaa", CreatedAt: "2026-05-02T10:00:00Z"},
-						{Name: "test-job.cccc", CreatedAt: "2026-05-02T11:00:00Z"},
-					},
-				},
-			})
-
-		case strings.HasSuffix(r.URL.Path, "/logs"):
-			streamPaths = append(streamPaths, r.URL.Path)
-
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(r.URL.Path + " content\n"))
-
-		default:
-			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer ts.Close()
-
-	root := newRootCmd()
-	_ = root.PersistentFlags().Set("controller-url", ts.URL)
-
-	var buf bytes.Buffer
-	root.SetOut(&buf)
-	root.SetErr(&buf)
-	root.SetArgs([]string{"logs", "test/job"})
-
-	if err := root.Execute(); err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Stream paths fired in chronological order (CreatedAt asc):
-	// aaaa (10:00) → cccc (11:00) → bbbb (12:00). Sequential
-	// streaming guarantees deterministic order — concurrent
-	// fan-out wouldn't.
-	want := []string{
-		"/pods/test-job.aaaa/logs",
-		"/pods/test-job.cccc/logs",
-		"/pods/test-job.bbbb/logs",
-	}
-
-	if len(streamPaths) != len(want) {
-		t.Fatalf("got %d streams, want %d: %v", len(streamPaths), len(want), streamPaths)
-	}
-
-	for i, w := range want {
-		if streamPaths[i] != w {
-			t.Errorf("streamPaths[%d] = %q, want %q (chronological order broken)",
-				i, streamPaths[i], w)
-		}
-	}
-}
-
-// TestLogsBareScopeListsAllPodsInScope mirrors the get pd bare scope
-// behavior: no slash, no dot → treat the ref as a scope filter.
-func TestLogsBareScopeListsAllPodsInScope(t *testing.T) {
+// TestLogsBareScopeUsesMultiplexedEndpoint mirrors the bare-scope
+// `vd logs <scope>` shape. Single request, no name filter.
+func TestLogsBareScopeUsesMultiplexedEndpoint(t *testing.T) {
 	var (
 		mu        sync.Mutex
-		listQuery string
+		logsQuery string
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
-		if r.URL.Path == "/pods" {
-			listQuery = r.URL.RawQuery
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data":   map[string]any{"pods": []controller.Pod{}},
-			})
+		if r.URL.Path == "/logs" {
+			logsQuery = r.URL.RawQuery
+			w.Header().Set("X-Voodu-Containers", "clowk-lp-web.aaaa")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("[clowk-lp-web.aaaa] line\n"))
 
 			return
 		}
@@ -300,19 +197,52 @@ func TestLogsBareScopeListsAllPodsInScope(t *testing.T) {
 	root.SetErr(&buf)
 	root.SetArgs([]string{"logs", "clowk-lp"})
 
-	// Empty match → error, but the listing must have happened with
-	// scope=clowk-lp and NO name filter.
-	_ = root.Execute()
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if !strings.Contains(listQuery, "scope=clowk-lp") {
-		t.Errorf("list query missing scope: %q", listQuery)
+	if !strings.Contains(logsQuery, "scope=clowk-lp") {
+		t.Errorf("logs query missing scope: %q", logsQuery)
 	}
 
-	if strings.Contains(listQuery, "name=") {
-		t.Errorf("bare scope must NOT carry a name filter: %q", listQuery)
+	if strings.Contains(logsQuery, "name=") {
+		t.Errorf("bare scope must NOT carry a name filter: %q", logsQuery)
+	}
+}
+
+// TestLogsZeroMatchSurfacesFriendlyError — the server signals
+// "no matches" via an empty X-Voodu-Containers header. The CLI must
+// turn that into the same "no containers match" error the operator
+// used to see from the client-side fan-out path.
+func TestLogsZeroMatchSurfacesFriendlyError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/logs" {
+			w.Header().Set("X-Voodu-Containers", "")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected: %s", r.URL.Path)
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"logs", "nope"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("expected error on zero match")
+	}
+
+	if !strings.Contains(err.Error(), "no containers match") {
+		t.Errorf("error message: got %q, want substring 'no containers match'", err.Error())
 	}
 }
 
