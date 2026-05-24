@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/docker"
@@ -270,4 +271,79 @@ func sortPods(pods []Pod) {
 
 		return a.ReplicaID < b.ReplicaID
 	})
+}
+
+// enrichPodsConcurrency caps the in-flight docker inspects when the
+// /pods?detail=true handler is fanning out. Picked as the sweet spot
+// between "all serial" (slow on a 100-pod host) and "all parallel"
+// (docker daemon goes unhappy past ~16 concurrent inspects on small
+// VMs). Pure number — change if you ever profile and find a better
+// knee.
+const enrichPodsConcurrency = 8
+
+// enrichPods turns a list of compact Pod records into the rich
+// PodDetail shape, in parallel. Used by GET /pods?detail=true so the
+// CLI and WebUI don't have to N+1 their way through /pods/{name}
+// client-side — the server pays the inspect cost once and ships the
+// joined response.
+//
+// Semantics:
+//
+//   - Best-effort: an inspect failure on one pod degrades that slot
+//     to "just the basic Pod info" (the embedded Pod fields stay
+//     populated, the rich extras are zero-valued and omit from
+//     JSON via `omitempty`). The list as a whole still returns
+//     and downstreams can render partial data.
+//   - Order preserved: outputs[i] always corresponds to inputs[i].
+//   - Bounded concurrency: at most `enrichPodsConcurrency` inspects
+//     in flight, so a hundred-pod host doesn't fork a hundred
+//     `docker inspect` children at once.
+//
+// describer is the same PodDescriber interface GET /pods/{name}
+// uses; passing it explicitly keeps this function testable without
+// the api.go plumbing.
+func enrichPods(pods []Pod, describer PodDescriber) []PodDetail {
+	out := make([]PodDetail, len(pods))
+	sem := make(chan struct{}, enrichPodsConcurrency)
+
+	var wg sync.WaitGroup
+	for i := range pods {
+		i := i
+		p := pods[i]
+		wg.Add(1)
+
+		sem <- struct{}{} // acquire slot
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }() // release slot
+
+			det, err := describer.GetPod(p.Name)
+			if err != nil || det == nil {
+				// Inspect failed (daemon hiccup, race with delete) or
+				// the container vanished between list and inspect.
+				// Fall back to the compact Pod so the row still
+				// renders something useful.
+				out[i] = PodDetail{Pod: p}
+				return
+			}
+
+			// describer.GetPod re-derives identity from labels and may
+			// leave Scope/ResourceName/ReplicaID empty for pre-M0
+			// containers. The list-time identity (already in `p`) is
+			// the trustworthy one, so layer it back on top.
+			det.Pod.Kind = p.Kind
+			det.Pod.Scope = p.Scope
+			det.Pod.ResourceName = p.ResourceName
+			det.Pod.ReplicaID = p.ReplicaID
+			det.Pod.ReleaseID = p.ReleaseID
+			det.Pod.Role = p.Role
+			det.Pod.CreatedAt = p.CreatedAt
+
+			out[i] = *det
+		}()
+	}
+
+	wg.Wait()
+
+	return out
 }

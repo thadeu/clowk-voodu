@@ -292,6 +292,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
+	mux.HandleFunc("GET /logs", a.handleLogsMulti)
 	mux.HandleFunc("POST /pods/{name}/stop", a.handlePodStop)
 	mux.HandleFunc("POST /pods/{name}/start", a.handlePodStart)
 	mux.HandleFunc("/plugins", a.handlePlugins)
@@ -1400,6 +1401,30 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 	// running pods. Honours the same filters as the pods list so
 	// `vd get pods -s fsw` scopes both halves of the response.
 	degraded := a.collectDegradedResources(r.Context(), pods, wantKind, wantScope, wantName)
+
+	// detail=true enriches each pod with the full inspect view (env,
+	// labels, networks, ports, state, etc.) — same shape /pods/{name}
+	// returns, but in bulk. The CLI's `vd describe pod` used to
+	// fan-out one /pods/{name} per match client-side; with this flag
+	// it asks once and the server pays the inspect cost in parallel.
+	//
+	// Enables the WebUI and any future Go consumer (plugins) to share
+	// the same rich list without duplicating fan-out logic. Compact
+	// shape stays the default — `vd get pods` and the dashboard's
+	// header still pay only the cheap list cost.
+	if r.URL.Query().Get("detail") == "true" {
+		describer, _ := lister.(PodDescriber)
+		if describer == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("pod describer not configured (server not wired with docker-backed lister)"))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data:   map[string]any{"pods": enrichPods(pods, describer), "degraded": degraded},
+		})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",

@@ -675,3 +675,149 @@ func TestPods_DegradedReportsRunningReplicas(t *testing.T) {
 		t.Errorf("ReplicaIDs: got %d (%v), want 2 (a1, b2)", len(d.ReplicaIDs), d.ReplicaIDs)
 	}
 }
+
+// TestPodsGet_DetailTrue_EnrichesEachRow pins the `?detail=true`
+// branch: every Pod in the response carries the rich PodDetail fields
+// (ports, env, networks) joined server-side instead of by N+1
+// client-side fetches. This is what the CLI's `vd describe pod` and
+// the WebUI's /pods listing both consume.
+func TestPodsGet_DetailTrue_EnrichesEachRow(t *testing.T) {
+	api, _ := newTestAPI(t)
+
+	api.Pods = &fakePodsLister{
+		pods: []Pod{
+			{Name: "x-web.a", Kind: "deployment", Scope: "x", ResourceName: "web", ReplicaID: "a", Image: "x-web:latest", Running: true},
+			{Name: "x-db.0", Kind: "statefulset", Scope: "x", ResourceName: "db", ReplicaID: "0", Image: "postgres:16", Running: true},
+		},
+		details: map[string]*PodDetail{
+			"x-web.a": {
+				Pod:        Pod{Name: "x-web.a", Image: "x-web:latest"},
+				ID:         "abc123",
+				WorkingDir: "/app",
+				Ports:      []docker.ContainerPort{{Container: "80/tcp"}},
+				Env:        map[string]string{"PORT": "80"},
+			},
+			"x-db.0": {
+				Pod:           Pod{Name: "x-db.0", Image: "postgres:16"},
+				ID:            "def456",
+				RestartPolicy: "unless-stopped",
+				Ports:         []docker.ContainerPort{{Container: "5432/tcp"}},
+				Env:           map[string]string{"POSTGRES_DB": "main"},
+			},
+		},
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods?detail=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	var env struct {
+		Status string
+		Data   struct {
+			Pods []struct {
+				Name       string                  `json:"name"`
+				Kind       string                  `json:"kind"`
+				Scope      string                  `json:"scope"`
+				Image      string                  `json:"image"`
+				Ports      []docker.ContainerPort  `json:"ports"`
+				Env        map[string]string       `json:"env"`
+				WorkingDir string                  `json:"working_dir"`
+			} `json:"pods"`
+		}
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(env.Data.Pods) != 2 {
+		t.Fatalf("expected 2 pods, got %d", len(env.Data.Pods))
+	}
+
+	// Identity from the list (kind/scope) must survive the join.
+	if env.Data.Pods[0].Kind != "deployment" || env.Data.Pods[0].Scope != "x" {
+		t.Errorf("pod[0] identity lost: %+v", env.Data.Pods[0])
+	}
+
+	// Rich fields from the detail must show up.
+	if len(env.Data.Pods[0].Ports) != 1 || env.Data.Pods[0].Ports[0].Container != "80/tcp" {
+		t.Errorf("pod[0] missing ports: %+v", env.Data.Pods[0].Ports)
+	}
+
+	if env.Data.Pods[1].Env["POSTGRES_DB"] != "main" {
+		t.Errorf("pod[1] missing env: %+v", env.Data.Pods[1].Env)
+	}
+}
+
+// TestPodsGet_DetailTrue_DegradesGracefullyOnInspectFailure pins that
+// when a single GetPod fails, the slot falls back to the compact Pod
+// instead of taking down the whole list. Operators see partial data
+// instead of a 500.
+func TestPodsGet_DetailTrue_DegradesGracefullyOnInspectFailure(t *testing.T) {
+	api, _ := newTestAPI(t)
+
+	api.Pods = &fakePodsLister{
+		pods: []Pod{
+			{Name: "good.a", Kind: "deployment", Scope: "x", Image: "x:1", Running: true},
+			{Name: "bad.b", Kind: "deployment", Scope: "x", Image: "x:2", Running: true},
+		},
+		// "good.a" present, "bad.b" missing → GetPod returns (nil, nil)
+		details: map[string]*PodDetail{
+			"good.a": {Pod: Pod{Name: "good.a"}, ID: "ok"},
+		},
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods?detail=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	var env struct {
+		Data struct {
+			Pods []struct {
+				Name string `json:"name"`
+				ID   string `json:"id"`
+			} `json:"pods"`
+		}
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+
+	if len(env.Data.Pods) != 2 {
+		t.Fatalf("expected 2 pods (one with detail, one without), got %d", len(env.Data.Pods))
+	}
+
+	// Slots may be in any order — find by name.
+	var good, bad string
+	for _, p := range env.Data.Pods {
+		if p.Name == "good.a" {
+			good = p.ID
+		}
+		if p.Name == "bad.b" {
+			bad = p.ID
+		}
+	}
+
+	if good != "ok" {
+		t.Errorf("good.a should keep its inspect id, got %q", good)
+	}
+	if bad != "" {
+		t.Errorf("bad.b should have empty id (fallback path), got %q", bad)
+	}
+}

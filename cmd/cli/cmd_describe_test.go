@@ -803,15 +803,23 @@ func TestDescribePodRoutesToPodsName(t *testing.T) {
 }
 
 // TestDescribePodAcceptsScopeNameRef locks in the "all replicas of
-// an app" shape: `vd describe pod clowk-lp/web` lists matching pods
-// via /pods?scope=&name=, then fetches /pods/{name} for each. The
-// operator types the scope/name they already know — no need to
-// 'voodu get pods | grep' first to copy a replica id.
+// an app" shape: `vd describe pod clowk-lp/web` issues ONE call to
+// /pods?scope=&name=&detail=true and the server returns the matched
+// rows already enriched with the full PodDetail shape. The operator
+// types the scope/name they already know — no need to 'voodu get
+// pods | grep' first to copy a replica id, and the CLI doesn't
+// fan-out N+1 detail fetches.
+//
+// Two invariants pinned here:
+//   1. The query carries `detail=true` (otherwise the CLI would
+//      receive compact rows with no inspect fields to render).
+//   2. NO /pods/{name} round-trips happen — that path is reserved
+//      for `vd describe pod <name>` (single container by name).
 func TestDescribePodAcceptsScopeNameRef(t *testing.T) {
 	var (
-		mu             sync.Mutex
-		listQuery      string
-		fetchedDetails []string
+		mu              sync.Mutex
+		listQuery       string
+		perPodFetchHits []string
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -822,31 +830,23 @@ func TestDescribePodAcceptsScopeNameRef(t *testing.T) {
 		case r.URL.Path == "/pods":
 			listQuery = r.URL.RawQuery
 
+			// `?detail=true` shape: the Pods slice is []PodDetail with
+			// inspect-level fields already populated. The CLI renders
+			// directly from this without a second round-trip.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "ok",
 				"data": map[string]any{
-					"pods": []controller.Pod{
-						{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "aaaa"},
-						{Name: "clowk-lp-web.bbbb", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "bbbb"},
+					"pods": []controller.PodDetail{
+						{Pod: controller.Pod{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "aaaa"}},
+						{Pod: controller.Pod{Name: "clowk-lp-web.bbbb", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web", ReplicaID: "bbbb"}},
 					},
 				},
 			})
 
 		case strings.HasPrefix(r.URL.Path, "/pods/"):
-			name := strings.TrimPrefix(r.URL.Path, "/pods/")
-			fetchedDetails = append(fetchedDetails, name)
-
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data": map[string]any{
-					"pod": &controller.PodDetail{
-						Pod: controller.Pod{
-							Name: name, Kind: "deployment", Scope: "clowk-lp",
-							ResourceName: "web",
-						},
-					},
-				},
-			})
+			// Per-pod fetch is forbidden in the enriched-list flow.
+			// Record any hit so the assertion below catches a regression.
+			perPodFetchHits = append(perPodFetchHits, strings.TrimPrefix(r.URL.Path, "/pods/"))
 
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -862,29 +862,29 @@ func TestDescribePodAcceptsScopeNameRef(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	for _, want := range []string{"scope=clowk-lp", "name=web"} {
+	for _, want := range []string{"scope=clowk-lp", "name=web", "detail=true"} {
 		if !strings.Contains(listQuery, want) {
 			t.Errorf("list query missing %q: %q", want, listQuery)
 		}
 	}
 
-	wantDetails := []string{"clowk-lp-web.aaaa", "clowk-lp-web.bbbb"}
-	if strings.Join(fetchedDetails, ",") != strings.Join(wantDetails, ",") {
-		t.Errorf("fetched details: got %v, want %v", fetchedDetails, wantDetails)
+	if len(perPodFetchHits) > 0 {
+		t.Errorf("CLI must not fan-out /pods/{name} when ?detail=true is used; saw hits: %v", perPodFetchHits)
 	}
 }
 
 // TestDescribePodAcceptsBareScopeRef locks in the third ref shape:
 // `vd describe pod clowk-lp` (no slash, no dot) lists every pod in
-// the scope across all kinds, then renders the detail for each one.
-// The discriminator hinges on the dot-vs-no-dot heuristic — if a
-// future refactor accidentally treats bare refs as container names
-// again, this test catches it before the operator does.
+// the scope across all kinds via ONE /pods?scope=&detail=true call,
+// then renders the enriched detail for each match. The discriminator
+// hinges on the dot-vs-no-dot heuristic — if a future refactor
+// accidentally treats bare refs as container names again, this test
+// catches it before the operator does.
 func TestDescribePodAcceptsBareScopeRef(t *testing.T) {
 	var (
-		mu             sync.Mutex
-		listQuery      string
-		fetchedDetails []string
+		mu              sync.Mutex
+		listQuery       string
+		perPodFetchHits []string
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -898,26 +898,16 @@ func TestDescribePodAcceptsBareScopeRef(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "ok",
 				"data": map[string]any{
-					"pods": []controller.Pod{
-						{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web"},
-						{Name: "clowk-lp-crawler1.bbbb", Kind: "cronjob", Scope: "clowk-lp", ResourceName: "crawler1"},
-						{Name: "clowk-lp-migrate.cccc", Kind: "job", Scope: "clowk-lp", ResourceName: "migrate"},
+					"pods": []controller.PodDetail{
+						{Pod: controller.Pod{Name: "clowk-lp-web.aaaa", Kind: "deployment", Scope: "clowk-lp", ResourceName: "web"}},
+						{Pod: controller.Pod{Name: "clowk-lp-crawler1.bbbb", Kind: "cronjob", Scope: "clowk-lp", ResourceName: "crawler1"}},
+						{Pod: controller.Pod{Name: "clowk-lp-migrate.cccc", Kind: "job", Scope: "clowk-lp", ResourceName: "migrate"}},
 					},
 				},
 			})
 
 		case strings.HasPrefix(r.URL.Path, "/pods/"):
-			name := strings.TrimPrefix(r.URL.Path, "/pods/")
-			fetchedDetails = append(fetchedDetails, name)
-
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "ok",
-				"data": map[string]any{
-					"pod": &controller.PodDetail{
-						Pod: controller.Pod{Name: name, Scope: "clowk-lp"},
-					},
-				},
-			})
+			perPodFetchHits = append(perPodFetchHits, strings.TrimPrefix(r.URL.Path, "/pods/"))
 
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -933,19 +923,21 @@ func TestDescribePodAcceptsBareScopeRef(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// The list query should carry the scope but no name — bare ref
-	// means "every container in this scope regardless of resource".
+	// Bare ref → scope filter + detail=true, but NO name filter.
 	if !strings.Contains(listQuery, "scope=clowk-lp") {
 		t.Errorf("list query missing scope filter: %q", listQuery)
+	}
+
+	if !strings.Contains(listQuery, "detail=true") {
+		t.Errorf("list query missing detail=true: %q", listQuery)
 	}
 
 	if strings.Contains(listQuery, "name=") {
 		t.Errorf("bare scope ref must NOT carry a name filter, got %q", listQuery)
 	}
 
-	wantDetails := []string{"clowk-lp-web.aaaa", "clowk-lp-crawler1.bbbb", "clowk-lp-migrate.cccc"}
-	if strings.Join(fetchedDetails, ",") != strings.Join(wantDetails, ",") {
-		t.Errorf("fetched details: got %v, want %v", fetchedDetails, wantDetails)
+	if len(perPodFetchHits) > 0 {
+		t.Errorf("CLI must not fan-out /pods/{name} when ?detail=true is used; saw hits: %v", perPodFetchHits)
 	}
 }
 

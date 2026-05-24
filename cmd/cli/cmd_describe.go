@@ -1091,30 +1091,36 @@ func fetchPodDetail(cmd *cobra.Command, name string) (*controller.PodDetail, err
 	return env.Data.Pod, nil
 }
 
-// podsListResponse mirrors the /pods envelope. Local copy so the
-// describe-side resolution stays decoupled from cmd_get_pods.go's
-// own podsResponse — they happen to be identical today, but a
-// future divergence (extra fields on /pods) shouldn't ripple here.
+// podsListResponse mirrors the /pods envelope when called with
+// `?detail=true` — the server returns the full PodDetail per row
+// (state, env, networks, ports, …) so describe never has to fan
+// out a second round of /pods/{name} fetches.
+//
+// Local copy so the describe-side resolution stays decoupled from
+// cmd_get_pods.go's compact podsResponse — they're intentionally
+// different shapes (compact list vs rich detail).
 type podsListResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Pods []controller.Pod `json:"pods"`
+		Pods []controller.PodDetail `json:"pods"`
 	} `json:"data"`
 	Error string `json:"error,omitempty"`
 }
 
-// runDescribePodByFilter is the shared enumerator: list /pods with
-// whatever filter combination the caller built up (scope-only,
-// scope+name, name-only), then fetch /pods/{name} for each match
-// and render rich detail.
+// runDescribePodByFilter is the shared enumerator: hit /pods?detail=true
+// with whatever filter combination the caller built up (scope-only,
+// scope+name, name-only) and the server returns the matched rows
+// ALREADY enriched with the full PodDetail shape.
 //
-// Two-phase: list call for the matching container names, then one
-// detail fetch per name. N+1 calls, but pod counts per resource /
-// scope are small (typically <20 across a whole scope) and the
-// alternative would require a new server endpoint for marginal
-// value. If a scope ever grows large enough to feel slow here, the
-// fix is server-side (`/pods?expand=detail` returning PodDetail[]),
-// not client-side parallelization.
+// Single round-trip. The server does the inspect fan-out in parallel
+// (see enrichPods in internal/controller/pods.go), so a scope with
+// 50 pods is one HTTP request from the CLI's point of view.
+//
+// Historical note: this used to do its own N+1 client-side, opening
+// `/pods/{name}` once per match. That logic was lifted into the
+// `?detail=true` branch of handlePods so the CLI, the Rails WebUI, and
+// any future Go consumer can share the same enriched-list endpoint
+// without redoing the orchestration on each side.
 //
 // `ref` is carried purely for error messages — the operator types
 // it and expects to see it echoed back when nothing matches.
@@ -1134,6 +1140,10 @@ func runDescribePodByFilter(cmd *cobra.Command, ref, scope, name string, opts de
 	if name != "" {
 		q.Set("name", name)
 	}
+
+	// detail=true joins the inspect view per row server-side. The
+	// response Pods slice is []PodDetail instead of []Pod.
+	q.Set("detail", "true")
 
 	resp, err := controllerDo(root, http.MethodGet, "/pods", q.Encode(), nil)
 	if err != nil {
@@ -1161,18 +1171,12 @@ func runDescribePodByFilter(cmd *cobra.Command, ref, scope, name string, opts de
 		return fmt.Errorf("no pods match %q (scope=%q, name=%q)", ref, scope, name)
 	}
 
-	// Fetch rich detail for each matching pod. Bail early on the
-	// first failure — partial output would be confusing ("did the
-	// rest succeed or fail?").
+	// Convert []PodDetail → []*PodDetail for the renderers (they
+	// take pointers historically; cheaper than refactoring three
+	// renderers' signatures).
 	details := make([]*controller.PodDetail, 0, len(env.Data.Pods))
-
-	for _, p := range env.Data.Pods {
-		d, err := fetchPodDetail(cmd, p.Name)
-		if err != nil {
-			return fmt.Errorf("pod %s: %w", p.Name, err)
-		}
-
-		details = append(details, d)
+	for i := range env.Data.Pods {
+		details = append(details, &env.Data.Pods[i])
 	}
 
 	switch describeOutputMode(root) {

@@ -2,12 +2,30 @@
 // the network-exposable observability surface the Rails WebUI
 // consumes. These handlers are thin wrappers over the existing
 // internal handlers (`handleStats`, `handlePods`, etc.) — no
-// business logic lives here. The wrap layer:
+// business logic lives here.
 //
-//  1. Reshapes path params (the public URL uses /api/pat/v1/pods/{name},
-//     the internal handler expects the same — pass-through).
-//  2. Doesn't add response transformation (the JSON envelope shape
-//     stays identical to the orchestration plane).
+// ── Invariant: PAT proxies stay passthrough ──────────────────────
+//
+// Every handler in this file is either:
+//
+//   1. a VERBATIM passthrough to its orchestration-plane twin
+//      (e.g. `a.handleStats(w, r)`), OR
+//   2. limited to translating INPUT (e.g. path param → query
+//      param, like `handlePATPodRestart` resolving a container
+//      name into a (kind, scope, name) triple).
+//
+// Response bodies MUST be byte-identical between the two planes —
+// same field names, same envelope, same timestamps, same handler-
+// added query params. This is what guarantees that adding
+// `?detail=true` to handlePods automatically lights up for both the
+// CLI and the WebUI without coordinated changes, and what stops the
+// wire shapes from silently drifting as features land.
+//
+// If a future PAT response NEEDS to differ from the orchestration
+// one, the divergence belongs in the underlying handler behind a
+// query param (e.g. `?for=pat`), not here. Keeping the proxy dumb
+// is what lets us treat "CLI sees X" and "WebUI sees X" as the same
+// statement.
 //
 // Auth and rate limit middleware are applied at route registration
 // (PATHandler method below), not here, so the proxy handlers stay
@@ -62,6 +80,12 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/pods/{name}/logs",
 		auth.Middleware(ScopeRead, a.handlePATPodLogs))
 
+	// Multi-pod tail (server-side fan-out across kind/scope/name).
+	// Same handler as the orchestration plane — verbatim passthrough,
+	// per the invariant at the top of this file.
+	mux.HandleFunc("GET /api/pat/v1/logs",
+		auth.Middleware(ScopeRead, a.handlePATLogsMulti))
+
 	// Action endpoints — scope=actions + per-PAT rate limit.
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
@@ -100,6 +124,15 @@ func (a *API) handlePATPodDescribe(w http.ResponseWriter, r *http.Request) {
 // (no buffering wrapper) so Flush continues to work end-to-end.
 func (a *API) handlePATPodLogs(w http.ResponseWriter, r *http.Request) {
 	a.handlePodLogs(w, r)
+}
+
+// handlePATLogsMulti is the proxy for the server-side multi-pod
+// log tail. Same chunked-transfer / Flusher contract as the
+// single-pod variant — the underlying handler multiplexes per-pod
+// streams and writes `[pod-name] ` prefixed lines to the response,
+// flushing after each line so the WebUI sees them as they land.
+func (a *API) handlePATLogsMulti(w http.ResponseWriter, r *http.Request) {
+	a.handleLogsMulti(w, r)
 }
 
 // handlePATPodRestart is the proxy for triggering a rolling

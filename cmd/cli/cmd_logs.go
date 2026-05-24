@@ -289,10 +289,12 @@ func resolveLogsTargets(cmd *cobra.Command, ref string) ([]string, error) {
 	return out, nil
 }
 
-// fetchPodsList GETs /pods with the given filter and returns the
-// matching Pod entries. Shared between logs and describe pod's
-// scope/name resolution paths so any wire-shape change ripples to
-// both at the same time.
+// fetchPodsList GETs /pods (compact) with the given filter and
+// returns the matching Pod entries. Logs resolution only needs the
+// container Name field — no point paying for the rich /pods?detail=true
+// shape that describe uses. The local response struct decouples
+// this call from podsListResponse in cmd_describe.go (which now
+// decodes []PodDetail for its enriched payload).
 func fetchPodsList(cmd *cobra.Command, q url.Values) ([]controller.Pod, error) {
 	root := cmd.Root()
 
@@ -309,7 +311,13 @@ func fetchPodsList(cmd *cobra.Command, q url.Values) ([]controller.Pod, error) {
 		return nil, formatControllerError(resp.StatusCode, raw)
 	}
 
-	var env podsListResponse
+	var env struct {
+		Status string `json:"status"`
+		Data   struct {
+			Pods []controller.Pod `json:"pods"`
+		} `json:"data"`
+		Error string `json:"error,omitempty"`
+	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("decode pods list: %w", err)
 	}
