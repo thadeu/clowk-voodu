@@ -128,6 +128,12 @@ type API struct {
 	// callers to maintain that bookkeeping.
 	System systemstats.Collector
 
+	// MetricsDir is where the sampler appends NDJSON time-series.
+	// handleMetrics reads from here for chart queries. Empty string
+	// → 503 (controller not wired with metrics support). Production
+	// wires `paths.MetricsDir()`; same dir the Sampler writes to.
+	MetricsDir string
+
 	// Readiness powers `GET /pods/{name}/ready` — the per-replica
 	// readiness gate caddy (or any ingress) reads to decide
 	// whether to route to a given upstream. Nil → 503 / 404. The
@@ -301,6 +307,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /pods/{name}/ready", a.handlePodReady)
 	mux.HandleFunc("GET /stats", a.handleStats)
 	mux.HandleFunc("GET /system", a.handleSystem)
+	mux.HandleFunc("GET /metrics", a.handleMetrics)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)

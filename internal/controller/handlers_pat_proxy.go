@@ -89,6 +89,13 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/logs",
 		auth.Middleware(ScopeRead, a.handlePATLogsMulti))
 
+	// Time-series metrics (M2). Verbatim passthrough — chart
+	// queries read NDJSON the background Sampler writes; no
+	// per-PAT scoping (read scope is enough). The handler caps
+	// MaxBuckets/range itself so a malformed query can't fan out.
+	mux.HandleFunc("GET /api/pat/v1/metrics",
+		auth.Middleware(ScopeRead, a.handlePATMetrics))
+
 	// Action endpoints — scope=actions + per-PAT rate limit.
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
@@ -136,6 +143,14 @@ func (a *API) handlePATPodDescribe(w http.ResponseWriter, r *http.Request) {
 // (no buffering wrapper) so Flush continues to work end-to-end.
 func (a *API) handlePATPodLogs(w http.ResponseWriter, r *http.Request) {
 	a.handlePodLogs(w, r)
+}
+
+// handlePATMetrics is the proxy for the time-series chart endpoint.
+// Verbatim passthrough per the invariant at the top of this file —
+// the WebUI sees byte-identical JSON to what a CLI `vd metrics`
+// would consume against the orchestration plane.
+func (a *API) handlePATMetrics(w http.ResponseWriter, r *http.Request) {
+	a.handleMetrics(w, r)
 }
 
 // handlePATLogsMulti is the proxy for the server-side multi-pod

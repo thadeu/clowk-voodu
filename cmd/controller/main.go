@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.voodu.clowk.in/internal/controller"
+	"go.voodu.clowk.in/internal/metrics"
 	"go.voodu.clowk.in/internal/paths"
 )
 
@@ -40,6 +41,14 @@ func main() {
 		nodeName    = flag.String("name", "voodu-0", "etcd cluster member name")
 		quietEtcd   = flag.Bool("quiet-etcd", true, "suppress etcd info logging")
 		showVersion = flag.Bool("version", false, "print version and exit")
+
+		// Metrics sampler — persists 15s-cadence time-series rows to
+		// NDJSON under `<VOODU_ROOT>/cache/metrics/` so WebUI charts
+		// can render history. Both honour env vars so the systemd unit
+		// can tune retention/cadence per-host without changing the
+		// service file's ExecStart.
+		metricsInterval  = flag.Duration("metrics-interval", parseDurationOr("VOODU_METRICS_INTERVAL", metrics.DefaultInterval), "metrics sampler tick cadence (env: VOODU_METRICS_INTERVAL, default 15s)")
+		metricsRetention = flag.Duration("metrics-retention", parseDurationOr("VOODU_METRICS_RETENTION", metrics.DefaultRetention), "metrics file retention window (env: VOODU_METRICS_RETENTION, default 168h = 7d)")
 	)
 
 	flag.Parse()
@@ -60,18 +69,20 @@ func main() {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
 
 	srv := controller.NewServer(controller.Config{
-		DataDir:        *dataDir,
-		HTTPAddr:       *httpAddr,
-		PATAddr:        *patAddr,
-		PATActionRate:  *patRate,
-		PATActionBurst: *patBurst,
-		EtcdClient:     *etcdClient,
-		EtcdPeer:       *etcdPeer,
-		NodeName:       *nodeName,
-		PluginsRoot:    *pluginsDir,
-		Version:        fmt.Sprintf("%s (commit: %s)", version, commit),
-		Logger:         logger,
-		QuietEtcd:      *quietEtcd,
+		DataDir:          *dataDir,
+		HTTPAddr:         *httpAddr,
+		PATAddr:          *patAddr,
+		PATActionRate:    *patRate,
+		PATActionBurst:   *patBurst,
+		EtcdClient:       *etcdClient,
+		EtcdPeer:         *etcdPeer,
+		NodeName:         *nodeName,
+		PluginsRoot:      *pluginsDir,
+		Version:          fmt.Sprintf("%s (commit: %s)", version, commit),
+		Logger:           logger,
+		QuietEtcd:        *quietEtcd,
+		MetricsInterval:  *metricsInterval,
+		MetricsRetention: *metricsRetention,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -99,4 +110,24 @@ func envOr(name, fallback string) string {
 	}
 
 	return fallback
+}
+
+// parseDurationOr seeds a duration flag from an env var. Falls
+// back to `fallback` when the var is unset OR fails to parse —
+// printing a parse error here would race with flag.Parse's own
+// error path and confuse the user. Bad input silently degrades
+// to the default; operator notices via the controller log line
+// that reports the active config.
+func parseDurationOr(name string, fallback time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+
+	return d
 }

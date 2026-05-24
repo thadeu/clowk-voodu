@@ -13,6 +13,7 @@ import (
 
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/envfile"
+	"go.voodu.clowk.in/internal/metrics"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/internal/secrets"
@@ -51,6 +52,21 @@ type Config struct {
 	// endpoints. Default 3 — operator can quickly chain up to 3
 	// restarts before steady-state kicks in.
 	PATActionBurst int
+
+	// MetricsDir is where the time-series sampler appends NDJSON.
+	// Defaults to `paths.MetricsDir()` when empty. Override useful
+	// for tests; production wires the canonical CacheDir path.
+	MetricsDir string
+
+	// MetricsInterval is the sampler tick cadence. Default 15s
+	// (`metrics.DefaultInterval`). Operator override via
+	// `--metrics-interval` / `VOODU_METRICS_INTERVAL`.
+	MetricsInterval time.Duration
+
+	// MetricsRetention is the file-cleanup window. Default 7 days
+	// (`metrics.DefaultRetention`). Operator override via
+	// `--metrics-retention` / `VOODU_METRICS_RETENTION`.
+	MetricsRetention time.Duration
 }
 
 // Server composes embedded etcd + HTTP API + reconciler into a single
@@ -81,6 +97,15 @@ type Server struct {
 	autoscaler     *Autoscaler
 	cancelScaler   context.CancelFunc
 	autoscalerDone chan struct{}
+
+	// Metrics sampler goroutine — M2.C2. Persists 15s-cadence
+	// time-series rows for system + per-pod to NDJSON under
+	// MetricsDir, runs cleanup of old files each tick. Same
+	// shutdown pattern as autoscaler/cron.
+	metricsSampler *metrics.Sampler
+	metricsWriter  *metrics.Writer
+	cancelMetrics  context.CancelFunc
+	metricsDone    chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -190,6 +215,17 @@ func (s *Server) Start(ctx context.Context) error {
 		// instance; constructing one per request would lose the
 		// baseline and report 0 for every rate metric.
 		System: systemstats.NewGopsutilCollector(),
+
+		// MetricsDir tells handleMetrics where to read the NDJSON
+		// time-series the Sampler appends to. Same path as the
+		// sampler's writer — they're two sides of the same store.
+		MetricsDir: func() string {
+			if s.cfg.MetricsDir != "" {
+				return s.cfg.MetricsDir
+			}
+
+			return paths.MetricsDir()
+		}(),
 
 		// Plugin-block expansion: discovers plugins under
 		// PluginsRoot at apply time and routes non-core kinds
@@ -445,6 +481,41 @@ func (s *Server) Start(ctx context.Context) error {
 		s.autoscaler.Run(scalerCtx)
 	}()
 
+	// Metrics sampler — persists 15s-cadence time-series to NDJSON
+	// for chart history. Failure to open the writer is logged but
+	// NOT fatal: the controller still serves /system + /pods + the
+	// rest; charts just have no history until the operator fixes
+	// disk perms / space. Same StatsCollector shared with autoscaler
+	// + API — single source of truth for runtime numbers.
+	metricsDir := s.cfg.MetricsDir
+	if metricsDir == "" {
+		metricsDir = paths.MetricsDir()
+	}
+
+	if w, err := metrics.NewWriter(metricsDir, s.cfg.Logger); err != nil {
+		s.cfg.Logger.Printf("metrics: writer disabled (%v); charts will have no history", err)
+	} else {
+		s.metricsWriter = w
+		s.metricsSampler = &metrics.Sampler{
+			Tick:      s.cfg.MetricsInterval,
+			Retention: s.cfg.MetricsRetention,
+			Writer:    w,
+			System:    s.api.System,
+			Pods:      NewMetricsPodSource(s.api.Stats),
+			Logger:    s.cfg.Logger,
+		}
+
+		metricsCtx, cancelMetrics := context.WithCancel(context.Background())
+		s.cancelMetrics = cancelMetrics
+		s.metricsDone = make(chan struct{})
+
+		go func() {
+			defer close(s.metricsDone)
+
+			s.metricsSampler.Run(metricsCtx)
+		}()
+	}
+
 	s.http = &http.Server{
 		Addr:              s.cfg.HTTPAddr,
 		Handler:           s.api.Handler(),
@@ -549,6 +620,21 @@ func (s *Server) PATAddr() string {
 }
 
 func (s *Server) teardown() {
+	// Metrics sampler stops first — it owns a writer holding a
+	// file fd, and we want the file flushed + closed before the
+	// process exits so the tail of the kernel page cache hits disk.
+	if s.cancelMetrics != nil {
+		s.cancelMetrics()
+	}
+
+	if s.metricsDone != nil {
+		<-s.metricsDone
+	}
+
+	if s.metricsWriter != nil {
+		_ = s.metricsWriter.Close()
+	}
+
 	if s.cancelScaler != nil {
 		s.cancelScaler()
 	}

@@ -34,6 +34,13 @@ func VolumesDir() string  { return filepath.Join(Root(), "volumes") }
 func AssetsDir() string   { return filepath.Join(Root(), "assets") }
 func CacheDir() string    { return filepath.Join(Root(), "cache") }
 
+// MetricsDir is where the time-series sampler appends NDJSON files
+// (one file per UTC day, `metrics-YYYY-MM-DD.ndjson`). Lives under
+// CacheDir because metrics are derived data — if the directory
+// disappears, the controller re-creates it on the next sample tick
+// and just loses pre-loss history. No manifest survives there.
+func MetricsDir() string { return filepath.Join(CacheDir(), "metrics") }
+
 // AssetDir is the materialised on-disk root for one asset
 // manifest. Asset blocks take 1 label (unscoped, scope="") or
 // 2 labels (scoped). Each file key in the spec lands as a
