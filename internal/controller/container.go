@@ -324,6 +324,20 @@ type ContainerSpec struct {
 	// `--cap-add`. See manifest.DeploymentSpec for the contract.
 	CapAdd []string
 
+	// Ulimits is the operator-declared per-resource ulimit table.
+	// Each entry becomes one `--ulimit <key>=<value>` flag at create
+	// time. Values flow verbatim — docker accepts both "N" (soft=hard)
+	// and "soft:hard" shapes. Voodu's platform defaults (nofile, nproc)
+	// still apply for any key the operator doesn't override.
+	Ulimits map[string]string
+
+	// DockerOptions is a raw pass-through to `docker run`. Each entry
+	// is appended verbatim to the argv before the image. No parsing,
+	// no validation — the operator is responsible for not duplicating
+	// flags voodu already manages. See manifest.DeploymentSpec for
+	// the operator contract.
+	DockerOptions []string
+
 	// LogMaxSize / LogMaxFiles cap the docker json-file log
 	// driver per container — see docker.ContainerConfig for the
 	// flag-level details. Handler fills both fields from the
@@ -405,6 +419,8 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		MemoryLimitBytes: spec.MemoryLimitBytes,
 		ExtraHosts:       spec.ExtraHosts,
 		CapAdd:           spec.CapAdd,
+		Ulimits:          spec.Ulimits,
+		DockerOptions:    spec.DockerOptions,
 		LogMaxSize:       spec.LogMaxSize,
 		LogMaxFiles:      spec.LogMaxFiles,
 	}
@@ -748,6 +764,8 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		MemoryLimitBytes: spec.MemoryLimitBytes,
 		ExtraHosts:       spec.ExtraHosts,
 		CapAdd:           spec.CapAdd,
+		Ulimits:          spec.Ulimits,
+		DockerOptions:    spec.DockerOptions,
 		LogMaxSize:       spec.LogMaxSize,
 		LogMaxFiles:      spec.LogMaxFiles,
 	}

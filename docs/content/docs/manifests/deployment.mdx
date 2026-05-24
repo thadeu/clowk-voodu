@@ -35,6 +35,11 @@ deployment "scope" "name" {
   extra_hosts  = ["legacy.internal:10.0.0.5"]
   cap_add      = ["NET_ADMIN"]
 
+  ulimits = {
+    nofile = "1048576:1048576"
+  }
+  docker_options = ["--shm-size=64m"]
+
   # Cross-cutting blocks (each documented separately):
   release    { ... }
   depends_on { assets = [...] }
@@ -73,6 +78,8 @@ None. An empty `deployment "scope" "name" {}` is valid — it means "build at re
 | `keep_releases` | int | `5` (when unset or `≤ 0`) | Release history cap on disk. |
 | `extra_hosts` | []string | — | Each entry `"name:ip"`. Layered atop the auto-injected `host.docker.internal:host-gateway`. |
 | `cap_add` | []string | — | Linux capabilities without the `CAP_` prefix (e.g. `"SYS_NICE"`). |
+| `ulimits` | map[string]string | `{nofile = "65536:65536", nproc = "4096:4096"}` | Per-resource ulimit table → one `--ulimit key=value` flag per entry. Platform defaults still apply for keys the operator does NOT declare. Values flow verbatim — both `"N"` and `"soft:hard"` shapes are accepted. No name validation: a typo lands as a docker daemon error at create time. |
+| `docker_options` | []string | — | Raw bypass — each entry is appended verbatim to `docker run` before the image. No parsing, no validation. Use for compose-only knobs voodu does not model: `"--shm-size=64m"`, `"--pids-limit=1000"`, `"--sysctl=net.core.somaxconn=4096"`, `"--device=/dev/snd"`. **Do NOT redeclare** flags voodu already manages (`--name`, `--network`, `--restart`, `--env-file`, `--cpus`, `--memory`, `--ulimit`, `--label`, `--add-host`, `--cap-add`, `--log-opt`) — duplicates will make docker reject the container. |
 
 ## Validation
 
@@ -134,6 +141,28 @@ deployment "infra" "node-exporter" {
 }
 ```
 
+### Raw docker pass-through (compose-only knobs)
+
+```hcl
+deployment "prod" "search" {
+  image = "ghcr.io/myorg/search:1.0"
+
+  ulimits = {
+    nofile  = "1048576:1048576"   # huge file table for hot connections
+    memlock = "-1"                 # lock RSS so the index doesn't swap
+  }
+
+  docker_options = [
+    "--shm-size=2g",
+    "--sysctl=net.core.somaxconn=4096",
+    "--sysctl=net.ipv4.tcp_keepalive_time=60",
+    "--pids-limit=4096",
+  ]
+}
+```
+
+`ulimits` is a key-by-key override of voodu's platform defaults (`nofile=65536:65536`, `nproc=4096:4096`) — any key you don't declare stays on the default. `docker_options` is a raw bypass: each string is appended verbatim to `docker run` between voodu's managed flags and the image, so anything docker accepts works (`--shm-size`, `--pids-limit`, `--sysctl`, `--device`, `--privileged`, etc.). Do **not** redeclare flags voodu already manages (`--name`, `--network`, `--restart`, `--env-file`, `--cpus`, `--memory`, `--ulimit`, `--label`, `--add-host`, `--cap-add`, `--log-opt`) — docker will reject the duplicate.
+
 ### Public exposure (explicit opt-in)
 
 ```hcl
@@ -159,7 +188,7 @@ deployment "prod" "edge" {
 
 **Jobs use `deployment`-like fields but are not deployments.** If you need a one-shot, use [`job`](/docs/manifests/jobs#job). If you need cron, use [`cronjob`](/docs/manifests/jobs#cronjob). `deployment` is for long-lived processes.
 
-**Spec hash excludes scaling / cosmetic fields.** `replicas`, `on_deploy`, `keep_releases`, `post_deploy`, `health_check`, and `release {}` are NOT folded into the spec hash — changing any of them won't trigger a rolling restart by itself. The fields that ARE hashed: `image`/`build`, `command`, `env`, `env_file`, `env_from`, `ports`, `volumes`, `networks`, `network_mode`, `restart`, `extra_hosts`, `cap_add`, `probes`, `init`, `autoscale`, `resources`, `logs`.
+**Spec hash excludes scaling / cosmetic fields.** `replicas`, `on_deploy`, `keep_releases`, `post_deploy`, `health_check`, and `release {}` are NOT folded into the spec hash — changing any of them won't trigger a rolling restart by itself. The fields that ARE hashed: `image`/`build`, `command`, `env`, `env_file`, `env_from`, `ports`, `volumes`, `networks`, `network_mode`, `restart`, `extra_hosts`, `cap_add`, `ulimits`, `docker_options`, `probes`, `init`, `autoscale`, `resources`, `logs`.
 
 **Manifest files can be `.hcl`, `.voodu`, `.vdu`, or `.vd`.** All four extensions parse as HCL.
 

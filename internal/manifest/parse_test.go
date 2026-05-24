@@ -306,6 +306,60 @@ func TestParseHCLStatefulsetRegistryModeKeepsBuildNil(t *testing.T) {
 	}
 }
 
+// TestParseHCLDeploymentUlimitsAndDockerOptions pins the raw
+// docker-run pass-throughs: ulimits is a map (any key flows verbatim
+// to docker --ulimit), docker_options is a list of raw flags appended
+// untouched. Same shape exists on statefulset/job/cronjob/init — one
+// canonical pin here keeps the wire contract stable.
+func TestParseHCLDeploymentUlimitsAndDockerOptions(t *testing.T) {
+	src := `
+deployment "prod" "api" {
+  image = "nginx:1.27"
+
+  ulimits = {
+    nofile  = "1048576:1048576"
+    memlock = "-1"
+  }
+
+  docker_options = [
+    "--shm-size=64m",
+    "--sysctl=net.core.somaxconn=4096",
+  ]
+}
+`
+	tmp := writeTemp(t, "dep_passthrough.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec DeploymentSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := spec.Ulimits["nofile"]; got != "1048576:1048576" {
+		t.Errorf("ulimits[nofile]: got %q", got)
+	}
+
+	if got := spec.Ulimits["memlock"]; got != "-1" {
+		t.Errorf("ulimits[memlock]: got %q", got)
+	}
+
+	want := []string{"--shm-size=64m", "--sysctl=net.core.somaxconn=4096"}
+	if len(spec.DockerOptions) != len(want) {
+		t.Fatalf("docker_options length: got %d want %d", len(spec.DockerOptions), len(want))
+	}
+
+	for i, v := range want {
+		if spec.DockerOptions[i] != v {
+			t.Errorf("docker_options[%d]: got %q want %q", i, spec.DockerOptions[i], v)
+		}
+	}
+}
+
 func TestParseHCLDeploymentResourcesBlock(t *testing.T) {
 	// resources { limits { cpu = "2" memory = "4Gi" } } — parsed
 	// into the wire spec verbatim (k8svalues normalises later, at

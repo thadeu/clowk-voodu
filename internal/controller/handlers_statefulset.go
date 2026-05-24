@@ -107,6 +107,11 @@ type statefulsetSpec struct {
 	CapAdd     []string          `json:"cap_add,omitempty"`
 	BuildArgs  map[string]string `json:"build_args,omitempty"`
 
+	// Ulimits / DockerOptions are raw docker-run pass-throughs. See
+	// manifest.DeploymentSpec for the operator contract.
+	Ulimits       map[string]string `json:"ulimits,omitempty"`
+	DockerOptions []string          `json:"docker_options,omitempty"`
+
 	// VolumeClaims is the per-pod volume-template list. M-S2 wires
 	// the docker volume creation; M-S1 ignores the field but keeps
 	// the JSON shape stable so plugins authored against the early
@@ -631,6 +636,8 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 				Env:            podEnv,
 				ExtraHosts:     spec.ExtraHosts,
 				CapAdd:         spec.CapAdd,
+				Ulimits:        spec.Ulimits,
+				DockerOptions:  spec.DockerOptions,
 				Logs:           spec.Logs,
 			}
 
@@ -657,6 +664,8 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			Ulimits:          spec.Ulimits,
+			DockerOptions:    spec.DockerOptions,
 			LogMaxSize:       logMaxSize,
 			LogMaxFiles:      logMaxFiles,
 		})
@@ -934,6 +943,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 				Env:            podEnv,
 				ExtraHosts:     spec.ExtraHosts,
 				CapAdd:         spec.CapAdd,
+				Ulimits:        spec.Ulimits,
+				DockerOptions:  spec.DockerOptions,
 				Logs:           spec.Logs,
 			}
 
@@ -960,6 +971,8 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			Ulimits:          spec.Ulimits,
+			DockerOptions:    spec.DockerOptions,
 			LogMaxSize:       logMaxSize,
 			LogMaxFiles:      logMaxFiles,
 		}); err != nil {
@@ -1120,6 +1133,8 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		ExtraHosts     []string                `json:"extra_hosts,omitempty"`
 		CapAdd         []string                `json:"cap_add,omitempty"`
 		BuildArgs      map[string]string       `json:"build_args,omitempty"`
+		Ulimits        map[string]string       `json:"ulimits,omitempty"`
+		DockerOptions  []string                `json:"docker_options,omitempty"`
 		Resources      *resourcesWireSpec      `json:"resources,omitempty"`
 		Logs           *logsWireSpec           `json:"logs,omitempty"`
 		VolumeClaims   []volumeClaim           `json:"volume_claims"`
@@ -1138,6 +1153,11 @@ func statefulsetSpecHash(spec statefulsetSpec, assetDigests map[string]string) s
 		ExtraHosts:  hosts,
 		CapAdd:      caps,
 		BuildArgs:   spec.BuildArgs,
+		// See deploymentSpecHash for why Ulimits / DockerOptions
+		// fold in: both translate to docker-run flags frozen at
+		// create time and need recreate to take effect.
+		Ulimits:       spec.Ulimits,
+		DockerOptions: spec.DockerOptions,
 		// See deploymentSpecHash for why Resources folds in. Same
 		// rationale: editing the cgroup caps must trigger a rolling
 		// recreate, otherwise the new HCL is ignored at runtime.

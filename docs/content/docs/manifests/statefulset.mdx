@@ -64,7 +64,7 @@ All of these are supported on statefulsets:
 - `image` / `build {}` (mutex)
 - `replicas`, `command`, `env`, `env_file`, `env_from`
 - `ports`, `volumes`, `networks`, `network`, `network_mode`
-- `restart`, `extra_hosts`, `cap_add`
+- `restart`, `extra_hosts`, `cap_add`, `ulimits`, `docker_options`
 - `resources {}`, `logs {}`, `probes {}`, `depends_on {}`
 - `init "<name>" {}` (runs per-ordinal — re-runs each time pod-N is recreated)
 

@@ -263,6 +263,20 @@ func (r *initContainerRunner) runOne(
 		Role:         "init",
 	})
 
+	// Per-init override of the raw docker-run pass-throughs:
+	// declared ic.Ulimits / ic.DockerOptions REPLACE the parent's
+	// when non-nil, otherwise inherit. Operator wanted a hairy
+	// migration init with --shm-size=2g, leave the main pod tight.
+	ulimits := parent.Ulimits
+	if ic.Ulimits != nil {
+		ulimits = ic.Ulimits
+	}
+
+	dockerOpts := parent.DockerOptions
+	if ic.DockerOptions != nil {
+		dockerOpts = ic.DockerOptions
+	}
+
 	spec := ContainerSpec{
 		Name:             cname,
 		Image:            image,
@@ -277,6 +291,8 @@ func (r *initContainerRunner) runOne(
 		Labels:           labels,
 		ExtraHosts:       parent.ExtraHosts,
 		CapAdd:           parent.CapAdd,
+		Ulimits:          ulimits,
+		DockerOptions:    dockerOpts,
 		CPULimit:         cpu,
 		MemoryLimitBytes: memBytes,
 		LogMaxSize:       logMaxSize,
@@ -375,6 +391,8 @@ type initContainerParent struct {
 	Env            map[string]string
 	ExtraHosts     []string
 	CapAdd         []string
+	Ulimits        map[string]string
+	DockerOptions  []string
 	Logs           *logsWireSpec
 }
 

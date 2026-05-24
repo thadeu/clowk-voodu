@@ -25,6 +25,8 @@ job "scope" "name" {
   network_mode = ""
   extra_hosts = ["..."]
   cap_add  = ["..."]
+  ulimits  = { nofile = "1048576:1048576" }
+  docker_options = ["--shm-size=64m"]
 
   timeout = "10m"
 
@@ -55,6 +57,7 @@ None at the root. Empty `job "scope" "name" {}` is parseable but useless without
 | `volumes` | []string | — | Mounts. |
 | `networks` / `network` / `network_mode` | — | bridge | Same semantics as `deployment`. |
 | `extra_hosts`, `cap_add` | — | — | Same as `deployment`. |
+| `ulimits`, `docker_options` | — | platform-default ulimits / — | Raw docker-run pass-throughs. See [`deployment`](/docs/manifests/deployment) for the contract. |
 | `timeout` | duration | — | Hard cap. Empty = no timeout. |
 | `successful_history_limit` | int | `3` | Successful containers retained for `voodu logs`. |
 | `failed_history_limit` | int | `1` | Failed containers retained. |
@@ -123,7 +126,7 @@ cronjob "scope" "name" {
 
   # All job-like fields flattened at the root:
   image, command, env, env_from, env_file, volumes, networks, network_mode,
-  timeout, extra_hosts, cap_add
+  timeout, extra_hosts, cap_add, ulimits, docker_options
 
   successful_history_limit = 3
   failed_history_limit     = 5

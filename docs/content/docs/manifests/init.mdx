@@ -57,6 +57,7 @@ Init containers inherit from the parent kind:
 - `env`, `env_from`, `env_file`
 - `volumes`, `networks`
 - `extra_hosts`, `cap_add`
+- `ulimits`, `docker_options` (per-init `ulimits = {...}` / `docker_options = [...]` REPLACE the parent's when declared)
 
 So `bin/rails db:migrate` sees the same `DATABASE_URL` your replicas see — no duplication.
 

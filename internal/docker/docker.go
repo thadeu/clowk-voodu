@@ -160,6 +160,25 @@ type ContainerConfig struct {
 	// as-is.
 	CapAdd []string
 
+	// Ulimits is the per-resource `--ulimit <key>=<value>` table.
+	// Each entry produces one --ulimit flag. Voodu's platform defaults
+	// (nofile=65536:65536, nproc=4096:4096) apply for any key the
+	// operator does NOT declare here; declared keys win and replace
+	// the default on a per-key basis. Values flow verbatim to docker
+	// — "N" (soft=hard) or "soft:hard" shapes both accepted.
+	Ulimits map[string]string
+
+	// DockerOptions is a raw pass-through bypass. Each entry is
+	// appended verbatim to the `docker run` argv between the managed
+	// flags voodu emits and the image. No parsing, no validation.
+	// Use for compose-only knobs voodu doesn't model (--shm-size,
+	// --pids-limit, --sysctl, --device, etc.). Operators MUST avoid
+	// flags voodu already manages (--name, --network, --restart,
+	// --env-file, --cpus, --memory, --ulimit, --label, --add-host,
+	// --cap-add, --log-opt) — duplicates will make docker reject the
+	// container at create time.
+	DockerOptions []string
+
 	// LogMaxSize and LogMaxFiles cap the docker json-file log
 	// driver per container — equivalent to docker-compose
 	// `logging.options.max-size` / `max-file`. Both must be set
@@ -392,8 +411,33 @@ func buildRunArgs(cfg ContainerConfig) []string {
 		args = append(args, "-w", cfg.WorkingDir)
 	}
 
-	args = append(args, "--ulimit", "nofile=65536:65536")
-	args = append(args, "--ulimit", "nproc=4096:4096")
+	// Ulimit table: start from platform defaults and let operator
+	// overrides win per-key. Defaults still apply for any key the
+	// operator did not declare, so the existing "tight sockets + lots
+	// of files" baseline is preserved unless explicitly opted out.
+	ulimits := map[string]string{
+		"nofile": "65536:65536",
+		"nproc":  "4096:4096",
+	}
+
+	for k, v := range cfg.Ulimits {
+		if k == "" {
+			continue
+		}
+
+		ulimits[k] = v
+	}
+
+	ulimitKeys := make([]string, 0, len(ulimits))
+	for k := range ulimits {
+		ulimitKeys = append(ulimitKeys, k)
+	}
+
+	sort.Strings(ulimitKeys)
+
+	for _, k := range ulimitKeys {
+		args = append(args, "--ulimit", k+"="+ulimits[k])
+	}
 
 	// Resource caps via cgroups. Empty/zero values mean "no limit"
 	// — docker daemon's defaults apply (effectively unbounded
@@ -426,6 +470,20 @@ func buildRunArgs(cfg ContainerConfig) []string {
 	// terminal and a pty per replica is wasted kernel state.
 	if cfg.TTY {
 		args = append(args, "-t")
+	}
+
+	// Raw bypass: operator-supplied flags flow verbatim. Splicing
+	// here (after every managed flag, before the image) means
+	// operator flags are docker's "later wins" tiebreaker if anyone
+	// duplicates a flag voodu already emitted — but the contract
+	// documents this as undefined behaviour, so duplicates are an
+	// operator bug.
+	for _, opt := range cfg.DockerOptions {
+		if opt == "" {
+			continue
+		}
+
+		args = append(args, opt)
 	}
 
 	args = append(args, cfg.Image)

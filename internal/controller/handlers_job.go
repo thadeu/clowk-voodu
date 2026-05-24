@@ -61,6 +61,11 @@ type jobSpec struct {
 	CapAdd     []string          `json:"cap_add,omitempty"`
 	BuildArgs  map[string]string `json:"build_args,omitempty"`
 
+	// Ulimits / DockerOptions are raw docker-run pass-throughs. See
+	// manifest.DeploymentSpec for the operator contract.
+	Ulimits       map[string]string `json:"ulimits,omitempty"`
+	DockerOptions []string          `json:"docker_options,omitempty"`
+
 	SuccessfulHistoryLimit int `json:"successful_history_limit,omitempty"`
 	FailedHistoryLimit     int `json:"failed_history_limit,omitempty"`
 
@@ -422,6 +427,8 @@ func (h *JobHandler) RunOnce(ctx context.Context, scope, name string) (JobRun, e
 		Labels:        labels,
 		ExtraHosts:    spec.ExtraHosts,
 		CapAdd:        spec.CapAdd,
+		Ulimits:       spec.Ulimits,
+		DockerOptions: spec.DockerOptions,
 		LogMaxSize:    jobLogMaxSize,
 		LogMaxFiles:   jobLogMaxFiles,
 		// AutoRemove is intentionally false: docker keeps the stopped

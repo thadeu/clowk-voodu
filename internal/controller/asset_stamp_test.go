@@ -856,6 +856,72 @@ func TestSpecHash_ComposeShapedFieldsFlipHash(t *testing.T) {
 	}
 }
 
+// TestSpecHash_UlimitsAndDockerOptionsFlipHash pins the drift-
+// detection contract for the raw docker-run pass-throughs. Both
+// translate to flags frozen at container create time; without hash
+// folding an operator edit would silently leave live replicas on
+// the old runtime parameters. Same property at the statefulset
+// layer.
+func TestSpecHash_UlimitsAndDockerOptionsFlipHash(t *testing.T) {
+	base := deploymentSpec{Image: "nginx:1.25"}
+	baseHash := deploymentSpecHash(base, nil)
+
+	withUlimits := base
+	withUlimits.Ulimits = map[string]string{"nofile": "1048576:1048576"}
+
+	if deploymentSpecHash(withUlimits, nil) == baseHash {
+		t.Error("Ulimits change must flip hash")
+	}
+
+	withOpts := base
+	withOpts.DockerOptions = []string{"--shm-size=64m"}
+
+	if deploymentSpecHash(withOpts, nil) == baseHash {
+		t.Error("DockerOptions change must flip hash")
+	}
+
+	// Statefulset mirror — postgres / redis operators count on
+	// this to roll the cluster on a sysctl edit.
+	sts := statefulsetSpec{Image: "redis:7"}
+	stsBase := statefulsetSpecHash(sts, nil)
+
+	stsUlimits := sts
+	stsUlimits.Ulimits = map[string]string{"nofile": "200000:200000"}
+
+	if statefulsetSpecHash(stsUlimits, nil) == stsBase {
+		t.Error("statefulset Ulimits change must flip hash")
+	}
+
+	stsOpts := sts
+	stsOpts.DockerOptions = []string{"--sysctl=net.core.somaxconn=2048"}
+
+	if statefulsetSpecHash(stsOpts, nil) == stsBase {
+		t.Error("statefulset DockerOptions change must flip hash")
+	}
+}
+
+// TestSpecHash_DockerOptionsOrderSensitive pins the opposite of the
+// ExtraHosts / CapAdd invariants: docker_options IS order-sensitive
+// because docker honours flag order for some pairings (later wins on
+// `--sysctl` collisions; `--device` ordering is preserved). Treating
+// the slice as a set would produce a hash that fails to catch a real
+// runtime-affecting change.
+func TestSpecHash_DockerOptionsOrderSensitive(t *testing.T) {
+	a := deploymentSpec{
+		Image:         "nginx",
+		DockerOptions: []string{"--shm-size=64m", "--pids-limit=1000"},
+	}
+
+	b := deploymentSpec{
+		Image:         "nginx",
+		DockerOptions: []string{"--pids-limit=1000", "--shm-size=64m"},
+	}
+
+	if deploymentSpecHash(a, nil) == deploymentSpecHash(b, nil) {
+		t.Error("docker_options reorder MUST flip hash (order is semantic)")
+	}
+}
+
 // TestSpecHash_ExtraHostsOrderInvariant pins that reordering
 // extra_hosts in the HCL doesn't trigger a spurious recreate. The
 // runtime contract is set membership, not list order — the hash

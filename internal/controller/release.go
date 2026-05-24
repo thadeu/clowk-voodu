@@ -300,6 +300,8 @@ func (h *DeploymentHandler) runReleaseCommand(ctx context.Context, scope, deploy
 		Labels:        labels,
 		ExtraHosts:    spec.ExtraHosts,
 		CapAdd:        spec.CapAdd,
+		Ulimits:       spec.Ulimits,
+		DockerOptions: spec.DockerOptions,
 		LogMaxSize:    releaseLogMaxSize,
 		LogMaxFiles:   releaseLogMaxFiles,
 		// AutoRemove is explicitly false: we need the container to

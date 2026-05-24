@@ -20,6 +20,7 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 | [`ingress/`](./ingress) | Path-based routing, multiple hosts, load-balancing knobs |
 | [`multi-env/`](./multi-env) | One manifest, many remotes — apply the same file to staging / prod-1 / prod-2 via `-r` |
 | [`shared-scope/`](./shared-scope) | Cross-repo applies into the same scope using `?prune=false` |
+| [`docker-passthrough/`](./docker-passthrough) | Raw `docker run` pass-throughs — `ulimits = {}` (per-key override of platform defaults) and `docker_options = []` (verbatim flag bypass for `--shm-size`, `--sysctl`, `--pids-limit`, `--device`, etc.). Available on every kind |
 
 ## Pattern reference
 

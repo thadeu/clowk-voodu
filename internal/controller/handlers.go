@@ -97,6 +97,14 @@ type deploymentSpec struct {
 	// without `CAP_` prefix (SYS_NICE, NET_ADMIN, IPC_LOCK, …).
 	CapAdd []string `json:"cap_add,omitempty"`
 
+	// Ulimits / DockerOptions are raw docker-run pass-throughs. See
+	// manifest.DeploymentSpec for the operator contract. Wire-side
+	// these are passed through to ContainerSpec without
+	// interpretation; the runtime layer (docker.buildRunArgs) is the
+	// only place that knows about them.
+	Ulimits       map[string]string `json:"ulimits,omitempty"`
+	DockerOptions []string          `json:"docker_options,omitempty"`
+
 	// BuildArgs is the docker `--build-arg KEY=value` map applied at
 	// build time when Image is empty. Independent of `lang {}` — works
 	// for any Dockerfile.
@@ -179,6 +187,12 @@ type initContainerWireSpec struct {
 	Timeout   string             `json:"timeout,omitempty"`
 	Retries   int                `json:"retries,omitempty"`
 	Resources *resourcesWireSpec `json:"resources,omitempty"`
+
+	// Ulimits / DockerOptions override the parent's docker-run
+	// pass-throughs on a per-init basis. nil/empty inherits the
+	// parent deployment's setup. See deploymentSpec for the contract.
+	Ulimits       map[string]string `json:"ulimits,omitempty"`
+	DockerOptions []string          `json:"docker_options,omitempty"`
 }
 
 // autoscaleWireSpec is the controller-side mirror of
@@ -1047,6 +1061,8 @@ func (h *DeploymentHandler) ensureReplicaCount(ctx context.Context, scope, name,
 				Env:            podEnv,
 				ExtraHosts:     spec.ExtraHosts,
 				CapAdd:         spec.CapAdd,
+				Ulimits:        spec.Ulimits,
+				DockerOptions:  spec.DockerOptions,
 				Logs:           spec.Logs,
 			}
 
@@ -1073,6 +1089,8 @@ func (h *DeploymentHandler) ensureReplicaCount(ctx context.Context, scope, name,
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			Ulimits:          spec.Ulimits,
+			DockerOptions:    spec.DockerOptions,
 			LogMaxSize:       logMaxSize,
 			LogMaxFiles:      logMaxFiles,
 		})
@@ -1412,6 +1430,8 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 				Env:            podEnv,
 				ExtraHosts:     spec.ExtraHosts,
 				CapAdd:         spec.CapAdd,
+				Ulimits:        spec.Ulimits,
+				DockerOptions:  spec.DockerOptions,
 				Logs:           spec.Logs,
 			}
 
@@ -1438,6 +1458,8 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			MemoryLimitBytes: memBytes,
 			ExtraHosts:       spec.ExtraHosts,
 			CapAdd:           spec.CapAdd,
+			Ulimits:          spec.Ulimits,
+			DockerOptions:    spec.DockerOptions,
 			LogMaxSize:       logMaxSize,
 			LogMaxFiles:      logMaxFiles,
 		}); err != nil {
@@ -2051,18 +2073,20 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 	// list exactly. Any rearrangement is a semantic change and should
 	// trigger a recreate.
 	input := struct {
-		Image       string             `json:"image"`
-		Command     []string           `json:"command"`
-		Ports       []string           `json:"ports"`
-		Volumes     []string           `json:"volumes"`
-		Env         map[string]string  `json:"env"`
-		EnvFrom     []string           `json:"env_from,omitempty"`
-		Networks    []string           `json:"networks"`
-		NetworkMode string             `json:"network_mode"`
-		Restart     string             `json:"restart"`
-		ExtraHosts  []string           `json:"extra_hosts,omitempty"`
-		CapAdd      []string           `json:"cap_add,omitempty"`
-		BuildArgs   map[string]string  `json:"build_args,omitempty"`
+		Image          string                  `json:"image"`
+		Command        []string                `json:"command"`
+		Ports          []string                `json:"ports"`
+		Volumes        []string                `json:"volumes"`
+		Env            map[string]string       `json:"env"`
+		EnvFrom        []string                `json:"env_from,omitempty"`
+		Networks       []string                `json:"networks"`
+		NetworkMode    string                  `json:"network_mode"`
+		Restart        string                  `json:"restart"`
+		ExtraHosts     []string                `json:"extra_hosts,omitempty"`
+		CapAdd         []string                `json:"cap_add,omitempty"`
+		BuildArgs      map[string]string       `json:"build_args,omitempty"`
+		Ulimits        map[string]string       `json:"ulimits,omitempty"`
+		DockerOptions  []string                `json:"docker_options,omitempty"`
 		Resources      *resourcesWireSpec      `json:"resources,omitempty"`
 		Autoscale      *autoscaleWireSpec      `json:"autoscale,omitempty"`
 		Logs           *logsWireSpec           `json:"logs,omitempty"`
@@ -2082,6 +2106,15 @@ func deploymentSpecHash(spec deploymentSpec, assetDigests map[string]string) str
 		ExtraHosts:  hosts,
 		CapAdd:      caps,
 		BuildArgs:   spec.BuildArgs,
+		// Ulimits / DockerOptions fold into the hash: both translate
+		// to docker-run flags frozen at container-create time, so an
+		// edit only takes effect after recreate. Without this mix-in,
+		// the operator changes a ulimit / adds a --sysctl, applies,
+		// and live replicas keep the old runtime parameters — silent
+		// drift. omitempty preserves pre-existing hashes for specs
+		// that don't declare either field.
+		Ulimits:       spec.Ulimits,
+		DockerOptions: spec.DockerOptions,
 		// Resources fold into the hash so a `resources { limits {
 		// cpu, memory } }` edit triggers a rolling restart. Without
 		// this, the operator changes a CPU cap, runs `vd apply`, the

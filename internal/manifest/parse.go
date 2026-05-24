@@ -217,6 +217,11 @@ type hclDeployment struct {
 	EnvFile    []string `hcl:"env_file,optional"`
 	EnvFrom    []string `hcl:"env_from,optional"`
 
+	// Raw docker-run pass-throughs. See DeploymentSpec.Ulimits /
+	// DockerOptions for the contract; values flow verbatim to docker.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
+
 	Build          *hclBuildBlock          `hcl:"build,block"`
 	Release        *hclReleaseBlock        `hcl:"release,block"`
 	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
@@ -661,6 +666,12 @@ type hclInitContainerBlock struct {
 	Timeout   string             `hcl:"timeout,optional"`
 	Retries   int                `hcl:"retries,optional"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
+
+	// Raw docker-run pass-throughs — see DeploymentSpec.Ulimits /
+	// DockerOptions for the contract. Per-init override of the
+	// parent deployment's setup at the init's docker-run.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
 }
 
 // initContainerBlocksToSpec converts the HCL block list into the
@@ -680,12 +691,14 @@ func initContainerBlocksToSpec(blocks []hclInitContainerBlock) []InitContainerSp
 	out := make([]InitContainerSpec, 0, len(blocks))
 	for _, b := range blocks {
 		out = append(out, InitContainerSpec{
-			Name:      b.Name,
-			Image:     b.Image,
-			Command:   b.Command,
-			Timeout:   b.Timeout,
-			Retries:   b.Retries,
-			Resources: resourcesBlockToSpec(b.Resources),
+			Name:          b.Name,
+			Image:         b.Image,
+			Command:       b.Command,
+			Timeout:       b.Timeout,
+			Retries:       b.Retries,
+			Resources:     resourcesBlockToSpec(b.Resources),
+			Ulimits:       b.Ulimits,
+			DockerOptions: b.DockerOptions,
 		})
 	}
 
@@ -939,24 +952,26 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 	}
 
 	s := DeploymentSpec{
-		Image:        b.Image,
-		Replicas:     b.Replicas,
-		Command:      b.Command,
-		Env:          b.Env,
-		Ports:        b.Ports,
-		Volumes:      b.Volumes,
-		Network:      b.Network,
-		Networks:     b.Networks,
-		NetworkMode:  b.NetworkMode,
-		Restart:      b.Restart,
-		HealthCheck:  b.HealthCheck,
-		PostDeploy:   b.PostDeploy,
-		KeepReleases: b.KeepReleases,
-		ExtraHosts:   b.ExtraHosts,
-		CapAdd:       b.CapAdd,
-		EnvFile:      b.EnvFile,
-		EnvFrom:      b.EnvFrom,
-		Build:        buildBlockToSpec(b.Build),
+		Image:         b.Image,
+		Replicas:      b.Replicas,
+		Command:       b.Command,
+		Env:           b.Env,
+		Ports:         b.Ports,
+		Volumes:       b.Volumes,
+		Network:       b.Network,
+		Networks:      b.Networks,
+		NetworkMode:   b.NetworkMode,
+		Restart:       b.Restart,
+		HealthCheck:   b.HealthCheck,
+		PostDeploy:    b.PostDeploy,
+		KeepReleases:  b.KeepReleases,
+		ExtraHosts:    b.ExtraHosts,
+		CapAdd:        b.CapAdd,
+		EnvFile:       b.EnvFile,
+		EnvFrom:       b.EnvFrom,
+		Ulimits:       b.Ulimits,
+		DockerOptions: b.DockerOptions,
+		Build:         buildBlockToSpec(b.Build),
 	}
 
 	if b.Release != nil {
@@ -1074,6 +1089,11 @@ type hclApp struct {
 	EnvFile    []string `hcl:"env_file,optional"`
 	EnvFrom    []string `hcl:"env_from,optional"`
 
+	// Raw docker-run pass-throughs — see DeploymentSpec.Ulimits /
+	// DockerOptions for the contract.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
+
 	Build          *hclBuildBlock          `hcl:"build,block"`
 	Release        *hclReleaseBlock        `hcl:"release,block"`
 	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
@@ -1103,24 +1123,26 @@ func (b hclApp) deploymentSpec() (DeploymentSpec, error) {
 	}
 
 	s := DeploymentSpec{
-		Image:        b.Image,
-		Replicas:     b.Replicas,
-		Command:      b.Command,
-		Env:          b.Env,
-		Ports:        b.Ports,
-		Volumes:      b.Volumes,
-		Network:      b.Network,
-		Networks:     b.Networks,
-		NetworkMode:  b.NetworkMode,
-		Restart:      b.Restart,
-		HealthCheck:  b.HealthCheck,
-		PostDeploy:   b.PostDeploy,
-		KeepReleases: b.KeepReleases,
-		ExtraHosts:   b.ExtraHosts,
-		CapAdd:       b.CapAdd,
-		EnvFile:      b.EnvFile,
-		EnvFrom:      b.EnvFrom,
-		Build:        buildBlockToSpec(b.Build),
+		Image:         b.Image,
+		Replicas:      b.Replicas,
+		Command:       b.Command,
+		Env:           b.Env,
+		Ports:         b.Ports,
+		Volumes:       b.Volumes,
+		Network:       b.Network,
+		Networks:      b.Networks,
+		NetworkMode:   b.NetworkMode,
+		Restart:       b.Restart,
+		HealthCheck:   b.HealthCheck,
+		PostDeploy:    b.PostDeploy,
+		KeepReleases:  b.KeepReleases,
+		ExtraHosts:    b.ExtraHosts,
+		CapAdd:        b.CapAdd,
+		EnvFile:       b.EnvFile,
+		EnvFrom:       b.EnvFrom,
+		Ulimits:       b.Ulimits,
+		DockerOptions: b.DockerOptions,
+		Build:         buildBlockToSpec(b.Build),
 	}
 
 	if b.Release != nil {
@@ -1234,6 +1256,11 @@ type hclStatefulset struct {
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
 
+	// Raw docker-run pass-throughs — see DeploymentSpec.Ulimits /
+	// DockerOptions for the contract.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
+
 	Build          *hclBuildBlock          `hcl:"build,block"`
 	VolumeClaims   []hclVolumeClaim        `hcl:"volume_claim,block"`
 	DependsOn      *hclDependsOn           `hcl:"depends_on,block"`
@@ -1260,22 +1287,24 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 	}
 
 	s := StatefulsetSpec{
-		Image:       b.Image,
-		Replicas:    b.Replicas,
-		Command:     b.Command,
-		Env:         b.Env,
-		EnvFrom:     b.EnvFrom,
-		Ports:       b.Ports,
-		Volumes:     b.Volumes,
-		Network:     b.Network,
-		Networks:    b.Networks,
-		NetworkMode: b.NetworkMode,
-		Restart:     b.Restart,
-		HealthCheck: b.HealthCheck,
-		ExtraHosts:  b.ExtraHosts,
-		CapAdd:      b.CapAdd,
-		EnvFile:     b.EnvFile,
-		Build:       buildBlockToSpec(b.Build),
+		Image:         b.Image,
+		Replicas:      b.Replicas,
+		Command:       b.Command,
+		Env:           b.Env,
+		EnvFrom:       b.EnvFrom,
+		Ports:         b.Ports,
+		Volumes:       b.Volumes,
+		Network:       b.Network,
+		Networks:      b.Networks,
+		NetworkMode:   b.NetworkMode,
+		Restart:       b.Restart,
+		HealthCheck:   b.HealthCheck,
+		ExtraHosts:    b.ExtraHosts,
+		CapAdd:        b.CapAdd,
+		EnvFile:       b.EnvFile,
+		Ulimits:       b.Ulimits,
+		DockerOptions: b.DockerOptions,
+		Build:         buildBlockToSpec(b.Build),
 	}
 
 	if len(b.VolumeClaims) > 0 {
@@ -1435,6 +1464,11 @@ type hclJob struct {
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
 
+	// Raw docker-run pass-throughs — see DeploymentSpec.Ulimits /
+	// DockerOptions for the contract.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
+
 	SuccessfulHistoryLimit int `hcl:"successful_history_limit,optional"`
 	FailedHistoryLimit     int `hcl:"failed_history_limit,optional"`
 
@@ -1462,6 +1496,8 @@ func (b hclJob) spec() (JobSpec, error) {
 		ExtraHosts:             b.ExtraHosts,
 		CapAdd:                 b.CapAdd,
 		EnvFile:                b.EnvFile,
+		Ulimits:                b.Ulimits,
+		DockerOptions:          b.DockerOptions,
 		Build:                  buildBlockToSpec(b.Build),
 		SuccessfulHistoryLimit: b.SuccessfulHistoryLimit,
 		FailedHistoryLimit:     b.FailedHistoryLimit,
@@ -1516,6 +1552,11 @@ type hclCronJob struct {
 	CapAdd     []string `hcl:"cap_add,optional"`
 	EnvFile    []string `hcl:"env_file,optional"`
 
+	// Raw docker-run pass-throughs — see DeploymentSpec.Ulimits /
+	// DockerOptions for the contract.
+	Ulimits       map[string]string `hcl:"ulimits,optional"`
+	DockerOptions []string          `hcl:"docker_options,optional"`
+
 	Build     *hclBuildBlock     `hcl:"build,block"`
 	DependsOn *hclDependsOn      `hcl:"depends_on,block"`
 	Resources *hclResourcesBlock `hcl:"resources,block"`
@@ -1528,19 +1569,21 @@ func (b hclCronJob) spec() (CronJobSpec, error) {
 	}
 
 	job := JobSpec{
-		Image:       b.Image,
-		Command:     b.Command,
-		Env:         b.Env,
-		EnvFrom:     b.EnvFrom,
-		Volumes:     b.Volumes,
-		Network:     b.Network,
-		Networks:    b.Networks,
-		NetworkMode: b.NetworkMode,
-		Timeout:     b.Timeout,
-		ExtraHosts:  b.ExtraHosts,
-		CapAdd:      b.CapAdd,
-		EnvFile:     b.EnvFile,
-		Build:       buildBlockToSpec(b.Build),
+		Image:         b.Image,
+		Command:       b.Command,
+		Env:           b.Env,
+		EnvFrom:       b.EnvFrom,
+		Volumes:       b.Volumes,
+		Network:       b.Network,
+		Networks:      b.Networks,
+		NetworkMode:   b.NetworkMode,
+		Timeout:       b.Timeout,
+		ExtraHosts:    b.ExtraHosts,
+		CapAdd:        b.CapAdd,
+		EnvFile:       b.EnvFile,
+		Ulimits:       b.Ulimits,
+		DockerOptions: b.DockerOptions,
+		Build:         buildBlockToSpec(b.Build),
 	}
 
 	if b.DependsOn != nil {

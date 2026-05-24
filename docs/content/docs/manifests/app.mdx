@@ -31,6 +31,8 @@ app "scope" "name" {
   keep_releases = 5
   extra_hosts = ["..."]
   cap_add     = ["..."]
+  ulimits     = { nofile = "1048576:1048576" }
+  docker_options = ["--shm-size=64m"]
 
   # Ingress-side — REQUIRED:
   host = "myapp.example.com"

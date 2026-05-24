@@ -301,6 +301,8 @@ func (h *CronJobHandler) Tick(ctx context.Context, scope, name string) (JobRun, 
 		Labels:        labels,
 		ExtraHosts:    spec.Job.ExtraHosts,
 		CapAdd:        spec.Job.CapAdd,
+		Ulimits:       spec.Job.Ulimits,
+		DockerOptions: spec.Job.DockerOptions,
 		LogMaxSize:    cronLogMaxSize,
 		LogMaxFiles:   cronLogMaxFiles,
 		// AutoRemove is intentionally false: docker keeps the stopped

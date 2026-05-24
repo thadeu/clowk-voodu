@@ -52,6 +52,102 @@ func TestCreateContainer_EmitsLogOpts(t *testing.T) {
 	}
 }
 
+// TestCreateContainer_DefaultUlimits pins the platform-default
+// ulimit table: a config with no Ulimits set still emits the
+// historical baseline (nofile=65536:65536, nproc=4096:4096). This
+// matters because the values shape kernel limits inherited by
+// every long-running voodu container, and a silent regression
+// would surface as production fd exhaustion / fork failures.
+func TestCreateContainer_DefaultUlimits(t *testing.T) {
+	args := buildRunArgs(ContainerConfig{Name: "x", Image: "nginx"})
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "--ulimit nofile=65536:65536") {
+		t.Errorf("expected default nofile ulimit, got: %s", joined)
+	}
+
+	if !strings.Contains(joined, "--ulimit nproc=4096:4096") {
+		t.Errorf("expected default nproc ulimit, got: %s", joined)
+	}
+}
+
+// TestCreateContainer_UlimitsOverride pins per-key override
+// semantics: an operator-declared `ulimits = { nofile = "..." }`
+// REPLACES that key in the default table but leaves other defaults
+// (nproc) intact, and a brand-new key (memlock) lands as an
+// additional --ulimit flag.
+func TestCreateContainer_UlimitsOverride(t *testing.T) {
+	args := buildRunArgs(ContainerConfig{
+		Name:  "x",
+		Image: "nginx",
+		Ulimits: map[string]string{
+			"nofile":  "1048576:1048576",
+			"memlock": "-1",
+		},
+	})
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "--ulimit nofile=1048576:1048576") {
+		t.Errorf("expected overridden nofile, got: %s", joined)
+	}
+
+	if !strings.Contains(joined, "--ulimit nproc=4096:4096") {
+		t.Errorf("expected default nproc to survive override, got: %s", joined)
+	}
+
+	if !strings.Contains(joined, "--ulimit memlock=-1") {
+		t.Errorf("expected new memlock ulimit, got: %s", joined)
+	}
+
+	if strings.Contains(joined, "--ulimit nofile=65536:65536") {
+		t.Errorf("expected default nofile to be replaced, got: %s", joined)
+	}
+}
+
+// TestCreateContainer_DockerOptions pins the raw-bypass surface:
+// every DockerOptions entry lands in argv verbatim, in declared
+// order, between the managed flags and the image. Empty strings
+// are filtered (defensive — operators may build the slice via
+// conditional expressions).
+func TestCreateContainer_DockerOptions(t *testing.T) {
+	args := buildRunArgs(ContainerConfig{
+		Name:  "x",
+		Image: "nginx",
+		DockerOptions: []string{
+			"--shm-size=64m",
+			"",
+			"--sysctl=net.core.somaxconn=4096",
+			"--pids-limit=1000",
+		},
+	})
+
+	// Locate the image — operator flags must come immediately before.
+	imageIdx := -1
+	for i, a := range args {
+		if a == "nginx" {
+			imageIdx = i
+			break
+		}
+	}
+
+	if imageIdx == -1 {
+		t.Fatalf("image not found in args: %v", args)
+	}
+
+	want := []string{
+		"--shm-size=64m",
+		"--sysctl=net.core.somaxconn=4096",
+		"--pids-limit=1000",
+	}
+
+	got := args[imageIdx-len(want) : imageIdx]
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("docker option %d: want %q got %q (full args: %v)", i, w, got[i], args)
+		}
+	}
+}
+
 // TestCreateContainer_OmitsLogOptsWhenZero pins the inverse:
 // when either field is missing the entire `--log-opt` pair is
 // skipped, so the container inherits docker's daemon default.

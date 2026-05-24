@@ -89,6 +89,43 @@ type DeploymentSpec struct {
 	// why — it's effectively root in the container.
 	CapAdd []string `yaml:"cap_add,omitempty" json:"cap_add,omitempty"`
 
+	// Ulimits overrides the per-resource ulimit table on a key-by-key
+	// basis. Each entry becomes one `--ulimit <key>=<value>` flag on
+	// docker run. Voodu's platform defaults (nofile=65536:65536,
+	// nproc=4096:4096) still apply for any key the operator does NOT
+	// declare; declared keys win. Value is forwarded verbatim — docker
+	// accepts `"N"` (soft=hard) and `"soft:hard"` shapes.
+	//
+	//	ulimits = {
+	//	  nofile  = "1048576:1048576"
+	//	  memlock = "-1"
+	//	  core    = "0"
+	//	}
+	//
+	// No validation: voodu doesn't enumerate the legal ulimit names
+	// (they're kernel-defined and change across distros). A typo lands
+	// as a docker daemon error at container creation, not at apply.
+	Ulimits map[string]string `yaml:"ulimits,omitempty" json:"ulimits,omitempty"`
+
+	// DockerOptions is a raw bypass for arbitrary `docker run` flags.
+	// Each entry is appended verbatim to the argv between the managed
+	// flags voodu emits and the image. No parsing, no validation —
+	// strings flow straight to docker. Use for compose-only knobs voodu
+	// doesn't model: `--shm-size=64m`, `--pids-limit=1000`,
+	// `--sysctl=net.core.somaxconn=4096`, `--device=/dev/snd`, etc.
+	//
+	//	docker_options = [
+	//	  "--shm-size=64m",
+	//	  "--pids-limit=1000",
+	//	  "--sysctl=net.ipv4.tcp_keepalive_time=60",
+	//	]
+	//
+	// Footgun: do NOT redeclare flags voodu already manages (--name,
+	// --network, --restart, --env-file, --cpus, --memory, --ulimit,
+	// --label, --add-host, --cap-add, --log-opt). Duplicates will make
+	// `docker run` reject the container.
+	DockerOptions []string `yaml:"docker_options,omitempty" json:"docker_options,omitempty"`
+
 	// EnvFile lists local file paths (relative to the operator's CWD)
 	// whose KEY=value lines are merged into the spec's `env` map at
 	// `vd apply` time. Files are read CLIENT-side; the controller sees
@@ -299,6 +336,14 @@ type InitContainerSpec struct {
 	// limit", which is the operator-friendly default for prep
 	// steps that may legitimately exceed steady-state caps.
 	Resources *ResourcesSpec `yaml:"resources,omitempty" json:"resources,omitempty"`
+
+	// Ulimits and DockerOptions are raw docker-run pass-throughs —
+	// see DeploymentSpec for the full contract. nil/empty inherits
+	// the parent deployment's setup (callers merge before passing to
+	// the runtime); a populated map/slice REPLACES the parent's at
+	// the init container's docker-run.
+	Ulimits       map[string]string `yaml:"ulimits,omitempty"        json:"ulimits,omitempty"`
+	DockerOptions []string          `yaml:"docker_options,omitempty" json:"docker_options,omitempty"`
 }
 
 // AutoscaleSpec is the M7 CPU-based horizontal autoscale block. Lives
@@ -922,6 +967,11 @@ type StatefulsetSpec struct {
 	CapAdd     []string `yaml:"cap_add,omitempty"     json:"cap_add,omitempty"`
 	EnvFile    []string `yaml:"env_file,omitempty"    json:"env_file,omitempty"`
 
+	// Ulimits and DockerOptions are raw docker-run pass-throughs —
+	// see DeploymentSpec for the full contract.
+	Ulimits       map[string]string `yaml:"ulimits,omitempty"        json:"ulimits,omitempty"`
+	DockerOptions []string          `yaml:"docker_options,omitempty" json:"docker_options,omitempty"`
+
 	// EnvFrom stacks env files from other resources, same shape +
 	// semantics as JobSpec.EnvFrom: each entry is `<scope>/<name>`
 	// (or bare `<name>` for the current scope), the controller emits
@@ -1167,6 +1217,11 @@ type JobSpec struct {
 	ExtraHosts []string `yaml:"extra_hosts,omitempty" json:"extra_hosts,omitempty"`
 	CapAdd     []string `yaml:"cap_add,omitempty"     json:"cap_add,omitempty"`
 	EnvFile    []string `yaml:"env_file,omitempty"    json:"env_file,omitempty"`
+
+	// Ulimits and DockerOptions are raw docker-run pass-throughs —
+	// see DeploymentSpec for the full contract.
+	Ulimits       map[string]string `yaml:"ulimits,omitempty"        json:"ulimits,omitempty"`
+	DockerOptions []string          `yaml:"docker_options,omitempty" json:"docker_options,omitempty"`
 
 	// EnvFrom stacks env files from other resources at run time.
 	// Each entry is a `<scope>/<name>` ref (or bare `<name>` for
