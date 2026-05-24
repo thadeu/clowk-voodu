@@ -321,6 +321,33 @@ func TestPATPlane_StatsRouteReachable(t *testing.T) {
 	}
 }
 
+// TestPATPlane_SystemRouteReachable proves the /system endpoint is
+// plumbed end-to-end through auth + the passthrough proxy. Like the
+// stats variant, a 503 from the underlying handler (no collector
+// wired) still counts as "the route reached the handler"; what we're
+// pinning is NOT 401/403/404 — meaning auth + scope + routing all
+// resolved correctly.
+func TestPATPlane_SystemRouteReachable(t *testing.T) {
+	api, plain, _, _ := newTestPATAPI(t)
+
+	ts := httptest.NewServer(api.PATHandler(nil, 10, 3))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/system", nil)
+	req.Header.Set("Authorization", patBearer(plain))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		t.Errorf("system route blocked by middleware/router: status=%d", resp.StatusCode)
+	}
+}
+
 // TestPATPlane_RevokedTokenRejected pins the revoke lifecycle through
 // the PAT plane: after DeletePAT, requests with that token MUST be
 // rejected. Without this, a leaked-then-revoked token would still

@@ -12,12 +12,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/internal/secrets"
+	"go.voodu.clowk.in/internal/systemstats"
 	"go.voodu.clowk.in/pkg/plugin"
 )
 
@@ -116,6 +118,15 @@ type API struct {
 	// bound to Pods + docker.DockerStatsClient + Store. Single
 	// shape across CLI + future SDK.
 	Stats *StatsCollector
+
+	// System powers `GET /system` — the host-level CPU/memory/disk/
+	// network/uptime snapshot used by the WebUI's overview header
+	// (and a future `vd system` CLI). Nil → 503. Production wires
+	// systemstats.GopsutilCollector, which carries rate state
+	// (lastSampled, lastCounters) so disk-I/O and net throughput
+	// rates are computed across consecutive calls without forcing
+	// callers to maintain that bookkeeping.
+	System systemstats.Collector
 
 	// Readiness powers `GET /pods/{name}/ready` — the per-replica
 	// readiness gate caddy (or any ingress) reads to decide
@@ -289,6 +300,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /pods/{name}", a.handlePodDescribe)
 	mux.HandleFunc("GET /pods/{name}/ready", a.handlePodReady)
 	mux.HandleFunc("GET /stats", a.handleStats)
+	mux.HandleFunc("GET /system", a.handleSystem)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
@@ -1712,6 +1724,54 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSystem returns the host-level snapshot (CPU%, memory, disk
+// usage, disk I/O rate, network rate, uptime, kernel) for the VM
+// the controller runs on.
+//
+// GET /system
+//
+// Why a separate endpoint instead of widening /stats?
+//
+//   - /stats is per-pod by identity (kind/scope/name/replica) — its
+//     cost scales with pod count. /system is fixed-cost and totally
+//     orthogonal. Mixing them under one path muddies the cache
+//     story (TTLs / invalidation cadences differ) and the
+//     authorization story (a future read-only-system role is easier
+//     when it's one URL).
+//   - The WebUI's overview header reads /system once per page load.
+//     The CLI can get a `vd system` command pointing at the same
+//     URL with zero shared state with `vd stats`.
+//
+// 503 when the collector isn't wired (test setups that didn't ask
+// for system stats). Otherwise the response envelope is:
+//
+//	{"status":"ok","data": <systemstats.Snapshot> }
+//
+// See internal/systemstats for the Snapshot field documentation.
+// The Rails WebUI's Voodu::Client#system reads `data.host`,
+// `data.cpu`, `data.mem`, `data.disk`, `data.io`, `data.net`.
+//
+// IO + Net rates are deltas between consecutive calls — the first
+// request after process start returns 0 for those fields (no
+// baseline to diff against). Subsequent calls populate them.
+func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
+	if a.System == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("system collector not configured"))
+		return
+	}
+
+	snap, err := a.System.Snapshot(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   snap,
+	})
+}
+
 // handleExec dispatches unknown CLI commands to a plugin. Body is
 // {"args": ["<plugin>", "<cmd>", ...]} plus optional env. The CLI's
 // colon rewriter already split "postgres:create" into two args.
@@ -1878,6 +1938,39 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 
 	flusher, _ := w.(http.Flusher)
 
+	// Single mutex around the response writer because the heartbeat
+	// goroutine and the main read loop both write to it. Without it,
+	// a heartbeat byte could splice into a log line mid-flight.
+	var writeMu sync.Mutex
+	writeAndFlush := func(b []byte) bool {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if _, werr := w.Write(b); werr != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		return true
+	}
+
+	// Keep-alive heartbeat — writes a single newline every
+	// keepaliveInterval. The WebUI's log stream parser drops empty
+	// lines (log_stream_controller.js: `if (line.length > 0)`),
+	// so the heartbeat is invisible in the UI. Purpose is purely
+	// network: under idle containers (no log lines for >30s), the
+	// TCP socket would otherwise be killed by NAT timeouts, the
+	// Rails-side Net::HTTP read timeout, or proxy keep-alive
+	// expiry — surfacing as `Net::ReadTimeout with TCPSocket:(closed)`
+	// inline in the operator's log feed. The heartbeat keeps the
+	// channel warm so the read never times out while the container
+	// is just quiet.
+	hbCtx, hbCancel := context.WithCancel(r.Context())
+	defer hbCancel()
+
+	go runLogKeepalive(hbCtx, writeAndFlush)
+
 	// Small buffer + Flush after every read keeps `voodu logs -f` lines
 	// from sitting in the chunked-transfer buffer until the next page
 	// boundary. Non-follow reads still benefit (faster TTFB) without
@@ -1887,17 +1980,45 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 	for {
 		n, readErr := stream.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			if !writeAndFlush(buf[:n]) {
 				return
-			}
-
-			if flusher != nil {
-				flusher.Flush()
 			}
 		}
 
 		if readErr != nil {
 			return
+		}
+	}
+}
+
+// keepaliveInterval is the cadence for the empty-line heartbeat that
+// keeps an idle log stream's TCP socket alive. 25s sits comfortably
+// under the most common close-the-idle-socket cutoffs:
+//
+//   - Default Linux net.ipv4.tcp_keepalive_time is 7200s (2h), but
+//     intermediate gear (corporate NAT, cloud load balancers, AWS
+//     ALB defaults) reaps idle at 60s or 30s.
+//   - Faraday's default open_timeout is 60s; if the Ruby Net::HTTP
+//     read times out from the upstream side first, we hit
+//     Net::ReadTimeout. 25s gives two chances per minute.
+const keepaliveInterval = 25 * time.Second
+
+// runLogKeepalive emits a single newline byte every keepaliveInterval
+// until the context fires or write fails. Pulled out because both
+// the single-pod (handlePodLogs) and multi-pod (streamMultiplexedLogs)
+// paths share the same heartbeat strategy.
+func runLogKeepalive(ctx context.Context, write func([]byte) bool) {
+	t := time.NewTicker(keepaliveInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !write([]byte{'\n'}) {
+				return
+			}
 		}
 	}
 }

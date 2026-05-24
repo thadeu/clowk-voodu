@@ -154,6 +154,8 @@ func streamMultiplexedLogs(ctx context.Context, dst io.Writer, source LogStreame
 	// writeMu serialises all writes to dst so per-line prefixes stay
 	// atomic across goroutines. Without it two pods scribbling at
 	// the same time could interleave bytes within a single line.
+	// The heartbeat goroutine shares this mutex with the per-pod
+	// streams.
 	var writeMu sync.Mutex
 
 	write := func(b []byte) {
@@ -170,6 +172,33 @@ func streamMultiplexedLogs(ctx context.Context, dst io.Writer, source LogStreame
 			flusher.Flush()
 		}
 	}
+
+	// writeOK variant for the keepalive ticker — needs the bool
+	// return to know when to stop (broken pipe == client gone).
+	writeOK := func(b []byte) bool {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if _, err := dst.Write(b); err != nil {
+			return false
+		}
+
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		return true
+	}
+
+	// Empty-line heartbeat — see handlePodLogs for the rationale.
+	// Same cadence (keepaliveInterval), same WebUI invisibility
+	// (parser drops empty lines). Without it, a /logs?follow with
+	// no log activity for ~30s appears in the Rails log feed as
+	// `Net::ReadTimeout with TCPSocket:(closed)` and the feed dies
+	// until the operator hits refresh.
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+
+	go runLogKeepalive(hbCtx, writeOK)
 
 	var wg sync.WaitGroup
 

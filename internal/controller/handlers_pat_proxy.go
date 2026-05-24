@@ -71,6 +71,9 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/stats",
 		auth.Middleware(ScopeRead, a.handlePATStats))
 
+	mux.HandleFunc("GET /api/pat/v1/system",
+		auth.Middleware(ScopeRead, a.handlePATSystem))
+
 	mux.HandleFunc("GET /api/pat/v1/pods",
 		auth.Middleware(ScopeRead, a.handlePATPods))
 
@@ -102,6 +105,15 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 // the JSON envelope every other endpoint uses).
 func (a *API) handlePATStats(w http.ResponseWriter, r *http.Request) {
 	a.handleStats(w, r)
+}
+
+// handlePATSystem is the proxy for the host-level snapshot
+// (CPU/memory/disk/net/uptime/kernel via gopsutil). Verbatim
+// passthrough per the invariant at the top of this file —
+// the WebUI sees byte-identical JSON to what a CLI `vd system`
+// would consume against the orchestration plane.
+func (a *API) handlePATSystem(w http.ResponseWriter, r *http.Request) {
+	a.handleSystem(w, r)
 }
 
 // handlePATPods is the proxy for the pods list. Includes the

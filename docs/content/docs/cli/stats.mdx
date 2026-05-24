@@ -1,0 +1,91 @@
+---
+title: voodu stats
+description: Live CPU and memory usage joined with the manifest's configured limits.
+---
+
+## Synopsis
+
+```bash
+voodu stats [ref] [flags]
+```
+
+Single-shot (no streaming). Pipe through `watch` for a refresh loop.
+
+One row per running replica — comparing siblings side by side is the fastest way to spot a leaky pod or an unbalanced load.
+
+`[ref]` can be:
+
+- Empty: every running pod
+- A scope: `myorg`
+- `scope/name`: every replica of one resource
+- A kind: `deployment` / `statefulset` / `job` / `cronjob`
+- `kind/scope/name`: fully qualified
+
+## Common usage
+
+```bash
+# All pods in one scope
+vd stats myorg
+
+# One resource (one row per replica)
+vd stats myorg/web
+
+# All deployments across every scope
+vd stats deployment
+
+# Include leaks / pre-M0 legacy pods
+vd stats --orphans
+
+# Composable JSON
+vd stats -o json
+```
+
+## Output
+
+```
+$ vd stats clowk-vd
+KIND        NAME                CPU        MEMORY
+deployment  clowk-vd/docs.35a3  0.02/0.5   40.8Mi/100Mi
+deployment  clowk-vd/docs.8f4c  0.001/0.5  40.6Mi/100Mi
+```
+
+| Column | Meaning |
+|---|---|
+| `KIND` | `deployment` / `statefulset` / `job` / `cronjob`. `(orphan)` suffix means no matching manifest. |
+| `NAME` | `scope/name.replica` — the operator's mental model. |
+| `CPU` | used/limit, paired in the manifest's unit. Limit `0.5` → `0.45/0.5` (cores). Limit `500m` → `450m/500m` (millicores). No limit → `450m` (millicores fallback). |
+| `MEMORY` | used/limit. Used comes from runtime bytes (rendered in `Mi`/`Gi`); limit echoes the manifest's verbatim per-pod string. `—` on either side = no data / no limit declared. |
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `-k`, `--kind` | Filter by kind. Equivalent to the first segment of a positional ref. |
+| `-s`, `--scope` | Filter by scope. |
+| `-n`, `--name` | Filter by resource name. |
+| `--orphans` | Include containers without a matching manifest (legacy / leaks). Hidden by default. |
+| `-o`, `--output` | `text` (default), `json`, or `yaml`. |
+
+Positional ref and explicit flags are alternative spellings of the same filter — passing both is rejected.
+
+## Recipes
+
+```bash
+# Spot replicas approaching their memory limit
+vd stats -o json | jq '.[] | select(.usage.memory_percent > 80)'
+
+# Find a leaky replica — same resource, very different memory
+vd stats myorg/web -o json | jq 'sort_by(.usage.memory_usage_bytes) | reverse'
+
+# Find leaks (containers running but no manifest)
+vd stats --orphans -o json | jq '.[] | select(.orphan)'
+
+# Refresh loop (poor man's streaming)
+watch -n 2 vd stats myorg
+```
+
+## Notes
+
+- Stopped pods are omitted by design — no cgroup to sample. Use `vd get pods` to see them.
+- Per-pod rows are deliberate: averaging hides the asymmetry that diagnoses memory leaks, unbalanced load, or a wedged replica. If you need aggregated numbers, fold them yourself from JSON.
+- The JSON wire shape carries the full record: `usage.cpu_percent`, `usage.memory_usage_bytes`, `usage.memory_percent`, `limits.memory_bytes`, `desired_replicas`, etc.

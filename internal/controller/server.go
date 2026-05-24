@@ -16,6 +16,7 @@ import (
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/internal/secrets"
+	"go.voodu.clowk.in/internal/systemstats"
 )
 
 // Config is everything the controller needs to start. All fields have
@@ -182,6 +183,13 @@ func (s *Server) Start(ctx context.Context) error {
 			Stats: docker.DockerStatsClient{},
 			Store: store,
 		},
+
+		// System snapshot collector — host-level CPU/memory/disk/net/
+		// uptime via gopsutil. Stateful (lastSampled counters drive
+		// the IO/Net rate deltas) so it MUST be a long-lived
+		// instance; constructing one per request would lose the
+		// baseline and report 0 for every rate metric.
+		System: systemstats.NewGopsutilCollector(),
 
 		// Plugin-block expansion: discovers plugins under
 		// PluginsRoot at apply time and routes non-core kinds
