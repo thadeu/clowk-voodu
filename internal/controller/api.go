@@ -1433,7 +1433,7 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, http.StatusOK, envelope{
 			Status: "ok",
-			Data:   map[string]any{"pods": enrichPods(pods, describer), "degraded": degraded},
+			Data:   map[string]any{"pods": enrichPods(pods, describer, a.Stats), "degraded": degraded},
 		})
 		return
 	}
@@ -1619,6 +1619,16 @@ func (a *API) handlePodDescribe(w http.ResponseWriter, r *http.Request) {
 	if detail == nil {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("pod %q not found", name))
 		return
+	}
+
+	// Join the live CPU/Memory snapshot the same way /pods?detail=true
+	// does. Without this the single-pod endpoint would always ship
+	// `stats: null`, leaving the WebUI's pod show page rendering 0%
+	// CPU / 0 MB while the table list shows real numbers — confusing
+	// drift between two views of the same pod. Reuses the same
+	// helpers enrichPods uses so the wire shape stays identical.
+	if a.Stats != nil {
+		attachStats(detail, collectStatsByName(a.Stats))
 	}
 
 	writeJSON(w, http.StatusOK, envelope{

@@ -104,6 +104,25 @@ type LimitStats struct {
 	MemoryBytes int64  `json:"memory_bytes,omitempty"`
 }
 
+// PodStatsSnapshot is the per-pod stats shape attached to PodDetail
+// when a caller asks /pods?detail=true and the controller has a
+// StatsCollector wired. It mirrors the Usage + Limits portion of
+// PodStats so detail-mode callers get the same numbers `vd stats`
+// shows, joined into the same record they already consume.
+//
+// Why a snapshot type instead of embedding PodStats directly?
+//
+//   - PodStats carries Identity + ContainerName + DesiredReplicas
+//     + Orphan, which are already represented on PodDetail.Pod. The
+//     snapshot strips the duplicate keys so the JSON stays tight.
+//   - Pointer (Stats *PodStatsSnapshot) with omitempty means callers
+//     that DON'T enable stats (or pods whose stats failed) just see
+//     the field absent — wire-shape backward compatible.
+type PodStatsSnapshot struct {
+	Usage  UsageStats `json:"usage"`
+	Limits LimitStats `json:"limits"`
+}
+
 // StatsFilter narrows the result set. Empty filter = all running
 // pods (minus orphans unless Orphans is true). Matches the field
 // vocabulary of /pods so a future caller can pass through the same

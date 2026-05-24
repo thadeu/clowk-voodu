@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -166,6 +167,22 @@ type PodDetail struct {
 	// when the operator wants to escape voodu and debug at the daemon
 	// level.
 	ID string `json:"id,omitempty"`
+
+	// Stats carries the live CPU/memory snapshot joined from the
+	// StatsCollector when /pods?detail=true is called against a
+	// controller that has stats wired. nil (and omitted from JSON)
+	// in three cases:
+	//
+	//   1. detail=false (the compact list never carries stats)
+	//   2. controller wasn't built with a StatsCollector (test
+	//      setups, plugins running in isolation)
+	//   3. this specific pod wasn't in the docker stats batch (race
+	//      with delete, container transitioning, orphan filtered
+	//      out by the collector)
+	//
+	// Callers reading detail responses MUST handle nil — the field's
+	// presence is a hint, not a guarantee.
+	Stats *PodStatsSnapshot `json:"stats,omitempty"`
 }
 
 // PodDescriber is the seam GET /pods/{name} dispatches through. The
@@ -298,13 +315,28 @@ const enrichPodsConcurrency = 8
 //   - Bounded concurrency: at most `enrichPodsConcurrency` inspects
 //     in flight, so a hundred-pod host doesn't fork a hundred
 //     `docker inspect` children at once.
+//   - Stats join: when `stats` is non-nil, enrichPods asks for a
+//     single docker stats batch (covering ALL running pods on the
+//     host — fixed cost regardless of N matches) and attaches the
+//     per-pod CPU/Mem usage + declared limits to each output's
+//     `.Stats` field. Failures or non-matching containers leave
+//     `.Stats` nil; the JSON omits it via omitempty.
 //
 // describer is the same PodDescriber interface GET /pods/{name}
-// uses; passing it explicitly keeps this function testable without
-// the api.go plumbing.
-func enrichPods(pods []Pod, describer PodDescriber) []PodDetail {
+// uses; stats is the optional StatsCollector — passing both
+// explicitly keeps this function testable without the api.go
+// plumbing.
+func enrichPods(pods []Pod, describer PodDescriber, stats *StatsCollector) []PodDetail {
 	out := make([]PodDetail, len(pods))
 	sem := make(chan struct{}, enrichPodsConcurrency)
+
+	// Stats fan-in: one docker stats call before the per-pod inspect
+	// loop. Daemon returns every running container's CPU/Mem in a
+	// single sample, so the cost is fixed at one daemon call no
+	// matter how many pods we're enriching. We pre-build the
+	// name→snapshot map so the inspect goroutines just do an O(1)
+	// lookup.
+	statsByName := collectStatsByName(stats)
 
 	var wg sync.WaitGroup
 	for i := range pods {
@@ -324,6 +356,7 @@ func enrichPods(pods []Pod, describer PodDescriber) []PodDetail {
 				// Fall back to the compact Pod so the row still
 				// renders something useful.
 				out[i] = PodDetail{Pod: p}
+				attachStats(&out[i], statsByName)
 				return
 			}
 
@@ -340,10 +373,58 @@ func enrichPods(pods []Pod, describer PodDescriber) []PodDetail {
 			det.Pod.CreatedAt = p.CreatedAt
 
 			out[i] = *det
+			attachStats(&out[i], statsByName)
 		}()
 	}
 
 	wg.Wait()
 
 	return out
+}
+
+// collectStatsByName runs StatsCollector once with an empty filter
+// (we want every running container — the per-pod attach uses the
+// name as the key) and returns a lookup map. nil collector or any
+// error degrades to an empty map; the caller's `attachStats` then
+// leaves every PodDetail.Stats nil and the JSON omits it. We pass
+// Orphans=true so containers without voodu labels still surface
+// numbers — better to show a real CPU% than to drop the row.
+//
+// Context: uses Background because the parent handler's ctx isn't
+// threaded down through enrichPods today; the stats call is fast
+// (~5–15ms for the docker sample) so the cancellation gap is
+// negligible. If profiling ever shows the call dominating the
+// detail response, threading ctx through is a small refactor.
+func collectStatsByName(stats *StatsCollector) map[string]PodStatsSnapshot {
+	if stats == nil {
+		return nil
+	}
+
+	rows, err := stats.Collect(context.Background(), StatsFilter{Orphans: true})
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+
+	out := make(map[string]PodStatsSnapshot, len(rows))
+	for _, r := range rows {
+		out[r.ContainerName] = PodStatsSnapshot{Usage: r.Usage, Limits: r.Limits}
+	}
+
+	return out
+}
+
+// attachStats writes the matching snapshot into pd.Stats if the map
+// has a row for pd.Name. No-op when the map is nil/empty (collector
+// off or failed) or when the pod's name isn't represented (orphan
+// stopped between list and stats sample). Caller already wrote the
+// embedded Pod identity, so we don't touch anything else.
+func attachStats(pd *PodDetail, statsByName map[string]PodStatsSnapshot) {
+	if statsByName == nil {
+		return
+	}
+
+	if snap, ok := statsByName[pd.Name]; ok {
+		snap := snap
+		pd.Stats = &snap
+	}
 }
