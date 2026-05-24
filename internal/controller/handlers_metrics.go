@@ -117,6 +117,7 @@ func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		Metric:   metric,
 		Scope:    strings.TrimSpace(q.Get("scope")),
 		Name:     strings.TrimSpace(q.Get("name")),
+		Pod:      strings.TrimSpace(q.Get("pod")),
 		Start:    start,
 		End:      now,
 		Interval: interval,

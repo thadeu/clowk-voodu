@@ -16,11 +16,23 @@ import (
 // QueryOpts is the input to Query. The handler at the HTTP layer
 // translates its query-string params into one of these.
 type QueryOpts struct {
-	Dir      string
-	Source   Source        // SourceSystem or SourcePod
-	Metric   string        // e.g. "cpu_percent" — see metricExtractors
-	Scope    string        // optional, pod source only
-	Name     string        // optional, pod source only
+	Dir    string
+	Source Source        // SourceSystem or SourcePod
+	Metric string        // e.g. "cpu_percent" — see metricExtractors
+	Scope  string        // optional, pod source only
+	Name   string        // optional, pod source only (resource name)
+	Pod    string        // optional, pod source only — exact-match on
+	// the docker container name (which is also how
+	// `vd logs` / `vd describe` address a pod). When
+	// set, narrows further than (scope, name) which
+	// aggregates across replicas. Lets the WebUI show
+	// per-replica charts when the operator clicks a
+	// replica chip.
+	//
+	// The NDJSON row stores this under the `container`
+	// key (daemon-truth field name); the wire param
+	// `?pod=` reads naturally for operators because
+	// "pod" is voodu's surface vocabulary.
 	Start    time.Time     // inclusive
 	End      time.Time     // exclusive (typically Now)
 	Interval time.Duration // bucket size; the handler decides "auto"
@@ -366,6 +378,15 @@ func streamFile(path string, opts QueryOpts, extractor metricExtractor, emit fun
 			}
 
 			if opts.Name != "" && !matchString(raw, "name", opts.Name) {
+				continue
+			}
+
+			// Pod filter — exact match on the row's `container`
+			// field (docker daemon's identifier; same key voodu's
+			// /pods/{name} uses). Narrows to ONE replica when set;
+			// ignored when blank so (scope, name) aggregation still
+			// works for "show me this deployment as a whole" queries.
+			if opts.Pod != "" && !matchString(raw, "container", opts.Pod) {
 				continue
 			}
 		}
