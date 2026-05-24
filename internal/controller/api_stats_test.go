@@ -8,6 +8,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -205,5 +206,140 @@ func TestStats_OrphansDefaultExcludes(t *testing.T) {
 
 	if len(env.Data.Pods) != 1 || !env.Data.Pods[0].Orphan {
 		t.Errorf("orphans=true should surface legacy: %+v", env.Data.Pods)
+	}
+}
+
+// TestStats_ServesFromSnapshotWhenPopulated pins the M-S1 refactor:
+// once RefreshSnapshot has run, /stats reads from the in-memory cache
+// and reports snapshot=true in the envelope + emits the
+// X-Voodu-Snapshot-Age header. This is the hot path the metrics
+// sampler keeps warm; it should never trigger a fresh docker stats
+// shellout per request.
+func TestStats_ServesFromSnapshotWhenPopulated(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	pods := &fakePodsLister{pods: []Pod{
+		makePod("deployment", "clowk-lp", "web", "a3f9", "voodu-clowk-lp-web.a3f9", true),
+	}}
+
+	stats := &fakeStatsClient{byName: map[string]docker.ContainerStats{
+		"voodu-clowk-lp-web.a3f9": makeStats("voodu-clowk-lp-web.a3f9", 12.5, 100*1024*1024),
+	}}
+
+	putDeploymentWithLimits(t, store, "clowk-lp", "web", "0.4", "254Mi")
+
+	api.Stats = &StatsCollector{Pods: pods, Stats: stats, Store: store}
+
+	// Prime the snapshot (the sampler does this every tick in prod).
+	if _, err := api.Stats.RefreshSnapshot(context.Background()); err != nil {
+		t.Fatalf("RefreshSnapshot: %v", err)
+	}
+
+	// Reset the docker fake's record so we can assert ZERO calls
+	// on the /stats request.
+	stats.calledWith = nil
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("X-Voodu-Snapshot-Age"); got == "" {
+		t.Error("expected X-Voodu-Snapshot-Age header on snapshot-served response")
+	}
+
+	var env struct {
+		Status string
+		Data   struct {
+			Pods     []PodStats
+			Snapshot bool `json:"snapshot"`
+		}
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if !env.Data.Snapshot {
+		t.Error("expected data.snapshot=true when served from cache")
+	}
+
+	if len(env.Data.Pods) != 1 || env.Data.Pods[0].Usage.CPUPercent != 12.5 {
+		t.Errorf("snapshot row drift: %+v", env.Data.Pods)
+	}
+
+	// The fakeStatsClient must NOT have been called on this request
+	// — confirming we read from cache, not the docker daemon.
+	if stats.calledWith != nil {
+		t.Errorf("expected zero docker stats calls when snapshot is warm; got %v", stats.calledWith)
+	}
+}
+
+// TestStats_FallsBackToCollectWhenSnapshotEmpty pins the first-boot
+// path: no RefreshSnapshot has run yet, so /stats must fall through
+// to a live Collect, surface snapshot=false, and skip the
+// X-Voodu-Snapshot-Age header.
+func TestStats_FallsBackToCollectWhenSnapshotEmpty(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	pods := &fakePodsLister{pods: []Pod{
+		makePod("deployment", "clowk-lp", "web", "a3f9", "voodu-clowk-lp-web.a3f9", true),
+	}}
+
+	stats := &fakeStatsClient{byName: map[string]docker.ContainerStats{
+		"voodu-clowk-lp-web.a3f9": makeStats("voodu-clowk-lp-web.a3f9", 12.5, 100*1024*1024),
+	}}
+
+	putDeploymentWithLimits(t, store, "clowk-lp", "web", "0.4", "254Mi")
+
+	api.Stats = &StatsCollector{Pods: pods, Stats: stats, Store: store}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("X-Voodu-Snapshot-Age"); got != "" {
+		t.Errorf("X-Voodu-Snapshot-Age should be absent on fallback; got %q", got)
+	}
+
+	var env struct {
+		Data struct {
+			Pods     []PodStats
+			Snapshot bool `json:"snapshot"`
+		}
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if env.Data.Snapshot {
+		t.Error("expected data.snapshot=false on cold-start fallback")
+	}
+
+	if len(env.Data.Pods) != 1 {
+		t.Errorf("expected 1 pod from fallback Collect, got %d", len(env.Data.Pods))
+	}
+
+	// Fallback path MUST have called the docker fake.
+	if stats.calledWith == nil {
+		t.Error("expected docker stats to be called on snapshot-empty fallback")
 	}
 }

@@ -44,10 +44,19 @@ func NewMetricsPodSource(c *StatsCollector) metrics.PodSource {
 }
 
 // Collect copies every running pod's runtime numbers into the
-// flat `metrics.PodRuntime` shape. Empty filter so we get every
-// managed container; cap is enforced upstream by the sampler.
+// flat `metrics.PodRuntime` shape. We call RefreshSnapshot rather
+// than Collect directly: that does the docker stats roundtrip AND
+// stores the orphans-included result in the collector's atomic
+// snapshot pointer in one shot. The side effect — keeping the
+// snapshot fresh so /stats, /pods?detail=true and the autoscaler
+// can read from cache — is the whole point of this refactor.
+//
+// We then filter orphans out of the returned slice so the
+// time-series store only carries data for containers the controller
+// is managing; leaked / pre-M0 containers don't belong on the
+// chart. (Orphans stay in the snapshot for /stats?orphans=true.)
 func (a *statsCollectorAdapter) Collect(ctx context.Context) ([]metrics.PodRuntime, error) {
-	rows, err := a.c.Collect(ctx, StatsFilter{Orphans: false})
+	rows, err := a.c.RefreshSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +64,10 @@ func (a *statsCollectorAdapter) Collect(ctx context.Context) ([]metrics.PodRunti
 	out := make([]metrics.PodRuntime, 0, len(rows))
 
 	for _, r := range rows {
+		if r.Orphan {
+			continue
+		}
+
 		out = append(out, metrics.PodRuntime{
 			Container:       r.ContainerName,
 			Kind:            r.Identity.Kind,

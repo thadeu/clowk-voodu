@@ -210,13 +210,29 @@ func (a *Autoscaler) evaluate(ctx context.Context) {
 func (a *Autoscaler) evaluateOne(ctx context.Context, scope, name string, spec deploymentSpec) error {
 	as := spec.Autoscale
 
-	stats, err := a.Stats.Collect(ctx, StatsFilter{
+	// Read from the StatsCollector's in-memory snapshot (refreshed
+	// every ~15s by the metrics sampler). Stale-by-up-to-one-tick is
+	// fine for autoscale decisions: the cooldown windows are 30s+
+	// anyway, so a 15s read-age never changes a scale verdict it
+	// wouldn't have changed off a fresh sample. Saves a `docker stats`
+	// roundtrip per deployment per evaluation tick on busy hosts.
+	filter := StatsFilter{
 		Kind:  string(KindDeployment),
 		Scope: scope,
 		Name:  name,
-	})
-	if err != nil {
-		return fmt.Errorf("collect stats: %w", err)
+	}
+
+	stats, _, ok := a.Stats.SnapshotPods(filter)
+	if !ok {
+		// Sampler hasn't ticked yet (first-boot warmup). Fall back
+		// to a live call so the autoscaler doesn't sit idle until
+		// the first snapshot lands.
+		live, err := a.Stats.Collect(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("collect stats: %w", err)
+		}
+
+		stats = live
 	}
 
 	if len(stats) == 0 {

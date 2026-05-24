@@ -382,26 +382,40 @@ func enrichPods(pods []Pod, describer PodDescriber, stats *StatsCollector) []Pod
 	return out
 }
 
-// collectStatsByName runs StatsCollector once with an empty filter
-// (we want every running container — the per-pod attach uses the
-// name as the key) and returns a lookup map. nil collector or any
-// error degrades to an empty map; the caller's `attachStats` then
-// leaves every PodDetail.Stats nil and the JSON omits it. We pass
-// Orphans=true so containers without voodu labels still surface
-// numbers — better to show a real CPU% than to drop the row.
+// collectStatsByName returns a name → snapshot lookup map for the
+// enrichment loop. We READ from the StatsCollector's cached
+// in-memory snapshot (refreshed every ~15s by the metrics sampler)
+// instead of shelling out to `docker stats` on every /pods?detail=true
+// request — that endpoint is polled aggressively by the WebUI and the
+// per-request docker call dominated controller CPU.
 //
-// Context: uses Background because the parent handler's ctx isn't
-// threaded down through enrichPods today; the stats call is fast
-// (~5–15ms for the docker sample) so the cancellation gap is
-// negligible. If profiling ever shows the call dominating the
-// detail response, threading ctx through is a small refactor.
+// Fallback: when the snapshot hasn't been populated yet (first-boot,
+// pre-first-sampler-tick) we fall back to a live Collect so detail
+// mode still works during the warmup window. nil collector or any
+// error degrades to nil; the caller's `attachStats` then leaves every
+// PodDetail.Stats nil and the JSON omits it.
+//
+// We ask for Orphans=true so containers without voodu labels still
+// surface numbers — better to show a real CPU% than to drop the row.
 func collectStatsByName(stats *StatsCollector) map[string]PodStatsSnapshot {
 	if stats == nil {
 		return nil
 	}
 
-	rows, err := stats.Collect(context.Background(), StatsFilter{Orphans: true})
-	if err != nil || len(rows) == 0 {
+	rows, _, ok := stats.SnapshotPods(StatsFilter{Orphans: true})
+	if !ok {
+		// Snapshot not populated yet — fall back to live Collect so
+		// detail mode works during the warmup window before the
+		// sampler's first tick.
+		live, err := stats.Collect(context.Background(), StatsFilter{Orphans: true})
+		if err != nil || len(live) == 0 {
+			return nil
+		}
+
+		rows = live
+	}
+
+	if len(rows) == 0 {
 		return nil
 	}
 

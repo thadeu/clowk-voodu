@@ -1729,15 +1729,49 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		Orphans: q.Get("orphans") == "true" || q.Get("orphans") == "1",
 	}
 
-	pods, err := a.Stats.Collect(r.Context(), filter)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+	// Try the in-memory snapshot first (refreshed every ~15s by the
+	// metrics sampler). Avoids a fresh `docker stats` shellout on
+	// every /stats request — which the WebUI was hammering. Fall
+	// back to a live Collect only when the snapshot hasn't been
+	// populated yet (first-boot, before the sampler has ticked).
+	var (
+		pods        []PodStats
+		sampledAt   time.Time
+		fromSnap    bool
+		snapshotAge time.Duration
+	)
+
+	if rows, ts, ok := a.Stats.SnapshotPods(filter); ok {
+		pods = rows
+		sampledAt = ts
+		fromSnap = true
+		snapshotAge = time.Since(ts)
+	} else {
+		live, err := a.Stats.Collect(r.Context(), filter)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		pods = live
+	}
+
+	if fromSnap {
+		w.Header().Set("X-Voodu-Snapshot-Age", strconv.FormatFloat(snapshotAge.Seconds(), 'f', 1, 64))
+	}
+
+	data := map[string]any{
+		"pods":     pods,
+		"snapshot": fromSnap,
+	}
+
+	if fromSnap {
+		data["sampled_at"] = sampledAt.Format(time.RFC3339)
 	}
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data:   map[string]any{"pods": pods},
+		Data:   data,
 	})
 }
 

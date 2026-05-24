@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"go.voodu.clowk.in/internal/docker"
 )
@@ -177,6 +179,94 @@ type StatsCollector struct {
 	// when nil (rare — tests that don't care about limits), all
 	// results have empty Limits and are marked Orphan=true.
 	Store Store
+
+	// snapshot holds the most recent full Collect(Orphans:true) result
+	// stamped with the sample time. The metrics sampler refreshes it
+	// every tick (~15s); /stats, /pods?detail=true and the autoscaler
+	// read from it instead of triggering their own `docker stats`
+	// shellout. Atomic pointer so reads are lock-free (the hot path is
+	// HTTP handlers); writes happen on the sampler goroutine.
+	snapshot atomic.Pointer[statsSnapshot]
+}
+
+// statsSnapshot is the cached "last sample" record. Pods is the full
+// orphans-included set so SnapshotPods can apply any filter in-memory
+// without losing rows.
+type statsSnapshot struct {
+	Pods []PodStats
+	Ts   time.Time
+}
+
+// RefreshSnapshot performs a live docker.Collect (with Orphans=true so
+// the cached set covers every filter shape) and stores the result for
+// downstream SnapshotPods callers. Returns the freshly collected rows
+// so the sampler (the canonical caller) can persist them in the same
+// pass without doing a second docker roundtrip.
+//
+// Safe to call on a nil collector — returns (nil, nil). That mirrors
+// the rest of the stats surface so test wiring that omits the
+// collector still compiles.
+func (c *StatsCollector) RefreshSnapshot(ctx context.Context) ([]PodStats, error) {
+	if c == nil {
+		return nil, nil
+	}
+
+	rows, err := c.Collect(ctx, StatsFilter{Orphans: true})
+	if err != nil {
+		return nil, err
+	}
+
+	snap := &statsSnapshot{
+		Pods: rows,
+		Ts:   time.Now().UTC(),
+	}
+
+	c.snapshot.Store(snap)
+
+	return rows, nil
+}
+
+// SnapshotPods returns the cached pod stats filtered in-memory by
+// kind/scope/name (and orphans toggle). The third return is false
+// when no snapshot has been recorded yet — first-boot before the
+// sampler has ticked. Callers should fall back to Collect in that
+// case.
+//
+// The returned slice is a fresh allocation; callers can sort or
+// mutate it without affecting the cache.
+func (c *StatsCollector) SnapshotPods(filter StatsFilter) ([]PodStats, time.Time, bool) {
+	if c == nil {
+		return nil, time.Time{}, false
+	}
+
+	snap := c.snapshot.Load()
+	if snap == nil {
+		return nil, time.Time{}, false
+	}
+
+	out := make([]PodStats, 0, len(snap.Pods))
+
+	for _, p := range snap.Pods {
+		if filter.Kind != "" && p.Identity.Kind != filter.Kind {
+			continue
+		}
+
+		if filter.Scope != "" && p.Identity.Scope != filter.Scope {
+			continue
+		}
+
+		if filter.Name != "" && p.Identity.Name != filter.Name {
+			continue
+		}
+
+		if p.Orphan && !filter.Orphans {
+			continue
+		}
+
+		out = append(out, p)
+	}
+
+	return out, snap.Ts, true
 }
 
 // Collect joins pods + docker stats + manifest limits and returns

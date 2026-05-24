@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"go.voodu.clowk.in/internal/docker"
 )
@@ -452,5 +453,165 @@ func TestFilterPods_FieldVocabulary(t *testing.T) {
 				t.Errorf("got %d, want %d: %+v", len(got), c.want, got)
 			}
 		})
+	}
+}
+
+// TestStatsCollector_SnapshotEmptyBeforeRefresh pins the first-boot
+// case: SnapshotPods returns ok=false when RefreshSnapshot has never
+// run. Callers (handleStats, enrichPods, autoscaler) rely on this to
+// know they need to fall back to a live Collect.
+func TestStatsCollector_SnapshotEmptyBeforeRefresh(t *testing.T) {
+	collector := &StatsCollector{
+		Pods:  &fakePodsLister{},
+		Stats: &fakeStatsClient{},
+	}
+
+	_, _, ok := collector.SnapshotPods(StatsFilter{})
+	if ok {
+		t.Error("snapshot should report ok=false before first RefreshSnapshot")
+	}
+}
+
+// TestStatsCollector_RefreshAndSnapshotRoundtrip exercises the
+// happy path: RefreshSnapshot pulls live data, stores it, and the
+// next SnapshotPods returns the same rows plus a sample timestamp
+// no older than the call.
+func TestStatsCollector_RefreshAndSnapshotRoundtrip(t *testing.T) {
+	pods := &fakePodsLister{pods: []Pod{
+		makePod("deployment", "clowk-lp", "web", "a3f9", "voodu-clowk-lp-web.a3f9", true),
+	}}
+
+	stats := &fakeStatsClient{byName: map[string]docker.ContainerStats{
+		"voodu-clowk-lp-web.a3f9": makeStats("voodu-clowk-lp-web.a3f9", 47.5, 120*1024*1024),
+	}}
+
+	store := newMemStore()
+	putDeploymentWithLimits(t, store, "clowk-lp", "web", "0.4", "254Mi")
+
+	collector := &StatsCollector{Pods: pods, Stats: stats, Store: store}
+
+	before := time.Now().Add(-time.Second)
+
+	rows, err := collector.RefreshSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rows) != 1 {
+		t.Fatalf("RefreshSnapshot returned %d rows, want 1", len(rows))
+	}
+
+	got, ts, ok := collector.SnapshotPods(StatsFilter{})
+	if !ok {
+		t.Fatal("snapshot should be populated after RefreshSnapshot")
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("SnapshotPods returned %d rows, want 1", len(got))
+	}
+
+	if got[0].Identity.Name != "web" || got[0].Usage.CPUPercent != 47.5 {
+		t.Errorf("snapshot row content drifted: %+v", got[0])
+	}
+
+	if ts.Before(before) {
+		t.Errorf("snapshot timestamp %v should be after %v", ts, before)
+	}
+}
+
+// TestStatsCollector_SnapshotFilterMath pins the in-memory filter
+// applied at read time. The snapshot always stores Orphans=true
+// (every pod the host has) so SnapshotPods can narrow without
+// re-collecting.
+func TestStatsCollector_SnapshotFilterMath(t *testing.T) {
+	pods := &fakePodsLister{pods: []Pod{
+		makePod("deployment", "scope-a", "web", "1", "scope-a-web.1", true),
+		makePod("deployment", "scope-b", "web", "1", "scope-b-web.1", true),
+		makePod("statefulset", "scope-a", "pg", "0", "scope-a-pg.0", true),
+		// Legacy / orphan — only surfaces under Orphans=true.
+		{Name: "legacy", Running: true},
+	}}
+
+	stats := &fakeStatsClient{byName: map[string]docker.ContainerStats{
+		"scope-a-web.1": makeStats("scope-a-web.1", 1, 1),
+		"scope-b-web.1": makeStats("scope-b-web.1", 1, 1),
+		"scope-a-pg.0":  makeStats("scope-a-pg.0", 1, 1),
+		"legacy":        makeStats("legacy", 1, 1),
+	}}
+
+	store := newMemStore()
+	putDeploymentWithLimits(t, store, "scope-a", "web", "", "")
+	putDeploymentWithLimits(t, store, "scope-b", "web", "", "")
+	// statefulset path: use deployment store helper isn't right; just
+	// leave pg as orphan (no manifest) so it ALSO requires Orphans=true.
+
+	collector := &StatsCollector{Pods: pods, Stats: stats, Store: store}
+
+	if _, err := collector.RefreshSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		filter StatsFilter
+		want   int
+	}{
+		{"orphans included → all 4", StatsFilter{Orphans: true}, 4},
+		{"no orphans → only managed", StatsFilter{}, 2},
+		{"by scope (managed)", StatsFilter{Scope: "scope-a"}, 1},
+		{"by scope + orphans", StatsFilter{Scope: "scope-a", Orphans: true}, 2},
+		{"by kind", StatsFilter{Kind: "deployment"}, 2},
+		{"by name", StatsFilter{Name: "web"}, 2},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, _, ok := collector.SnapshotPods(c.filter)
+			if !ok {
+				t.Fatal("snapshot not populated")
+			}
+
+			if len(got) != c.want {
+				t.Errorf("got %d pods, want %d: %+v", len(got), c.want, got)
+			}
+		})
+	}
+}
+
+// TestStatsCollector_SnapshotIsolation pins that mutating the
+// returned slice doesn't poison the cached entry — important
+// because handlers may sort or filter after the call.
+func TestStatsCollector_SnapshotIsolation(t *testing.T) {
+	pods := &fakePodsLister{pods: []Pod{
+		makePod("deployment", "x", "a", "1", "x-a.1", true),
+		makePod("deployment", "x", "b", "1", "x-b.1", true),
+	}}
+
+	stats := &fakeStatsClient{byName: map[string]docker.ContainerStats{
+		"x-a.1": makeStats("x-a.1", 1, 1),
+		"x-b.1": makeStats("x-b.1", 1, 1),
+	}}
+
+	store := newMemStore()
+	putDeploymentWithLimits(t, store, "x", "a", "", "")
+	putDeploymentWithLimits(t, store, "x", "b", "", "")
+
+	collector := &StatsCollector{Pods: pods, Stats: stats, Store: store}
+
+	if _, err := collector.RefreshSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	first, _, _ := collector.SnapshotPods(StatsFilter{})
+	if len(first) != 2 {
+		t.Fatalf("got %d, want 2", len(first))
+	}
+
+	// Mutate the returned slice.
+	first[0].Usage.CPUPercent = 999
+
+	second, _, _ := collector.SnapshotPods(StatsFilter{})
+	if second[0].Usage.CPUPercent == 999 {
+		t.Error("snapshot leaked: mutating returned slice corrupted cache")
 	}
 }
