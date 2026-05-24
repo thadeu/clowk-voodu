@@ -24,7 +24,6 @@ package systemstats
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -32,19 +31,30 @@ import (
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
-	psnet "github.com/shirou/gopsutil/v4/net"
 )
 
 // Snapshot is the wire-shape returned by GET /system. Field tags are
 // JSON because the same struct is encoded straight into the response
 // body — keeps a single source of truth for the HTTP contract.
+//
+// Scope intentionally narrowed in W7: disk I/O rate and network
+// throughput LEFT this struct because at the host level they're
+// either misleading (sum over docker0/veth/eth0 double-counts the
+// same byte flowing in/out) or hard to interpret without per-NIC
+// breakdown. Per-pod NET I/O / BLOCK I/O moved into UsageStats
+// (see internal/controller/stats.go) where docker already provides
+// authoritative counts per-container.
+//
+// /system stays focused on "is this VM healthy at the OS level":
+//   - boot identity + uptime
+//   - CPU% + cores + load
+//   - memory used/total
+//   - disk SPACE used/total (per mount)
 type Snapshot struct {
 	Host HostInfo `json:"host"`
 	CPU  CPUStats `json:"cpu"`
 	Mem  MemStats `json:"mem"`
 	Disk []DiskFS `json:"disk"`
-	IO   IORate   `json:"io"`
-	Net  NetRate  `json:"net"`
 }
 
 // HostInfo is the static identity of the box — fields that don't
@@ -91,51 +101,24 @@ type DiskFS struct {
 	TotalBytes uint64 `json:"total_bytes"`
 }
 
-// IORate is throughput per second, summed across all block devices.
-// Computed as delta between two samples — first call returns 0
-// (no prior sample to diff against).
-type IORate struct {
-	ReadBytesPerSec  float64 `json:"read_bytes_per_sec"`
-	WriteBytesPerSec float64 `json:"write_bytes_per_sec"`
-}
-
-// NetRate mirrors IORate for network interfaces (aggregate across
-// all NICs). Same first-call-returns-zero contract.
-type NetRate struct {
-	RxBytesPerSec float64 `json:"rx_bytes_per_sec"`
-	TxBytesPerSec float64 `json:"tx_bytes_per_sec"`
-}
-
 // Collector is the single-method seam tests use to inject canned
 // snapshots without dragging in gopsutil's OS dependencies.
 type Collector interface {
 	Snapshot(ctx context.Context) (Snapshot, error)
 }
 
-// GopsutilCollector is the production implementation. It keeps a
-// small amount of state — the last sampled IO/Net counters — so it
-// can compute rates without forcing every caller to maintain that
-// bookkeeping themselves.
-//
-// Thread-safe: protected by a mutex on the rate-state read-modify-
-// write. Per-sample work is short (~5–15ms on Linux), so contention
-// is not a concern at the WebUI's polling cadence (~once per 10s).
-type GopsutilCollector struct {
-	mu          sync.Mutex
-	lastSampled time.Time
-
-	lastReadBytes  uint64
-	lastWriteBytes uint64
-	lastRxBytes    uint64
-	lastTxBytes    uint64
-}
+// GopsutilCollector is the production implementation. Stateless
+// after W7 (host disk-I/O / network-rate sampling moved out — those
+// metrics now live per-pod on UsageStats). Kept as a struct (not a
+// free function) for interface satisfaction + future extensions
+// that might need state again.
+type GopsutilCollector struct{}
 
 // NewGopsutilCollector returns a collector ready to serve requests.
-// No pre-sampling — the first Snapshot will return 0 for CPU%, IO
-// rate, and Net rate (those metrics need two samples to diff).
-// Subsequent calls populate the rates from the delta. Callers that
-// want a populated first response should call Snapshot twice in
-// quick succession (a few seconds apart) at startup.
+// The first Snapshot returns 0 for CPU% (gopsutil's cpu.Percent
+// needs two samples to compute the delta); subsequent calls give
+// the real percentage. All other fields populate from the first
+// call.
 func NewGopsutilCollector() *GopsutilCollector {
 	return &GopsutilCollector{}
 }
@@ -204,81 +187,5 @@ func (g *GopsutilCollector) Snapshot(ctx context.Context) (Snapshot, error) {
 		}}
 	}
 
-	// IO + Net rates — read raw counters then delta against the
-	// last sample. Mutex-serialised because two concurrent callers
-	// must not both think they're the "first" reader and clobber
-	// the baseline.
-	now := time.Now()
-
-	var (
-		rb, wb uint64
-		rx, tx uint64
-	)
-
-	if io, err := disk.IOCountersWithContext(ctx); err == nil {
-		for _, c := range io {
-			rb += c.ReadBytes
-			wb += c.WriteBytes
-		}
-	}
-
-	if ni, err := psnet.IOCountersWithContext(ctx, false); err == nil && len(ni) > 0 {
-		rx = ni[0].BytesRecv
-		tx = ni[0].BytesSent
-	}
-
-	snap.IO, snap.Net = g.updateRates(now, rb, wb, rx, tx)
-
 	return snap, nil
-}
-
-// updateRates is the rate-calculation seam — pulled out of Snapshot
-// so the delta math can be tested without standing up gopsutil.
-// Caller passes the raw cumulative counters; this returns the rates
-// since the previous call and updates the baseline.
-//
-// First-call semantics: lastSampled.IsZero() → returns zero rates,
-// only seeds the baseline. This is the documented "first Snapshot
-// returns 0 for IO/Net" behaviour. Counter wrap-around (uint64
-// underflow when current < last — happens on interface reset) also
-// returns zero for that field rather than emitting a bogus huge
-// number; a missed sample is better than a misleading one.
-func (g *GopsutilCollector) updateRates(now time.Time, rb, wb, rx, tx uint64) (IORate, NetRate) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	var (
-		io  IORate
-		net NetRate
-	)
-
-	if !g.lastSampled.IsZero() {
-		elapsed := now.Sub(g.lastSampled).Seconds()
-		if elapsed > 0 {
-			io.ReadBytesPerSec = rate(rb, g.lastReadBytes, elapsed)
-			io.WriteBytesPerSec = rate(wb, g.lastWriteBytes, elapsed)
-			net.RxBytesPerSec = rate(rx, g.lastRxBytes, elapsed)
-			net.TxBytesPerSec = rate(tx, g.lastTxBytes, elapsed)
-		}
-	}
-
-	g.lastSampled = now
-	g.lastReadBytes = rb
-	g.lastWriteBytes = wb
-	g.lastRxBytes = rx
-	g.lastTxBytes = tx
-
-	return io, net
-}
-
-// rate computes (current - previous) / elapsed, guarding against
-// uint64 underflow when the counter went backwards (interface
-// reset, daemon restart). Returns 0 rather than a huge number so
-// the dashboard doesn't briefly show "8.4 PB/s" after a reboot.
-func rate(current, previous uint64, elapsedSeconds float64) float64 {
-	if current < previous {
-		return 0
-	}
-
-	return float64(current-previous) / elapsedSeconds
 }

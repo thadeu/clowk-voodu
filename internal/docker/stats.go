@@ -72,6 +72,28 @@ type ContainerStats struct {
 	// PIDs is the process count inside the container. Useful for
 	// detecting fork bombs / runaway worker pools.
 	PIDs int `json:"pids,omitempty"`
+
+	// NetRxBytes / NetTxBytes are CUMULATIVE network counters since
+	// container start — same numbers `docker stats` shows in its
+	// "NET I/O" column ("338kB / 41.7kB"). Wraps to zero on container
+	// restart, NOT on cgroup-level interface flap (the daemon
+	// resets the counter only when the container itself restarts).
+	//
+	// Cumulative chosen over rate so the controller is stateless
+	// per-call. Rate (bytes/sec) would need per-container baseline
+	// tracking; a future enhancement layered on top — not v1.
+	NetRxBytes uint64 `json:"net_rx_bytes,omitempty"`
+	NetTxBytes uint64 `json:"net_tx_bytes,omitempty"`
+
+	// BlockReadBytes / BlockWriteBytes are CUMULATIVE block-device
+	// I/O counters since container start — `docker stats` "BLOCK I/O"
+	// column. Useful for spotting "this container is hammering the
+	// disk" without per-cgroup syscall tracing.
+	//
+	// Read/Write include only block-device I/O (page cache hits are
+	// invisible here, by design — same semantics as `iostat`).
+	BlockReadBytes  uint64 `json:"block_read_bytes,omitempty"`
+	BlockWriteBytes uint64 `json:"block_write_bytes,omitempty"`
 }
 
 // StatsClient is the seam controller-side collectors dispatch through.
@@ -172,7 +194,7 @@ func parseStatsLine(line string) (ContainerStats, error) {
 		return ContainerStats{}, fmt.Errorf("cpu_percent: %w", err)
 	}
 
-	memUsage, memLimit, err := parseMemUsage(raw.MemUsage)
+	memUsage, memLimit, err := parseDualBytes(raw.MemUsage)
 	if err != nil {
 		return ContainerStats{}, fmt.Errorf("mem_usage: %w", err)
 	}
@@ -184,14 +206,26 @@ func parseStatsLine(line string) (ContainerStats, error) {
 
 	pids, _ := strconv.Atoi(strings.TrimSpace(raw.PIDs))
 
+	// NetIO / BlockIO are formatted as "RX / TX" and "READ / WRITE"
+	// respectively. Same "A / B" docker convention parseDualBytes
+	// understands. Parse errors degrade to 0 — these are advisory
+	// metrics, not the primary correctness signal of `docker stats`,
+	// so a malformed NET column shouldn't fail the whole stats fetch.
+	netRx, netTx, _ := parseDualBytes(raw.NetIO)
+	blkRead, blkWrite, _ := parseDualBytes(raw.BlockIO)
+
 	return ContainerStats{
-		Name:          strings.TrimSpace(raw.Name),
-		ID:            strings.TrimSpace(raw.ID),
-		CPUPercent:    cpu,
-		MemUsageBytes: memUsage,
-		MemLimitBytes: memLimit,
-		MemPercent:    memPerc,
-		PIDs:          pids,
+		Name:            strings.TrimSpace(raw.Name),
+		ID:              strings.TrimSpace(raw.ID),
+		CPUPercent:      cpu,
+		MemUsageBytes:   memUsage,
+		MemLimitBytes:   memLimit,
+		MemPercent:      memPerc,
+		PIDs:            pids,
+		NetRxBytes:      netRx,
+		NetTxBytes:      netTx,
+		BlockReadBytes:  blkRead,
+		BlockWriteBytes: blkWrite,
 	}, nil
 }
 
@@ -216,16 +250,19 @@ func parsePercent(s string) (float64, error) {
 	return v, nil
 }
 
-// parseMemUsage splits the "USED / LIMIT" docker stats column into
-// the two byte counts. Both sides honour docker's unit suffixes
-// (B/KiB/MiB/GiB/TiB and their decimal kB/MB/GB/TB cousins). The
-// caller gets uint64 — well past the host's physical memory ceiling.
+// parseDualBytes splits a docker-stats two-value column into byte
+// counts. Three columns use the same shape:
 //
-// "--" appears for stopped containers (analogous to parsePercent).
-// We treat it as 0/0; the caller can distinguish "no stats" from
-// "zero usage" via the parent ContainerStats record (it just won't be
-// in the result set for stopped pods).
-func parseMemUsage(s string) (uint64, uint64, error) {
+//   - MemUsage  "112.1MiB / 1.921GiB"  → (used, limit)
+//   - NetIO     "338kB / 41.7kB"       → (rx, tx)
+//   - BlockIO   "2.04GB / 1.21MB"      → (read, write)
+//
+// Both sides honour docker's unit suffixes (B/KiB/MiB/GiB/TiB and
+// their decimal kB/MB/GB/TB cousins). "--" appears for stopped
+// containers — mapped to (0, 0), nil — and an empty string is also
+// (0, 0). Malformed input (non-matching split, unknown unit) returns
+// an error so callers can decide whether to degrade or fail.
+func parseDualBytes(s string) (uint64, uint64, error) {
 	s = strings.TrimSpace(s)
 
 	if s == "" || s == "--" {
@@ -234,20 +271,20 @@ func parseMemUsage(s string) (uint64, uint64, error) {
 
 	parts := strings.Split(s, "/")
 	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("expected USED / LIMIT, got %q", s)
+		return 0, 0, fmt.Errorf("expected A / B, got %q", s)
 	}
 
-	used, err := parseBytes(strings.TrimSpace(parts[0]))
+	a, err := parseBytes(strings.TrimSpace(parts[0]))
 	if err != nil {
-		return 0, 0, fmt.Errorf("used: %w", err)
+		return 0, 0, fmt.Errorf("left: %w", err)
 	}
 
-	limit, err := parseBytes(strings.TrimSpace(parts[1]))
+	b, err := parseBytes(strings.TrimSpace(parts[1]))
 	if err != nil {
-		return 0, 0, fmt.Errorf("limit: %w", err)
+		return 0, 0, fmt.Errorf("right: %w", err)
 	}
 
-	return used, limit, nil
+	return a, b, nil
 }
 
 // memUnit maps docker's unit suffix vocabulary to byte multipliers.

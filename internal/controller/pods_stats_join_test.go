@@ -98,6 +98,26 @@ func TestPodsDetail_AttachesPodStatsWhenCollectorWired(t *testing.T) {
 	if got.Stats.Limits.Memory != "254Mi" {
 		t.Errorf("Limits.Memory=%q want 254Mi", got.Stats.Limits.Memory)
 	}
+
+	// W7: NET/BLOCK I/O cumulative bytes ride alongside CPU/Mem.
+	// Same makeStats fixture sets these — assert they survive the
+	// docker.ContainerStats → UsageStats → PodStatsSnapshot copy
+	// path end-to-end.
+	if got.Stats.Usage.NetRxBytes != 338_000 {
+		t.Errorf("NetRxBytes=%d want 338000", got.Stats.Usage.NetRxBytes)
+	}
+
+	if got.Stats.Usage.NetTxBytes != 41_700 {
+		t.Errorf("NetTxBytes=%d want 41700", got.Stats.Usage.NetTxBytes)
+	}
+
+	if got.Stats.Usage.BlockReadBytes != 2_040_000_000 {
+		t.Errorf("BlockReadBytes=%d want 2_040_000_000", got.Stats.Usage.BlockReadBytes)
+	}
+
+	if got.Stats.Usage.BlockWriteBytes != 1_210_000 {
+		t.Errorf("BlockWriteBytes=%d want 1_210_000", got.Stats.Usage.BlockWriteBytes)
+	}
 }
 
 // TestPodsDetail_OmitsStatsWhenCollectorMissing pins backward

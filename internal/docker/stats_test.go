@@ -124,12 +124,12 @@ func TestParsePercent_StripsSuffix(t *testing.T) {
 	}
 }
 
-// TestParseMemUsage_SplitsUsedLimit pins the canonical
+// TestParseDualBytes_SplitsUsedLimit pins the canonical
 // "112.1MiB / 1.921GiB" docker format. Both halves go through
 // parseBytes, so unit coverage rides on parseBytes tests; here we
 // only check the split + plumbing.
-func TestParseMemUsage_SplitsUsedLimit(t *testing.T) {
-	used, limit, err := parseMemUsage("112.1MiB / 1.921GiB")
+func TestParseDualBytes_SplitsUsedLimit(t *testing.T) {
+	used, limit, err := parseDualBytes("112.1MiB / 1.921GiB")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,11 +151,11 @@ func TestParseMemUsage_SplitsUsedLimit(t *testing.T) {
 	}
 }
 
-// TestParseMemUsage_MalformedErrors — anything without exactly one
+// TestParseDualBytes_MalformedErrors — anything without exactly one
 // slash separator is unrecognisable. The parser shouldn't try to
 // guess; emit an error and let the caller surface it.
-func TestParseMemUsage_MalformedErrors(t *testing.T) {
-	_, _, err := parseMemUsage("112.1MiB")
+func TestParseDualBytes_MalformedErrors(t *testing.T) {
+	_, _, err := parseDualBytes("112.1MiB")
 	if err == nil {
 		t.Fatal("expected error on missing slash")
 	}
@@ -197,6 +197,27 @@ func TestParseStatsLine_HappyPath(t *testing.T) {
 	wantMem := uint64(memF)
 	if stats.MemUsageBytes != wantMem {
 		t.Errorf("mem_usage: got %d, want %d", stats.MemUsageBytes, wantMem)
+	}
+
+	// NetIO "338kB / 41.7kB" → 338000 rx, 41700 tx (docker uses
+	// decimal kB for network — 1kB = 1000B).
+	if stats.NetRxBytes != 338_000 {
+		t.Errorf("net_rx_bytes: got %d, want 338000", stats.NetRxBytes)
+	}
+
+	if stats.NetTxBytes != 41_700 {
+		t.Errorf("net_tx_bytes: got %d, want 41700", stats.NetTxBytes)
+	}
+
+	// BlockIO "2.04GB / 1.21MB" → 2.04e9 read, 1.21e6 write.
+	wantBlkRead := uint64(2.04 * 1000 * 1000 * 1000)
+	if stats.BlockReadBytes != wantBlkRead {
+		t.Errorf("block_read_bytes: got %d, want %d", stats.BlockReadBytes, wantBlkRead)
+	}
+
+	wantBlkWrite := uint64(1.21 * 1000 * 1000)
+	if stats.BlockWriteBytes != wantBlkWrite {
+		t.Errorf("block_write_bytes: got %d, want %d", stats.BlockWriteBytes, wantBlkWrite)
 	}
 }
 

@@ -43,14 +43,22 @@ func (f *fakeStatsClient) ContainerStats(names []string) ([]docker.ContainerStat
 }
 
 // makeStats is a small helper to keep test fixtures readable.
+// NET I/O + BLOCK I/O default to plausible cumulative byte counts
+// — non-zero so tests asserting "got attached" pass a strict
+// equality. Tests that don't care about them just ignore those
+// fields.
 func makeStats(name string, cpu float64, mem uint64) docker.ContainerStats {
 	return docker.ContainerStats{
-		Name:          name,
-		CPUPercent:    cpu,
-		MemUsageBytes: mem,
-		MemLimitBytes: 1024 * 1024 * 1024,
-		MemPercent:    float64(mem) / float64(1024*1024*1024) * 100,
-		PIDs:          5,
+		Name:            name,
+		CPUPercent:      cpu,
+		MemUsageBytes:   mem,
+		MemLimitBytes:   1024 * 1024 * 1024,
+		MemPercent:      float64(mem) / float64(1024*1024*1024) * 100,
+		PIDs:            5,
+		NetRxBytes:      338_000,
+		NetTxBytes:      41_700,
+		BlockReadBytes:  2_040_000_000,
+		BlockWriteBytes: 1_210_000,
 	}
 }
 

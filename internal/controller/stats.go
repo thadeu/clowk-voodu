@@ -90,6 +90,24 @@ type UsageStats struct {
 	MemoryLimitBytes uint64  `json:"memory_limit_bytes"`
 	MemoryPercent    float64 `json:"memory_percent"`
 	PIDs             int     `json:"pids,omitempty"`
+
+	// Network + block-device I/O are CUMULATIVE byte counts since
+	// container start — same numbers the operator sees in
+	// `docker stats` NET I/O and BLOCK I/O columns. Match each
+	// other in shape (rx/tx, read/write) so the wire is symmetric.
+	//
+	// omitempty so legacy clients that read the response shape
+	// before W7 still parse cleanly — they just see zeros for these
+	// fields (or the key absent in JSON when all four are zero).
+	//
+	// Cumulative chosen over rate (bytes/sec) to keep StatsCollector
+	// stateless per call. Rate computation would require per-container
+	// baseline tracking; v1 ships cumulative, future enhancement can
+	// add `*_per_sec` companion fields without breaking this shape.
+	NetRxBytes      uint64 `json:"net_rx_bytes,omitempty"`
+	NetTxBytes      uint64 `json:"net_tx_bytes,omitempty"`
+	BlockReadBytes  uint64 `json:"block_read_bytes,omitempty"`
+	BlockWriteBytes uint64 `json:"block_write_bytes,omitempty"`
 }
 
 // LimitStats is the manifest-declared resource ceiling. CPU and
@@ -255,6 +273,10 @@ func (c *StatsCollector) Collect(ctx context.Context, filter StatsFilter) ([]Pod
 				MemoryLimitBytes: runtime.MemLimitBytes,
 				MemoryPercent:    runtime.MemPercent,
 				PIDs:             runtime.PIDs,
+				NetRxBytes:       runtime.NetRxBytes,
+				NetTxBytes:       runtime.NetTxBytes,
+				BlockReadBytes:   runtime.BlockReadBytes,
+				BlockWriteBytes:  runtime.BlockWriteBytes,
 			},
 			Limits:          meta.Limits,
 			DesiredReplicas: meta.Desired,

@@ -57,8 +57,6 @@ func TestSystem_HappyPathEnvelope(t *testing.T) {
 			CPU:  systemstats.CPUStats{Percent: 12.4, Cores: 8, Load1: 0.41, Load5: 0.86, Load15: 1.21},
 			Mem:  systemstats.MemStats{UsedBytes: 8_123_456_789, TotalBytes: 16_777_216_000, AvailableBytes: 7_234_567_890},
 			Disk: []systemstats.DiskFS{{Mount: "/", UsedBytes: 184_000_000_000, TotalBytes: 500_000_000_000}},
-			IO:   systemstats.IORate{ReadBytesPerSec: 12_582_912, WriteBytesPerSec: 31_457_280},
-			Net:  systemstats.NetRate{RxBytesPerSec: 27_750_000, TxBytesPerSec: 12_700_000},
 		},
 	}
 
@@ -99,8 +97,14 @@ func TestSystem_HappyPathEnvelope(t *testing.T) {
 	mustHave(t, env.Data, "cpu", "cores")
 	mustHave(t, env.Data, "mem", "used_bytes")
 	mustHave(t, env.Data, "mem", "total_bytes")
-	mustHave(t, env.Data, "io", "read_bytes_per_sec")
-	mustHave(t, env.Data, "net", "rx_bytes_per_sec")
+
+	// W7 regression guard — host-level io/net moved to per-pod
+	// UsageStats. Don't let them sneak back in.
+	for _, key := range []string{"io", "net"} {
+		if _, present := env.Data[key]; present {
+			t.Errorf("key %q reappeared in /system response — host-level net/io was deliberately removed in W7", key)
+		}
+	}
 
 	disk, _ := env.Data["disk"].([]any)
 	if len(disk) == 0 {
