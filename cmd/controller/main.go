@@ -49,6 +49,14 @@ func main() {
 		// service file's ExecStart.
 		metricsInterval  = flag.Duration("metrics-interval", parseDurationOr("VOODU_METRICS_INTERVAL", metrics.DefaultInterval), "metrics sampler tick cadence (env: VOODU_METRICS_INTERVAL, default 15s)")
 		metricsRetention = flag.Duration("metrics-retention", parseDurationOr("VOODU_METRICS_RETENTION", metrics.DefaultRetention), "metrics file retention window (env: VOODU_METRICS_RETENTION, default 168h = 7d)")
+
+		// Ingress sampler — tails voodu-caddy's JSON access log,
+		// aggregates per-deployment HTTP metrics (count, status
+		// breakdown, latency p50/p90/p95/p99) in the same Tick cadence
+		// as the system+pod sampler. Default path matches voodu-caddy's
+		// install: $VOODU_CADDY_STATE_DIR/logs/access.log bind-mounted
+		// to /var/log/caddy inside the Caddy container.
+		caddyLog = flag.String("caddy-log", envOr("VOODU_CADDY_LOG", metrics.DefaultCaddyAccessLog), "voodu-caddy access log path; empty disables ingress sampler (env: VOODU_CADDY_LOG)")
 	)
 
 	flag.Parse()
@@ -83,6 +91,7 @@ func main() {
 		QuietEtcd:        *quietEtcd,
 		MetricsInterval:  *metricsInterval,
 		MetricsRetention: *metricsRetention,
+		CaddyAccessLog:   *caddyLog,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

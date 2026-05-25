@@ -110,6 +110,22 @@ var metricExtractors = map[string]metricExtractor{
 	"block_write_bytes":       uintOrFloatField("block_write_bytes"),
 	"block_read_delta_bytes":  uintOrFloatField("block_read_delta_bytes"),
 	"block_write_delta_bytes": uintOrFloatField("block_write_delta_bytes"),
+
+	// Ingress metrics — emitted by IngressSampler from Caddy access logs.
+	// req_count is the primary counter; per-status counters break it down.
+	// latency_p* and latency_max are computed at drain time by the
+	// aggregator. bytes_out is response-body bytes Caddy SENT to clients.
+	"req_count":      uintOrFloatField("req_count"),
+	"req_2xx":        uintOrFloatField("req_2xx"),
+	"req_3xx":        uintOrFloatField("req_3xx"),
+	"req_4xx":        uintOrFloatField("req_4xx"),
+	"req_5xx":        uintOrFloatField("req_5xx"),
+	"latency_p50_ms": uintOrFloatField("latency_p50_ms"),
+	"latency_p90_ms": uintOrFloatField("latency_p90_ms"),
+	"latency_p95_ms": uintOrFloatField("latency_p95_ms"),
+	"latency_p99_ms": uintOrFloatField("latency_p99_ms"),
+	"latency_max_ms": uintOrFloatField("latency_max_ms"),
+	"bytes_out":      uintOrFloatField("bytes_out"),
 }
 
 // uintOrFloatField returns an extractor that accepts both JSON

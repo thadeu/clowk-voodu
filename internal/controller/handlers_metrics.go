@@ -142,8 +142,11 @@ func parseSource(raw string) (metrics.Source, error) {
 		return metrics.SourceSystem, nil
 	case string(metrics.SourcePod):
 		return metrics.SourcePod, nil
+	case string(metrics.SourceIngress):
+		return metrics.SourceIngress, nil
 	default:
-		return "", fmt.Errorf("source must be %q or %q", metrics.SourceSystem, metrics.SourcePod)
+		return "", fmt.Errorf("source must be %q, %q, or %q",
+			metrics.SourceSystem, metrics.SourcePod, metrics.SourceIngress)
 	}
 }
 

@@ -63,6 +63,16 @@ type Config struct {
 	// `--metrics-interval` / `VOODU_METRICS_INTERVAL`.
 	MetricsInterval time.Duration
 
+	// CaddyAccessLog is the host-side path of voodu-caddy's JSON
+	// access log. Default: metrics.DefaultCaddyAccessLog
+	// (/opt/voodu/caddy/logs/access.log — see voodu-caddy's install
+	// script for the bind mount that puts the file there). Empty
+	// string OR a path that doesn't exist gracefully disables the
+	// ingress sampler (it logs once + emits nothing); the controller
+	// keeps serving without HTTP metrics. Override useful for tests
+	// that point at a fixture file.
+	CaddyAccessLog string
+
 	// MetricsRetention is the file-cleanup window. Default 7 days
 	// (`metrics.DefaultRetention`). Operator override via
 	// `--metrics-retention` / `VOODU_METRICS_RETENTION`.
@@ -106,6 +116,16 @@ type Server struct {
 	metricsWriter  *metrics.Writer
 	cancelMetrics  context.CancelFunc
 	metricsDone    chan struct{}
+
+	// Ingress sampler — Phase 1 of HTTP metrics. Tails Caddy's
+	// access log, aggregates per-deployment counts/latency/status
+	// in 15s windows, writes to the SAME NDJSON store the system
+	// + pod sampler appends to (just with source: "ingress").
+	// Independent lifecycle so a Caddy-less install (no plugin
+	// installed yet) doesn't block boot.
+	ingressSampler *metrics.IngressSampler
+	cancelIngress  context.CancelFunc
+	ingressDone    chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -514,6 +534,36 @@ func (s *Server) Start(ctx context.Context) error {
 
 			s.metricsSampler.Run(metricsCtx)
 		}()
+
+		// Ingress sampler — same writer (shared NDJSON files), uses
+		// the controller's Store to resolve host → (scope, name) via
+		// the ingressLister adapter. Disabled when CaddyAccessLog is
+		// empty OR the file is missing (sampler silently no-ops if
+		// the log file doesn't exist; the install of voodu-caddy
+		// creates it, so first-boot before plugin install is
+		// gracefully empty until the operator installs Caddy).
+		caddyLog := s.cfg.CaddyAccessLog
+		if caddyLog == "" {
+			caddyLog = metrics.DefaultCaddyAccessLog
+		}
+
+		s.ingressSampler = &metrics.IngressSampler{
+			LogPath: caddyLog,
+			Tick:    s.cfg.MetricsInterval,
+			Writer:  w,
+			Hosts:   metrics.NewCachedHostResolver(newIngressLister(s.api.Store)),
+			Logger:  s.cfg.Logger,
+		}
+
+		ingressCtx, cancelIngress := context.WithCancel(context.Background())
+		s.cancelIngress = cancelIngress
+		s.ingressDone = make(chan struct{})
+
+		go func() {
+			defer close(s.ingressDone)
+
+			s.ingressSampler.Run(ingressCtx)
+		}()
 	}
 
 	s.http = &http.Server{
@@ -623,6 +673,14 @@ func (s *Server) teardown() {
 	// Metrics sampler stops first — it owns a writer holding a
 	// file fd, and we want the file flushed + closed before the
 	// process exits so the tail of the kernel page cache hits disk.
+	if s.cancelIngress != nil {
+		s.cancelIngress()
+	}
+
+	if s.ingressDone != nil {
+		<-s.ingressDone
+	}
+
 	if s.cancelMetrics != nil {
 		s.cancelMetrics()
 	}

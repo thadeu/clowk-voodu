@@ -89,6 +89,21 @@ func (w *Writer) WritePod(s PodSample) error {
 	return w.appendLine(s.Ts.UTC(), line)
 }
 
+// WriteIngress appends one ingress (HTTP metrics) row. Same day-by-ts
+// selection as WriteSystem / WritePod; all three sources share the
+// daily NDJSON file so the reader can stream once for queries that
+// touch multiple sources.
+func (w *Writer) WriteIngress(s IngressSample) error {
+	s.Source = SourceIngress
+
+	line, err := marshalLine(s)
+	if err != nil {
+		return fmt.Errorf("marshal ingress: %w", err)
+	}
+
+	return w.appendLine(s.Ts.UTC(), line)
+}
+
 // marshalLine builds a complete NDJSON line as one []byte —
 // trailing newline included — so the caller can issue a single
 // Write() against the file. See Writer doc for why this matters.
