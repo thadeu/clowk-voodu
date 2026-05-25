@@ -1800,7 +1800,9 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 //
 // See internal/systemstats for the Snapshot field documentation.
 // The Rails WebUI's Voodu::Client#system reads `data.host`,
-// `data.cpu`, `data.mem`, `data.disk`, `data.io`, `data.net`.
+// `data.cpu`, `data.mem`, `data.disk`, `data.io`, `data.net`,
+// AND `data.voodu.version` (controller build version, used by the
+// Settings page subtitle).
 //
 // IO + Net rates are deltas between consecutive calls — the first
 // request after process start returns 0 for those fields (no
@@ -1817,9 +1819,21 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Embed Snapshot so existing host/cpu/mem/disk JSON layout is
+	// preserved verbatim, then tack on a "voodu" sub-object. Same
+	// pattern any future top-level addition can follow without
+	// touching the systemstats package.
+	resp := struct {
+		systemstats.Snapshot
+		Voodu struct {
+			Version string `json:"version"`
+		} `json:"voodu"`
+	}{Snapshot: snap}
+	resp.Voodu.Version = a.Version
+
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
-		Data:   snap,
+		Data:   resp,
 	})
 }
 

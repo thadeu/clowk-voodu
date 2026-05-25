@@ -100,6 +100,17 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
 
+	// PAT management proxies. ScopeActions (not ScopeRead) because
+	// the redacted list still leaks token NAMES + PREFIXES + scopes,
+	// which is admin-level metadata. The Rails WebUI's Settings page
+	// renders this section only when the configured PAT has actions
+	// scope; read-only PATs see an inline "admin PAT required" hint.
+	mux.HandleFunc("GET /api/pat/v1/pats",
+		auth.Middleware(ScopeActions, a.handlePATList))
+
+	mux.HandleFunc("DELETE /api/pat/v1/pats/{id}",
+		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATRevoke)))
+
 	// Reuse the existing log-requests middleware so PAT-plane
 	// requests get the same access log line shape as the
 	// orchestration plane. logRequests audited: never logs the

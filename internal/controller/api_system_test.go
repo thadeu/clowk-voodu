@@ -98,6 +98,13 @@ func TestSystem_HappyPathEnvelope(t *testing.T) {
 	mustHave(t, env.Data, "mem", "used_bytes")
 	mustHave(t, env.Data, "mem", "total_bytes")
 
+	// Controller's own build version, read by the Rails WebUI's
+	// Settings page subtitle ("voodu vX.Y.Z").
+	mustHave(t, env.Data, "voodu", "version")
+	if v, _ := env.Data["voodu"].(map[string]any); v["version"] != "test" {
+		t.Errorf("voodu.version: got %v want test", v["version"])
+	}
+
 	// W7 regression guard — host-level io/net moved to per-pod
 	// UsageStats. Don't let them sneak back in.
 	for _, key := range []string{"io", "net"} {
