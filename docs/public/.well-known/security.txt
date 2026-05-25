@@ -1,0 +1,9 @@
+# Security policy for voodu (https://voodu.clowk.in)
+# Format: RFC 9116 (https://www.rfc-editor.org/rfc/rfc9116)
+
+Contact: mailto:security@clowk.in
+Contact: https://github.com/thadeu/clowk-voodu/security/advisories/new
+Expires: 2027-12-31T23:59:59Z
+Preferred-Languages: en, pt-BR
+Canonical: https://voodu.clowk.in/.well-known/security.txt
+Policy: https://voodu.clowk.in/docs/reference/security/

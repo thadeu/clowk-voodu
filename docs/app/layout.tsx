@@ -16,7 +16,7 @@ const plexMono = IBM_Plex_Mono({
   display: 'swap',
 });
 
-const SITE_URL = 'https://voodu.sh';
+const SITE_URL = 'https://voodu.clowk.in';
 const OG_IMAGE = `${SITE_URL}/og-image.png`;
 
 export const metadata: Metadata = {

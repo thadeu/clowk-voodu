@@ -1,0 +1,87 @@
+# Voodu
+
+> Self-hosted PaaS with declarative HCL manifests. One file describes the running system; `voodu apply` reconciles. Heroku-shaped UX on a k8s-honest reconciliation loop, no cluster control plane. Apps, ingress with auto-TLS, stateful services (Postgres, Redis, Mongo) with backups — all on your own boxes. MIT, single Go binary, no telemetry.
+
+Voodu is for operators who want push-to-deploy ergonomics without running a Kubernetes cluster. The CLI streams a build context over SSH to a single controller (embedded etcd, Caddy ingress, docker as the runtime), which reconciles the declared state against what's running. Plugins extend the surface — Postgres with replication and PITR, Redis with sentinel HA, custom kinds via a small dispatch protocol.
+
+## Getting started
+
+- [Install](https://voodu.clowk.in/docs/getting-started/install/): one-line bootstrap for the controller on a fresh Ubuntu/Debian box, plus the `vd` CLI install.
+- [First deploy](https://voodu.clowk.in/docs/getting-started/first-deploy/): hello-world `app` block with TLS, walked end-to-end.
+- [Remotes](https://voodu.clowk.in/docs/getting-started/remotes/): registering SSH targets, multi-host applies, the `-r` flag.
+
+## Manifest reference (HCL kinds)
+
+- [Overview](https://voodu.clowk.in/docs/manifests/overview/): the kinds voodu accepts and how they compose.
+- [`deployment`](https://voodu.clowk.in/docs/manifests/deployment/): long-running stateless workloads. Image or build mode, rolling restarts, env stacking, raw docker pass-throughs.
+- [`statefulset`](https://voodu.clowk.in/docs/manifests/statefulset/): pods with stable per-ordinal identity and persistent volume claims.
+- [`app`](https://voodu.clowk.in/docs/manifests/app/): sugar block — `deployment` + `ingress` with the same identity in one shape.
+- [`ingress`](https://voodu.clowk.in/docs/manifests/ingress/): host routing, TLS, load balancing — handled by the Caddy plugin.
+- [`job`](https://voodu.clowk.in/docs/manifests/jobs/) and `cronjob`: one-shot containers, on demand or on a cron schedule.
+- [`asset`](https://voodu.clowk.in/docs/manifests/asset/): declarative file bundles materialised on the host for bind-mount or env interpolation.
+- [`registry`](https://voodu.clowk.in/docs/manifests/registry/): private image pull secrets, atomic `~/.docker/config.json` regeneration.
+- [`config`](https://voodu.clowk.in/docs/manifests/config/) buckets: out-of-band env vars set via `vd config`, layered into pods via `env_from`.
+- [`build`](https://voodu.clowk.in/docs/manifests/build/) block: build-from-source with docker-compose-shaped fields and auto-detected runtimes (Go/Ruby/Node/Python).
+- [`resources`](https://voodu.clowk.in/docs/manifests/resources/): k8s-style CPU/memory limits via cgroups.
+- [`autoscale`](https://voodu.clowk.in/docs/manifests/autoscale/): CPU-based horizontal scaling with asymmetric cooldowns.
+- [`probes`](https://voodu.clowk.in/docs/manifests/probes/): kubelet-style liveness, readiness, startup. HTTP, TCP, or exec.
+- [`init`](https://voodu.clowk.in/docs/manifests/init/) containers: ordered prep steps before main containers spawn.
+- [`release`](https://voodu.clowk.in/docs/manifests/release/) phase: pre/post-deploy commands (migrations, warmup, smoke tests).
+- [`on_deploy`](https://voodu.clowk.in/docs/manifests/on-deploy/) and [`on_probe`](https://voodu.clowk.in/docs/manifests/on-probe/): webhook fan-out on rollout / health transitions.
+- [`logs`](https://voodu.clowk.in/docs/manifests/logs/): docker json-file driver caps per container.
+- [`depends_on`](https://voodu.clowk.in/docs/manifests/depends-on/): explicit asset dependencies for spec-hash invalidation.
+- [Interpolation](https://voodu.clowk.in/docs/manifests/interpolation/): `${VAR}`, `${VAR:-default}`, `${asset.x.y}`, `${ref.kind.name.field}`.
+
+## Plugins (stateful services)
+
+- [`postgres`](https://voodu.clowk.in/docs/manifests/postgres/): single primary + N replicas via streaming replication, auto-generated passwords, `vd pg:promote` for manual failover, backup/restore with PITR.
+- [`redis`](https://voodu.clowk.in/docs/manifests/redis/): single instance or sentinel HA (data redis + sibling redis-ha resource).
+- [Caddy](https://voodu.clowk.in/docs/plugins/caddy/): the reference ingress plugin — automatic Let's Encrypt + on-demand wildcards.
+- [Build your own](https://voodu.clowk.in/docs/plugins/build-your-own/): plugin dispatch protocol, manifest emission, asset materialisation.
+
+## CLI reference
+
+- [`vd apply`](https://voodu.clowk.in/docs/cli/apply/): the workhorse — stream context, plan, reconcile.
+- [`vd diff`](https://voodu.clowk.in/docs/cli/diff/): plan-style dry run with detailed exit codes for CI gates.
+- [`vd logs`](https://voodu.clowk.in/docs/cli/logs/): tail logs by pod, app, or scope.
+- [`vd config`](https://voodu.clowk.in/docs/cli/config/): out-of-band env management.
+- [`vd remote`](https://voodu.clowk.in/docs/cli/remote/): SSH target registration and multi-host operations.
+- [`vd plugins`](https://voodu.clowk.in/docs/cli/plugins/): install plugins from GitHub releases.
+- [`vd stats`](https://voodu.clowk.in/docs/cli/stats/): live CPU/memory usage joined with configured limits.
+
+## Architecture
+
+- [Overview](https://voodu.clowk.in/docs/architecture/overview/): controller, CLI, transport, runtime — how the pieces fit.
+- [Controller](https://voodu.clowk.in/docs/architecture/controller/): single-host Go service with embedded etcd; reconcile loop, plugin dispatch, asset materialisation.
+- [Reconciler](https://voodu.clowk.in/docs/architecture/reconciler/): spec hash, drift detection, rolling restart semantics.
+- [API](https://voodu.clowk.in/docs/architecture/api/) and [PAT v1](https://voodu.clowk.in/docs/architecture/api-pat-v1/): the controller's HTTP surface, authentication, scopes.
+
+## Examples
+
+- [Hello world](https://voodu.clowk.in/docs/examples/hello-world/) — minimal app + ingress with TLS.
+- [Production stack](https://voodu.clowk.in/docs/examples/production-stack/) — Postgres + Redis + app + ingress wired together.
+- [Stateful services](https://voodu.clowk.in/docs/examples/stateful-services/) — databases with persistent volumes.
+- [Build modes](https://voodu.clowk.in/docs/examples/build-modes/) — image vs build, custom Dockerfile, auto-detect.
+- [Init containers](https://voodu.clowk.in/docs/examples/init-containers/) — migrations, warmup, prep.
+- [Multi-environment](https://voodu.clowk.in/docs/examples/multi-environment/) — staging vs prod from one manifest.
+- [Health checks](https://voodu.clowk.in/docs/examples/health-checks/) — probes wiring, ingress gating.
+- [On-deploy webhooks](https://voodu.clowk.in/docs/examples/on-deploy/) — Slack, PagerDuty, Datadog fan-out.
+- [Assets](https://voodu.clowk.in/docs/examples/assets/) — file bundles for config files and asset refs.
+- [Private registry](https://voodu.clowk.in/docs/examples/private-registry/) — GHCR, ECR, Docker Hub auth.
+- [Shared scope](https://voodu.clowk.in/docs/examples/shared-scope/) — cross-repo applies into the same scope.
+
+## Reference
+
+- [FAQ](https://voodu.clowk.in/docs/reference/faq/) — common questions and gotchas.
+- [Errors](https://voodu.clowk.in/docs/reference/errors/) — error codes and remediation.
+- [Cron](https://voodu.clowk.in/docs/reference/cron/) — cron expression syntax voodu accepts.
+- [Security](https://voodu.clowk.in/docs/reference/security/) — threat model, auth, secrets handling.
+- [Contributing](https://voodu.clowk.in/docs/reference/contributing/) — development setup, testing, PR process.
+
+## Project
+
+- Website: https://voodu.clowk.in
+- Docs: https://voodu.clowk.in/docs
+- GitHub: https://github.com/thadeu/clowk-voodu
+- Full content for ingestion: https://voodu.clowk.in/llms-full.txt
+- License: MIT

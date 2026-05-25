@@ -94,7 +94,7 @@ $ voodu apply -f voodu.hcl  ──ssh──▶  voodu-controller
 
 ## Links
 
-- Website: https://voodu.sh
+- Website: https://voodu.clowk.in
 - GitHub: https://github.com/thadeu/clowk-voodu
-- Docs: https://voodu.sh/docs
+- Docs: https://voodu.clowk.in/docs
 - License: MIT
