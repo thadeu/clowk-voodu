@@ -308,6 +308,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /stats", a.handleStats)
 	mux.HandleFunc("GET /system", a.handleSystem)
 	mux.HandleFunc("GET /metrics", a.handleMetrics)
+	mux.HandleFunc("GET /metrics/dump", a.handleMetricsDump)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)

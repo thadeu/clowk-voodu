@@ -96,6 +96,14 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/metrics",
 		auth.Middleware(ScopeRead, a.handlePATMetrics))
 
+	// Incremental NDJSON dump for the WebUI's local metrics
+	// warehouse. Verbatim passthrough; the WebUI streams the
+	// response into its SQLite store on every recurring sync tick.
+	// ScopeRead is correct — no mutation, just reading the same
+	// NDJSON files /metrics aggregates.
+	mux.HandleFunc("GET /api/pat/v1/metrics/dump",
+		auth.Middleware(ScopeRead, a.handlePATMetricsDump))
+
 	// Action endpoints — scope=actions + per-PAT rate limit.
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
@@ -162,6 +170,15 @@ func (a *API) handlePATPodLogs(w http.ResponseWriter, r *http.Request) {
 // would consume against the orchestration plane.
 func (a *API) handlePATMetrics(w http.ResponseWriter, r *http.Request) {
 	a.handleMetrics(w, r)
+}
+
+// handlePATMetricsDump is the proxy for the incremental NDJSON
+// dump that the WebUI's local metrics warehouse pulls on every
+// recurring sync tick. Verbatim passthrough; the underlying handler
+// streams `application/x-ndjson` chunked so the WebUI client can
+// ingest line-by-line as bytes arrive.
+func (a *API) handlePATMetricsDump(w http.ResponseWriter, r *http.Request) {
+	a.handleMetricsDump(w, r)
 }
 
 // handlePATLogsMulti is the proxy for the server-side multi-pod
