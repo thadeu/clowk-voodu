@@ -49,6 +49,23 @@ type Pod struct {
 	Status    string `json:"status"`
 	Running   bool   `json:"running"`
 	CreatedAt string `json:"created_at,omitempty"`
+
+	// Spec is the declared manifest from etcd for this pod's
+	// (kind, scope, resource_name). Populated only when the caller
+	// passes `?spec=true`; nil otherwise. PodDetail inherits this
+	// field via embedding, so both the compact list and the rich
+	// inspect surface the same shape.
+	//
+	// Used by the WebUI's snapshot sync to render probes / env /
+	// resources / lifecycle hooks straight from the source of
+	// truth, instead of re-deriving them from runtime state. Carries
+	// the full Manifest envelope (Kind, Scope, Name, Spec body,
+	// Metadata.UpdatedAt) so "last applied N ago" badges and any
+	// future revision-aware UI have the data they need.
+	//
+	// Skipped silently when the manifest can't be found (orphan
+	// container that outlived its spec) — the field stays nil.
+	Spec *Manifest `json:"spec,omitempty"`
 }
 
 // PodsLister enumerates voodu-managed containers on the host. Behind
@@ -380,6 +397,43 @@ func enrichPods(pods []Pod, describer PodDescriber, stats *StatsCollector) []Pod
 	wg.Wait()
 
 	return out
+}
+
+// attachSpec joins each pod's declared manifest from etcd onto its
+// Spec field. Used by /pods and /pods/{name} when the caller passes
+// `?spec=true` — the WebUI snapshot-sync job needs the full picture
+// (runtime + stats + spec body + metadata) in a single request to
+// render probes / env / resources without a second roundtrip.
+//
+// Behaviour:
+//   - nil store (test setup with no etcd backend) → no-op
+//   - pod missing Kind or ResourceName (pre-M0 orphan, unlabeled
+//     container) → no-op for that pod
+//   - manifest not found in etcd (`vd apply --prune` removed the
+//     spec while a pod still runs) → silently skip; field stays nil
+//   - any other store error → log + leave nil; never fail the request
+//
+// The Pod struct's Spec field is reachable from both compact rows
+// AND PodDetail (which embeds Pod), so this helper services both
+// surfaces with one signature.
+func attachSpec(ctx context.Context, store Store, p *Pod) {
+	if store == nil || p == nil {
+		return
+	}
+
+	if p.Kind == "" || p.ResourceName == "" {
+		return
+	}
+
+	m, err := store.Get(ctx, Kind(p.Kind), p.Scope, p.ResourceName)
+	if err != nil || m == nil {
+		// Orphan pod (spec deleted) or transient etcd error. Either
+		// way the WebUI can degrade gracefully — runtime+stats alone
+		// is still useful.
+		return
+	}
+
+	p.Spec = m
 }
 
 // collectStatsByName returns a name → snapshot lookup map for the

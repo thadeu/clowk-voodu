@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -755,6 +756,134 @@ func TestPodsGet_DetailTrue_EnrichesEachRow(t *testing.T) {
 
 	if env.Data.Pods[1].Env["POSTGRES_DB"] != "main" {
 		t.Errorf("pod[1] missing env: %+v", env.Data.Pods[1].Env)
+	}
+}
+
+// TestPodsGet_SpecTrue_AttachesManifest pins the `?spec=true` join:
+// each pod whose (kind, scope, resource_name) has a manifest in etcd
+// gets its `spec` field populated with the full Manifest envelope.
+// Used by the WebUI snapshot-sync to render probes / env / resources
+// from the source of truth in a single request.
+//
+// Orthogonal to `?detail=true` — the two compose. Test the
+// combination since that's the primary WebUI shape.
+func TestPodsGet_SpecTrue_AttachesManifest(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	// Seed the store with manifests for two of the three pods.
+	// "orphan" has no spec — exercises the graceful-degrade path
+	// (field stays nil, response still succeeds).
+	_, _ = store.Put(t.Context(), &Manifest{
+		Kind:  KindDeployment,
+		Scope: "x",
+		Name:  "web",
+		Spec:  json.RawMessage(`{"image":"x-web:latest","replicas":3}`),
+	})
+	_, _ = store.Put(t.Context(), &Manifest{
+		Kind:  KindStatefulset,
+		Scope: "x",
+		Name:  "db",
+		Spec:  json.RawMessage(`{"image":"postgres:16"}`),
+	})
+
+	api.Pods = &fakePodsLister{
+		pods: []Pod{
+			{Name: "x-web.a", Kind: "deployment", Scope: "x", ResourceName: "web", ReplicaID: "a", Image: "x-web:latest", Running: true},
+			{Name: "x-db.0", Kind: "statefulset", Scope: "x", ResourceName: "db", ReplicaID: "0", Image: "postgres:16", Running: true},
+			{Name: "orphan.z", Kind: "deployment", Scope: "x", ResourceName: "orphan", ReplicaID: "z", Image: "old:1", Running: true},
+		},
+		details: map[string]*PodDetail{
+			"x-web.a":   {Pod: Pod{Name: "x-web.a", Image: "x-web:latest"}, ID: "1"},
+			"x-db.0":    {Pod: Pod{Name: "x-db.0", Image: "postgres:16"}, ID: "2"},
+			"orphan.z":  {Pod: Pod{Name: "orphan.z", Image: "old:1"}, ID: "3"},
+		},
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods?detail=true&spec=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	var env struct {
+		Data struct {
+			Pods []struct {
+				Name         string    `json:"name"`
+				Kind         string    `json:"kind"`
+				ResourceName string    `json:"resource_name"`
+				Spec         *Manifest `json:"spec"`
+			} `json:"pods"`
+		}
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(env.Data.Pods) != 3 {
+		t.Fatalf("expected 3 pods, got %d", len(env.Data.Pods))
+	}
+
+	byName := map[string]*Manifest{}
+	for _, p := range env.Data.Pods {
+		byName[p.Name] = p.Spec
+	}
+
+	// Pods with matching manifests get the full envelope.
+	if m := byName["x-web.a"]; m == nil {
+		t.Errorf("x-web.a should carry a Spec from the store")
+	} else if m.Kind != KindDeployment || m.Name != "web" || !strings.Contains(string(m.Spec), `"replicas":3`) {
+		t.Errorf("x-web.a spec mismatched manifest: %+v", m)
+	}
+
+	if m := byName["x-db.0"]; m == nil {
+		t.Errorf("x-db.0 should carry a Spec from the store")
+	} else if m.Kind != KindStatefulset || m.Name != "db" {
+		t.Errorf("x-db.0 spec mismatched manifest: %+v", m)
+	}
+
+	// Orphan pod (no manifest in etcd) → Spec stays nil, no error.
+	if m := byName["orphan.z"]; m != nil {
+		t.Errorf("orphan.z should have nil Spec (no manifest in store), got %+v", m)
+	}
+}
+
+// TestPodsGet_SpecOmittedWhenNotRequested pins that the default path
+// never returns a Spec field even if the store would have a match. We
+// don't want to silently pay the etcd join on every call.
+func TestPodsGet_SpecOmittedWhenNotRequested(t *testing.T) {
+	api, store := newTestAPI(t)
+
+	_, _ = store.Put(t.Context(), &Manifest{
+		Kind: KindDeployment, Scope: "x", Name: "web",
+		Spec: json.RawMessage(`{"image":"x:1"}`),
+	})
+
+	api.Pods = &fakePodsLister{
+		pods: []Pod{
+			{Name: "x-web.a", Kind: "deployment", Scope: "x", ResourceName: "web", Image: "x:1", Running: true},
+		},
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), `"spec"`) {
+		t.Errorf("default /pods response leaked spec field: %s", body)
 	}
 }
 

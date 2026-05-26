@@ -1422,6 +1422,18 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 	// `vd get pods -s fsw` scopes both halves of the response.
 	degraded := a.collectDegradedResources(r.Context(), pods, wantKind, wantScope, wantName)
 
+	// spec=true joins each pod's declared manifest from etcd onto its
+	// Spec field. Used by the WebUI snapshot-sync job (state warehouse
+	// pattern) to render probes / env / resources / lifecycle hooks
+	// from the source of truth in a single request. Orthogonal to
+	// detail=true — they compose:
+	//
+	//   ?spec=true              → compact list + spec
+	//   ?detail=true            → rich inspect, no spec
+	//   ?detail=true&spec=true  → rich inspect + spec (the full
+	//                              picture the WebUI uses)
+	wantSpec := r.URL.Query().Get("spec") == "true"
+
 	// detail=true enriches each pod with the full inspect view (env,
 	// labels, networks, ports, state, etc.) — same shape /pods/{name}
 	// returns, but in bulk. The CLI's `vd describe pod` used to
@@ -1439,11 +1451,25 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		enriched := enrichPods(pods, describer, a.Stats)
+
+		if wantSpec {
+			for i := range enriched {
+				attachSpec(r.Context(), a.Store, &enriched[i].Pod)
+			}
+		}
+
 		writeJSON(w, http.StatusOK, envelope{
 			Status: "ok",
-			Data:   map[string]any{"pods": enrichPods(pods, describer, a.Stats), "degraded": degraded},
+			Data:   map[string]any{"pods": enriched, "degraded": degraded},
 		})
 		return
+	}
+
+	if wantSpec {
+		for i := range pods {
+			attachSpec(r.Context(), a.Store, &pods[i])
+		}
 	}
 
 	writeJSON(w, http.StatusOK, envelope{
@@ -1637,6 +1663,14 @@ func (a *API) handlePodDescribe(w http.ResponseWriter, r *http.Request) {
 	// helpers enrichPods uses so the wire shape stays identical.
 	if a.Stats != nil {
 		attachStats(detail, collectStatsByName(a.Stats))
+	}
+
+	// spec=true mirrors /pods?spec=true — attach the declared manifest
+	// from etcd. Lets the WebUI pod-show page render probes / env /
+	// resources directly from the source of truth without a second
+	// GET /apply roundtrip.
+	if r.URL.Query().Get("spec") == "true" {
+		attachSpec(r.Context(), a.Store, &detail.Pod)
 	}
 
 	writeJSON(w, http.StatusOK, envelope{
