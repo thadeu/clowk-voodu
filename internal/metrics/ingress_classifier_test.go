@@ -21,6 +21,15 @@ func TestIsAssetRequest_FrameworkPrefixes(t *testing.T) {
 		{"/build/manifest.json", true, "remix/vite build dir"},
 		// Crawler / browser cache files
 		{"/favicon.ico", true, "favicon"},
+		{"/favicon-16x16.png", true, "favicon sized variant"},
+		{"/favicon-32x32.png", true, "favicon sized variant"},
+		{"/favicon", true, "favicon no extension"},
+		{"/apple-touch-icon.png", true, "iOS home-screen icon"},
+		{"/apple-touch-icon-precomposed.png", true, "iOS legacy precomposed"},
+		{"/apple-icon-180x180.png", true, "iOS icon sized variant"},
+		{"/icon-192.png", true, "PWA manifest icon 192"},
+		{"/icon-512.png", true, "PWA manifest icon 512"},
+		{"/icon-maskable-512.png", true, "PWA maskable icon"},
 		{"/robots.txt", true, "robots"},
 		{"/sitemap.xml", true, "sitemap (crawler file, not user hit)"},
 	}

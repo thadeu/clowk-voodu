@@ -89,9 +89,20 @@ var assetPathPrefixes = []string{
 	"/dist/",          // Bundler outputs occasionally served directly
 	"/.well-known/",   // ACME / security.txt / discovery files
 	"/__webpack_hmr",  // Webpack dev server HMR endpoint
-	"/favicon.ico",    // Always asset, often served as 404 on missing
 	"/robots.txt",     // Crawler files, not user hits
 	"/sitemap.xml",    // Same
+	// Favicon / app icon family — kept as PREFIXES (not exact paths)
+	// so all the common variants modern apps ship are covered:
+	//   /favicon, /favicon.ico, /favicon-16x16.png, /favicon-32x32.png
+	//   /apple-touch-icon.png, /apple-touch-icon-precomposed.png
+	//   /apple-icon.png, /apple-icon-180x180.png
+	//   /icon-192.png, /icon-512.png, /icon-maskable-512.png (PWA)
+	// Prefix match means we don't have to enumerate every size + ext
+	// the operator's framework happens to emit.
+	"/favicon",
+	"/apple-touch-icon",
+	"/apple-icon",
+	"/icon-",
 	// Specific filenames (not directories) operators repeatedly hit
 	// without it being a "real" user request:
 	"/manifest.json",  // PWA manifest — extension `.json` is left out
