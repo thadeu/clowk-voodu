@@ -272,9 +272,11 @@ func (s *IngressSampler) emit(ts time.Time) {
 }
 
 // writeRow renders one IngressSample. `bucket` may be nil (= no
-// traffic this window); the resulting row carries zeros + nil
-// percentile pointers. Pointer-nil + omitempty in IngressSample
-// keeps the JSON line tight.
+// traffic this window); the resulting row carries zeros across
+// every numeric field (heartbeat-zero contract — see IngressSample
+// docstring). Latency percentiles come back as pointers from
+// `Percentiles()`; we dereference + default to 0 for the same
+// reason.
 func (s *IngressSampler) writeRow(ts time.Time, k ingressKey, bucket *ingressBucket) {
 	row := IngressSample{
 		Ts:     ts,
@@ -291,12 +293,26 @@ func (s *IngressSampler) writeRow(ts time.Time, k ingressKey, bucket *ingressBuc
 		row.Req4xx = bucket.s4xx
 		row.Req5xx = bucket.s5xx
 		row.BytesOut = bucket.bytesOut
-		row.LatencyP50Ms, row.LatencyP90Ms, row.LatencyP95Ms, row.LatencyP99Ms, row.LatencyMaxMs = bucket.Percentiles()
+
+		p50, p90, p95, p99, max := bucket.Percentiles()
+		row.LatencyP50Ms = derefOrZero(p50)
+		row.LatencyP90Ms = derefOrZero(p90)
+		row.LatencyP95Ms = derefOrZero(p95)
+		row.LatencyP99Ms = derefOrZero(p99)
+		row.LatencyMaxMs = derefOrZero(max)
 	}
 
 	if err := s.Writer.WriteIngress(row); err != nil {
 		s.logf("ingress: write %s: %v", k.host, err)
 	}
+}
+
+func derefOrZero(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+
+	return *p
 }
 
 func (s *IngressSampler) logf(format string, args ...any) {

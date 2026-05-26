@@ -121,21 +121,12 @@ func TestIngressSampler_AggregatesAndEmits(t *testing.T) {
 	// Latency percentiles populated (3 samples → all five present).
 	// With nearest-rank on [10, 20, 500]: p99 index = int(2 * 0.99) = 1
 	// → sorted[1] = 20ms. Max correctly = 500ms.
-	if sample.LatencyP99Ms == nil || *sample.LatencyP99Ms != 20.0 {
-		t.Errorf("p99: want 20ms (nearest-rank on 3 samples), got %v", deref(sample.LatencyP99Ms))
+	if sample.LatencyP99Ms != 20.0 {
+		t.Errorf("p99: want 20ms (nearest-rank on 3 samples), got %v", sample.LatencyP99Ms)
 	}
-	if sample.LatencyMaxMs == nil || *sample.LatencyMaxMs != 500.0 {
-		t.Errorf("max: want 500ms, got %v", deref(sample.LatencyMaxMs))
+	if sample.LatencyMaxMs != 500.0 {
+		t.Errorf("max: want 500ms, got %v", sample.LatencyMaxMs)
 	}
-}
-
-// deref formats a *float64 for assertion messages — prints "<nil>"
-// instead of the pointer address when the latency wasn't populated.
-func deref(p *float64) string {
-	if p == nil {
-		return "<nil>"
-	}
-	return fmt.Sprintf("%v", *p)
 }
 
 // Hosts not declared as ingress get skipped — sampler never emits
@@ -223,6 +214,49 @@ func TestIngressSampler_FirstOpenSeeksToEOF(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"req_count":0`) {
 		t.Errorf("expected heartbeat row with req_count:0, got:\n%s", raw)
+	}
+}
+
+// TestIngressSampler_HeartbeatZeroShape pins the contract that a
+// quiet-window row carries EVERY numeric field with value 0, not
+// omitted. Charts depend on this for continuity — losing any of
+// the fields below would resurrect the "freezes during idle" bug
+// for that specific metric.
+func TestIngressSampler_HeartbeatZeroShape(t *testing.T) {
+	logDir := t.TempDir()
+	logFile := filepath.Join(logDir, "access.log")
+	os.WriteFile(logFile, []byte(""), 0o644)
+
+	metricsDir := t.TempDir()
+	writer, _ := NewWriter(metricsDir, nil)
+
+	sampler := &IngressSampler{
+		LogPath: logFile,
+		Now:     func() time.Time { return time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC) },
+		Hosts: &StaticHostResolver{Bindings: map[string]IngressBinding{
+			"quiet.example.com": {Host: "quiet.example.com", Scope: "x", Name: "web"},
+		}},
+		Writer: writer,
+	}
+	sampler.agg = NewIngressAggregator()
+	sampler.evaluate()
+
+	raw, err := os.ReadFile(filepath.Join(metricsDir, "metrics-2026-05-26.ndjson"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	line := strings.TrimSpace(string(raw))
+	for _, field := range []string{
+		`"req_count":0`,
+		`"req_2xx":0`, `"req_3xx":0`, `"req_4xx":0`, `"req_5xx":0`,
+		`"bytes_out":0`,
+		`"latency_p50_ms":0`, `"latency_p90_ms":0`, `"latency_p95_ms":0`,
+		`"latency_p99_ms":0`, `"latency_max_ms":0`,
+	} {
+		if !strings.Contains(line, field) {
+			t.Errorf("heartbeat row missing %q\n  got: %s", field, line)
+		}
 	}
 }
 

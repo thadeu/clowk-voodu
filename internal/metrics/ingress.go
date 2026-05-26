@@ -25,12 +25,31 @@ const DefaultCaddyAccessLog = "/opt/voodu/caddy/logs/access.log"
 // trip 5xx-count alerts on the metrics that DO survive.
 const MaxRequestsPerWindow = 50_000
 
-// IngressSample is one row per (host, scope, name) per Tick. Pointer
-// fields for the percentiles + max so the encoder omits them via
-// omitempty when the window had zero requests (no durations to
-// summarise) — readers/WebUI use the missing-field signal the same
-// way they handle "no delta on first sample" elsewhere in this
-// package.
+// IngressSample is one row per (host, scope, name) per Tick.
+//
+// Heartbeat-zero contract: EVERY numeric field carries a value on
+// EVERY row, even on quiet windows where no traffic was observed.
+// No `omitempty`, no pointer-nil tricks. A heartbeat row literally
+// reads `..."req_count":0,"req_5xx":0,"latency_p95_ms":0,...` and
+// the chart renderer interprets a continuous time series rather
+// than freezing on the last burst.
+//
+// Trade-offs documented:
+//
+//   - MAX aggregation downstream is unaffected (0 stays below any
+//     real latency).
+//   - MIN/AVG aggregation OVER WINDOWS THAT MIX HEARTBEATS AND
+//     REAL TRAFFIC will be dragged toward zero (e.g. one 100ms
+//     request + nineteen 0ms heartbeats = avg 5ms, looks like
+//     "really fast" when it actually means "almost no traffic").
+//     Acceptable: operators reading p95 charts care about the
+//     TAIL during loaded windows, not the average during quiet
+//     ones. If a future view wants "p95 of windows with traffic
+//     only," the warehouse can filter `req_count > 0` at query
+//     time without changing the wire shape.
+//   - Disk: each row ~10–15 extra bytes vs the previous omit-
+//     based shape. Negligible against the 7d retention + per-
+//     tick rate, and the win in chart continuity is worth it.
 type IngressSample struct {
 	Ts     time.Time `json:"ts"`
 	Source Source    `json:"source"`
@@ -39,27 +58,26 @@ type IngressSample struct {
 	Name   string    `json:"name"`
 
 	ReqCount uint64 `json:"req_count"`
-	Req2xx   uint64 `json:"req_2xx,omitempty"`
-	Req3xx   uint64 `json:"req_3xx,omitempty"`
-	Req4xx   uint64 `json:"req_4xx,omitempty"`
-	Req5xx   uint64 `json:"req_5xx,omitempty"`
+	Req2xx   uint64 `json:"req_2xx"`
+	Req3xx   uint64 `json:"req_3xx"`
+	Req4xx   uint64 `json:"req_4xx"`
+	Req5xx   uint64 `json:"req_5xx"`
 
-	// Latencies in milliseconds. Pointer + omitempty so a 0-request
-	// window doesn't ship five zero percentile fields (would dilute
-	// MAX aggregation on the WebUI side into pretending the deployment
-	// had a real "0 ms p99" at that bucket).
-	LatencyP50Ms *float64 `json:"latency_p50_ms,omitempty"`
-	LatencyP90Ms *float64 `json:"latency_p90_ms,omitempty"`
-	LatencyP95Ms *float64 `json:"latency_p95_ms,omitempty"`
-	LatencyP99Ms *float64 `json:"latency_p99_ms,omitempty"`
-	LatencyMaxMs *float64 `json:"latency_max_ms,omitempty"`
+	// Latencies in milliseconds. Plain float64 (not *float64) — see
+	// the heartbeat-zero contract above for why 0 is a load-bearing
+	// value here.
+	LatencyP50Ms float64 `json:"latency_p50_ms"`
+	LatencyP90Ms float64 `json:"latency_p90_ms"`
+	LatencyP95Ms float64 `json:"latency_p95_ms"`
+	LatencyP99Ms float64 `json:"latency_p99_ms"`
+	LatencyMaxMs float64 `json:"latency_max_ms"`
 
-	// Cumulative bytes Caddy SENT to clients within the window. Useful
-	// for "throughput" charts. We don't track bytes_in (request body
-	// size) because Caddy's `size` field is response size only and a
-	// real bytes-in metric would require parsing `bytes_read`; deferred
-	// until an operator asks.
-	BytesOut uint64 `json:"bytes_out,omitempty"`
+	// Cumulative bytes Caddy SENT to clients within the window. We
+	// don't track bytes_in (request body size) because Caddy's
+	// `size` field is response size only and a real bytes-in metric
+	// would require parsing `bytes_read`; deferred until an operator
+	// asks.
+	BytesOut uint64 `json:"bytes_out"`
 }
 
 // IngressRequest is one parsed Caddy access log line, narrowed to
