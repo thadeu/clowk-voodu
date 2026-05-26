@@ -7,8 +7,16 @@ import "sync"
 // Lookup once per parsed line; rows with unmanaged hosts (e.g.
 // traffic to a host not declared in any voodu ingress) are skipped
 // — we don't synthesise identity, we just don't count.
+//
+// All returns every binding the resolver currently knows about.
+// Used by the sampler to emit zero-count "heartbeat" samples for
+// known deployments that received no traffic in a window — keeps
+// the warehouse time series continuous so HTTP charts advance in
+// lockstep with resource charts (CPU/Mem/Net) instead of freezing
+// at the last burst.
 type HostResolver interface {
 	Lookup(host string) (scope, name string, ok bool)
+	All() []IngressBinding
 }
 
 // IngressLister is the view of voodu's apply store the resolver
@@ -91,6 +99,22 @@ func (r *CachedHostResolver) Lookup(host string) (string, string, bool) {
 	return b.Scope, b.Name, true
 }
 
+// All returns a snapshot of every binding currently in the table.
+// Used by the sampler's heartbeat-zero path so quiet deployments
+// still get a sample every tick. Snapshot semantics (not live)
+// since the caller iterates without holding the read lock.
+func (r *CachedHostResolver) All() []IngressBinding {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]IngressBinding, 0, len(r.table))
+	for _, b := range r.table {
+		out = append(out, b)
+	}
+
+	return out
+}
+
 // StaticHostResolver is a fixed map for tests + the rare case where
 // the operator wants to manually pin host → deployment without
 // declaring an ingress. Production wiring uses CachedHostResolver.
@@ -105,4 +129,13 @@ func (s *StaticHostResolver) Lookup(host string) (string, string, bool) {
 	}
 
 	return b.Scope, b.Name, true
+}
+
+func (s *StaticHostResolver) All() []IngressBinding {
+	out := make([]IngressBinding, 0, len(s.Bindings))
+	for _, b := range s.Bindings {
+		out = append(out, b)
+	}
+
+	return out
 }

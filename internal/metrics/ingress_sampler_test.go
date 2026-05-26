@@ -206,9 +206,23 @@ func TestIngressSampler_FirstOpenSeeksToEOF(t *testing.T) {
 
 	sampler.evaluate()
 
+	// Heartbeat-zero emits 1 row per known binding even with no
+	// fresh traffic (post-2026-05-26 behaviour — keeps HTTP charts
+	// in lockstep with resource charts). The historical lines'
+	// counts MUST NOT show up: if EOF-seek failed and we ingested
+	// 100 + 200 bytes from the pre-existing log, the row would
+	// carry req_count=2 and bytes_out=300. A heartbeat-only run
+	// carries req_count=0 and no bytes_out (omitempty).
 	dayFile := filepath.Join(metricsDir, "metrics-2026-05-25.ndjson")
-	if raw, err := os.ReadFile(dayFile); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
-		t.Errorf("expected EOF-seek to skip historical lines, but got rows:\n%s", raw)
+	raw, err := os.ReadFile(dayFile)
+	if err != nil {
+		t.Fatalf("expected heartbeat row, got read err: %v", err)
+	}
+	if strings.Contains(string(raw), `"req_count":2`) || strings.Contains(string(raw), `"bytes_out":300`) {
+		t.Errorf("EOF-seek failed; row carries historical traffic:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), `"req_count":0`) {
+		t.Errorf("expected heartbeat row with req_count:0, got:\n%s", raw)
 	}
 }
 

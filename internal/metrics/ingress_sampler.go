@@ -218,41 +218,84 @@ func (s *IngressSampler) closeFile() {
 }
 
 // emit drains the aggregator and writes one IngressSample per
-// non-empty bucket. Zero-count buckets are not written — saves disk
-// AND avoids the "0 ms p99 looks real on the chart" trap. A deployment
-// with no recent traffic shows "no data" on its HTTP cards (the WebUI
-// distinguishes from "down" via the resource metrics that keep flowing).
+// known ingress binding — INCLUDING bindings with zero traffic in
+// the window (count=0, latency pointers nil/omitempty).
+//
+// Why zero-emit even when no traffic: the resource sampler (CPU/
+// Mem/Net) emits every tick regardless of activity, so its chart
+// advances continuously through quiet periods. If the ingress
+// sampler only wrote samples when traffic > 0, HTTP charts would
+// FREEZE at the last burst — operators saw timestamps lag behind
+// the resource charts by minutes, looking like the dashboard was
+// broken. Symmetric "always emit" keeps both surfaces in lockstep
+// even when an app is idle.
+//
+// Buckets with traffic carry the real numbers; bucketless bindings
+// carry zeros. Latency percentiles stay nil pointers (omitempty
+// drops them from JSON), so a zero-count row genuinely communicates
+// "no requests this window" rather than the misleading "p99=0ms"
+// that would dilute the chart's MAX aggregation downstream.
+//
+// Disk cost: ~150 bytes × N bindings × 4 ticks/min × 60min × 24h
+// × 7d = ~9 MB/binding/week. Bounded + cheap; rotation/retention
+// keeps it from growing unbounded.
 func (s *IngressSampler) emit(ts time.Time) {
 	if s.Writer == nil {
-		// Drain anyway so the buckets don't accumulate forever.
 		_ = s.agg.Drain()
 		return
 	}
 
-	for k, b := range s.agg.Drain() {
-		if b.count == 0 {
+	drained := s.agg.Drain()
+
+	// Build the union of (a) known bindings and (b) bucket keys, so
+	// we cover both "binding with data" and the pathological "data
+	// for an unknown binding" (shouldn't happen — sampler only
+	// pushes mapped hosts — but if it ever does, don't silently
+	// drop those numbers).
+	seen := make(map[ingressKey]bool, len(drained))
+
+	for _, b := range s.Hosts.All() {
+		k := ingressKey{host: b.Host, scope: b.Scope, name: b.Name}
+		seen[k] = true
+		s.writeRow(ts, k, drained[k])
+	}
+
+	for k, bucket := range drained {
+		if seen[k] {
 			continue
 		}
+		// Orphan bucket: emit normally (data arrived for a host that
+		// disappeared from the binding table mid-tick — race during
+		// `vd delete`). Skipping would lose real numbers.
+		s.writeRow(ts, k, bucket)
+	}
+}
 
-		row := IngressSample{
-			Ts:       ts,
-			Source:   SourceIngress,
-			Host:     k.host,
-			Scope:    k.scope,
-			Name:     k.name,
-			ReqCount: b.count,
-			Req2xx:   b.s2xx,
-			Req3xx:   b.s3xx,
-			Req4xx:   b.s4xx,
-			Req5xx:   b.s5xx,
-			BytesOut: b.bytesOut,
-		}
+// writeRow renders one IngressSample. `bucket` may be nil (= no
+// traffic this window); the resulting row carries zeros + nil
+// percentile pointers. Pointer-nil + omitempty in IngressSample
+// keeps the JSON line tight.
+func (s *IngressSampler) writeRow(ts time.Time, k ingressKey, bucket *ingressBucket) {
+	row := IngressSample{
+		Ts:     ts,
+		Source: SourceIngress,
+		Host:   k.host,
+		Scope:  k.scope,
+		Name:   k.name,
+	}
 
-		row.LatencyP50Ms, row.LatencyP90Ms, row.LatencyP95Ms, row.LatencyP99Ms, row.LatencyMaxMs = b.Percentiles()
+	if bucket != nil {
+		row.ReqCount = bucket.count
+		row.Req2xx = bucket.s2xx
+		row.Req3xx = bucket.s3xx
+		row.Req4xx = bucket.s4xx
+		row.Req5xx = bucket.s5xx
+		row.BytesOut = bucket.bytesOut
+		row.LatencyP50Ms, row.LatencyP90Ms, row.LatencyP95Ms, row.LatencyP99Ms, row.LatencyMaxMs = bucket.Percentiles()
+	}
 
-		if err := s.Writer.WriteIngress(row); err != nil {
-			s.logf("ingress: write %s: %v", k.host, err)
-		}
+	if err := s.Writer.WriteIngress(row); err != nil {
+		s.logf("ingress: write %s: %v", k.host, err)
 	}
 }
 
