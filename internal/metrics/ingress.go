@@ -65,8 +65,14 @@ type IngressSample struct {
 // IngressRequest is one parsed Caddy access log line, narrowed to
 // the fields the aggregator cares about. Public so tests can build
 // fixtures without going through JSON parsing.
+//
+// URI is the request path (Caddy `request.uri`, e.g. "/api/users"
+// or "/_next/static/chunks/abc.js"). Used by IsAssetRequest to
+// classify the row before incrementing the page/API counter — see
+// ingress_aggregator.go's Push for the skip logic.
 type IngressRequest struct {
 	Host       string
+	URI        string
 	DurationMs float64
 	Status     int
 	SizeBytes  uint64

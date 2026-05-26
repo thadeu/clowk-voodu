@@ -64,6 +64,28 @@ func (a *IngressAggregator) Push(host, scope, name string, req IngressRequest) {
 		a.buckets[k] = b
 	}
 
+	// Bytes-out is ALWAYS summed, even for asset requests — operators
+	// care about true egress bandwidth (capacity / billing signal),
+	// and excluding assets would understate that wildly (a single
+	// page load shifts ~1–2 MB of JS+CSS+images). Counted before the
+	// asset short-circuit below.
+	b.bytesOut += req.SizeBytes
+
+	// Asset filter. Without this, one Next.js page navigation
+	// inflates req_count by 30–100× via the chunks/CSS/fonts the
+	// browser fetches in parallel. We skip count, status breakdown,
+	// AND latency for asset rows — assets are usually cache hits at
+	// ~1 ms, so including them in p95 latency would drag the
+	// percentile toward "everything is fast" when real page/API
+	// requests are slow.
+	//
+	// See ingress_classifier.go IsAssetRequest for the exact
+	// heuristic + which prefixes/extensions it treats as asset.
+	// Bytes-out (above) intentionally still includes assets.
+	if IsAssetRequest(req.URI) {
+		return
+	}
+
 	b.count++
 
 	switch {
@@ -76,8 +98,6 @@ func (a *IngressAggregator) Push(host, scope, name string, req IngressRequest) {
 	case req.Status >= 200:
 		b.s2xx++
 	}
-
-	b.bytesOut += req.SizeBytes
 
 	// Cap-and-drop on duration samples. 50K samples per window per
 	// (host, scope, name) is enough for p99 accuracy on any realistic

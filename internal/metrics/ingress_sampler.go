@@ -274,6 +274,7 @@ func parseCaddyLine(line []byte) (IngressRequest, bool) {
 	var raw struct {
 		Request struct {
 			Host string `json:"host"`
+			URI  string `json:"uri"`
 		} `json:"request"`
 		Duration float64 `json:"duration"`
 		Status   int     `json:"status"`
@@ -294,6 +295,7 @@ func parseCaddyLine(line []byte) (IngressRequest, bool) {
 
 	return IngressRequest{
 		Host:       raw.Request.Host,
+		URI:        raw.Request.URI,
 		DurationMs: raw.Duration * 1000.0,
 		Status:     raw.Status,
 		SizeBytes:  raw.Size,
