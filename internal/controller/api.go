@@ -1451,7 +1451,21 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		enriched := enrichPods(pods, describer, a.Stats)
+		// stats=false skips the docker stats batch — the single
+		// most expensive thing this endpoint does (daemon samples
+		// cgroup files twice per container to compute CPU%).
+		// Polling consumers like the WebUI's state-sync job
+		// (every 30s) opt out: they have a dedicated metrics
+		// pipeline (NDJSON warehouse, server-side sampler) and
+		// don't need stats joined per call. CLI consumers (`vd
+		// get pods -o wide`) and one-off operator pulls still
+		// get stats by default for the rich snapshot.
+		statsSource := a.Stats
+		if r.URL.Query().Get("stats") == "false" {
+			statsSource = nil
+		}
+
+		enriched := enrichPods(pods, describer, statsSource)
 
 		if wantSpec {
 			for i := range enriched {

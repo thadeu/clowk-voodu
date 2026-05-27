@@ -1,33 +1,47 @@
-// stats.go wraps `docker stats --no-stream --format json` so callers
-// get a Go-typed view of container CPU/memory/network/block-io
-// utilisation without parsing the human-formatted columns themselves.
+// stats.go uses the official Docker Go SDK (github.com/moby/moby/client)
+// to collect per-container runtime utilisation. Previously we shelled out
+// to `docker stats --no-stream --format json` per call, which carried two
+// kinds of overhead:
 //
-// `docker stats` is the only reliable source for live cgroup-level
-// usage on a single host. The daemon samples cgroup files internally;
-// our wrapper just shells out, normalises units, and returns structs.
+//   1. fork + exec per invocation — process spawn, pipe wiring, text
+//      parsing on the way back.
+//   2. burst load on dockerd — all N containers sampled in one batch
+//      caused periodic CPU spikes (visible as cyclical 100% bumps on
+//      the host's CPU chart).
+//
+// The SDK eliminates (1) entirely (HTTP keep-alive to the docker socket,
+// typed JSON decode), and the per-container staggered loop here
+// transforms (2) from a single tall spike into a flat plateau spread
+// across the polling window.
+//
 // We deliberately do NOT talk to /sys/fs/cgroup directly because the
-// path differs between cgroup v1 and v2 and across distros — the
-// docker daemon already handles that diversity, so we let it.
+// path differs between cgroup v1 and v2 and across distros — the daemon
+// already handles that diversity, so we let it.
 //
-// Single-shot only (`--no-stream`): each call takes ~1-2s because
-// the daemon needs to sample twice to compute CPU%. Callers that
-// need refresh are expected to poll.
+// Single-shot semantics (`Stream: false, IncludePreviousSample: true`):
+// daemon takes two samples 1s apart to compute CPU% delta, then returns.
+// Same fidelity as the old `--no-stream` CLI flag — just without the
+// fork+exec tax.
 
 package docker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // ContainerStats is the typed view of one container's runtime
 // utilisation, normalised to numeric fields the caller can render or
-// alert on. Strings like "112.1MiB / 1.921GiB" from docker are split
-// into the underlying byte counts here so downstream code stays free
-// of unit-parsing concerns.
+// alert on.
 //
 // "Limit" fields reflect the docker daemon's view (cgroup memory
 // limit, --cpus quota). When no limit was set at `docker run`, docker
@@ -41,9 +55,7 @@ type ContainerStats struct {
 	// caller joins on this to recover voodu's structured identity.
 	Name string `json:"name"`
 
-	// ID is the short container id docker emits in `--format json`
-	// (12-char prefix). Useful when the caller wants to escape into
-	// `docker logs <id>` for debugging.
+	// ID is the short container id (12-char prefix).
 	ID string `json:"id,omitempty"`
 
 	// CPUPercent is the percentage of available CPU resources the
@@ -58,106 +70,135 @@ type ContainerStats struct {
 	MemUsageBytes uint64 `json:"mem_usage_bytes"`
 
 	// MemLimitBytes is the cgroup memory limit. When no limit was
-	// configured, docker reports the host total memory — the caller
-	// can detect "no effective cap" by comparing this to the host's
-	// physical memory.
+	// declared, docker reports the host's total memory here. Callers
+	// comparing usage to a manifest cap should not trust this field
+	// at face value.
 	MemLimitBytes uint64 `json:"mem_limit_bytes"`
 
-	// MemPercent is MemUsageBytes / MemLimitBytes * 100, as docker
-	// computes it. Kept as a separate field rather than derived in Go
-	// so we match `docker stats` output verbatim — operators reading
-	// both should see the same number.
+	// MemPercent is MemUsageBytes / MemLimitBytes × 100. Convenience
+	// — keeps callers free of unit math.
 	MemPercent float64 `json:"mem_percent"`
 
-	// PIDs is the process count inside the container. Useful for
-	// detecting fork bombs / runaway worker pools.
-	PIDs int `json:"pids,omitempty"`
-
 	// NetRxBytes / NetTxBytes are CUMULATIVE network counters since
-	// container start — same numbers `docker stats` shows in its
-	// "NET I/O" column ("338kB / 41.7kB"). Wraps to zero on container
-	// restart, NOT on cgroup-level interface flap (the daemon
-	// resets the counter only when the container itself restarts).
-	//
-	// Cumulative chosen over rate so the controller is stateless
-	// per-call. Rate (bytes/sec) would need per-container baseline
-	// tracking; a future enhancement layered on top — not v1.
+	// container start, summed across all interfaces. Same value
+	// `docker stats` shows in its NET I/O column.
 	NetRxBytes uint64 `json:"net_rx_bytes,omitempty"`
 	NetTxBytes uint64 `json:"net_tx_bytes,omitempty"`
 
 	// BlockReadBytes / BlockWriteBytes are CUMULATIVE block-device
 	// I/O counters since container start — `docker stats` "BLOCK I/O"
-	// column. Useful for spotting "this container is hammering the
-	// disk" without per-cgroup syscall tracing.
-	//
-	// Read/Write include only block-device I/O (page cache hits are
-	// invisible here, by design — same semantics as `iostat`).
+	// column. Sourced from cgroup blkio stats (cgroup v1) or the
+	// `io_service_bytes_recursive` slice (cgroup v2).
 	BlockReadBytes  uint64 `json:"block_read_bytes,omitempty"`
 	BlockWriteBytes uint64 `json:"block_write_bytes,omitempty"`
+
+	// PIDs is the current number of processes in the container's
+	// cgroup. Useful for spotting fork-bomb regressions or process-
+	// pool misconfiguration. Sourced from cgroup pids.current.
+	PIDs uint64 `json:"pids,omitempty"`
 }
 
 // StatsClient is the seam controller-side collectors dispatch through.
-// Production wires DockerStatsClient (shells out); tests substitute
+// Production wires DockerStatsClient (uses the SDK); tests substitute
 // a fake to assert join behaviour without docker on the box.
-//
-// The slice argument is an opt-in filter: pass nil/empty to fetch all
-// running containers, or specific names to narrow the call. Docker
-// honours the filter daemon-side, which is faster than fetching all
-// and filtering client-side on a busy host.
 type StatsClient interface {
 	ContainerStats(names []string) ([]ContainerStats, error)
 }
 
-// DockerStatsClient is the production StatsClient. Stateless; safe
-// to share across goroutines.
+// DockerStatsClient is the production StatsClient. Stateless from the
+// caller's perspective; internally caches the docker SDK client across
+// calls (HTTP keep-alive at the socket).
 type DockerStatsClient struct{}
 
-// ContainerStats shells out `docker stats --no-stream --format json
-// [names...]` and parses the line-delimited JSON output into typed
-// structs. Returns the entries in the order docker emitted them
-// (stable enough for tests; callers needing canonical order should
-// sort themselves).
+// StaggerPerSampleMin is the floor between two consecutive single-
+// container stat requests. Spreads CPU/IO load on the docker daemon
+// across the polling window instead of bursting all N requests at
+// once. 200ms × 10 pods = 2s of staggered work — well under the
+// sampler's 60s tick budget.
 //
-// When names is non-empty, docker filters daemon-side — a missing
-// name is silently omitted rather than erroring (matches `docker
-// stats foo bar` behaviour: it lists the ones it knows about).
-//
-// Stopped containers are absent from the output by design: `docker
-// stats` only reports on running containers (their cgroup is the
-// data source). Callers that need "config + zero usage" rows for
-// stopped pods must inject those themselves.
-func (DockerStatsClient) ContainerStats(names []string) ([]ContainerStats, error) {
-	args := []string{"stats", "--no-stream", "--format", "{{json .}}"}
-	args = append(args, names...)
+// Override via VOODU_STATS_STAGGER_MS for tuning without rebuild.
+var StaggerPerSampleMin = parseEnvDurationMs("VOODU_STATS_STAGGER_MS", 200*time.Millisecond)
 
-	cmd := exec.Command("docker", args...)
+// StatsTimeout caps the total time a single ContainerStats batch can
+// take. Each per-container call also costs ~1s (daemon's two-sample
+// pause to compute CPU% delta), so 30s comfortably covers ~25 pods
+// even with the stagger above.
+const StatsTimeout = 30 * time.Second
 
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("docker stats: %w", err)
-	}
+// dockerClient is the package-level singleton SDK client. Lazy-init on
+// first use; subsequent calls reuse the connection. Safe to share
+// across goroutines (the underlying HTTP client is concurrency-safe).
+var (
+	dockerClient     *client.Client
+	dockerClientErr  error
+	dockerClientOnce sync.Once
+)
 
-	return parseStatsOutput(output)
+func getDockerClient() (*client.Client, error) {
+	dockerClientOnce.Do(func() {
+		// `FromEnv` honours DOCKER_HOST + DOCKER_API_VERSION etc.
+		// `WithAPIVersionNegotiation` lets the SDK auto-pick the
+		// highest version both sides support — avoids the
+		// "client version newer than daemon" error on older hosts.
+		// API-version negotiation is now the default per moby v28 SDK,
+		// so we don't need WithAPIVersionNegotiation explicitly. FromEnv
+		// still honours DOCKER_HOST + DOCKER_TLS_VERIFY etc.
+		dockerClient, dockerClientErr = client.New(client.FromEnv)
+	})
+
+	return dockerClient, dockerClientErr
 }
 
-// parseStatsOutput converts the raw line-delimited JSON docker emits
-// into typed ContainerStats. Each line is one container — empty lines
-// (trailing newline) are skipped. Malformed lines are reported as
-// errors rather than silently dropped because the caller's filter
-// expectation might depend on counts matching the input slice.
-func parseStatsOutput(raw []byte) ([]ContainerStats, error) {
-	lines := strings.Split(string(raw), "\n")
-	out := make([]ContainerStats, 0, len(lines))
+// ContainerStats samples each named container in turn via the docker
+// SDK and returns the typed results. Containers are processed serially
+// with a short stagger between requests — daemon-side that means one
+// CPU/Mem read at a time instead of an N-wide burst, smoothing the
+// dockerd CPU profile.
+//
+// Behaviours preserved from the previous CLI shim:
+//   - missing names are silently omitted (container vanished between
+//     list + stat; matches `docker stats foo` returning what it can)
+//   - stopped containers are absent from the output (no live cgroup
+//     to sample)
+//   - returns entries in input order (callers needing canonical order
+//     should sort themselves)
+//
+// Empty names slice returns empty slice — the SDK path requires
+// explicit container IDs (no "all running" shortcut here; if needed,
+// caller passes the names from ListContainers).
+func (DockerStatsClient) ContainerStats(names []string) ([]ContainerStats, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
 
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	cli, err := getDockerClient()
+	if err != nil {
+		return nil, fmt.Errorf("docker client init: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), StatsTimeout)
+	defer cancel()
+
+	out := make([]ContainerStats, 0, len(names))
+
+	for i, name := range names {
+		// Stagger between samples (skip before the first). Daemon
+		// gets to breathe between reads — concurrent calls were the
+		// source of the periodic CPU spikes.
+		if i > 0 && StaggerPerSampleMin > 0 {
+			select {
+			case <-time.After(StaggerPerSampleMin):
+			case <-ctx.Done():
+				return out, ctx.Err()
+			}
 		}
 
-		stats, err := parseStatsLine(line)
+		stats, err := sampleOne(ctx, cli, name)
 		if err != nil {
-			return nil, fmt.Errorf("docker stats line %d: %w", i+1, err)
+			// Skip + continue — one missing/stopped container shouldn't
+			// fail the whole batch. The CLI version had the same
+			// behaviour (docker stats silently omits missing names).
+			continue
 		}
 
 		out = append(out, stats)
@@ -166,187 +207,152 @@ func parseStatsOutput(raw []byte) ([]ContainerStats, error) {
 	return out, nil
 }
 
-// dockerStatsLine mirrors the raw `--format json` shape docker emits.
-// Lives as a private struct (only used inside parseStatsLine) — the
-// public API is ContainerStats, which carries the parsed numeric
-// fields the rest of the codebase consumes.
-type dockerStatsLine struct {
-	Name      string `json:"Name"`
-	ID        string `json:"ID"`
-	Container string `json:"Container"` // long ID, unused
-	CPUPerc   string `json:"CPUPerc"`   // "0.14%"
-	MemUsage  string `json:"MemUsage"`  // "112.1MiB / 1.921GiB"
-	MemPerc   string `json:"MemPerc"`   // "5.70%"
-	NetIO     string `json:"NetIO"`     // "338kB / 41.7kB" — captured but unused
-	BlockIO   string `json:"BlockIO"`   // "2.04GB / 1.21MB" — captured but unused
-	PIDs      string `json:"PIDs"`      // "19"
+// sampleOne fetches a single container's stats via the SDK + converts
+// to our ContainerStats shape. The daemon takes two samples 1s apart
+// (because IncludePreviousSample=true) to compute the CPU% delta; this
+// is the same cost the old `--no-stream` CLI flag carried.
+func sampleOne(ctx context.Context, cli *client.Client, name string) (ContainerStats, error) {
+	result, err := cli.ContainerStats(ctx, name, client.ContainerStatsOptions{
+		Stream:                false,
+		IncludePreviousSample: true, // required for CPU% delta calculation
+	})
+	if err != nil {
+		return ContainerStats{}, fmt.Errorf("container stats %s: %w", name, err)
+	}
+
+	defer result.Body.Close()
+
+	var raw container.StatsResponse
+	if err := json.NewDecoder(result.Body).Decode(&raw); err != nil {
+		return ContainerStats{}, fmt.Errorf("decode stats %s: %w", name, err)
+	}
+
+	return convertStats(raw, name), nil
 }
 
-func parseStatsLine(line string) (ContainerStats, error) {
-	var raw dockerStatsLine
-
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		return ContainerStats{}, fmt.Errorf("decode json: %w", err)
+// convertStats turns the SDK's StatsResponse into our internal
+// ContainerStats shape. CPU% derivation matches what `docker stats`
+// itself computes (see daemon/stats/collector.go in moby/moby for the
+// canonical formula).
+func convertStats(raw container.StatsResponse, fallbackName string) ContainerStats {
+	name := raw.Name
+	if name == "" {
+		name = fallbackName
 	}
 
-	cpu, err := parsePercent(raw.CPUPerc)
-	if err != nil {
-		return ContainerStats{}, fmt.Errorf("cpu_percent: %w", err)
+	// Docker prefixes names with "/" (e.g. "/fsw-controller.8879");
+	// strip it so the value lines up with what `docker ps` shows in
+	// the NAMES column (and what voodu uses everywhere else as the
+	// natural key).
+	name = strings.TrimPrefix(name, "/")
+
+	id := raw.ID
+	if len(id) > 12 {
+		id = id[:12]
 	}
 
-	memUsage, memLimit, err := parseDualBytes(raw.MemUsage)
-	if err != nil {
-		return ContainerStats{}, fmt.Errorf("mem_usage: %w", err)
+	cpuPercent := calcCPUPercent(raw.CPUStats, raw.PreCPUStats)
+
+	memUsage := raw.MemoryStats.Usage
+	// Subtract page cache so the number matches `docker stats` (which
+	// surfaces RSS, not Usage). Cache lives in MemoryStats.Stats — key
+	// is "cache" on cgroup v1, "file" on cgroup v2.
+	if cache, ok := raw.MemoryStats.Stats["cache"]; ok {
+		memUsage = subSat(memUsage, cache)
+	} else if file, ok := raw.MemoryStats.Stats["file"]; ok {
+		memUsage = subSat(memUsage, file)
 	}
 
-	memPerc, err := parsePercent(raw.MemPerc)
-	if err != nil {
-		return ContainerStats{}, fmt.Errorf("mem_percent: %w", err)
+	memLimit := raw.MemoryStats.Limit
+
+	var memPercent float64
+	if memLimit > 0 {
+		memPercent = float64(memUsage) / float64(memLimit) * 100
 	}
 
-	pids, _ := strconv.Atoi(strings.TrimSpace(raw.PIDs))
+	var rx, tx uint64
+	for _, n := range raw.Networks {
+		rx += n.RxBytes
+		tx += n.TxBytes
+	}
 
-	// NetIO / BlockIO are formatted as "RX / TX" and "READ / WRITE"
-	// respectively. Same "A / B" docker convention parseDualBytes
-	// understands. Parse errors degrade to 0 — these are advisory
-	// metrics, not the primary correctness signal of `docker stats`,
-	// so a malformed NET column shouldn't fail the whole stats fetch.
-	netRx, netTx, _ := parseDualBytes(raw.NetIO)
-	blkRead, blkWrite, _ := parseDualBytes(raw.BlockIO)
+	var blkRead, blkWrite uint64
+	for _, e := range raw.BlkioStats.IoServiceBytesRecursive {
+		switch strings.ToLower(e.Op) {
+		case "read":
+			blkRead += e.Value
+		case "write":
+			blkWrite += e.Value
+		}
+	}
 
 	return ContainerStats{
-		Name:            strings.TrimSpace(raw.Name),
-		ID:              strings.TrimSpace(raw.ID),
-		CPUPercent:      cpu,
+		Name:            name,
+		ID:              id,
+		CPUPercent:      cpuPercent,
 		MemUsageBytes:   memUsage,
 		MemLimitBytes:   memLimit,
-		MemPercent:      memPerc,
-		PIDs:            pids,
-		NetRxBytes:      netRx,
-		NetTxBytes:      netTx,
+		MemPercent:      memPercent,
+		NetRxBytes:      rx,
+		NetTxBytes:      tx,
 		BlockReadBytes:  blkRead,
 		BlockWriteBytes: blkWrite,
-	}, nil
+		PIDs:            raw.PidsStats.Current,
+	}
 }
 
-// parsePercent strips the trailing "%" from a docker-emitted percent
-// string and parses the leading number. Docker uses "--" when stats
-// are unavailable for a stopped container (shouldn't happen with
-// --no-stream filtering, but defensive); we map that to 0.
-func parsePercent(s string) (float64, error) {
-	s = strings.TrimSpace(s)
-
-	if s == "" || s == "--" {
-		return 0, nil
-	}
-
-	s = strings.TrimSuffix(s, "%")
-
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%q: %w", s, err)
-	}
-
-	return v, nil
-}
-
-// parseDualBytes splits a docker-stats two-value column into byte
-// counts. Three columns use the same shape:
+// calcCPUPercent — same formula `docker stats` uses internally
+// (see daemon/stats/collector_unix.go: calculateCPUPercentUnix).
 //
-//   - MemUsage  "112.1MiB / 1.921GiB"  → (used, limit)
-//   - NetIO     "338kB / 41.7kB"       → (rx, tx)
-//   - BlockIO   "2.04GB / 1.21MB"      → (read, write)
+//	cpuDelta    = current.TotalUsage - pre.TotalUsage
+//	systemDelta = current.SystemUsage - pre.SystemUsage
+//	percent     = (cpuDelta / systemDelta) × onlineCPUs × 100
 //
-// Both sides honour docker's unit suffixes (B/KiB/MiB/GiB/TiB and
-// their decimal kB/MB/GB/TB cousins). "--" appears for stopped
-// containers — mapped to (0, 0), nil — and an empty string is also
-// (0, 0). Malformed input (non-matching split, unknown unit) returns
-// an error so callers can decide whether to degrade or fail.
-func parseDualBytes(s string) (uint64, uint64, error) {
-	s = strings.TrimSpace(s)
-
-	if s == "" || s == "--" {
-		return 0, 0, nil
+// Returns 0 when systemDelta is 0 (cold-start, or pre sample missing).
+// OnlineCPUs falls back to len(PercpuUsage) for older daemons that
+// don't populate the field directly.
+func calcCPUPercent(cur, pre container.CPUStats) float64 {
+	cpuDelta := float64(cur.CPUUsage.TotalUsage) - float64(pre.CPUUsage.TotalUsage)
+	systemDelta := float64(cur.SystemUsage) - float64(pre.SystemUsage)
+	if systemDelta <= 0 || cpuDelta < 0 {
+		return 0
 	}
 
-	parts := strings.Split(s, "/")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("expected A / B, got %q", s)
+	onlineCPUs := float64(cur.OnlineCPUs)
+	if onlineCPUs == 0 {
+		onlineCPUs = float64(len(cur.CPUUsage.PercpuUsage))
 	}
 
-	a, err := parseBytes(strings.TrimSpace(parts[0]))
-	if err != nil {
-		return 0, 0, fmt.Errorf("left: %w", err)
+	if onlineCPUs == 0 {
+		onlineCPUs = 1
 	}
 
-	b, err := parseBytes(strings.TrimSpace(parts[1]))
-	if err != nil {
-		return 0, 0, fmt.Errorf("right: %w", err)
-	}
-
-	return a, b, nil
+	return (cpuDelta / systemDelta) * onlineCPUs * 100
 }
 
-// memUnit maps docker's unit suffix vocabulary to byte multipliers.
-// Docker prefers binary units (MiB, GiB) for memory and decimal
-// (kB, MB, GB) for network/block I/O, but the parser accepts both
-// so other callers (NetIO/BlockIO if surfaced later) can reuse it.
-var memUnit = map[string]uint64{
-	"":    1,
-	"B":   1,
-	"kB":  1000,
-	"KB":  1000,
-	"KiB": 1024,
-	"MB":  1000 * 1000,
-	"MiB": 1024 * 1024,
-	"GB":  1000 * 1000 * 1000,
-	"GiB": 1024 * 1024 * 1024,
-	"TB":  1000 * 1000 * 1000 * 1000,
-	"TiB": 1024 * 1024 * 1024 * 1024,
+// subSat — saturating subtraction (no underflow). Page cache CAN
+// exceed Usage in rare daemon races; clamp to 0 instead of wrapping.
+func subSat(a, b uint64) uint64 {
+	if b >= a {
+		return 0
+	}
+
+	return a - b
 }
 
-// parseBytes converts docker's human-formatted size string ("112.1MiB"
-// / "1.921GiB" / "338kB") into an absolute byte count. Round-trips a
-// 0.1MiB difference at the float64 level — docker's own precision —
-// which is fine for display.
-//
-// Returns an error when the unit isn't recognised; callers should
-// surface that rather than fall back to a misleading 0.
-func parseBytes(s string) (uint64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, nil
+// parseEnvDurationMs reads an env var as integer milliseconds. Returns
+// fallback on empty/unparseable. Used for tuning the stagger without
+// a controller rebuild.
+func parseEnvDurationMs(key string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
 	}
 
-	// Walk forward while we're still on a numeric character (digits,
-	// dot, optional leading minus is rejected — sizes are non-neg).
-	cutoff := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= '0' && c <= '9') || c == '.' {
-			cutoff = i + 1
-			continue
-		}
-
-		break
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
 	}
 
-	numStr := s[:cutoff]
-	unit := strings.TrimSpace(s[cutoff:])
-
-	mult, ok := memUnit[unit]
-	if !ok {
-		return 0, fmt.Errorf("unknown unit %q in %q", unit, s)
-	}
-
-	v, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse %q: %w", numStr, err)
-	}
-
-	if v < 0 {
-		return 0, fmt.Errorf("negative size %q", s)
-	}
-
-	return uint64(v * float64(mult)), nil
+	return time.Duration(n) * time.Millisecond
 }

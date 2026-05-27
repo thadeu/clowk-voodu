@@ -6,9 +6,10 @@
 package docker
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"sort"
@@ -17,7 +18,11 @@ import (
 	"sync"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/creack/pty"
+	containerapi "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const (
@@ -531,57 +536,168 @@ func ListContainers(all bool) ([]ContainerInfo, error) {
 	return ListContainersFiltered(all, nil)
 }
 
-// ListContainersFiltered runs `docker ps` scoped to voodu-managed
-// containers (via createdby=voodu) plus any extra label filters the
+// ListContainersFiltered queries containers scoped to voodu-managed
+// resources (via createdby=voodu) plus any extra label filters the
 // caller supplies.
 //
-// Each entry in extraLabels is a `key=value` pair appended as
-// `--filter label=…`. Docker AND-combines multiple label filters, so
-// passing `[voodu.kind=deployment, voodu.scope=softphone]` returns
-// only the deployment containers in that scope. Used by the
-// reconciler (ListByIdentity) and `voodu get pods`.
+// Each entry in extraLabels is a `key=value` pair. Docker AND-combines
+// multiple label filters, so passing `[voodu.kind=deployment,
+// voodu.scope=softphone]` returns only the deployment containers in
+// that scope. Used by the reconciler (ListByIdentity) and `voodu
+// get pods`.
+//
+// Uses the Docker SDK (HTTP over /var/run/docker.sock) instead of
+// shelling out to `docker ps`. Two wins:
+//
+//   1. No fork+exec per call. The reconciler hits this path on every
+//      tick + every plugin dispatch; the daemon listening on the
+//      filter path was reportedly the source of periodic CPU spikes
+//      visible on the host's CPU chart.
+//   2. Typed response. Previously we parsed `docker ps --format json`
+//      one line per container, with a try/catch that silently
+//      dropped malformed lines; now invalid responses error loudly
+//      (the SDK does the JSON decode for us in one shot).
 func ListContainersFiltered(all bool, extraLabels []string) ([]ContainerInfo, error) {
-	args := []string{"ps"}
-
-	if all {
-		args = append(args, "-a")
+	cli, err := getDockerClient()
+	if err != nil {
+		return nil, fmt.Errorf("docker client init: %w", err)
 	}
 
-	args = append(args, "--format", "json", "--filter", fmt.Sprintf("label=%s=%s", VooduLabelKey, VooduLabelValue))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	listFilters := make(dockerclient.Filters).
+		Add("label", fmt.Sprintf("%s=%s", VooduLabelKey, VooduLabelValue))
 
 	for _, lbl := range extraLabels {
 		if lbl == "" {
 			continue
 		}
 
-		args = append(args, "--filter", "label="+lbl)
+		listFilters = listFilters.Add("label", lbl)
 	}
 
-	cmd := exec.Command("docker", args...)
-	output, err := cmd.Output()
-
+	result, err := cli.ContainerList(ctx, dockerclient.ContainerListOptions{
+		All:     all,
+		Filters: listFilters,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list containers: %v", err)
+		return nil, fmt.Errorf("docker container list: %w", err)
 	}
 
-	var containers []ContainerInfo
-	lines := strings.Split(string(output), "\n")
-
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		var container ContainerInfo
-
-		if err := json.Unmarshal([]byte(line), &container); err != nil {
-			continue
-		}
-
-		containers = append(containers, container)
+	out := make([]ContainerInfo, 0, len(result.Items))
+	for _, s := range result.Items {
+		out = append(out, summaryToContainerInfo(s))
 	}
 
-	return containers, nil
+	return out, nil
+}
+
+// summaryToContainerInfo maps the SDK's container.Summary (the daemon's
+// /containers/json response shape) to our ContainerInfo. Field-level
+// equivalent of what the old `docker ps --format json` parser used to
+// build; preserves the on-wire contract callers depend on.
+//
+// `Names` is joined with "," to match the previous string shape (the
+// CLI's `{{.Names}}` column did the same). Leading "/" prefixes are
+// stripped — docker's own listing emits them but every voodu caller
+// works with the prefix-less name.
+//
+// The snake_case fields (`name`, `app_name`, `process_type`, …) on
+// ContainerInfo aren't populated by either implementation — they're
+// legacy carry-over from the Gokku era and stay zero-valued. Removed
+// when there's a confirmed-no-readers pass.
+func summaryToContainerInfo(s containerapi.Summary) ContainerInfo {
+	id := s.ID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+
+	stripped := make([]string, 0, len(s.Names))
+	for _, n := range s.Names {
+		stripped = append(stripped, strings.TrimPrefix(n, "/"))
+	}
+
+	created := time.Unix(s.Created, 0).UTC().Format(time.RFC3339)
+
+	return ContainerInfo{
+		ID:      id,
+		Names:   strings.Join(stripped, ","),
+		Image:   s.Image,
+		Status:  s.Status,
+		Ports:   formatPortSummary(s.Ports),
+		Command: s.Command,
+		Created: created,
+	}
+}
+
+// formatPortSummary turns the SDK's []PortSummary into the text shape
+// `docker ps` previously rendered (e.g. "0.0.0.0:80->80/tcp"). Same
+// look-and-feel for any caller that does string-matching on the
+// Ports field.
+func formatPortSummary(ports []containerapi.PortSummary) string {
+	if len(ports) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		if p.PublicPort > 0 {
+			// PortSummary.IP is netip.Addr (Go 1.18+ stdlib). The
+			// zero value's String() is "invalid IP", so we explicit-
+			// check IsValid() and fall back to docker's CLI default
+			// ("0.0.0.0") to preserve the on-screen shape callers
+			// might have grepped against.
+			ip := "0.0.0.0"
+			if p.IP.IsValid() {
+				ip = p.IP.String()
+			}
+
+			parts = append(parts, fmt.Sprintf("%s:%d->%d/%s", ip, p.PublicPort, p.PrivatePort, p.Type))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d/%s", p.PrivatePort, p.Type))
+		}
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+// sdkContainerInspect is the single point through which every
+// container-inspect call in this package hits the daemon. Returns
+// (nil, nil) when the daemon reports "no such container" so callers
+// can distinguish "vanished" from "real daemon error" with a single
+// nil-check instead of swallowing errors via substring matching as
+// the exec-shell era did.
+//
+// Centralising here means one place handles:
+//   - HTTP keep-alive (cached SDK client)
+//   - timeout budget (10s — daemon inspect is usually <50ms)
+//   - "not found" normalisation via cerrdefs.IsNotFound
+//
+// Every caller that previously shelled out `docker inspect <name>` —
+// InspectLabels, InspectContainer, GetContainerImage, GetContainerImageID,
+// IsRunning, the WaitForHealthy loop, inspectContainerShape — now
+// routes through this helper. ContainerExists could too, but it's a
+// boolean and the existing fast-fail behaviour is fine.
+func sdkContainerInspect(name string) (*containerapi.InspectResponse, error) {
+	cli, err := getDockerClient()
+	if err != nil {
+		return nil, fmt.Errorf("docker client init: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := cli.ContainerInspect(ctx, name, dockerclient.ContainerInspectOptions{})
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return &resp.Container, nil
 }
 
 // InspectLabels returns the labels of a single container as a flat
@@ -592,29 +708,20 @@ func ListContainersFiltered(all bool, extraLabels []string) ([]ContainerInfo, er
 // Returns (nil, nil) when the container does not exist — distinct
 // from (nil, err) which is a real failure to inspect.
 func InspectLabels(name string) (map[string]string, error) {
-	if !ContainerExists(name) {
-		return nil, nil
-	}
-
-	cmd := exec.Command("docker", "inspect", name, "--format", "{{json .Config.Labels}}")
-
-	out, err := cmd.Output()
+	resp, err := sdkContainerInspect(name)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s labels: %w", name, err)
 	}
 
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" || trimmed == "null" {
+	if resp == nil {
+		return nil, nil // container vanished — preserve old (nil, nil) signal
+	}
+
+	if resp.Config == nil || resp.Config.Labels == nil {
 		return map[string]string{}, nil
 	}
 
-	var labels map[string]string
-
-	if err := json.Unmarshal([]byte(trimmed), &labels); err != nil {
-		return nil, fmt.Errorf("parse labels for %s: %w", name, err)
-	}
-
-	return labels, nil
+	return resp.Config.Labels, nil
 }
 
 // ContainerDetail is the rich-inspect blob `voodu describe pod`
@@ -693,74 +800,63 @@ type ContainerPort struct {
 // noise for an operator. This helper keeps just the parts `voodu
 // describe pod` actually renders. New fields can be added one by one.
 func InspectContainer(name string) (*ContainerDetail, error) {
-	if !ContainerExists(name) {
-		return nil, nil
-	}
-
-	cmd := exec.Command("docker", "inspect", name)
-
-	out, err := cmd.Output()
+	r, err := sdkContainerInspect(name)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s: %w", name, err)
 	}
 
-	// `docker inspect <name>` returns a JSON array (always one element
-	// for a single name). Decode into a permissive intermediate shape
-	// then map to the flat detail.
-	var raw []dockerInspectRaw
-
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parse inspect %s: %w", name, err)
-	}
-
-	if len(raw) == 0 {
+	if r == nil {
 		return nil, nil
 	}
 
-	r := raw[0]
-
 	d := &ContainerDetail{
-		ID:    r.ID,
-		Name:  strings.TrimPrefix(r.Name, "/"),
-		Image: r.Config.Image,
-		State: ContainerState{
-			Status:     r.State.Status,
+		ID:   r.ID,
+		Name: strings.TrimPrefix(r.Name, "/"),
+	}
+
+	if r.Config != nil {
+		d.Image = r.Config.Image
+		d.Command = r.Config.Cmd
+		d.Entrypoint = r.Config.Entrypoint
+		d.WorkingDir = r.Config.WorkingDir
+		d.Labels = r.Config.Labels
+
+		if len(r.Config.Env) > 0 {
+			d.Env = make(map[string]string, len(r.Config.Env))
+
+			for _, kv := range r.Config.Env {
+				if i := strings.IndexByte(kv, '='); i >= 0 {
+					d.Env[kv[:i]] = kv[i+1:]
+				} else {
+					d.Env[kv] = ""
+				}
+			}
+		}
+	}
+
+	if r.State != nil {
+		d.State = ContainerState{
+			Status:     string(r.State.Status),
 			Running:    r.State.Running,
 			ExitCode:   r.State.ExitCode,
 			StartedAt:  r.State.StartedAt,
 			FinishedAt: r.State.FinishedAt,
 			Restarts:   r.RestartCount,
-		},
-		Command:    r.Config.Cmd,
-		Entrypoint: r.Config.Entrypoint,
-		WorkingDir: r.Config.WorkingDir,
-		Labels:     r.Config.Labels,
-	}
-
-	if len(r.Config.Env) > 0 {
-		d.Env = make(map[string]string, len(r.Config.Env))
-
-		for _, kv := range r.Config.Env {
-			if i := strings.IndexByte(kv, '='); i >= 0 {
-				d.Env[kv[:i]] = kv[i+1:]
-			} else {
-				d.Env[kv] = ""
-			}
 		}
 	}
 
-	if r.HostConfig.RestartPolicy.Name != "" {
-		d.RestartPolicy = r.HostConfig.RestartPolicy.Name
+	if r.HostConfig != nil && r.HostConfig.RestartPolicy.Name != "" {
+		d.RestartPolicy = string(r.HostConfig.RestartPolicy.Name)
 	}
 
-	if len(r.NetworkSettings.Networks) > 0 {
+	if r.NetworkSettings != nil && len(r.NetworkSettings.Networks) > 0 {
 		d.Networks = make(map[string]ContainerNetwork, len(r.NetworkSettings.Networks))
 
 		for k, n := range r.NetworkSettings.Networks {
 			d.Networks[k] = ContainerNetwork{
 				NetworkID: n.NetworkID,
-				IPAddress: n.IPAddress,
-				Gateway:   n.Gateway,
+				IPAddress: addrToString(n.IPAddress),
+				Gateway:   addrToString(n.Gateway),
 				Aliases:   n.Aliases,
 			}
 		}
@@ -768,7 +864,7 @@ func InspectContainer(name string) (*ContainerDetail, error) {
 
 	for _, m := range r.Mounts {
 		d.Mounts = append(d.Mounts, ContainerMount{
-			Type:        m.Type,
+			Type:        string(m.Type),
 			Source:      m.Source,
 			Destination: m.Destination,
 			Mode:        m.Mode,
@@ -776,85 +872,43 @@ func InspectContainer(name string) (*ContainerDetail, error) {
 		})
 	}
 
-	for portKey, bindings := range r.NetworkSettings.Ports {
-		if len(bindings) == 0 {
-			d.Ports = append(d.Ports, ContainerPort{Container: portKey})
-			continue
-		}
+	if r.NetworkSettings != nil {
+		for portKey, bindings := range r.NetworkSettings.Ports {
+			portStr := portKey.String() // "80/tcp" — matches the old --format key
 
-		for _, b := range bindings {
-			d.Ports = append(d.Ports, ContainerPort{
-				Container: portKey,
-				HostIP:    b.HostIP,
-				HostPort:  b.HostPort,
-			})
+			if len(bindings) == 0 {
+				d.Ports = append(d.Ports, ContainerPort{Container: portStr})
+				continue
+			}
+
+			for _, b := range bindings {
+				d.Ports = append(d.Ports, ContainerPort{
+					Container: portStr,
+					HostIP:    addrToString(b.HostIP),
+					HostPort:  b.HostPort,
+				})
+			}
 		}
 	}
 
 	return d, nil
 }
 
-// dockerInspectRaw is the permissive shape we decode `docker inspect`
-// into. Only the subfields we actually surface are listed — extra
-// fields in the docker JSON are ignored without warning.
-type dockerInspectRaw struct {
-	ID              string                  `json:"Id"`
-	Name            string                  `json:"Name"`
-	RestartCount    int                     `json:"RestartCount"`
-	State           dockerInspectState      `json:"State"`
-	Config          dockerInspectConfig     `json:"Config"`
-	HostConfig      dockerInspectHostConfig `json:"HostConfig"`
-	NetworkSettings dockerInspectNetSet     `json:"NetworkSettings"`
-	Mounts          []dockerInspectMount    `json:"Mounts"`
+// addrToString — handles the SDK's netip.Addr fields. An invalid
+// Addr (zero value) stringifies as "invalid IP", which we don't
+// want on the wire; return "" instead.
+func addrToString(a netip.Addr) string {
+	if !a.IsValid() {
+		return ""
+	}
+
+	return a.String()
 }
 
-type dockerInspectState struct {
-	Status     string `json:"Status"`
-	Running    bool   `json:"Running"`
-	ExitCode   int    `json:"ExitCode"`
-	StartedAt  string `json:"StartedAt"`
-	FinishedAt string `json:"FinishedAt"`
-}
-
-type dockerInspectConfig struct {
-	Image      string            `json:"Image"`
-	Cmd        []string          `json:"Cmd"`
-	Entrypoint []string          `json:"Entrypoint"`
-	Env        []string          `json:"Env"`
-	Labels     map[string]string `json:"Labels"`
-	WorkingDir string            `json:"WorkingDir"`
-}
-
-type dockerInspectHostConfig struct {
-	RestartPolicy struct {
-		Name string `json:"Name"`
-	} `json:"RestartPolicy"`
-}
-
-type dockerInspectNetSet struct {
-	Networks map[string]dockerInspectNetwork    `json:"Networks"`
-	Ports    map[string][]dockerInspectPortBind `json:"Ports"`
-}
-
-type dockerInspectNetwork struct {
-	NetworkID string   `json:"NetworkID"`
-	IPAddress string   `json:"IPAddress"`
-	Gateway   string   `json:"Gateway"`
-	Aliases   []string `json:"Aliases"`
-}
-
-type dockerInspectPortBind struct {
-	HostIP   string `json:"HostIp"`
-	HostPort string `json:"HostPort"`
-}
-
-type dockerInspectMount struct {
-	Type        string `json:"Type"`
-	Source      string `json:"Source"`
-	Destination string `json:"Destination"`
-	Mode        string `json:"Mode"`
-	RW          bool   `json:"RW"`
-}
+// (Removed dockerInspectRaw + sibling types: those were the
+// permissive JSON-decode targets the old exec-shell `docker inspect`
+// path used. The SDK now returns typed `container.InspectResponse`
+// directly, so callers map straight from there into ContainerDetail.)
 
 // ContainerExists checks if a container exists.
 // First checks containers with Voodu labels, then falls back to direct name check for backwards compatibility.
@@ -889,18 +943,16 @@ func ContainerExists(name string) bool {
 // callers distinguish "not running" from "unreadable" by checking the
 // error.
 func GetContainerImage(name string) (string, error) {
-	if !ContainerExists(name) {
-		return "", nil
-	}
-
-	cmd := exec.Command("docker", "inspect", name, "--format", "{{.Config.Image}}")
-
-	out, err := cmd.Output()
+	resp, err := sdkContainerInspect(name)
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", name, err)
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	if resp == nil || resp.Config == nil {
+		return "", nil
+	}
+
+	return resp.Config.Image, nil
 }
 
 // GetContainerImageID returns the image ID (sha256) the container was
@@ -912,18 +964,16 @@ func GetContainerImage(name string) (string, error) {
 //
 // Empty string + nil error means no such container.
 func GetContainerImageID(name string) (string, error) {
-	if !ContainerExists(name) {
-		return "", nil
-	}
-
-	cmd := exec.Command("docker", "inspect", name, "--format", "{{.Image}}")
-
-	out, err := cmd.Output()
+	resp, err := sdkContainerInspect(name)
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", name, err)
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	if resp == nil {
+		return "", nil
+	}
+
+	return resp.Image, nil
 }
 
 // TagImage points dst at the same image ID currently aliased by
@@ -998,21 +1048,24 @@ func RemoveImageTag(ref string) error {
 //
 // Empty string + nil error means the image doesn't exist locally.
 func GetImageID(ref string) (string, error) {
-	cmd := exec.Command("docker", "inspect", ref, "--format", "{{.Id}}")
-
-	out, err := cmd.Output()
+	cli, err := getDockerClient()
 	if err != nil {
-		// Exit code 1 with "No such object" on stderr is the common
-		// "image not pulled/built yet" case — treat it as non-fatal so
-		// the caller can transient-retry.
-		if strings.Contains(string(out), "No such") {
-			return "", nil
-		}
+		return "", nil // preserve old fail-soft contract — caller retries on next tick
+	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := cli.ImageInspect(ctx, ref)
+	if err != nil {
+		// "No such image" / daemon hiccup / any other failure → empty
+		// string, nil error. Same fail-soft semantics the old exec path
+		// had: caller distinguishes "missing" from "broken" via
+		// ImageExists or by checking the empty return.
 		return "", nil
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	return resp.ID, nil
 }
 
 // ContainerIsRunning checks if a container is currently running.
@@ -1103,17 +1156,20 @@ func ContainerIP(name string) (string, error) {
 // Returns (false, nil) when the container doesn't exist — the caller
 // can decide whether that's an error in its context.
 func IsRunning(name string) (bool, error) {
-	cmd := exec.Command("docker", "inspect", "--format", "{{.State.Running}}", name)
-
-	out, err := cmd.Output()
+	resp, err := sdkContainerInspect(name)
 	if err != nil {
-		// `docker inspect` exits non-zero when the container is missing.
-		// Treat "missing" as "not running" and let the caller distinguish
-		// via ContainerExists if it cares.
+		// Daemon trouble (not "not found", which sdkContainerInspect
+		// returns as nil resp). Preserve old "treat missing as not
+		// running" by also swallowing transient errors — the caller
+		// can use ContainerExists for the distinction.
 		return false, nil
 	}
 
-	return strings.TrimSpace(string(out)) == "true", nil
+	if resp == nil || resp.State == nil {
+		return false, nil
+	}
+
+	return resp.State.Running, nil
 }
 
 // StartContainer runs `docker start` on an existing, stopped container.
@@ -1420,95 +1476,87 @@ func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error)
 // them would require two pipes and callers always want them
 // interleaved anyway (just like a tail of a normal process).
 func LogsStream(name string, follow bool, tail int, since string) (io.ReadCloser, error) {
-	args := []string{"logs"}
+	cli, err := getDockerClient()
+	if err != nil {
+		return nil, fmt.Errorf("docker logs %s: client init: %w", name, err)
+	}
 
-	if follow {
-		args = append(args, "-f")
+	// Detached context — caller controls lifecycle via Close() on the
+	// returned reader. We can't use a request-scoped ctx because the
+	// reader may outlive any single Goroutine's stack frame
+	// (LogTailIslandJob holds it across many polls when follow=true).
+	ctx, cancel := context.WithCancel(context.Background())
+
+	opts := dockerclient.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Since:      since,
 	}
 
 	if tail > 0 {
-		args = append(args, "--tail", strconv.Itoa(tail))
+		opts.Tail = strconv.Itoa(tail)
+	} else {
+		opts.Tail = "all"
 	}
 
-	if since != "" {
-		args = append(args, "--since", since)
-	}
-
-	args = append(args, name)
-
-	cmd := exec.Command("docker", args...)
-
-	// Merge stdout + stderr onto a SINGLE OS pipe so the reader
-	// gets both streams interleaved in arrival order. Earlier
-	// version used StdoutPipe/StderrPipe separately and read
-	// stdout first; for daemons that log only to stderr (postgres,
-	// redis, jobs writing to stderr by convention) the reader
-	// blocked on stdout forever and `vd logs -f` showed only
-	// the initial buffered output — never streamed live. With
-	// the merged pipe, daemon stderr lines surface immediately.
-	pr, pw, err := os.Pipe()
+	sdkStream, err := cli.ContainerLogs(ctx, name, opts)
 	if err != nil {
-		return nil, fmt.Errorf("docker logs %s: pipe: %w", name, err)
+		cancel()
+		return nil, fmt.Errorf("docker logs %s: %w", name, err)
 	}
 
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+	// The daemon multiplexes stdout/stderr in a single TCP stream
+	// using an 8-byte header per frame (stream type + length). The
+	// CLI's `docker logs` does the demultiplex transparently; the
+	// SDK leaves it to us — `stdcopy.StdCopy` is the canonical
+	// helper. Pointing both `destOut` and `destErr` at the SAME
+	// writer interleaves the two streams in arrival order, matching
+	// the historical `cmd.Stdout = pw; cmd.Stderr = pw` behaviour
+	// (and what an operator sees from `docker logs <name> 2>&1`).
+	//
+	// The goroutine + io.Pipe glue exists because StdCopy is
+	// pull-driven (writes to the dest as it reads from the source),
+	// but callers want a pull-driven io.Reader they can pipe to a
+	// response.Writer. The pipe bridges the two.
+	pr, pw := io.Pipe()
 
-	if err := cmd.Start(); err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
-
-		return nil, fmt.Errorf("docker logs %s: start: %w", name, err)
-	}
-
-	// CRITICAL: close the WRITER end in the parent. The child
-	// inherited a duplicate of pw; closing in the parent doesn't
-	// affect the child's stdout/stderr but ensures `pr.Read`
-	// returns EOF when the child exits and closes its end. Without
-	// this, the parent's pw stays open and the reader blocks
-	// forever after the child exits — `vd logs` (without -f)
-	// against an exited container would never return.
-	_ = pw.Close()
+	go func() {
+		_, err := stdcopy.StdCopy(pw, pw, sdkStream)
+		_ = sdkStream.Close()
+		// CloseWithError(nil) is equivalent to Close() and signals EOF
+		// to the reader side. Any StdCopy error (mid-frame disconnect)
+		// surfaces to the next Read on pr.
+		_ = pw.CloseWithError(err)
+	}()
 
 	return &dockerLogsReader{
-		cmd:    cmd,
-		merged: pr,
+		stream: pr,
+		cancel: cancel,
 	}, nil
 }
 
-// dockerLogsReader is a thin io.ReadCloser over the merged
-// stdout+stderr pipe. The actual reading is one os.Read against
-// the pipe; the cmd-side merge happens at process start (see
-// LogsStream).
+// dockerLogsReader wraps the demultiplexed stdout/stderr pipe from
+// the SDK ContainerLogs path. Close() cancels the upstream context,
+// which unblocks the StdCopy goroutine and frees the HTTP connection
+// to the daemon.
 type dockerLogsReader struct {
-	cmd    *exec.Cmd
-	merged io.ReadCloser
+	stream io.ReadCloser
+	cancel context.CancelFunc
 
 	once sync.Once
 }
 
-// Read returns whatever the docker process has written so far
-// across BOTH stdout and stderr, interleaved in OS-write order.
-// Atomic per write call, not per line — same trade-off `docker
-// logs name 2>&1` makes on a shell.
 func (r *dockerLogsReader) Read(p []byte) (int, error) {
-	return r.merged.Read(p)
+	return r.stream.Read(p)
 }
 
-// Close kills the docker process and reaps it. Idempotent — the
-// HTTP handler may call it multiple times if the client disconnects
-// mid-stream.
+// Close is idempotent — the HTTP handler may call it twice if the
+// client disconnects mid-stream and then the deferred close fires.
 func (r *dockerLogsReader) Close() error {
 	r.once.Do(func() {
-		_ = r.merged.Close()
-
-		if r.cmd.Process != nil {
-			_ = r.cmd.Process.Kill()
-		}
-
-		// Wait reaps the process; the error is uninteresting (we just
-		// killed it) so we discard it.
-		_ = r.cmd.Wait()
+		r.cancel()         // signal StdCopy goroutine to wind down
+		_ = r.stream.Close()
 	})
 
 	return nil
@@ -1604,16 +1652,18 @@ func WaitForContainerHealth(name string, timeout int) error {
 			return fmt.Errorf("container failed to become healthy within %ds", timeout)
 		}
 
-		cmd := exec.Command("docker", "inspect", name, "--format", "{{.State.Health.Status}}")
-		output, err := cmd.Output()
-		if err != nil {
+		resp, err := sdkContainerInspect(name)
+		if err != nil || resp == nil || resp.State == nil || resp.State.Health == nil {
+			// No health check configured (or transient daemon error)
+			// — the old shell path read empty `--format` output the
+			// same way and treated it as "ready". Preserve that.
 			time.Sleep(3 * time.Second)
 			fmt.Println("-----> Container ready (no health check configured)")
 
 			return nil
 		}
 
-		status := strings.TrimSpace(string(output))
+		status := resp.State.Health.Status
 		elapsed := int(time.Since(startTime).Seconds())
 
 		switch status {
@@ -1956,61 +2006,50 @@ type containerShape struct {
 }
 
 // inspectContainerShape pulls image, network mode, port bindings and
-// bind-mount volumes out of a running container via `docker inspect`.
+// bind-mount volumes out of a running container via the SDK. Same
+// callsites the legacy exec-shell version had — the on-wire result
+// shape (containerShape) is unchanged.
 func inspectContainerShape(name string) (*containerShape, error) {
-	cmd := exec.Command("docker", "inspect", name)
-
-	output, err := cmd.Output()
+	r, err := sdkContainerInspect(name)
 	if err != nil {
 		return nil, err
 	}
 
-	var raw []struct {
-		Config struct {
-			Image string `json:"Image"`
-		} `json:"Config"`
-
-		HostConfig struct {
-			NetworkMode  string                           `json:"NetworkMode"`
-			Binds        []string                         `json:"Binds"`
-			PortBindings map[string][]struct{ HostIP, HostPort string } `json:"PortBindings"`
-		} `json:"HostConfig"`
-	}
-
-	if err := json.Unmarshal(output, &raw); err != nil {
-		return nil, fmt.Errorf("parse docker inspect: %w", err)
-	}
-
-	if len(raw) == 0 {
+	if r == nil {
 		return nil, fmt.Errorf("no container data for %s", name)
 	}
 
-	entry := raw[0]
+	shape := &containerShape{}
 
-	shape := &containerShape{
-		Image:       entry.Config.Image,
-		NetworkMode: entry.HostConfig.NetworkMode,
-		Volumes:     entry.HostConfig.Binds,
+	if r.Config != nil {
+		shape.Image = r.Config.Image
+	}
+
+	if r.HostConfig != nil {
+		shape.NetworkMode = string(r.HostConfig.NetworkMode)
+		shape.Volumes = r.HostConfig.Binds
+
+		for portKey, bindings := range r.HostConfig.PortBindings {
+			// portKey: network.Port (struct). .Num() gives the port int.
+			containerPort := strconv.Itoa(int(portKey.Num()))
+
+			for _, b := range bindings {
+				if b.HostPort == "" {
+					continue
+				}
+
+				hostIP := addrToString(b.HostIP)
+				if hostIP != "" {
+					shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s:%s", hostIP, b.HostPort, containerPort))
+				} else {
+					shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s", b.HostPort, containerPort))
+				}
+			}
+		}
 	}
 
 	if shape.NetworkMode == "" {
 		shape.NetworkMode = "bridge"
-	}
-
-	for containerSpec, bindings := range entry.HostConfig.PortBindings {
-		containerPort := strings.SplitN(containerSpec, "/", 2)[0]
-
-		for _, b := range bindings {
-			if b.HostPort == "" {
-				continue
-			}
-
-			if b.HostIP != "" {
-				shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s:%s", b.HostIP, b.HostPort, containerPort))
-			} else {
-				shape.Ports = append(shape.Ports, fmt.Sprintf("%s:%s", b.HostPort, containerPort))
-			}
-		}
 	}
 
 	return shape, nil

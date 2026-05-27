@@ -362,7 +362,7 @@ func (c *StatsCollector) Collect(ctx context.Context, filter StatsFilter) ([]Pod
 				MemoryUsageBytes: runtime.MemUsageBytes,
 				MemoryLimitBytes: runtime.MemLimitBytes,
 				MemoryPercent:    runtime.MemPercent,
-				PIDs:             runtime.PIDs,
+				PIDs:             int(runtime.PIDs),
 				NetRxBytes:       runtime.NetRxBytes,
 				NetTxBytes:       runtime.NetTxBytes,
 				BlockReadBytes:   runtime.BlockReadBytes,

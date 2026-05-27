@@ -459,7 +459,7 @@ write_systemd_unit() {
 
   cat >"$tmp" <<UNIT
 [Unit]
-Description=Voodu controller (etcd + HTTP API)
+Description=Voodu Controller — embedded etcd + reconciler + observability API
 Documentation=https://github.com/${REPO}
 After=network-online.target docker.service
 Wants=network-online.target
@@ -474,6 +474,26 @@ ExecStart=${BIN_DIR}/voodu-controller
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+
+# Sandboxing — least-privilege boundaries the controller doesn't
+# need to cross. Defence-in-depth against a compromised binary or
+# plugin: the controller talks to dockerd via its socket and writes
+# its own state under \${VOODU_ROOT}; nothing else on the filesystem
+# is its concern.
+#
+# ProtectSystem=strict       → entire FS read-only (with the
+#                              well-known exceptions /tmp, /var/tmp,
+#                              /proc, /sys, /dev — see systemd.exec(5))
+# ReadWritePaths=\${VOODU_ROOT} → carve back write access to the state
+#                              dir only (etcd data, metrics NDJSON,
+#                              caddy logs bind-mount target)
+# ProtectHome=yes            → /home, /root invisible to the controller
+# NoNewPrivileges=yes        → can't gain privileges via setuid/setcap;
+#                              child docker CLI invocations honour this
+ProtectSystem=strict
+ReadWritePaths=${VOODU_ROOT}
+ProtectHome=yes
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
