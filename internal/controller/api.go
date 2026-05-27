@@ -2023,7 +2023,13 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 		tail = n
 	}
 
-	stream, err := a.Logs.Logs(name, LogsOptions{Follow: follow, Tail: tail})
+	// since: passed verbatim to docker logs --since. Same semantics
+	// as handleLogsMulti — see that handler's comment for accepted
+	// formats. WebUI polling consumers use this to fetch only new
+	// lines since the last poll.
+	since := strings.TrimSpace(q.Get("since"))
+
+	stream, err := a.Logs.Logs(name, LogsOptions{Follow: follow, Tail: tail, Since: since})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("open log stream: %w", err))
 		return

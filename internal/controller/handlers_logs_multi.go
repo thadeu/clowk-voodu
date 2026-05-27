@@ -83,6 +83,18 @@ func (a *API) handleLogsMulti(w http.ResponseWriter, r *http.Request) {
 	wantScope := strings.TrimSpace(q.Get("scope"))
 	wantName := strings.TrimSpace(q.Get("name"))
 
+	// `since` filters lines emitted at/after the given timestamp.
+	// Passed verbatim to docker logs --since (it accepts RFC3339
+	// absolute, relative duration like "10m", or unix string). We
+	// trust the caller to format it correctly; bad values get
+	// rejected by docker itself and surface as an error line.
+	//
+	// Designed for polling consumers (WebUI's LogTailIslandJob):
+	// they advance a watermark each poll and ask only for what's
+	// new, killing the redundant re-tail of the last 500 lines
+	// every cycle.
+	wantSince := strings.TrimSpace(q.Get("since"))
+
 	pods, err := lister.ListPods()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("list pods: %w", err))
@@ -99,7 +111,11 @@ func (a *API) handleLogsMulti(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamMultiplexedLogs(r.Context(), w, a.Logs, matches, LogsOptions{Follow: follow, Tail: tail})
+	streamMultiplexedLogs(r.Context(), w, a.Logs, matches, LogsOptions{
+		Follow: follow,
+		Tail:   tail,
+		Since:  wantSince,
+	})
 }
 
 // filterPodsForLogs is the same filter shape handlePods uses, kept

@@ -1392,23 +1392,34 @@ func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error)
 	return 1, fmt.Errorf("docker exec %s: %w", name, err)
 }
 
-// LogsStream spawns `docker logs [-f] [--tail N] <name>` and returns
-// the merged stdout+stderr as a ReadCloser. The caller MUST Close the
-// returned reader to reap the docker process — otherwise we leak a
-// zombie per call.
+// LogsStream spawns `docker logs [-f] [--tail N] [--since X] <name>`
+// and returns the merged stdout+stderr as a ReadCloser. The caller
+// MUST Close the returned reader to reap the docker process —
+// otherwise we leak a zombie per call.
 //
 // Tail = 0 means "all logs"; positive values translate to `--tail N`.
 // Follow streams new lines as they arrive (until the container exits
-// or the reader is closed). Both modes work on stopped containers
-// because docker keeps the json-file driver's log around until the
-// container is removed — this is the whole point of dropping
-// AutoRemove on jobs.
+// or the reader is closed).
+//
+// Since is passed through verbatim to `docker logs --since=X`. Docker
+// accepts three forms:
+//   - Absolute RFC3339:     "2026-05-26T23:30:09.391Z"
+//   - Relative duration:    "10m", "1h", "30s"
+//   - Unix timestamp:       "1779836259"
+// Empty string skips the flag entirely (= all logs from container
+// start, modulo --tail). When both Since AND Tail are set, docker
+// applies --since first then takes the last --tail of THAT window —
+// useful for "the last N lines since timestamp X."
+//
+// Both modes work on stopped containers because docker keeps the
+// json-file driver's log around until the container is removed —
+// this is the whole point of dropping AutoRemove on jobs.
 //
 // Stderr is interleaved with stdout in the returned stream because
 // `docker logs` already merges them at the daemon level. Splitting
 // them would require two pipes and callers always want them
 // interleaved anyway (just like a tail of a normal process).
-func LogsStream(name string, follow bool, tail int) (io.ReadCloser, error) {
+func LogsStream(name string, follow bool, tail int, since string) (io.ReadCloser, error) {
 	args := []string{"logs"}
 
 	if follow {
@@ -1417,6 +1428,10 @@ func LogsStream(name string, follow bool, tail int) (io.ReadCloser, error) {
 
 	if tail > 0 {
 		args = append(args, "--tail", strconv.Itoa(tail))
+	}
+
+	if since != "" {
+		args = append(args, "--since", since)
 	}
 
 	args = append(args, name)

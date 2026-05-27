@@ -171,8 +171,8 @@ type ContainerManager interface {
 	InspectLabels(name string) (map[string]string, error)
 }
 
-// LogsOptions tunes the docker logs invocation. Both fields are
-// optional — zero values mean "all logs, no follow".
+// LogsOptions tunes the docker logs invocation. All fields are
+// optional — zero values mean "all logs, no follow, no since cap".
 type LogsOptions struct {
 	// Follow asks for a streaming tail (`docker logs -f`). The reader
 	// stays open until the container exits or the caller closes it.
@@ -181,6 +181,17 @@ type LogsOptions struct {
 	// Tail caps the number of trailing lines returned. Zero means
 	// unlimited (whole log). Negative values are treated as zero.
 	Tail int
+
+	// Since filters lines to those emitted at or after the given
+	// timestamp (`docker logs --since`). Accepts the same formats
+	// docker does: RFC3339 absolute ("2026-05-26T23:30:09.391Z"),
+	// relative duration ("10m", "1h"), or unix timestamp string.
+	// Empty = no filter.
+	//
+	// Used by polling consumers (the WebUI's LogTailIslandJob) to
+	// fetch only what's new since the last poll, avoiding the
+	// redundant re-tail of the last N lines every cycle.
+	Since string
 }
 
 // ContainerSlot is a snapshot of one running deployment replica (or
@@ -711,7 +722,7 @@ func (DockerContainerManager) Wait(name string) (int, error) {
 // Logs is a thin shim over docker.LogsStream. The interface lives on
 // ContainerManager so the API handler stays testable with a fake.
 func (DockerContainerManager) Logs(name string, opts LogsOptions) (io.ReadCloser, error) {
-	return docker.LogsStream(name, opts.Follow, opts.Tail)
+	return docker.LogsStream(name, opts.Follow, opts.Tail, opts.Since)
 }
 
 // Exec is a thin shim over docker.ExecContainer. Translates the
