@@ -2026,7 +2026,11 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	follow := q.Get("follow") == "true"
 
-	tail := 0
+	// tail sentinel: -1 means "no ?tail param was sent" → docker
+	// daemon default ("all", full history). A literal `?tail=0`
+	// parses to 0 → only new lines from this moment forward,
+	// no backfill. Distinct semantics worth carrying through.
+	tail := -1
 	if t := strings.TrimSpace(q.Get("tail")); t != "" {
 		n, err := strconv.Atoi(t)
 		if err != nil || n < 0 {

@@ -68,7 +68,11 @@ func (a *API) handleLogsMulti(w http.ResponseWriter, r *http.Request) {
 
 	follow := q.Get("follow") == "true"
 
-	tail := 0
+	// tail sentinel: -1 = "no ?tail param sent" → docker default ("all").
+	// 0 = "zero historical lines, only new from now" — distinct
+	// from "all" so the WebUI can request a clean viewport on
+	// /logs page open.
+	tail := -1
 	if t := strings.TrimSpace(q.Get("tail")); t != "" {
 		n, err := strconv.Atoi(t)
 		if err != nil || n < 0 {

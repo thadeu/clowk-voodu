@@ -1494,10 +1494,21 @@ func LogsStream(name string, follow bool, tail int, since string) (io.ReadCloser
 		Since:      since,
 	}
 
-	if tail > 0 {
+	// tail semantics:
+	//   tail <  0 → omit the param; docker daemon's default is "all"
+	//                (full history) which matches the old CLI behaviour
+	//                of `docker logs <name>` with no --tail flag.
+	//   tail == 0 → explicit "zero historical lines, follow only" —
+	//                operator wants a clean viewport that fills from
+	//                this moment forward. Distinct from "all".
+	//   tail >  0 → return the last N lines as historical backfill.
+	//
+	// We pass the integer through verbatim when non-negative; the SDK
+	// turns it into the `tail=<N>` query param the docker engine API
+	// expects. An empty `opts.Tail` makes the SDK skip the param
+	// entirely, which the daemon reads as "all".
+	if tail >= 0 {
 		opts.Tail = strconv.Itoa(tail)
-	} else {
-		opts.Tail = "all"
 	}
 
 	sdkStream, err := cli.ContainerLogs(ctx, name, opts)
