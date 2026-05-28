@@ -163,7 +163,12 @@ func runLogs(cmd *cobra.Command, ref string, follow bool, tail int) error {
 func streamMultiLogs(cmd *cobra.Command, ref string, q url.Values) error {
 	ctx := cmd.Context()
 
-	resp, err := controllerDo(cmd.Root(), http.MethodGet, "/logs", q.Encode(), nil)
+	// `controllerStream` (no overall request timeout) instead of
+	// `controllerDo` (30s budget) — otherwise `?follow=true` is killed
+	// at exactly 30s with `context deadline exceeded` and the operator
+	// sees the tail drop mid-line. Connect + response-header timeouts
+	// still apply, so an unreachable controller surfaces fast.
+	resp, err := controllerStream(ctx, cmd.Root(), http.MethodGet, "/logs", q.Encode(), nil)
 	if err != nil {
 		return err
 	}

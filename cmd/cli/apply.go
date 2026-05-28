@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1373,6 +1375,12 @@ func envAsMap() map[string]string {
 // controllerDo is the one-stop HTTP helper for apply/diff/delete. It
 // honours --controller-url and VOODU_CONTROLLER_URL and sets a sane
 // timeout so the CLI never hangs on an unreachable controller.
+//
+// NOT for streaming endpoints (`/logs?follow=true`, future SSE, etc.) —
+// `http.Client.Timeout` is the TOTAL request budget INCLUDING body read,
+// so a 30s ceiling here kills any long-lived stream at the 30s mark with
+// `context deadline exceeded`. Streaming callers should use
+// `controllerStream` below.
 func controllerDo(root *cobra.Command, method, path, rawQuery string, body io.Reader) (*http.Response, error) {
 	base := strings.TrimRight(controllerURL(root), "/")
 	full := base + path
@@ -1393,6 +1401,57 @@ func controllerDo(root *cobra.Command, method, path, rawQuery string, body io.Re
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
 
 	client := &http.Client{Timeout: applyTimeout}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("controller %s %s: %w", method, path, err)
+	}
+
+	return resp, nil
+}
+
+// controllerStream is the streaming sibling of controllerDo. It honours
+// the same controller-URL resolution but installs NO overall request
+// timeout — the body is read for as long as the controller keeps writing,
+// up to whatever ctx (typically `cmd.Context()`) cancels.
+//
+// Per-step transport guards stay in place (15s to connect + read response
+// headers); only the body-read budget is unbounded. That keeps "controller
+// is reachable but never sends headers" surfaceable as an error while
+// letting a healthy `?follow=true` tail run indefinitely.
+//
+// Used by `vd logs -f` (multi-pod multiplex) and any future SSE / chunked
+// endpoint added to the CLI. Apply/diff/delete keep `controllerDo` — they
+// have an actual request body that should fit in the 30s budget.
+func controllerStream(ctx context.Context, root *cobra.Command, method, path, rawQuery string, body io.Reader) (*http.Response, error) {
+	base := strings.TrimRight(controllerURL(root), "/")
+	full := base + path
+
+	if rawQuery != "" {
+		full += "?" + rawQuery
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, full, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+
+	// Transport-level guards keep the failure-mode useful without ever
+	// trimming the body-read budget — `Client.Timeout` is left zero.
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 15 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 15 * time.Second,
+	}
+
+	client := &http.Client{Transport: transport}
 
 	resp, err := client.Do(req)
 	if err != nil {
