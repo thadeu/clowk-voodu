@@ -25,7 +25,7 @@ import (
 // the (kind, scope, name) filter and multiplexes their lines into
 // one chunked response.
 //
-//	GET /logs?follow=&tail=&kind=&scope=&name=
+//	GET /logs?follow=&tail=&since=&timestamps=&kind=&scope=&name=
 //
 // Filters use the same vocabulary as GET /pods so the same query
 // works on both endpoints. `follow=true` keeps every per-pod stream
@@ -99,6 +99,13 @@ func (a *API) handleLogsMulti(w http.ResponseWriter, r *http.Request) {
 	// every cycle.
 	wantSince := strings.TrimSpace(q.Get("since"))
 
+	// `timestamps` opts into docker's per-line RFC3339Nano prefix
+	// (`docker logs --timestamps`). Off by default so the historic
+	// CLI rendering (`vd logs`) stays clean; the off-host poller
+	// turns it on to anchor its watermark to docker's clock instead
+	// of its own wall clock.
+	wantTimestamps := q.Get("timestamps") == "true"
+
 	pods, err := lister.ListPods()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("list pods: %w", err))
@@ -116,9 +123,10 @@ func (a *API) handleLogsMulti(w http.ResponseWriter, r *http.Request) {
 	}
 
 	streamMultiplexedLogs(r.Context(), w, a.Logs, matches, LogsOptions{
-		Follow: follow,
-		Tail:   tail,
-		Since:  wantSince,
+		Follow:     follow,
+		Tail:       tail,
+		Since:      wantSince,
+		Timestamps: wantTimestamps,
 	})
 }
 

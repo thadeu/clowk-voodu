@@ -192,6 +192,15 @@ type LogsOptions struct {
 	// fetch only what's new since the last poll, avoiding the
 	// redundant re-tail of the last N lines every cycle.
 	Since string
+
+	// Timestamps asks docker to prefix every emitted line with the
+	// container's source-of-truth RFC3339Nano timestamp (`docker logs
+	// --timestamps`). Off by default — existing CLI consumers (`vd
+	// logs`) get clean bodies. Off-host polling consumers turn it on
+	// to advance a watermark pinned to docker's clock instead of the
+	// poller's wall clock (clock skew between hosts otherwise causes
+	// missed or duplicated lines at the boundary).
+	Timestamps bool
 }
 
 // ContainerSlot is a snapshot of one running deployment replica (or
@@ -722,7 +731,7 @@ func (DockerContainerManager) Wait(name string) (int, error) {
 // Logs is a thin shim over docker.LogsStream. The interface lives on
 // ContainerManager so the API handler stays testable with a fake.
 func (DockerContainerManager) Logs(name string, opts LogsOptions) (io.ReadCloser, error) {
-	return docker.LogsStream(name, opts.Follow, opts.Tail, opts.Since)
+	return docker.LogsStream(name, opts.Follow, opts.Tail, opts.Since, opts.Timestamps)
 }
 
 // Exec is a thin shim over docker.ExecContainer. Translates the

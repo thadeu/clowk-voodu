@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeLogStreamer answers the LogStreamer interface from a per-name
@@ -39,7 +41,43 @@ func (f *fakeLogStreamer) Logs(name string, opts LogsOptions) (io.ReadCloser, er
 
 	body := f.logs[name]
 
+	// Mirror docker's --timestamps shape: prefix each non-empty line
+	// with an RFC3339Nano timestamp + single space, matching what
+	// `container.LogsOptions{Timestamps: true}` produces. Real docker
+	// uses the line's emit-time from the container's log driver; the
+	// fake substitutes a synthetic timestamp because the test only
+	// cares about the wire shape, not the value.
+	if opts.Timestamps {
+		body = prefixTimestamps(body)
+	}
+
 	return io.NopCloser(strings.NewReader(body)), nil
+}
+
+// prefixTimestamps emits each non-empty input line with an RFC3339Nano
+// timestamp + space prefix. Mirrors docker's `--timestamps` output so
+// the fake LogStreamer can stand in for the SDK in tests.
+func prefixTimestamps(body string) string {
+	if body == "" {
+		return ""
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	now := time.Date(2026, 5, 28, 12, 34, 56, 789000000, time.UTC)
+
+	var out strings.Builder
+
+	for scanner.Scan() {
+		ts := now.Format(time.RFC3339Nano)
+		out.WriteString(ts)
+		out.WriteByte(' ')
+		out.WriteString(scanner.Text())
+		out.WriteByte('\n')
+	}
+
+	return out.String()
 }
 
 func newLogsAPI(t *testing.T) (*API, *memStore, *fakePodsLister, *fakeLogStreamer) {
@@ -362,4 +400,207 @@ func (e *erroringStreamer) Logs(name string, _ LogsOptions) (io.ReadCloser, erro
 		return nil, err
 	}
 	return io.NopCloser(strings.NewReader(e.good[name])), nil
+}
+
+// TestPodLogs_TimestampsOptIn pins the new `?timestamps=true` contract
+// on the single-pod handler: the docker SDK's `--timestamps` prefix
+// surfaces verbatim in the response body, and the LogStreamer sees
+// Timestamps: true threaded through LogsOptions. The off-host poller
+// (voodu-webui Go binary) relies on this to pin its watermark to
+// docker's clock.
+func TestPodLogs_TimestampsOptIn(t *testing.T) {
+	api, _, _, logs := newLogsAPI(t)
+
+	logs.logs["test-web.aaaa"] = "hello\nworld\n"
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods/test-web.aaaa/logs?timestamps=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(logs.calls) != 1 {
+		t.Fatalf("expected 1 Logs call, got %d", len(logs.calls))
+	}
+
+	if !logs.calls[0].Opts.Timestamps {
+		t.Errorf("Timestamps not propagated to LogStreamer.Opts")
+	}
+
+	// Each non-empty line should start with a parseable RFC3339Nano
+	// timestamp + space + body.
+	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %q", len(lines), body)
+	}
+
+	for i, want := range []string{"hello", "world"} {
+		assertTimestampedLine(t, lines[i], want)
+	}
+}
+
+// TestPodLogs_TimestampsDefaultOff pins backward compat: without the
+// `?timestamps=true` param the legacy clean-body shape stays unchanged
+// and the LogStreamer sees Timestamps: false. `vd logs` and the
+// existing Rails Job depend on this.
+func TestPodLogs_TimestampsDefaultOff(t *testing.T) {
+	api, _, _, logs := newLogsAPI(t)
+
+	logs.logs["test-web.aaaa"] = "hello\nworld\n"
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/pods/test-web.aaaa/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(logs.calls) != 1 {
+		t.Fatalf("expected 1 Logs call, got %d", len(logs.calls))
+	}
+
+	if logs.calls[0].Opts.Timestamps {
+		t.Errorf("Timestamps should default to false")
+	}
+
+	if string(body) != "hello\nworld\n" {
+		t.Errorf("body should be clean (no timestamp prefix), got %q", body)
+	}
+}
+
+// TestLogsMulti_TimestampsOptIn covers the same opt-in on the multi-pod
+// handler: every line under the multiplexed `[pod-name] ` prefix should
+// then carry the docker RFC3339Nano timestamp between the prefix and
+// the body.
+func TestLogsMulti_TimestampsOptIn(t *testing.T) {
+	api, _, pods, logs := newLogsAPI(t)
+
+	pods.pods = []Pod{
+		{Name: "x-web.a", Kind: "deployment", Scope: "x", ResourceName: "web"},
+	}
+	logs.logs["x-web.a"] = "alpha-1\nalpha-2\n"
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/logs?scope=x&timestamps=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(logs.calls) != 1 {
+		t.Fatalf("expected 1 Logs call, got %d", len(logs.calls))
+	}
+
+	if !logs.calls[0].Opts.Timestamps {
+		t.Errorf("Timestamps not propagated through streamMultiplexedLogs")
+	}
+
+	// Pull every non-empty (non-heartbeat) line and assert shape:
+	// `[x-web.a] <RFC3339Nano> <body>`.
+	var seen []string
+
+	for _, line := range strings.Split(strings.TrimRight(string(body), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+
+		seen = append(seen, line)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %q", len(seen), body)
+	}
+
+	for i, want := range []string{"alpha-1", "alpha-2"} {
+		assertMultiplexedTimestampedLine(t, seen[i], "x-web.a", want)
+	}
+}
+
+// TestLogsMulti_TimestampsDefaultOff pins legacy CLI compat on the
+// multi-pod handler: without the param the response is byte-equal to
+// the pre-timestamps shape (`[pod-name] <body>`).
+func TestLogsMulti_TimestampsDefaultOff(t *testing.T) {
+	api, _, pods, logs := newLogsAPI(t)
+
+	pods.pods = []Pod{
+		{Name: "x-web.a", Kind: "deployment", Scope: "x", ResourceName: "web"},
+	}
+	logs.logs["x-web.a"] = "alpha-1\n"
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/logs?scope=x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(logs.calls) != 1 {
+		t.Fatalf("expected 1 Logs call, got %d", len(logs.calls))
+	}
+
+	if logs.calls[0].Opts.Timestamps {
+		t.Errorf("Timestamps should default to false")
+	}
+
+	if !strings.Contains(string(body), "[x-web.a] alpha-1") {
+		t.Errorf("legacy multiplexed shape broken, got %q", body)
+	}
+
+	if strings.Contains(string(body), "2026-") {
+		t.Errorf("body unexpectedly carries a timestamp prefix: %q", body)
+	}
+}
+
+// assertTimestampedLine checks `<RFC3339Nano> <body>` for the single
+// pod handler shape.
+func assertTimestampedLine(t *testing.T, line, wantBody string) {
+	t.Helper()
+
+	sp := strings.IndexByte(line, ' ')
+	if sp <= 0 {
+		t.Fatalf("line missing timestamp/body separator: %q", line)
+	}
+
+	tsStr := line[:sp]
+	body := line[sp+1:]
+
+	if _, err := time.Parse(time.RFC3339Nano, tsStr); err != nil {
+		t.Errorf("timestamp not RFC3339Nano: %q (%v)", tsStr, err)
+	}
+
+	if body != wantBody {
+		t.Errorf("body: got %q, want %q", body, wantBody)
+	}
+}
+
+// assertMultiplexedTimestampedLine checks
+// `[<pod>] <RFC3339Nano> <body>` for the multi-pod handler shape.
+func assertMultiplexedTimestampedLine(t *testing.T, line, wantPod, wantBody string) {
+	t.Helper()
+
+	prefix := "[" + wantPod + "] "
+	if !strings.HasPrefix(line, prefix) {
+		t.Fatalf("line missing pod prefix %q: %q", prefix, line)
+	}
+
+	assertTimestampedLine(t, strings.TrimPrefix(line, prefix), wantBody)
 }

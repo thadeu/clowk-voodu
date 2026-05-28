@@ -1989,7 +1989,7 @@ func pluginExitToHTTP(code int) int {
 // handlePodLogs streams stdout+stderr of one voodu-managed container
 // back to the caller, addressed by docker container name.
 //
-// GET /pods/{name}/logs?follow=&tail=
+// GET /pods/{name}/logs?follow=&tail=&since=&timestamps=
 //
 // {name} is the docker container name as it appears in `voodu get pods`
 // (e.g. "clowk-lp-web.a3f9"). The kind-aware /logs endpoint that used
@@ -2047,7 +2047,12 @@ func (a *API) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 	// lines since the last poll.
 	since := strings.TrimSpace(q.Get("since"))
 
-	stream, err := a.Logs.Logs(name, LogsOptions{Follow: follow, Tail: tail, Since: since})
+	// timestamps: opt-in `docker logs --timestamps` prefix. Off by
+	// default so the existing CLI rendering stays clean; the off-host
+	// poller turns it on to anchor its watermark to docker's clock.
+	timestamps := q.Get("timestamps") == "true"
+
+	stream, err := a.Logs.Logs(name, LogsOptions{Follow: follow, Tail: tail, Since: since, Timestamps: timestamps})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("open log stream: %w", err))
 		return

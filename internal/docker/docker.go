@@ -1448,10 +1448,10 @@ func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error)
 	return 1, fmt.Errorf("docker exec %s: %w", name, err)
 }
 
-// LogsStream spawns `docker logs [-f] [--tail N] [--since X] <name>`
-// and returns the merged stdout+stderr as a ReadCloser. The caller
-// MUST Close the returned reader to reap the docker process —
-// otherwise we leak a zombie per call.
+// LogsStream spawns `docker logs [-f] [--tail N] [--since X]
+// [--timestamps] <name>` and returns the merged stdout+stderr as a
+// ReadCloser. The caller MUST Close the returned reader to reap the
+// docker process — otherwise we leak a zombie per call.
 //
 // Tail = 0 means "all logs"; positive values translate to `--tail N`.
 // Follow streams new lines as they arrive (until the container exits
@@ -1467,6 +1467,13 @@ func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error)
 // applies --since first then takes the last --tail of THAT window —
 // useful for "the last N lines since timestamp X."
 //
+// Timestamps asks docker to prefix every emitted line with the
+// container's source-of-truth RFC3339Nano timestamp (`docker logs
+// --timestamps`). Off by default — the historical CLI rendering of
+// `vd logs` shows clean bodies. Off-host polling consumers turn it on
+// to anchor a watermark to docker's clock instead of their own wall
+// clock, killing skew-induced gaps and duplicates at the boundary.
+//
 // Both modes work on stopped containers because docker keeps the
 // json-file driver's log around until the container is removed —
 // this is the whole point of dropping AutoRemove on jobs.
@@ -1475,7 +1482,7 @@ func execContainerTTY(cmd *exec.Cmd, name string, opts ExecOptions) (int, error)
 // `docker logs` already merges them at the daemon level. Splitting
 // them would require two pipes and callers always want them
 // interleaved anyway (just like a tail of a normal process).
-func LogsStream(name string, follow bool, tail int, since string) (io.ReadCloser, error) {
+func LogsStream(name string, follow bool, tail int, since string, timestamps bool) (io.ReadCloser, error) {
 	cli, err := getDockerClient()
 	if err != nil {
 		return nil, fmt.Errorf("docker logs %s: client init: %w", name, err)
@@ -1492,6 +1499,7 @@ func LogsStream(name string, follow bool, tail int, since string) (io.ReadCloser
 		ShowStderr: true,
 		Follow:     follow,
 		Since:      since,
+		Timestamps: timestamps,
 	}
 
 	// tail semantics:
