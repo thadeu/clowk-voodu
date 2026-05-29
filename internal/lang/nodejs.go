@@ -123,14 +123,21 @@ FROM %s
 
 WORKDIR /app
 
-# Copy package files
+# Install dependencies with 'npm install' (NOT 'npm ci'): a project
+# managed by pnpm or bun has no package-lock.json, and 'npm ci' hard-
+# fails without one. 'npm install' resolves straight from package.json,
+# so any package.json project builds regardless of which lockfile it
+# ships. Dev deps are included on purpose — a runtime build step
+# (vite/tsc/esbuild) needs its toolchain, and the Procfile command is
+# free to run 'npm run build' before serving.
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --no-audit --no-fund
 
-# Copy application code
+# Copy application source. .dockerignore keeps node_modules/ and any
+# prebuilt dist/ out, so the image's deps are the ones just installed.
 COPY . .
 
-# Run the application
+# Default command — a Procfile line or manifest 'command' overrides it.
 CMD ["node", "%s"]
 `, appName, entrypoint, baseImage, entrypoint)
 }
