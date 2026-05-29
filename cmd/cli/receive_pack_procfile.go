@@ -146,7 +146,7 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 		reporter.Result(string(m.Kind), m.Scope, m.Name, "applied")
 	}
 
-	reporter.Summary(fmt.Sprintf("Procfile applied: %d resource(s) under scope %q", len(mans), scope))
+	reporter.Summary(fmt.Sprintf("procfile applied: %d resource(s) under scope %q", len(mans), scope))
 
 	return nil
 }

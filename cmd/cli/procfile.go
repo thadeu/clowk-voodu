@@ -473,6 +473,13 @@ func pushProcfileTarball(info *remote.Info, identity string, pa procfileApply, s
 		Stdin:    pr,
 		Stdout:   filter,
 		Stderr:   filter,
+		// Same env the regular apply sends: VOODU_PROTOCOL makes the
+		// server's procfile receive speak NDJSON, so its results +
+		// summary render through the eventRenderer (✓ vocabulary, live
+		// build-tail block) instead of falling back to the legacy text
+		// path — where a non-banner summary like "procfile applied"
+		// would leak its raw `----->` prefix.
+		Env: remoteEnv(),
 	})
 
 	_ = filter.Close()

@@ -27,7 +27,10 @@
 
 package main
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // Brand palette — values mirror brand_v1/spec.json. Aurora (slit) is
 // reserved per the brand kit's "active states only" rule: voodu uses
@@ -60,6 +63,12 @@ const (
 	cAmber   = "\x1b[38;2;255;194;71m"  // #FFC247 — modify (~)
 	cRose    = "\x1b[38;2;255;107;107m" // #FF6B6B — error / fail (✗)
 	cRoseDim = "\x1b[38;2;180;75;75m"   // dimmer rose — remove / pruned (-)
+
+	// Gray — secondary "description" text: a step's target/scope, the
+	// parenthetical detail, the elapsed-time tail. Recedes behind the
+	// action label so the eye lands on the verb first. A defined gray
+	// (not ANSI dim) keeps the weight consistent across terminals.
+	cGray = "\x1b[38;2;148;148;148m" // #949494
 )
 
 // Symbol vocabulary. Each maps to a visual class:
@@ -92,6 +101,7 @@ var noColor = os.Getenv("NO_COLOR") != ""
 
 func arrow() string         { return colorize(cMint400, symArrow) }
 func check() string         { return colorize(cMint400, symCheck) }
+func checkApplied() string  { return colorize(cAmber, symCheck) }
 func checkFinal() string    { return colorize(cAurora, symCheck) }
 func cross() string         { return colorize(cRose, symCross) }
 func plus() string          { return colorize(cMint400, symPlus) }
@@ -117,6 +127,49 @@ func mintText(s string) string {
 // auroraText wraps a string in aurora — terminus lines only.
 func auroraText(s string) string {
 	return colorize(cAurora, s)
+}
+
+// descText colors secondary "description" text gray — a step's target,
+// scope, parenthetical detail, or elapsed-time tail. The color vocabulary
+// the renderer speaks: success ✓ = mint (check), failure ✗ = rose (cross),
+// the action label = terminal default (reads white on a dark theme without
+// hardcoding a color that would vanish on a light one), description = this
+// gray.
+func descText(s string) string {
+	return colorize(cGray, s)
+}
+
+// splitLabelDetail divides a step label into its action head and an
+// optional description tail — everything from the first " — " or " ("
+// onward (e.g. "streaming over ssh — soft-web" → "streaming over ssh" +
+// " — soft-web"; "packing . (procfile → scope soft)" → "packing ." +
+// " (procfile → scope soft)"). The tail recedes to gray; the head stays
+// in the default foreground.
+func splitLabelDetail(label string) (action, detail string) {
+	idx := -1
+
+	for _, sep := range []string{" — ", " ("} {
+		if i := strings.Index(label, sep); i >= 0 && (idx < 0 || i < idx) {
+			idx = i
+		}
+	}
+
+	if idx < 0 {
+		return label, ""
+	}
+
+	return label[:idx], label[idx:]
+}
+
+// paintLabel renders a step label with the action/description color
+// split: action head in default fg, description tail in gray.
+func paintLabel(label string) string {
+	action, detail := splitLabelDetail(label)
+	if detail == "" {
+		return action
+	}
+
+	return action + descText(detail)
 }
 
 // colorize is the inner primitive. NO_COLOR strips escapes; otherwise

@@ -249,16 +249,15 @@ func (f *progressFilter) processLineLocked(line string) {
 		}
 
 		if em == "-----> Build completed" {
+			// closeCurrentStepLocked commits "✓ building release" — that
+			// line already marks the build done, so we DON'T print a
+			// second "✓ built <tag> in Ns" terminus (it was redundant).
 			f.closeCurrentStepLocked()
 
 			if f.active {
 				f.stopSpinnerLocked()
 				f.active = false
 			}
-
-			total := time.Since(f.started).Round(time.Second)
-
-			fmt.Fprintf(f.out, "%s Built %s in %s\n", check(), f.tag, total)
 
 			f.buildClosed = true
 
@@ -399,8 +398,8 @@ func (f *progressFilter) renderSpinnerLocked() {
 	f.paintBrailleLocked()
 
 	fmt.Fprintf(f.out, " %s %s\n\x1b[2K\x1b[1A",
-		f.currentStep,
-		dim(fmt.Sprintf("(%s)", elapsed)),
+		paintLabel(f.currentStep),
+		descText(fmt.Sprintf("(%s)", elapsed)),
 	)
 }
 
@@ -426,7 +425,7 @@ func (f *progressFilter) closeCurrentStepLocked() {
 	elapsed := time.Since(f.stepStarted).Round(time.Second)
 
 	fmt.Fprintf(f.out, "\r\x1b[2K%s %s %s\n",
-		check(), f.currentStep, dim(fmt.Sprintf("(%s)", elapsed)))
+		check(), paintLabel(f.currentStep), descText(fmt.Sprintf("(%s)", elapsed)))
 
 	f.currentStep = ""
 }
@@ -712,7 +711,9 @@ func (a *applyResultFilter) Write(p []byte) (int, error) {
 		data = data[idx+1:]
 
 		if isApplyResultLine(line) {
-			fmt.Fprintf(a.out, "%s %s\n", check(), line)
+			// Amber, matching the NDJSON eventRenderer — resource-applied
+			// lines stand apart from mint step-completions.
+			fmt.Fprintf(a.out, "%s %s\n", checkApplied(), colorize(cAmber, line))
 
 			a.resourceCount++
 		} else {

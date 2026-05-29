@@ -20,8 +20,67 @@ package main
 
 import (
 	"os"
+	"regexp"
 	"strings"
+
+	"golang.org/x/term"
 )
+
+// termWidth returns the current terminal column count, defaulting to 80
+// when stdout isn't a terminal or the size can't be read. Used to
+// truncate the live build-log tail so a long line never wraps and breaks
+// the in-place block redraw.
+func termWidth() int {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 {
+		return 80
+	}
+
+	return w
+}
+
+// csiPattern matches ANSI CSI escape sequences (colors, cursor moves).
+// Build subprocess output piped over SSH is plain, but BuildKit and tool
+// output occasionally slip a sequence in; stripping keeps the tail block's
+// own cursor math honest.
+var csiPattern = regexp.MustCompile("\x1b\\[[0-9;?:]*[ -/]*[@-~]")
+
+// sanitizeTailLine strips escape sequences and control characters from a
+// raw build-output line so it renders as a single clean row in the tail
+// block. Tabs become spaces; CR / other controls are dropped.
+func sanitizeTailLine(s string) string {
+	s = csiPattern.ReplaceAllString(s, "")
+
+	s = strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return ' '
+		}
+
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+
+		return r
+	}, s)
+
+	return strings.TrimRight(s, " ")
+}
+
+// truncateVisible clips s to at most max runes, appending an ellipsis
+// when it had to cut. Operates on runes (post-sanitize, so rune count ≈
+// display width — wide CJK aside, which the build rarely emits).
+func truncateVisible(s string, max int) string {
+	if max <= 1 {
+		return ""
+	}
+
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+
+	return string(r[:max-1]) + "…"
+}
 
 // supportsTruecolor returns whether the host terminal claims 24-bit
 // color support. We honour the standard $COLORTERM=truecolor signal

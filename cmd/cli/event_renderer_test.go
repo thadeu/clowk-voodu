@@ -106,10 +106,10 @@ func TestEventRendererRenderStepLifecycle(t *testing.T) {
 	}
 }
 
-// TestEventRendererBuildSummaryReplacesText confirms the client
-// synthesises the overall `✓ Built <tag> in Ns` line from the
-// Summary("Build completed") frame. The raw "Build completed" text
-// must NOT appear — we replace it with the tagged summary.
+// TestEventRendererBuildSummaryReplacesText: the build step_end's
+// "✓ Building release" line is the build's only success line. The
+// "Build completed" summary prints nothing — no redundant "built <tag>"
+// terminus, and the raw "Build completed" text must not leak.
 func TestEventRendererBuildSummaryReplacesText(t *testing.T) {
 	var buf bytes.Buffer
 
@@ -128,19 +128,25 @@ func TestEventRendererBuildSummaryReplacesText(t *testing.T) {
 
 	got := stripANSI(buf.String())
 
-	if !strings.Contains(got, "✓ Built api in") {
-		t.Errorf("expected ✓ Built api in … summary:\n%s", got)
+	if !strings.Contains(got, "✓ Building release") {
+		t.Errorf("expected the build step ✓ line:\n%s", got)
+	}
+
+	if strings.Contains(got, "built api") {
+		t.Errorf("redundant 'built <tag>' terminus must be gone:\n%s", got)
 	}
 
 	if strings.Contains(got, "Build completed") {
-		t.Errorf("raw 'Build completed' text must not leak when Built summary is synthesised:\n%s", got)
+		t.Errorf("raw 'Build completed' text must not leak:\n%s", got)
 	}
 }
 
-// TestEventRendererDeployCompletedDroppedAfterBuild locks in the
-// de-duplication rule: once Build completed has fired, Deploy
-// completed is redundant and gets swallowed. Otherwise the user
-// would see two "success" lines for one deploy.
+// TestEventRendererDeployCompletedDroppedAfterBuild locks in two rules:
+//   - The build step_end's "✓ Building release" line is the build's only
+//     success line — the "Build completed" summary no longer prints a
+//     redundant "built <tag>" terminus.
+//   - Once Build completed has fired, the sibling "Deploy completed"
+//     summary is redundant and gets swallowed.
 func TestEventRendererDeployCompletedDroppedAfterBuild(t *testing.T) {
 	var buf bytes.Buffer
 
@@ -160,12 +166,16 @@ func TestEventRendererDeployCompletedDroppedAfterBuild(t *testing.T) {
 
 	got := stripANSI(buf.String())
 
-	if !strings.Contains(got, "✓ Built web in") {
-		t.Errorf("expected ✓ Built web line:\n%s", got)
+	if !strings.Contains(got, "✓ Building release") {
+		t.Errorf("expected the build step ✓ line:\n%s", got)
+	}
+
+	if strings.Contains(got, "built web in") {
+		t.Errorf("the redundant 'built <tag>' terminus must be gone:\n%s", got)
 	}
 
 	if strings.Contains(got, "Deploy completed successfully") {
-		t.Errorf("Deploy completed must be swallowed after Built summary:\n%s", got)
+		t.Errorf("Deploy completed must be swallowed after the build summary:\n%s", got)
 	}
 }
 
@@ -195,6 +205,34 @@ func TestEventRendererResultIsStyled(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in output:\n%s", want, got)
 		}
+	}
+}
+
+// TestEventRendererResultLineIsAmber pins the color choice: resource-
+// applied lines wear amber (✓ + ref), distinct from the mint step ✓s.
+func TestEventRendererResultLineIsAmber(t *testing.T) {
+	noColor = false
+	defer func() { noColor = false }()
+
+	var buf bytes.Buffer
+
+	r := forceEventRenderer(&buf, false)
+
+	writeEvents(t, r, []progress.Event{
+		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
+		{Type: progress.EventResult, Kind: "deployment", Scope: "soft", Name: "web", Action: "applied"},
+	})
+
+	raw := buf.String()
+
+	// cAmber == #FFC247 == 255;194;71.
+	if !strings.Contains(raw, "255;194;71") {
+		t.Errorf("result line should be amber-colored, raw output:\n%q", raw)
+	}
+
+	// And it must NOT use the mint step color for the result ✓/ref.
+	if strings.Contains(stripANSI(raw), "deployment/soft/web applied") == false {
+		t.Errorf("result ref/action should still render:\n%s", stripANSI(raw))
 	}
 }
 

@@ -72,6 +72,16 @@ type eventRenderer struct {
 	buildClosed      bool
 	frame            int
 
+	// Live build-log tail. While a step is active, raw sub-output lines
+	// (the docker build's BuildKit stream, lang banners) that aren't
+	// typed events get buffered here and rendered as a transient block of
+	// up to buildTailN gray rows beneath the spinner — so the operator
+	// sees which build phase is running. The block collapses on step end
+	// (success) or is kept (failure). blockRows tracks how many rows the
+	// live block currently occupies so the clear math wipes all of them.
+	tail      []string
+	blockRows int
+
 	stopCh chan struct{}
 	doneCh chan struct{}
 
@@ -83,6 +93,12 @@ type eventRenderer struct {
 	// safely (one will always be zero).
 	resourceCount int
 }
+
+// buildTailN is how many trailing build sub-output lines the live block
+// shows beneath the spinner — enough to read the current build phase as
+// it scrolls. The block collapses to a single ✓ line on success, so the
+// height only matters while the build is live.
+const buildTailN = 10
 
 func newEventRenderer(out io.Writer, verbose bool) *eventRenderer {
 	return &eventRenderer{
@@ -125,20 +141,33 @@ func (r *eventRenderer) Write(p []byte) (int, error) {
 func (r *eventRenderer) processLineLocked(line []byte) {
 	trimmed := bytes.TrimSpace(line)
 
-	// Blank line as visual separator — pass through clean. Skip the
-	// spinner-clear because there's nothing to overdraw.
+	// Blank line. During an active step it MUST be swallowed: a bare
+	// newline here would push the cursor below the live block without the
+	// block knowing, so the next redraw paints the spinner one row lower —
+	// the "stacked spinner" ghosting (build output is full of blank
+	// separator lines). Outside a step it's a real visual separator.
 	if len(trimmed) == 0 {
+		if r.active && r.currentStepLabel != "" {
+			return
+		}
+
 		fmt.Fprintln(r.out)
+
 		return
 	}
 
 	var e progress.Event
 
 	if err := json.Unmarshal(trimmed, &e); err != nil {
-		// Non-JSON frame — stderr leak (panic trace) or legacy text.
-		// Clear the spinner row so the raw line lands clean.
-		if r.active {
-			fmt.Fprint(r.out, "\r\x1b[2K")
+		// Non-JSON frame: during a build it's the docker/BuildKit
+		// sub-output (and lang banners) interleaved on the stream — feed
+		// it to the live tail block instead of printing inline, so it
+		// shows the current phase and collapses on step end. Outside an
+		// active step it's a stderr leak / legacy line → print clean.
+		if r.active && r.currentStepLabel != "" {
+			r.pushTailLocked(string(line))
+
+			return
 		}
 
 		fmt.Fprintln(r.out, string(line))
@@ -193,9 +222,12 @@ func (r *eventRenderer) handleStepStartLocked(e progress.Event) {
 	r.currentStepLabel = e.Label
 	r.stepStarted = time.Now()
 
+	// Each step owns its own tail block — a fresh step starts empty.
+	r.tail = nil
+
 	// Synchronous first frame so sub-second steps still flash at least
 	// one spinner glyph before the ticker fires.
-	r.renderSpinnerLocked()
+	r.renderBlockLocked()
 }
 
 func (r *eventRenderer) handleStepEndLocked(e progress.Event) {
@@ -205,14 +237,28 @@ func (r *eventRenderer) handleStepEndLocked(e progress.Event) {
 
 	elapsed := time.Since(r.stepStarted).Round(time.Second)
 
+	// Wipe the live block (spinner + tail) so the committed line lands
+	// clean over the top row.
+	r.clearBlockLocked()
+
 	switch e.Status {
 	case progress.StatusOK:
-		fmt.Fprintf(r.out, "\r\x1b[2K%s %s %s\n",
-			check(), r.currentStepLabel, dim(fmt.Sprintf("(%s)", elapsed)))
+		// Success collapses the block — just the green ✓ line remains.
+		fmt.Fprintf(r.out, "%s %s %s\n",
+			check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
 
 	case progress.StatusFail:
-		fmt.Fprintf(r.out, "\r\x1b[2K%s %s %s\n",
-			cross(), r.currentStepLabel, dim(fmt.Sprintf("(%s)", elapsed)))
+		// Failure keeps the build tail: the last few lines are usually
+		// where it broke, so they stay on screen as committed gray rows
+		// beneath the ✗, above the reconciler's error.
+		fmt.Fprintf(r.out, "%s %s %s\n",
+			cross(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
+
+		width := termWidth()
+
+		for _, t := range r.tail {
+			fmt.Fprintf(r.out, "  %s\n", descText(truncateVisible(t, width-2)))
+		}
 
 		if e.Error != "" {
 			fmt.Fprintf(r.out, "  %s\n", colorize(cRose, e.Error))
@@ -221,13 +267,13 @@ func (r *eventRenderer) handleStepEndLocked(e progress.Event) {
 	case progress.StatusCancel:
 		// Neutral clear — no claim of success or failure. Caller emits
 		// the user-facing "Apply canceled." line next.
-		fmt.Fprint(r.out, "\r\x1b[2K")
 
 	default:
-		fmt.Fprintf(r.out, "\r\x1b[2K%s %s %s\n",
-			check(), r.currentStepLabel, dim(fmt.Sprintf("(%s)", elapsed)))
+		fmt.Fprintf(r.out, "%s %s %s\n",
+			check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
 	}
 
+	r.tail = nil
 	r.currentStepID = ""
 	r.currentStepLabel = ""
 }
@@ -236,14 +282,14 @@ func (r *eventRenderer) handleLogLocked(e progress.Event) {
 	switch e.Level {
 	case progress.LevelWarn:
 		if r.active {
-			fmt.Fprint(r.out, "\r\x1b[2K")
+			r.clearBlockLocked()
 		}
 
 		fmt.Fprintf(r.out, "%s %s\n", warn(), e.Text)
 
 	case progress.LevelError:
 		if r.active {
-			fmt.Fprint(r.out, "\r\x1b[2K")
+			r.clearBlockLocked()
 		}
 
 		fmt.Fprintf(r.out, "%s %s\n", cross(), e.Text)
@@ -251,7 +297,9 @@ func (r *eventRenderer) handleLogLocked(e progress.Event) {
 	default:
 		// info inside an active step gets swallowed (spinner is the
 		// story) but we still advance the frame so chatter-heavy phases
-		// animate even when the ticker is lock-starved.
+		// animate even when the ticker is lock-starved. The live build
+		// tail is fed by the RAW build sub-output (non-JSON frames in
+		// processLineLocked), not by these structured info logs.
 		if r.active {
 			r.advanceAndRenderLocked()
 			return
@@ -263,7 +311,7 @@ func (r *eventRenderer) handleLogLocked(e progress.Event) {
 
 func (r *eventRenderer) handleResultLocked(e progress.Event) {
 	if r.active {
-		fmt.Fprint(r.out, "\r\x1b[2K")
+		r.clearBlockLocked()
 	}
 
 	ref := e.Kind + "/" + e.Name
@@ -271,7 +319,10 @@ func (r *eventRenderer) handleResultLocked(e progress.Event) {
 		ref = e.Kind + "/" + e.Scope + "/" + e.Name
 	}
 
-	fmt.Fprintf(r.out, "%s %s %s\n", check(), ref, e.Action)
+	// Resource-applied lines wear amber (✓ + ref) to set them apart from
+	// the mint step-completions — the eye reads "these are the things that
+	// changed" distinctly from "this build/stream phase finished".
+	fmt.Fprintf(r.out, "%s %s %s\n", checkApplied(), colorize(cAmber, ref), descText(e.Action))
 
 	r.resourceCount++
 }
@@ -296,17 +347,15 @@ func (r *eventRenderer) handleSummaryLocked(e progress.Event) {
 
 	switch {
 	case strings.HasPrefix(e.Text, "Build completed"):
-		// Built X in Ns — synthesizes the overall build banner from
-		// the first step_start of this run. Mint ✓ (not aurora) — this
-		// is the build phase ending, not the whole apply.
+		// The "✓ building release (Ns)" step line (emitted by the build
+		// step_end) already marks the build done — so we DON'T print a
+		// second "✓ built <tag> in Ns" terminus here; it was redundant.
+		// We still stop the spinner and flag buildClosed so the later
+		// "Deploy completed" summary is de-duplicated.
 		if r.active {
 			r.stopSpinnerLocked()
 			r.active = false
 		}
-
-		total := time.Since(r.started).Round(time.Second)
-
-		fmt.Fprintf(r.out, "%s Built %s in %s\n", check(), r.tag, total)
 
 		r.buildClosed = true
 
@@ -343,44 +392,89 @@ func (r *eventRenderer) handleSummaryLocked(e progress.Event) {
 	}
 }
 
-// renderSpinnerLocked paints the active step line — spinner glyph (or
-// inline image) + label + elapsed-time tail. Cleared/repainted on
-// every frame tick; the cursor stays parked at the start of the line
-// so the next frame overwrites in place.
+// renderBlockLocked paints the live block in place: row 0 is the spinner
+// (braille glyph + label + elapsed tail); below it, up to buildTailN gray
+// rows mirror the most recent build sub-output. The cursor enters and
+// leaves at the block's top row, column 0, so each tick overwrites the
+// whole block cleanly. Tail rows are truncated to the terminal width — a
+// wrapped line would add screen rows the cursor-up count doesn't know
+// about, desyncing every subsequent redraw.
 //
 // Caller must hold r.mu.
-func (r *eventRenderer) renderSpinnerLocked() {
+func (r *eventRenderer) renderBlockLocked() {
 	if !r.active || r.currentStepLabel == "" {
 		return
 	}
 
 	elapsed := time.Since(r.stepStarted).Round(time.Second)
+	frames := []rune(brailleFrames)
 
-	// Clear line, park cursor at column 0, paint braille frame +
-	// label + dim elapsed-time tail.
-	fmt.Fprint(r.out, "\r\x1b[2K")
-	r.paintBrailleLocked()
+	var b strings.Builder
 
-	fmt.Fprintf(r.out, " %s %s",
-		r.currentStepLabel,
-		dim(fmt.Sprintf("(%s)", elapsed)),
-	)
+	// Row 0 — spinner glyph + label + elapsed.
+	b.WriteString("\r\x1b[2K")
+	b.WriteString(colorize(cMint400, string(frames[r.frame%len(frames)])))
+	b.WriteString(" ")
+	b.WriteString(paintLabel(r.currentStepLabel))
+	b.WriteString(" ")
+	b.WriteString(descText(fmt.Sprintf("(%s)", elapsed)))
 
-	// The trailing CR + line-up dance keeps the cursor positioned for
-	// the next overwrite. Without it, log lines emitted while a
-	// spinner is active would push the spinner down and leave its
-	// last frame as a dangling ghost row.
-	fmt.Fprint(r.out, "\n\x1b[2K\x1b[1A")
+	// Tail rows — gray, indented, truncated to the terminal width.
+	width := termWidth()
+
+	for _, t := range r.tail {
+		b.WriteString("\n\x1b[2K  ")
+		b.WriteString(descText(truncateVisible(t, width-2)))
+	}
+
+	// Park the cursor back at the top row, column 0.
+	if n := len(r.tail); n > 0 {
+		fmt.Fprintf(&b, "\x1b[%dA", n)
+	}
+
+	b.WriteString("\r")
+
+	fmt.Fprint(r.out, b.String())
+
+	r.blockRows = 1 + len(r.tail)
 }
 
-// paintBrailleLocked emits one mint-colored braille frame at the
-// cursor's current position. Cursor must already be at the line
-// start (caller clears with \r\x1b[2K beforehand).
-func (r *eventRenderer) paintBrailleLocked() {
-	frames := []rune(brailleFrames)
-	frame := frames[r.frame%len(frames)]
+// clearBlockLocked wipes the live block (spinner row + tail rows) and
+// returns the cursor to the top row, column 0, so the caller can print a
+// committed line over it. Inverse of renderBlockLocked's cursor walk.
+func (r *eventRenderer) clearBlockLocked() {
+	fmt.Fprint(r.out, "\r\x1b[2K")
 
-	fmt.Fprint(r.out, colorize(cMint400, string(frame)))
+	for i := 1; i < r.blockRows; i++ {
+		fmt.Fprint(r.out, "\n\x1b[2K")
+	}
+
+	if r.blockRows > 1 {
+		fmt.Fprintf(r.out, "\x1b[%dA", r.blockRows-1)
+	}
+
+	fmt.Fprint(r.out, "\r")
+
+	r.blockRows = 1
+}
+
+// pushTailLocked records a raw build sub-output line in the tail ring
+// (capped at buildTailN) and redraws the block. Blank/uninformative lines
+// don't earn a row but still advance the spinner so it never freezes
+// during a quiet stretch of the build.
+func (r *eventRenderer) pushTailLocked(raw string) {
+	frames := []rune(brailleFrames)
+	r.frame = (r.frame + 1) % len(frames)
+
+	if line := sanitizeTailLine(raw); line != "" {
+		r.tail = append(r.tail, line)
+
+		if len(r.tail) > buildTailN {
+			r.tail = r.tail[len(r.tail)-buildTailN:]
+		}
+	}
+
+	r.renderBlockLocked()
 }
 
 func (r *eventRenderer) advanceAndRenderLocked() {
@@ -391,7 +485,7 @@ func (r *eventRenderer) advanceAndRenderLocked() {
 	frames := []rune(brailleFrames)
 	r.frame = (r.frame + 1) % len(frames)
 
-	r.renderSpinnerLocked()
+	r.renderBlockLocked()
 }
 
 func (r *eventRenderer) closeCurrentStepLocked() {
@@ -401,9 +495,13 @@ func (r *eventRenderer) closeCurrentStepLocked() {
 
 	elapsed := time.Since(r.stepStarted).Round(time.Second)
 
-	fmt.Fprintf(r.out, "\r\x1b[2K%s %s %s\n",
-		check(), r.currentStepLabel, dim(fmt.Sprintf("(%s)", elapsed)))
+	// Implicit close = the prior step succeeded, so collapse its block.
+	r.clearBlockLocked()
 
+	fmt.Fprintf(r.out, "%s %s %s\n",
+		check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
+
+	r.tail = nil
 	r.currentStepID = ""
 	r.currentStepLabel = ""
 }
@@ -472,8 +570,9 @@ func (r *eventRenderer) Close() error {
 
 	if r.active {
 		r.stopSpinnerLocked()
-		fmt.Fprint(r.out, "\r\x1b[2K")
+		r.clearBlockLocked()
 		r.active = false
+		r.tail = nil
 		r.currentStepID = ""
 		r.currentStepLabel = ""
 	}

@@ -110,19 +110,23 @@ func TestProgressFilterCollapsesBuildBlock(t *testing.T) {
 	got := stripANSI(out.String())
 
 	// Must keep: each step banner becomes a committed `✓ <step> (Ns)`
-	// line when it closes. Pruned is a passthrough banner that emits
-	// its own ✓ inline. Build completed → overall `✓ Built <tag> in
-	// Ns` summary.
+	// line when it closes. Pruned is a passthrough banner that emits its
+	// own ✓ inline. "Build completed" closes the build step (committing
+	// "✓ Building release...") but no longer prints a redundant
+	// "✓ built <tag>" terminus.
 	for _, want := range []string{
 		"✓ Shipping web",
 		"✓ Creating release fb4b418b872f",
 		"✓ Building release...",
-		"✓ Built web in",
 		"✓ Pruned 1 old release(s)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in output:\n%s", want, got)
 		}
+	}
+
+	if strings.Contains(got, "built web in") {
+		t.Errorf("redundant 'built <tag>' terminus must be gone:\n%s", got)
 	}
 
 	// Must drop: the raw `----->` prefixed banners (replaced by their

@@ -64,6 +64,91 @@ func TestCheckVsCheckFinal(t *testing.T) {
 	}
 }
 
+// TestSplitLabelDetail pins the action/description boundary: everything
+// from the first " — " or " (" onward is the description tail, and the
+// earliest separator wins. Drives paintLabel's gray-the-tail behavior.
+func TestSplitLabelDetail(t *testing.T) {
+	cases := []struct {
+		label, action, detail string
+	}{
+		{"building release", "building release", ""},
+		{"streaming over ssh — soft-web", "streaming over ssh", " — soft-web"},
+		{"packing . (procfile → scope soft)", "packing .", " (procfile → scope soft)"},
+		{"deployment/soft/web", "deployment/soft/web", ""},
+		// Earliest separator wins: " (" at index 1 beats " — " later.
+		{"a (b) — c", "a", " (b) — c"},
+	}
+
+	for _, tc := range cases {
+		action, detail := splitLabelDetail(tc.label)
+		if action != tc.action || detail != tc.detail {
+			t.Errorf("splitLabelDetail(%q) = (%q,%q), want (%q,%q)",
+				tc.label, action, detail, tc.action, tc.detail)
+		}
+	}
+}
+
+// TestPaintLabel pins the color split: the action head stays plain
+// (terminal default fg), the description tail is wrapped gray. With
+// NO_COLOR it's a lossless round-trip (split then rejoin, no bytes
+// added or dropped).
+func TestPaintLabel(t *testing.T) {
+	t.Run("color: action plain, detail gray", func(t *testing.T) {
+		noColor = false
+
+		got := paintLabel("streaming over ssh — soft-web")
+
+		// Action is not wrapped — the line starts with the bare verb.
+		if !strings.HasPrefix(got, "streaming over ssh") {
+			t.Errorf("action head should be plain, got: %q", got)
+		}
+
+		// Detail is grayed.
+		if !strings.Contains(got, "148;148;148") {
+			t.Errorf("detail tail should be gray, got: %q", got)
+		}
+	})
+
+	t.Run("no detail: no color", func(t *testing.T) {
+		noColor = false
+
+		if got := paintLabel("building release"); got != "building release" {
+			t.Errorf("label without a detail tail must be untouched, got: %q", got)
+		}
+	})
+
+	t.Run("NO_COLOR: lossless round-trip", func(t *testing.T) {
+		noColor = true
+		defer func() { noColor = false }()
+
+		for _, label := range []string{
+			"streaming over ssh — soft-web",
+			"packing . (procfile → scope soft)",
+			"building release",
+		} {
+			if got := paintLabel(label); got != label {
+				t.Errorf("NO_COLOR paintLabel(%q) = %q, want round-trip", label, got)
+			}
+		}
+	})
+}
+
+// TestDescText pins the description gray + NO_COLOR strip.
+func TestDescText(t *testing.T) {
+	noColor = false
+
+	if got := descText("(0s)"); !strings.Contains(got, "148;148;148") || !strings.HasSuffix(got, "\x1b[0m") {
+		t.Errorf("descText should wrap in gray + reset, got: %q", got)
+	}
+
+	noColor = true
+	defer func() { noColor = false }()
+
+	if got := descText("(0s)"); got != "(0s)" {
+		t.Errorf("NO_COLOR descText should be bare, got: %q", got)
+	}
+}
+
 // TestDiffSymbolsHaveDistinctColors pins the +/~/- vocabulary. A
 // regression that painted all three with the same color would
 // flatten the diff visual and force operators to read every line

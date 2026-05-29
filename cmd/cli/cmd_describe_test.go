@@ -1059,3 +1059,61 @@ func TestRenderPodDetailShowsEnvWhenFlagged(t *testing.T) {
 		t.Errorf("--show-env hint should not appear when already revealed:\n%s", out)
 	}
 }
+
+// TestRenderIngressSummary_ReconcileError pins the ingress observability
+// fix: a recorded reconcile failure surfaces in `vd describe ingress`
+// (rose ✗ + reason) instead of the old silent "(no status recorded
+// yet)". Plugin info still renders alongside.
+func TestRenderIngressSummary_ReconcileError(t *testing.T) {
+	noColor = true
+	defer func() { noColor = false }()
+
+	st := controller.IngressStatus{
+		Plugin:             "caddy",
+		LastReconcileError: "ingress: deployment lp2-web has no live replicas yet",
+		LastReconcileAt:    time.Now().Add(-5 * time.Minute),
+	}
+
+	blob, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var buf bytes.Buffer
+	renderIngressSummary(&buf, blob)
+
+	out := buf.String()
+
+	for _, want := range []string{"reconcile error", "no live replicas yet", "plugin: caddy"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ingress summary missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderIngressSummary_Healthy: a clean status shows plugin/data with
+// no reconcile-error block.
+func TestRenderIngressSummary_Healthy(t *testing.T) {
+	noColor = true
+	defer func() { noColor = false }()
+
+	st := controller.IngressStatus{
+		Plugin: "caddy",
+		Data:   map[string]any{"host": "web.example.com"},
+	}
+
+	blob, _ := json.Marshal(st)
+
+	var buf bytes.Buffer
+	renderIngressSummary(&buf, blob)
+
+	out := buf.String()
+
+	if strings.Contains(out, "reconcile error") {
+		t.Errorf("healthy ingress must not show a reconcile error:\n%s", out)
+	}
+
+	if !strings.Contains(out, "plugin: caddy") {
+		t.Errorf("healthy ingress should show plugin:\n%s", out)
+	}
+}
