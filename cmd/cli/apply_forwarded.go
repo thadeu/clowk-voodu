@@ -35,6 +35,15 @@ import (
 // when Stdin is a stream). Non-interactive callers must pass
 // --auto-approve or the orchestrator refuses to proceed.
 func runApplyForwarded(info *remote.Info, identity string, stream streamResult, flags applyClientFlags) (int, error) {
+	// No manifest resolved (`vd apply -f` with no value, no `-f` at all,
+	// or `-f <path>` that matched no file). rewriteForStdinStream leaves
+	// stdin nil in that case; reading it would SIGSEGV. Fail with a clear
+	// message instead of a panic.
+	if stream.stdin == nil {
+		return 1, fmt.Errorf("nothing to apply: pass a manifest with -f " +
+			"(e.g. `vd apply -f Procfile`, `vd apply -f web`, or `vd apply -f ./dir`)")
+	}
+
 	// Drain stream.stdin once into memory so both SSH calls see the
 	// same bytes. Manifest JSON is KB-scale; buffering is fine and
 	// removes the "user edits the HCL between diff and apply" gotcha.

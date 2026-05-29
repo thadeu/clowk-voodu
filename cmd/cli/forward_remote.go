@@ -91,6 +91,43 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		identity = info.Identity
 	}
 
+	// `vd apply` / `vd apply -f` with no manifest path → discover one:
+	// Procfile first, else .voodu/. Rebuild the argv with the discovered
+	// `-f <target>` so the routing below treats it like an explicit -f
+	// (procfile flow for a Procfile, dir-apply for .voodu/).
+	if isApplyCommand(forwardArgs) {
+		if paths, _, rest := splitFileAndFormatFlags(forwardArgs); len(paths) == 0 {
+			if discovered := discoverApplyFiles(); len(discovered) > 0 {
+				rebuilt := append([]string{}, rest...)
+
+				for _, d := range discovered {
+					rebuilt = append(rebuilt, "-f", d)
+				}
+
+				forwardArgs = rebuilt
+			}
+		}
+	}
+
+	// Procfile apply is its own path: there's no HCL to parse client-
+	// side (the server reads the Procfile from the shipped source tree
+	// and generates the specs). Intercept BEFORE rewriteForStdinStream,
+	// which would choke trying to HCL-parse a `type: command` file.
+	if isApplyCommand(forwardArgs) {
+		if pa, ok := detectProcfileApply(forwardArgs); ok {
+			code, err := runProcfileForwarded(info, identity, pa)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+
+				if code == 0 {
+					code = 1
+				}
+			}
+
+			return code, true
+		}
+	}
+
 	// Manifest commands (apply/diff/delete) consume local files. We
 	// parse them here — on the dev machine where ${VAR} can resolve —
 	// and forward the result as JSON on stdin.

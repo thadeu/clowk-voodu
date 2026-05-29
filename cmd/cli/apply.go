@@ -56,6 +56,8 @@ type applyFlags struct {
 	verbose          bool   // apply only: passthrough raw build output instead of collapsing to a spinner
 	dryRun           bool   // delete only: print the plan and exit without removing anything
 	prune            bool   // delete only: also wipe config + on-disk app/volume dirs
+	app              string // apply only: Procfile mode scope (default: random 3-char id)
+	eject            bool   // apply only: scaffold an HCL .voodu from a Procfile instead of applying
 }
 
 func newApplyCmd() *cobra.Command {
@@ -114,6 +116,8 @@ raw stream when debugging a failed build.`,
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
 	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
 	cmd.Flags().BoolVarP(&f.verbose, "verbose", "v", false, "show raw docker build output (default: collapse into a spinner)")
+	cmd.Flags().StringVar(&f.app, "app", "", "Procfile mode: scope for the generated resources (default: a random 3-char id)")
+	cmd.Flags().BoolVar(&f.eject, "eject", false, "Procfile mode: write an equivalent .voodu file instead of applying")
 
 	return cmd
 }
@@ -240,6 +244,36 @@ before committing to the destructive operation.`,
 }
 
 func runApply(cmd *cobra.Command, f applyFlags) error {
+	// `vd apply` with no -f → discover an implicit target: Procfile
+	// first, else the .voodu/ dir. Keeps the zero-arg "deploy this
+	// project" ergonomics symmetric with the forwarded (remote) path.
+	if len(f.files) == 0 {
+		if discovered := discoverApplyFiles(); len(discovered) > 0 {
+			f.files = discovered
+		}
+	}
+
+	// Procfile mode: a `-f Procfile` (or --format procfile) input is not
+	// HCL. This local path is reached only when NO remote is configured
+	// (the remote path is intercepted in maybeForwardRemote before HCL
+	// parsing). --eject works fully offline; the runtime transform needs
+	// the server-side receive-pack fan-out, so a bare local apply with a
+	// Procfile points the operator at the remote flow.
+	if path, ok := procfilePathFromFiles(f.files, f.format); ok {
+		scope, err := resolveProcfileScope(f.app, path)
+		if err != nil {
+			return err
+		}
+
+		pa := procfileApply{path: path, scope: scope, eject: f.eject, force: f.force, verbose: f.verbose}
+
+		if f.eject {
+			return runProcfileEject(pa, scope)
+		}
+
+		return fmt.Errorf("Procfile apply requires a configured remote: run `vd remote add <user@host>` then `vd apply -f %s`, or pass --eject to scaffold an HCL file locally", path)
+	}
+
 	mans, err := loadManifests(cmd, f)
 	if err != nil {
 		return err
@@ -1337,24 +1371,39 @@ func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]s
 	return mergeEnvFilesInManifests(mans, filepath.Dir(resolved))
 }
 
-// resolveManifestPath adds a manifest extension when the user omitted
-// one. `voodu apply -f api` should just work when api.voodu (or .hcl,
-// .vdu, .vd) is sitting next to it.
+// resolveManifestPath locates the manifest file for a `-f` argument,
+// adding a manifest extension when the user omitted one AND preferring
+// voodu's project home `.voodu/`.
+//
+// Search order, first hit wins:
+//   1. `.voodu/<path>`  (+ `.hcl/.voodu/.vdu/.vd`)
+//   2. `<path>`         (+ `.hcl/.voodu/.vdu/.vd`)  ← today's behaviour
+//
+// So `vd apply -f web` finds `.voodu/web.voodu` if present, else a
+// root-level `web.voodu`. `vd apply -f infra/web` → `.voodu/infra/web.*`
+// first, else `infra/web.*`. Keeping manifests under `.voodu/` (next to
+// app.json) declutters the repo root and pairs with `--eject`, which
+// writes there. Absolute paths and stdin ("-") skip the `.voodu/` prefix.
 func resolveManifestPath(path string) (string, os.FileInfo, error) {
-	if info, err := os.Stat(path); err == nil {
-		return path, info, nil
+	bases := []string{path}
+	if path != "-" && !filepath.IsAbs(path) {
+		bases = []string{filepath.Join(vooduDir, path), path}
 	}
 
-	for _, ext := range []string{".hcl", ".voodu", ".vdu", ".vd"} {
-		candidate := path + ext
+	for _, base := range bases {
+		// Exact match first (path already carries an extension, or names
+		// a directory), then extension expansion.
+		for _, ext := range []string{"", ".hcl", ".voodu", ".vdu", ".vd"} {
+			candidate := base + ext
 
-		if info, err := os.Stat(candidate); err == nil {
-			return candidate, info, nil
+			if info, err := os.Stat(candidate); err == nil {
+				return candidate, info, nil
+			}
 		}
 	}
 
 	// Fall back to the original path so the error message names what the
-	// user typed, not an extension the user didn't write.
+	// user typed, not a prefix/extension they didn't write.
 	_, err := os.Stat(path)
 
 	return path, nil, err

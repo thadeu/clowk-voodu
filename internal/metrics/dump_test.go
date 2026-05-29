@@ -18,7 +18,6 @@ import (
 // rows on the boundary (chart has holes).
 func TestDump_FiltersBySince(t *testing.T) {
 	dir := t.TempDir()
-	today := time.Now().UTC().Format("2006-01-02")
 
 	// Three rows spaced 1s apart. Boundary row sits exactly at since;
 	// dump uses strict > so it must NOT appear in the output.
@@ -28,7 +27,11 @@ func TestDump_FiltersBySince(t *testing.T) {
 		`{"ts":"2026-05-25T10:00:02Z","source":"system","cpu_percent":12.0}`,
 	}
 
-	writeNDJSON(t, filepath.Join(dir, "metrics-"+today+".ndjson"), lines)
+	// Filename date MUST match the rows' date: listFiles picks files by
+	// the [Since, Now] day window, so a file dated outside it is skipped
+	// entirely. Using a literal date (not time.Now()) keeps the test
+	// deterministic regardless of the wall clock.
+	writeNDJSON(t, filepath.Join(dir, "metrics-2026-05-25.ndjson"), lines)
 
 	since, _ := time.Parse(time.RFC3339, "2026-05-25T10:00:01Z")
 	now, _ := time.Parse(time.RFC3339, "2026-05-25T10:00:03Z")
@@ -97,8 +100,9 @@ func TestDump_PassesGzipRotated(t *testing.T) {
 // match because it shares the same on-disk source of truth.
 func TestDump_TolerantOfCorruptLine(t *testing.T) {
 	dir := t.TempDir()
-	today := time.Now().UTC().Format("2006-01-02")
-	path := filepath.Join(dir, "metrics-"+today+".ndjson")
+	// Literal date matching the rows below — see TestDump_FiltersBySince
+	// for why a time.Now()-derived filename drifts out of the day window.
+	path := filepath.Join(dir, "metrics-2026-05-25.ndjson")
 
 	body := strings.Join([]string{
 		`{"ts":"2026-05-25T10:00:00Z","source":"system","cpu_percent":10.0}`,
@@ -144,9 +148,12 @@ func TestDump_TolerantOfCorruptLine(t *testing.T) {
 // path here means false-alarm logs every 30s.
 func TestDump_EmptyOnNoMatch(t *testing.T) {
 	dir := t.TempDir()
-	today := time.Now().UTC().Format("2006-01-02")
 
-	writeNDJSON(t, filepath.Join(dir, "metrics-"+today+".ndjson"), []string{
+	// Literal date matching the row — with a time.Now()-derived name the
+	// file falls outside the day window and the dump comes back empty
+	// for the WRONG reason (file skipped, not since-filtered). Pinning
+	// the date makes this genuinely exercise the "caught up → empty" path.
+	writeNDJSON(t, filepath.Join(dir, "metrics-2026-05-25.ndjson"), []string{
 		`{"ts":"2026-05-25T10:00:00Z","source":"system","cpu_percent":10.0}`,
 	})
 

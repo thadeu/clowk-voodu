@@ -32,8 +32,9 @@ import (
 // CLI drives it via SSH from `voodu apply`.
 func newReceivePackCmd() *cobra.Command {
 	var (
-		force      bool
-		specBase64 string
+		force         bool
+		specBase64    string
+		procfileScope string
 	)
 
 	cmd := &cobra.Command{
@@ -63,8 +64,22 @@ CLIs, manual receive-pack invocations), the pipeline falls back to
 fetching the spec from the local controller and finally to
 auto-detection if neither resolves.`,
 		Hidden: true,
-		Args:   cobra.ExactArgs(1),
+		// Procfile mode takes NO positional ref (the scope rides in via
+		// --procfile and the names come from the Procfile); the classic
+		// per-(scope,name) mode takes exactly one.
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Procfile fan-out: read the Procfile from the shipped tree,
+			// generate + persist + build every process. See
+			// runProcfileReceive.
+			if procfileScope != "" {
+				return runProcfileReceive(cmd, procfileScope, os.Stdin, force)
+			}
+
+			if len(args) != 1 {
+				return fmt.Errorf("receive-pack requires a <scope>/<name> ref (or --procfile <scope>)")
+			}
+
 			scope, name, err := parseScopedRef(args[0])
 			if err != nil {
 				return err
@@ -96,6 +111,7 @@ auto-detection if neither resolves.`,
 
 	cmd.Flags().BoolVar(&force, "force", false, "rebuild even if a release with the same content hash already exists")
 	cmd.Flags().StringVar(&specBase64, "spec", "", "base64-encoded JSON of the deployment build spec (CLI-driven; skips controller FetchSpec)")
+	cmd.Flags().StringVar(&procfileScope, "procfile", "", "Procfile fan-out: read Procfile from the tree, generate + build every process under this scope")
 
 	return cmd
 }
