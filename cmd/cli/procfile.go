@@ -128,9 +128,9 @@ func procfilePathFromFiles(files []string, format string) (string, bool) {
 // discoverApplyFiles resolves the implicit `-f` target when the operator
 // runs `vd apply` (or `vd apply -f`) with no manifest:
 //
-//   1. ./Procfile exists → apply it (the migration on-ramp).
-//   2. else .voodu/ holds manifests → apply the whole dir.
-//   3. else → nil, so the caller emits the normal "nothing to apply".
+//  1. ./Procfile exists → apply it (the migration on-ramp).
+//  2. else .voodu/ holds manifests → apply the whole dir.
+//  3. else → nil, so the caller emits the normal "nothing to apply".
 //
 // Returns the value(s) to feed `-f`, and prints what it picked so the
 // operator sees the implicit choice.
@@ -196,12 +196,6 @@ const (
 	appLinkFile = "app.json"
 )
 
-// projectLink is the schema of `.voodu/app.json`. Minimal today; the
-// JSON shape leaves room to grow into a fuller app manifest later.
-type projectLink struct {
-	Scope string `json:"scope"`
-}
-
 // resolveProcfileScope returns the scope every generated resource lands
 // under, with STABLE identity across applies:
 //
@@ -258,30 +252,65 @@ func resolveProcfileScope(app, procfilePath string) (string, error) {
 	return s, nil
 }
 
+// readAppFile loads `<dir>/.voodu/app.json` into a procfile.AppFile.
+// Returns (nil, nil) when the file is absent — a not-yet-linked project.
+func readAppFile(dir string) (*procfile.AppFile, error) {
+	data, err := os.ReadFile(filepath.Join(dir, vooduDir, appLinkFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return procfile.ParseAppFile(data)
+}
+
+// appIngressFor returns the per-process ingress declared in
+// `<dir>/.voodu/app.json`, or nil when there's none.
+func appIngressFor(dir string) map[string]procfile.AppIngress {
+	app, err := readAppFile(dir)
+	if err != nil || app == nil {
+		return nil
+	}
+
+	return app.Ingress
+}
+
 // readProjectScope returns the scope recorded in `<dir>/.voodu/app.json`,
 // or "" when the file is absent / unreadable / has no scope.
 func readProjectScope(dir string) string {
-	data, err := os.ReadFile(filepath.Join(dir, vooduDir, appLinkFile))
-	if err != nil {
+	app, err := readAppFile(dir)
+	if err != nil || app == nil {
 		return ""
 	}
 
-	var link projectLink
-	if json.Unmarshal(data, &link) != nil {
-		return ""
-	}
-
-	return strings.TrimSpace(link.Scope)
+	return strings.TrimSpace(app.Scope)
 }
 
-// writeProjectLink materialises `<dir>/.voodu/app.json` with the scope.
+// writeProjectLink materialises `<dir>/.voodu/app.json` with the scope,
+// PRESERVING any existing fields (notably the hand-authored `ingress`
+// block) so a scope change via --app doesn't clobber the operator's
+// routing config.
 func writeProjectLink(dir, scope string) error {
+	app, err := readAppFile(dir)
+	if err != nil {
+		return err
+	}
+
+	if app == nil {
+		app = &procfile.AppFile{}
+	}
+
+	app.Scope = scope
+
 	d := filepath.Join(dir, vooduDir)
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return err
 	}
 
-	b, err := json.MarshalIndent(projectLink{Scope: scope}, "", "  ")
+	b, err := json.MarshalIndent(app, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -369,7 +398,10 @@ func runProcfileEject(pa procfileApply, scope string) error {
 		return err
 	}
 
-	hcl, err := procfile.ToHCL(procs, procfile.Options{Scope: scope})
+	hcl, err := procfile.ToHCL(procs, procfile.Options{
+		Scope:   scope,
+		Ingress: appIngressFor(filepath.Dir(pa.path)),
+	})
 	if err != nil {
 		return err
 	}
@@ -418,9 +450,15 @@ func pushProcfileTarball(info *remote.Info, identity string, pa procfileApply, s
 	}
 
 	go func() {
+		// `.voodu/` is excluded from the build context by default (it's
+		// voodu metadata). Re-include ONLY app.json so the server can
+		// read the ingress declarations from the extracted tree — the
+		// negation rides as an ExtraIgnore appended after the builtins,
+		// leaving everything else under `.voodu/` excluded.
 		_, err := tarball.Stream(pw, dir, tarball.Options{
-			MaxSize:  buildContextMaxSize(),
-			Progress: tarProgress,
+			MaxSize:      buildContextMaxSize(),
+			Progress:     tarProgress,
+			ExtraIgnores: []string{"!" + filepath.ToSlash(filepath.Join(vooduDir, appLinkFile))},
 		})
 		_ = pw.CloseWithError(err)
 	}()

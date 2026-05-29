@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -93,6 +94,12 @@ type Options struct {
 	// The CLI resolves this from --app or a random short id; the
 	// transform itself never invents it.
 	Scope string
+
+	// Ingress is the per-process ingress declared in .voodu/app.json,
+	// keyed by process name. Each entry emits an `ingress` manifest
+	// alongside that process's deployment. nil = no routing (the
+	// Procfile default).
+	Ingress map[string]AppIngress
 }
 
 // Parse reads a Procfile and returns its process lines in declaration
@@ -158,17 +165,20 @@ func Parse(r io.Reader) ([]Process, error) {
 //
 //   - release:  → job  "<scope>" "release"   (one-shot)
 //   - any other → deployment "<scope>" "<type>" (long-running)
+//   - opts.Ingress[proc] → ingress "<scope>" "<proc>" routing to that
+//     process's deployment (port auto-filled from its assigned port).
 //
-// All resources inherit env_from = ["<scope>/env"]. Deployments get a
-// PORT env + published port from the BasePort range and restart
-// on-failure. Commands are shell-wrapped.
+// Deployments get a PORT env + published port from the BasePort range
+// and restart on-failure. Commands are shell-wrapped. Shared config vars
+// come from scope-level config (vd config <scope> set), not env_from.
 func ToManifests(procs []Process, opts Options) ([]controller.Manifest, error) {
 	if opts.Scope == "" {
 		return nil, fmt.Errorf("scope is required")
 	}
 
-	out := make([]controller.Manifest, 0, len(procs))
-	port := BasePort
+	out := make([]controller.Manifest, 0, len(procs)+len(opts.Ingress))
+	portByProc := make(map[string]int, len(procs))
+	nextAuto := BasePort
 
 	for _, p := range procs {
 		if p.IsRelease() {
@@ -186,8 +196,21 @@ func ToManifests(procs []Process, opts Options) ([]controller.Manifest, error) {
 			continue
 		}
 
+		// Port precedence: an ingress that declares a port for THIS
+		// process pins it (PORT env + published port + the ingress all
+		// agree — "declare it once"). Otherwise auto-assign from the
+		// BasePort range. Pinned ports don't consume an auto slot, so
+		// `web` on 80 leaves the next auto process on BasePort, not +1.
+		port := 0
+		if ing, ok := opts.Ingress[p.Type]; ok && ing.Port != 0 {
+			port = ing.Port
+		} else {
+			port = nextAuto
+			nextAuto++
+		}
+
 		portStr := strconv.Itoa(port)
-		port++
+		portByProc[p.Type] = port
 
 		spec := manifest.DeploymentSpec{
 			Command:  shellWrap(p.RawCommand),
@@ -198,6 +221,34 @@ func ToManifests(procs []Process, opts Options) ([]controller.Manifest, error) {
 		}
 
 		m, err := encode(controller.KindDeployment, opts.Scope, p.Type, spec)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, m)
+	}
+
+	// Ingress from app.json, keyed by process. Sorted for deterministic
+	// output. Each entry routes to its process's deployment; the port
+	// defaults to that deployment's assigned port.
+	procNames := make([]string, 0, len(opts.Ingress))
+	for proc := range opts.Ingress {
+		procNames = append(procNames, proc)
+	}
+	sort.Strings(procNames)
+
+	for _, proc := range procNames {
+		dp, ok := portByProc[proc]
+		if !ok {
+			return nil, fmt.Errorf("ingress %q: no matching Procfile process (must be a long-running deployment line, not %q/release)", proc, proc)
+		}
+
+		spec := opts.Ingress[proc].toSpec(proc, dp)
+		if spec.Host == "" {
+			return nil, fmt.Errorf("ingress %q: host is required", proc)
+		}
+
+		m, err := encode(controller.KindIngress, opts.Scope, proc, spec)
 		if err != nil {
 			return nil, err
 		}

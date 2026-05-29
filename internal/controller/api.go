@@ -1508,7 +1508,13 @@ func (a *API) handlePods(w http.ResponseWriter, r *http.Request) {
 // global logger but don't fail the /pods response — the pods list
 // is the primary deliverable; degraded is supplemental.
 func (a *API) collectDegradedResources(ctx context.Context, pods []Pod, wantKind, wantScope, wantName string) []DegradedResource {
-	kinds := []Kind{KindDeployment, KindStatefulset}
+	// Ingress is here even though it has no pods: a stuck ingress
+	// (route never applied because its deployment wasn't ready) is
+	// exactly the "why is nothing happening" case operators can't see
+	// otherwise. Its status blob shares the LastReconcileError /
+	// LastReconcileAt json tags with DeploymentStatus, so the decode
+	// below reads it the same way (plugin/data fields are ignored).
+	kinds := []Kind{KindDeployment, KindStatefulset, KindIngress}
 
 	// Honor the kind filter if set — skip kinds that don't match.
 	if wantKind != "" {

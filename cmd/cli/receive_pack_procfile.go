@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -15,6 +16,7 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/deploy"
+	"go.voodu.clowk.in/internal/manifest"
 	"go.voodu.clowk.in/internal/procfile"
 	"go.voodu.clowk.in/internal/progress"
 )
@@ -59,8 +61,12 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	}
 
 	// 2. Read the Procfile from the buffered tree + transform.
-	raw, err := readProcfileFromTar(tmpPath)
+	raw, err := readFileFromTar(tmpPath, "Procfile")
 	if err != nil {
+		if err == errFileNotInTar {
+			return fmt.Errorf("no Procfile found at the root of the shipped source")
+		}
+
 		return err
 	}
 
@@ -69,7 +75,40 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 		return err
 	}
 
-	mans, err := procfile.ToManifests(procs, procfile.Options{Scope: scope})
+	// .voodu/app.json — per-process ingress declarations. The client
+	// re-includes just this one file past the tarball's `.voodu/` ignore
+	// (everything else under .voodu/ stays out of the build context).
+	// Absent is fine (no routing); present-but-broken is a hard error so
+	// the operator notices instead of silently losing ingress.
+	opts := procfile.Options{Scope: scope}
+
+	if appRaw, aerr := readFileFromTar(tmpPath, filepath.Join(".voodu", "app.json")); aerr == nil {
+		// Interpolate ${VAR} from the scope's config bucket so ONE
+		// app.json serves multiple stages: `vd config <scope> set
+		// API_HOST=staging…` on the staging server vs `…=api…` on prod
+		// resolves per-server at apply time. Missing var (no `:-default`)
+		// is a hard error — set the config bucket before applying.
+		cfg, cerr := fetchScopeConfig(cmd, scope)
+		if cerr != nil {
+			return fmt.Errorf("read config bucket for scope %q: %w", scope, cerr)
+		}
+
+		interpolated, ierr := manifest.Interpolate(string(appRaw), cfg)
+		if ierr != nil {
+			return fmt.Errorf("app.json interpolation (set the var via `vd config %s set …`): %w", scope, ierr)
+		}
+
+		appFile, perr := procfile.ParseAppFile([]byte(interpolated))
+		if perr != nil {
+			return perr
+		}
+
+		opts.Ingress = appFile.Ingress
+	} else if aerr != errFileNotInTar {
+		return aerr
+	}
+
+	mans, err := procfile.ToManifests(procs, opts)
 	if err != nil {
 		return err
 	}
@@ -112,6 +151,45 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	return nil
 }
 
+// fetchScopeConfig returns the scope-level config bucket (the vars set
+// via `vd config <scope> set KEY=val`) from the local controller. Used to
+// interpolate ${VAR} in app.json. An absent bucket is an empty map, not
+// an error — the interpolation then errors only on a referenced-but-unset
+// var without a default.
+func fetchScopeConfig(cmd *cobra.Command, scope string) (map[string]string, error) {
+	resp, err := controllerDo(cmd.Root(), http.MethodGet, "/config", "scope="+url.QueryEscape(scope), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return map[string]string{}, nil
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return nil, formatControllerError(resp.StatusCode, raw)
+	}
+
+	var env struct {
+		Data struct {
+			Vars map[string]string `json:"vars"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode config response: %w", err)
+	}
+
+	if env.Data.Vars == nil {
+		return map[string]string{}, nil
+	}
+
+	return env.Data.Vars, nil
+}
+
 // applyManifestsLocally POSTs the generated manifests to the local
 // controller's /apply, reusing the exact persist + reconcile path a
 // normal `vd apply` uses (upsert-only; no prune). receive-pack runs on
@@ -137,10 +215,15 @@ func applyManifestsLocally(cmd *cobra.Command, mans []controller.Manifest) error
 	return nil
 }
 
-// readProcfileFromTar finds and returns the Procfile contents from a
-// gzipped tarball. The client tars the Procfile's own directory, so the
-// Procfile sits at the archive root ("Procfile" or "./Procfile").
-func readProcfileFromTar(path string) ([]byte, error) {
+// errFileNotInTar signals a clean "not present" so optional reads (like
+// .voodu/app.json) can distinguish absence from a real read error.
+var errFileNotInTar = fmt.Errorf("file not found in tarball")
+
+// readFileFromTar returns the contents of `want` (a `filepath.Clean`-ed
+// archive path) from a gzipped tarball. The client tars the Procfile's
+// own directory, so paths are root-relative ("Procfile",
+// ".voodu/app.json"). Returns errFileNotInTar when the entry is absent.
+func readFileFromTar(path, want string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open tarball: %w", err)
@@ -169,18 +252,17 @@ func readProcfileFromTar(path string) ([]byte, error) {
 			continue
 		}
 
-		// Match the Procfile at the archive root only — `clean` collapses
-		// a leading "./" so both "Procfile" and "./Procfile" resolve to
-		// "Procfile". A nested path/Procfile is intentionally ignored.
-		if filepath.Clean(hdr.Name) == "Procfile" {
+		// `clean` collapses a leading "./" so "./Procfile" matches
+		// "Procfile". Root-level match only — a nested path is ignored.
+		if filepath.Clean(hdr.Name) == want {
 			data, err := io.ReadAll(tr)
 			if err != nil {
-				return nil, fmt.Errorf("read Procfile entry: %w", err)
+				return nil, fmt.Errorf("read %s entry: %w", want, err)
 			}
 
 			return data, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no Procfile found at the root of the shipped source")
+	return nil, errFileNotInTar
 }

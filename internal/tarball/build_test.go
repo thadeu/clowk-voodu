@@ -517,3 +517,39 @@ func TestStreamNoWarnWhenNoDockerfile(t *testing.T) {
 		t.Errorf("warned about missing Dockerfile that user doesn't have:\n%s", progress.String())
 	}
 }
+
+// TestStreamExtraIgnoresReincludesVooduAppJSON pins the Procfile-mode
+// transport: `.voodu/` is a builtin ignore, but the procfile push passes
+// `ExtraIgnores: ["!.voodu/app.json"]` to re-include JUST app.json so the
+// server can read the ingress declarations from the extracted tree —
+// while the rest of `.voodu/` stays out of the build context.
+func TestStreamExtraIgnoresReincludesVooduAppJSON(t *testing.T) {
+	src := t.TempDir()
+
+	writeFile(t, src, "main.go", []byte("package main\n"), 0644)
+	writeFile(t, src, ".voodu/app.json", []byte(`{"scope":"ws"}`), 0644)
+	writeFile(t, src, ".voodu/ws.voodu", []byte("deployment \"ws\" \"web\" {}\n"), 0644)
+
+	var buf bytes.Buffer
+
+	if _, err := Stream(&buf, src, Options{ExtraIgnores: []string{"!.voodu/app.json"}}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	names := listTar(t, &buf)
+
+	got := map[string]bool{}
+	for _, n := range names {
+		got[n] = true
+	}
+
+	if !got["main.go"] {
+		t.Errorf("main.go missing: %v", names)
+	}
+	if !got[".voodu/app.json"] {
+		t.Errorf(".voodu/app.json should be re-included by the negation: %v", names)
+	}
+	if got[".voodu/ws.voodu"] {
+		t.Errorf(".voodu/ws.voodu should stay excluded (only app.json re-included): %v", names)
+	}
+}

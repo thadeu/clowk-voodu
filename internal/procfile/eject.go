@@ -2,8 +2,11 @@ package procfile
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+
+	"go.voodu.clowk.in/internal/manifest"
 )
 
 // ToHCL renders the same transform as ToManifests into a `.voodu` HCL
@@ -26,6 +29,7 @@ func ToHCL(procs []Process, opts Options) (string, error) {
 
 	port := BasePort
 	firstHTTP := ""
+	portByProc := map[string]int{}
 
 	for _, p := range procs {
 		if p.IsRelease() {
@@ -37,6 +41,7 @@ func ToHCL(procs []Process, opts Options) (string, error) {
 		}
 
 		portStr := strconv.Itoa(port)
+		portByProc[p.Type] = port
 		port++
 
 		if firstHTTP == "" {
@@ -54,20 +59,100 @@ func ToHCL(procs []Process, opts Options) (string, error) {
 		fmt.Fprintf(&b, "}\n\n")
 	}
 
-	// Commented ingress stub — host/TLS is opt-in and the operator
-	// picks which process is routable (no convention to guess from).
-	stubProc := firstHTTP
-	if stubProc == "" {
-		stubProc = "web"
+	// Real ingress blocks from app.json (sorted, deterministic). When
+	// none are declared, fall back to a commented stub so the operator
+	// sees how to add one.
+	if len(opts.Ingress) == 0 {
+		stubProc := firstHTTP
+		if stubProc == "" {
+			stubProc = "web"
+		}
+
+		fmt.Fprintf(&b, "# Expose a process over a domain with TLS — uncomment + edit:\n")
+		fmt.Fprintf(&b, "# ingress %q %q {\n", opts.Scope, stubProc)
+		fmt.Fprintf(&b, "#   host = \"app.example.com\"\n")
+		fmt.Fprintf(&b, "#   tls { enabled = true }\n")
+		fmt.Fprintf(&b, "# }\n")
+
+		return b.String(), nil
 	}
 
-	fmt.Fprintf(&b, "# Expose a process over a domain with TLS — uncomment + edit:\n")
-	fmt.Fprintf(&b, "# ingress %q %q {\n", opts.Scope, stubProc)
-	fmt.Fprintf(&b, "#   host = \"app.example.com\"\n")
-	fmt.Fprintf(&b, "#   tls { enabled = true }\n")
-	fmt.Fprintf(&b, "# }\n")
+	procNames := make([]string, 0, len(opts.Ingress))
+	for proc := range opts.Ingress {
+		procNames = append(procNames, proc)
+	}
+	sort.Strings(procNames)
+
+	for _, proc := range procNames {
+		dp, ok := portByProc[proc]
+		if !ok {
+			return "", fmt.Errorf("ingress %q: no matching Procfile process (must be a long-running deployment line, not %q/release)", proc, proc)
+		}
+
+		writeIngressHCL(&b, opts.Scope, proc, opts.Ingress[proc].toSpec(proc, dp))
+	}
 
 	return b.String(), nil
+}
+
+// writeIngressHCL renders one `ingress` block from a resolved IngressSpec.
+func writeIngressHCL(b *strings.Builder, scope, name string, spec manifest.IngressSpec) {
+	fmt.Fprintf(b, "ingress %q %q {\n", scope, name)
+	fmt.Fprintf(b, "  host    = %s\n", hclString(spec.Host))
+
+	if spec.Service != "" {
+		fmt.Fprintf(b, "  service = %s\n", hclString(spec.Service))
+	}
+
+	if spec.Port != 0 {
+		fmt.Fprintf(b, "  port    = %d\n", spec.Port)
+	}
+
+	if spec.TLS != nil {
+		fmt.Fprintf(b, "  tls {\n")
+		fmt.Fprintf(b, "    enabled = %t\n", spec.TLS.Enabled)
+
+		if spec.TLS.Provider != "" {
+			fmt.Fprintf(b, "    provider = %s\n", hclString(spec.TLS.Provider))
+		}
+
+		if spec.TLS.Email != "" {
+			fmt.Fprintf(b, "    email = %s\n", hclString(spec.TLS.Email))
+		}
+
+		if spec.TLS.OnDemand {
+			fmt.Fprintf(b, "    on_demand = true\n")
+		}
+
+		if spec.TLS.Ask != "" {
+			fmt.Fprintf(b, "    ask = %s\n", hclString(spec.TLS.Ask))
+		}
+
+		fmt.Fprintf(b, "  }\n")
+	}
+
+	for _, loc := range spec.Locations {
+		fmt.Fprintf(b, "  location {\n")
+		fmt.Fprintf(b, "    path  = %s\n", hclString(loc.Path))
+		fmt.Fprintf(b, "    strip = %t\n", loc.Strip)
+		fmt.Fprintf(b, "  }\n")
+	}
+
+	if spec.LB != nil {
+		fmt.Fprintf(b, "  lb {\n")
+
+		if spec.LB.Policy != "" {
+			fmt.Fprintf(b, "    policy   = %s\n", hclString(spec.LB.Policy))
+		}
+
+		if spec.LB.Interval != "" {
+			fmt.Fprintf(b, "    interval = %s\n", hclString(spec.LB.Interval))
+		}
+
+		fmt.Fprintf(b, "  }\n")
+	}
+
+	fmt.Fprintf(b, "}\n\n")
 }
 
 // hclStringList renders a Go string slice as an HCL list literal.

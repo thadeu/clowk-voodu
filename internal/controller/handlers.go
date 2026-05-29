@@ -1917,6 +1917,15 @@ type DeploymentStatus struct {
 	LastReconcileAt time.Time `json:"last_reconcile_at,omitempty"`
 }
 
+// recordOutcome stamps the latest reconcile result, clearing a stale
+// error on success. Satisfies reconcileOutcomeRecorder so the shared
+// recordReconcileResult hook can persist deployment/statefulset
+// failures without knowing the concrete status shape.
+func (s *DeploymentStatus) recordOutcome(at time.Time, errMsg string) {
+	s.LastReconcileAt = at
+	s.LastReconcileError = errMsg
+}
+
 // maxInitFailures caps the number of init-failure records retained
 // on the status blob. 10 is plenty to surface a chronic problem in
 // `vd describe` without bloating the status — the operator only

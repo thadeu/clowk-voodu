@@ -431,14 +431,23 @@ func renderDeploymentSummary(w io.Writer, blob json.RawMessage, pods []controlle
 // even act" tier — distinct from "probes say a replica is unhealthy"
 // (readiness) and "an init container blew up" (init failure).
 func renderReconcileInline(w io.Writer, st controller.DeploymentStatus) {
-	if st.LastReconcileError == "" {
+	renderReconcileError(w, st.LastReconcileError, st.LastReconcileAt)
+}
+
+// renderReconcileError is the kind-agnostic core: given a reconcile
+// error string + its timestamp, print the rose-dim block (or nothing
+// when there's no error). Shared by the deployment/statefulset summary
+// (via renderReconcileInline) and the ingress summary, so a stuck
+// ingress surfaces its reason the same way a stuck deployment does.
+func renderReconcileError(w io.Writer, lastErr string, at time.Time) {
+	if lastErr == "" {
 		return
 	}
 
-	rel := formatRelativeTime(st.LastReconcileAt)
+	rel := formatRelativeTime(at)
 
 	fmt.Fprintf(w, "\n  %s reconcile error %s\n", colorize(cRose, "✗"), dim(rel))
-	fmt.Fprintf(w, "    %s\n", colorize(cRose, st.LastReconcileError))
+	fmt.Fprintf(w, "    %s\n", colorize(cRose, lastErr))
 }
 
 // formatRelativeTime returns "(5m ago)" / "(just now)" / "(2h ago)"
@@ -673,6 +682,11 @@ func renderIngressSummary(w io.Writer, blob json.RawMessage) {
 	if !decodeStatus(w, blob, &st) {
 		return
 	}
+
+	// Surface a stuck reconcile first — the bridge between "I applied
+	// an ingress and curl says no route" and the reason (most often the
+	// target deployment had no live replica when the route was applied).
+	renderReconcileError(w, st.LastReconcileError, st.LastReconcileAt)
 
 	fmt.Fprintf(w, "  plugin: %s\n", dashIfEmpty(st.Plugin))
 

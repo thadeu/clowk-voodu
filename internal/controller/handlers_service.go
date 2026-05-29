@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -77,6 +78,26 @@ type IngressHandler struct {
 type IngressStatus struct {
 	Plugin string         `json:"plugin"`
 	Data   map[string]any `json:"data,omitempty"`
+
+	// LastReconcileError / LastReconcileAt mirror DeploymentStatus's
+	// reconcile-outcome fields (same json tags, so the degraded-resource
+	// scan can decode either blob into either struct). They exist because
+	// an ingress that fails to apply — most commonly because its target
+	// deployment had no live replica yet and the transient-retry budget
+	// ran out — used to leave NO status at all, so `vd describe ingress`
+	// printed "(no status recorded yet)" and the operator had to guess.
+	// The reconciler now records the failure here via recordOutcome.
+	LastReconcileError string    `json:"last_reconcile_error,omitempty"`
+	LastReconcileAt    time.Time `json:"last_reconcile_at,omitempty"`
+}
+
+// recordOutcome stamps the latest reconcile result on the ingress
+// status, preserving the plugin-produced Plugin/Data fields. Satisfies
+// reconcileOutcomeRecorder so recordReconcileResult can persist ingress
+// failures the same way it does deployments.
+func (s *IngressStatus) recordOutcome(at time.Time, errMsg string) {
+	s.LastReconcileAt = at
+	s.LastReconcileError = errMsg
 }
 
 func (h *IngressHandler) Handle(ctx context.Context, ev WatchEvent) error {
@@ -533,6 +554,83 @@ func (h *IngressHandler) lookupDeploymentSpec(ctx context.Context, scope, name s
 	}
 
 	return &spec, nil
+}
+
+// retriggerDependentIngresses re-applies any ingress in `scope` that
+// routes to deployment `depName` and is currently in a broken state
+// (no status recorded, or a recorded reconcile error). It closes the
+// ordering gap behind the most common ingress failure:
+//
+//	apply ingress + deployment together → the ingress reconcile runs
+//	first, finds no live replica (the deployment is still building /
+//	booting), returns Transient, retries for ~60s, then gives up. The
+//	deployment finishes a minute later — but nothing re-triggers the
+//	ingress, so its route stays empty FOREVER, silently.
+//
+// Called from recordReconcileResult on a clean deployment reconcile —
+// at which point the container has been created and is listable, so the
+// re-applied ingress resolves an upstream and writes its route. Re-Put
+// bumps the manifest's revision; the reconciler picks it up through the
+// regular watch path (the same mechanism the autoscaler relies on) and
+// the ingress gets a FRESH transient-retry budget.
+//
+// Guarded to broken ingresses only: a healthy ingress (clean status, no
+// error) is skipped, so a steady-state deployment reconcile doesn't
+// churn the router on every tick. Best-effort — every failure logs and
+// continues; the deployment reconcile already succeeded.
+func retriggerDependentIngresses(ctx context.Context, store Store, scope, depName string, logger *log.Logger) {
+	mans, err := store.ListByScope(ctx, KindIngress, scope)
+	if err != nil {
+		if logger != nil {
+			logger.Printf("ingress self-heal: list scope %q: %v", scope, err)
+		}
+
+		return
+	}
+
+	for _, m := range mans {
+		var spec ingressSpec
+		if err := json.Unmarshal(m.Spec, &spec); err != nil {
+			continue
+		}
+
+		// Service defaults to the ingress name — the same blank-fill
+		// rule apply() uses, so the match here agrees with what the
+		// handler will actually route to.
+		svc := spec.Service
+		if svc == "" {
+			svc = m.Name
+		}
+
+		if svc != depName {
+			continue
+		}
+
+		// Only nudge ingresses that are actually stuck. A status with
+		// no reconcile error means the route is already applied —
+		// re-Putting it would be pure churn.
+		app := AppID(m.Scope, m.Name)
+
+		if raw, gerr := store.GetStatus(ctx, KindIngress, app); gerr == nil && raw != nil {
+			var st IngressStatus
+
+			if json.Unmarshal(raw, &st) == nil && st.LastReconcileError == "" {
+				continue
+			}
+		}
+
+		if _, err := store.Put(ctx, m); err != nil {
+			if logger != nil {
+				logger.Printf("ingress self-heal: re-put %s: %v", app, err)
+			}
+
+			continue
+		}
+
+		if logger != nil {
+			logger.Printf("ingress self-heal: re-triggered %s after deployment %s/%s became ready", app, scope, depName)
+		}
+	}
 }
 
 // firstContainerPort pulls the first numeric port out of a deployment's
