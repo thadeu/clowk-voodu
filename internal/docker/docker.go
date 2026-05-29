@@ -1664,7 +1664,7 @@ func WaitForContainerHealth(name string, timeout int) error {
 	startTime := time.Now()
 	maxWait := time.Duration(timeout) * time.Second
 
-	fmt.Printf("-----> Waiting for container to be healthy (max %ds)...\n", timeout)
+	fmt.Printf("-----> waiting for container to be healthy (max %ds)...\n", timeout)
 
 	for {
 		if time.Since(startTime) > maxWait {
@@ -1677,7 +1677,7 @@ func WaitForContainerHealth(name string, timeout int) error {
 			// — the old shell path read empty `--format` output the
 			// same way and treated it as "ready". Preserve that.
 			time.Sleep(3 * time.Second)
-			fmt.Println("-----> Container ready (no health check configured)")
+			fmt.Println("-----> container ready (no health check configured)")
 
 			return nil
 		}
@@ -1687,7 +1687,7 @@ func WaitForContainerHealth(name string, timeout int) error {
 
 		switch status {
 		case "healthy":
-			fmt.Println("-----> Container is healthy!")
+			fmt.Println("-----> container is healthy!")
 
 			return nil
 		case "starting":
@@ -1711,7 +1711,7 @@ func StandardDeploy(cfg DeploymentConfig) error {
 	containerName := cfg.AppName
 
 	if ContainerExists(containerName) {
-		fmt.Printf("-----> Stopping old container: %s\n", containerName)
+		fmt.Printf("-----> stopping old container: %s\n", containerName)
 
 		if err := StopContainer(containerName); err != nil {
 			fmt.Printf("Warning: Failed to stop container: %v\n", err)
@@ -1737,31 +1737,31 @@ func StandardDeploy(cfg DeploymentConfig) error {
 
 	if len(cfg.Volumes) > 0 {
 		containerConfig.Volumes = append(containerConfig.Volumes, cfg.Volumes...)
-		fmt.Printf("-----> Adding %d custom volumes\n", len(cfg.Volumes))
+		fmt.Printf("-----> adding %d custom volumes\n", len(cfg.Volumes))
 	}
 
 	if cfg.NetworkMode != "host" {
 		if len(cfg.DockerPorts) > 0 {
 			containerConfig.Ports = cfg.DockerPorts
-			fmt.Println("-----> Using ports from voodu.yml")
+			fmt.Println("-----> using ports from voodu.yml")
 		} else if containerPort > 0 {
 			containerConfig.Ports = []string{fmt.Sprintf("%d:%d", containerPort, containerPort)}
 		}
 	} else {
-		fmt.Println("-----> Using host network (all ports exposed)")
+		fmt.Println("-----> using host network (all ports exposed)")
 	}
 
 	if fileExists(cfg.EnvFile) {
 		containerConfig.EnvFile = cfg.EnvFile
 	}
 
-	fmt.Printf("-----> Starting new container: %s\n", containerName)
+	fmt.Printf("-----> starting new container: %s\n", containerName)
 
 	if err := CreateContainer(containerConfig); err != nil {
 		return fmt.Errorf("failed to start container: %v", err)
 	}
 
-	fmt.Println("-----> Waiting for container to be ready...")
+	fmt.Println("-----> waiting for container to be ready...")
 	time.Sleep(5 * time.Second)
 
 	if !ContainerIsRunning(containerName) {
@@ -1772,8 +1772,8 @@ func StandardDeploy(cfg DeploymentConfig) error {
 	}
 
 	fmt.Println("=====> Standard Deployment Complete!")
-	fmt.Printf("-----> Active container: %s\n", containerName)
-	fmt.Printf("-----> Running image: %s\n", cfg.ImageTag)
+	fmt.Printf("-----> active container: %s\n", containerName)
+	fmt.Printf("-----> running image: %s\n", cfg.ImageTag)
 
 	return nil
 }
@@ -1807,7 +1807,7 @@ func BlueGreenDeploy(cfg DeploymentConfig) error {
 
 		cleanupOldBlueContainer(cfg.AppName)
 	} else {
-		fmt.Println("-----> First deployment, activating green")
+		fmt.Println("-----> first deployment, activating green")
 
 		if err := renameContainer(cfg.AppName+"-green", activeContainerName); err != nil {
 			return fmt.Errorf("failed to rename green to active: %v", err)
@@ -1817,8 +1817,8 @@ func BlueGreenDeploy(cfg DeploymentConfig) error {
 	}
 
 	fmt.Println("=====> Blue/Green Deployment Complete!")
-	fmt.Printf("-----> Active container: %s\n", activeContainerName)
-	fmt.Printf("-----> Running image: %s\n", cfg.ImageTag)
+	fmt.Printf("-----> active container: %s\n", activeContainerName)
+	fmt.Printf("-----> running image: %s\n", cfg.ImageTag)
 
 	return nil
 }
@@ -1844,7 +1844,7 @@ func fileExists(filename string) bool {
 
 func startGreenContainer(cfg DeploymentConfig, containerPort int) error {
 	greenName := cfg.AppName + "-green"
-	fmt.Printf("-----> Starting green container: %s\n", greenName)
+	fmt.Printf("-----> starting green container: %s\n", greenName)
 
 	if ContainerExists(greenName) {
 		fmt.Println("       Removing old green container...")
@@ -1863,7 +1863,7 @@ func startGreenContainer(cfg DeploymentConfig, containerPort int) error {
 
 	if len(cfg.Volumes) > 0 {
 		containerConfig.Volumes = append(containerConfig.Volumes, cfg.Volumes...)
-		fmt.Printf("-----> Adding %d custom volumes to green container\n", len(cfg.Volumes))
+		fmt.Printf("-----> adding %d custom volumes to green container\n", len(cfg.Volumes))
 	}
 
 	if cfg.NetworkMode != "host" {
@@ -1882,7 +1882,7 @@ func startGreenContainer(cfg DeploymentConfig, containerPort int) error {
 		return fmt.Errorf("failed to start green container: %v", err)
 	}
 
-	fmt.Printf("-----> Green container started (%s)\n", greenName)
+	fmt.Printf("-----> green container started (%s)\n", greenName)
 
 	return nil
 }
@@ -1891,7 +1891,7 @@ func switchTrafficBlueToGreen(appName string, containerPort int) error {
 	activeName := appName
 	greenName := appName + "-green"
 
-	fmt.Println("-----> Switching traffic: active → green")
+	fmt.Println("-----> switching traffic: active → green")
 
 	if ContainerIsRunning(activeName) {
 		fmt.Println("       Pausing active container...")
@@ -1912,7 +1912,7 @@ func switchTrafficBlueToGreen(appName string, containerPort int) error {
 
 	updateContainerRestartPolicy(activeName, "always")
 
-	fmt.Println("-----> Traffic switch complete (green → active)")
+	fmt.Println("-----> traffic switch complete (green → active)")
 
 	return nil
 }
@@ -1920,7 +1920,7 @@ func switchTrafficBlueToGreen(appName string, containerPort int) error {
 func cleanupOldBlueContainer(appName string) {
 	oldActiveName := appName + "-old"
 
-	fmt.Println("-----> Cleaning up old active container...")
+	fmt.Println("-----> cleaning up old active container...")
 
 	if ContainerExists(oldActiveName) {
 		fmt.Println("       Waiting 5s before removing old container...")
@@ -1930,7 +1930,7 @@ func cleanupOldBlueContainer(appName string) {
 		StopContainer(oldActiveName)
 		RemoveContainer(oldActiveName, true)
 
-		fmt.Println("-----> Old container cleaned up")
+		fmt.Println("-----> old container cleaned up")
 	}
 }
 
@@ -1971,7 +1971,7 @@ func RecreateActiveContainer(appName, envFile, appDir string) error {
 		return fmt.Errorf("no active container found for %s", appName)
 	}
 
-	fmt.Printf("-----> Recreating container: %s\n", activeContainer)
+	fmt.Printf("-----> recreating container: %s\n", activeContainer)
 
 	inspected, err := inspectContainerShape(activeContainer)
 	if err != nil {
@@ -2085,16 +2085,16 @@ func BlueGreenRollback(appName string) error {
 		return fmt.Errorf("no previous blue container found for rollback")
 	}
 
-	fmt.Println("-----> Stopping current blue container...")
+	fmt.Println("-----> stopping current blue container...")
 	StopContainer(blueName)
 
-	fmt.Println("-----> Restoring previous blue container...")
+	fmt.Println("-----> restoring previous blue container...")
 
 	if err := renameContainer(oldBlueName, blueName); err != nil {
 		return fmt.Errorf("failed to restore previous blue container: %v", err)
 	}
 
-	fmt.Println("-----> Starting previous blue container...")
+	fmt.Println("-----> starting previous blue container...")
 	cmd := exec.Command("docker", "start", blueName)
 	output, err := cmd.CombinedOutput()
 
@@ -2105,7 +2105,7 @@ func BlueGreenRollback(appName string) error {
 	time.Sleep(5 * time.Second)
 
 	fmt.Println("=====> Blue/Green Rollback Complete!")
-	fmt.Printf("-----> Active container: %s\n", blueName)
+	fmt.Printf("-----> active container: %s\n", blueName)
 
 	return nil
 }

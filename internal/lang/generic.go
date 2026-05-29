@@ -13,7 +13,7 @@ import (
 type Generic struct{}
 
 func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Building generic application...")
+	fmt.Println("-----> building generic application...")
 
 	var dockerfilePath string
 
@@ -25,16 +25,16 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
-				fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
+				fmt.Printf("-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 			} else {
-				fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
+				fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
 			}
 		} else {
-			fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
+			fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
 		}
 	} else {
 		dockerfilePath = filepath.Join(releaseDir, "Dockerfile")
-		fmt.Println("-----> Using default Dockerfile")
+		fmt.Println("-----> using default dockerfile")
 	}
 
 	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
@@ -75,13 +75,13 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 		return fmt.Errorf("docker build failed: %v", err)
 	}
 
-	fmt.Println("-----> Generic build complete!")
+	fmt.Println("-----> generic build complete!")
 
 	return nil
 }
 
 func (l *Generic) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Deploying generic application...")
+	fmt.Println("-----> deploying generic application...")
 
 	envFile := paths.AppEnvFile(appName)
 
@@ -131,7 +131,7 @@ func (l *Generic) EnsureDockerfile(releaseDir string, appName string, spec *Buil
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> Using existing Dockerfile")
+		fmt.Println("-----> using existing dockerfile")
 		return nil
 	}
 

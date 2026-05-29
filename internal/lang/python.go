@@ -19,10 +19,10 @@ func (l *Python) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Building Python application...")
+	fmt.Println("-----> building python application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> Using pre-built image from registry...")
+		fmt.Println("-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -32,7 +32,7 @@ func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> Pre-built image ready for deployment!")
+		fmt.Println("-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -45,13 +45,13 @@ func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return err
 	}
 
-	fmt.Println("-----> Python build complete!")
+	fmt.Println("-----> python build complete!")
 
 	return nil
 }
 
 func (l *Python) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Deploying Python application...")
+	fmt.Println("-----> deploying python application...")
 	return deployContainer(appName, spec, releaseDir)
 }
 
@@ -88,11 +88,11 @@ func (l *Python) EnsureDockerfile(releaseDir string, appName string, spec *Build
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> Using existing Dockerfile")
+		fmt.Println("-----> using existing dockerfile")
 		return nil
 	}
 
-	fmt.Println("-----> Generating Dockerfile for Python...")
+	fmt.Println("-----> generating dockerfile for python...")
 
 	dockerfileContent := l.generateDockerfile(spec, appName)
 
@@ -115,7 +115,7 @@ func (l *Python) generateDockerfile(spec *BuildSpec, appName string) string {
 			baseImage = fmt.Sprintf("python:%s-slim", block.Version)
 		} else {
 			baseImage = util.DetectPythonVersion(".")
-			fmt.Printf("-----> Using Python fallback: %s\n", baseImage)
+			fmt.Printf("-----> using python fallback: %s\n", baseImage)
 		}
 	}
 

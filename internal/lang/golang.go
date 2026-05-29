@@ -26,10 +26,10 @@ func (l *Golang) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Building Go application...")
+	fmt.Println("-----> building go application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> Using pre-built image from registry...")
+		fmt.Println("-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -39,7 +39,7 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> Pre-built image ready for deployment!")
+		fmt.Println("-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -71,7 +71,7 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 
 		cmd = exec.Command("docker", "build", "--progress=plain", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 
-		fmt.Printf("-----> Using custom Dockerfile: %s\n", dockerfilePath)
+		fmt.Printf("-----> using custom dockerfile: %s\n", dockerfilePath)
 	} else {
 		cmd = exec.Command("docker", "build", "--progress=plain", "-t", latestTag, "-t", immutableTag, releaseDir)
 	}
@@ -92,13 +92,13 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return err
 	}
 
-	fmt.Println("-----> Go build complete!")
+	fmt.Println("-----> go build complete!")
 
 	return nil
 }
 
 func (l *Golang) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Deploying Go application...")
+	fmt.Println("-----> deploying go application...")
 
 	return deployContainer(appName, spec, releaseDir)
 }
@@ -124,7 +124,7 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 		customDockerfilePath := filepath.Join(releaseDir, spec.Dockerfile)
 
 		if _, err := os.Stat(customDockerfilePath); err == nil {
-			fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
+			fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
 
 			return nil
 		}
@@ -133,7 +133,7 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
-				fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
+				fmt.Printf("-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 
 				return nil
 			}
@@ -145,12 +145,12 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> Using existing Dockerfile")
+		fmt.Println("-----> using existing dockerfile")
 
 		return nil
 	}
 
-	fmt.Println("-----> Generating Dockerfile for Go...")
+	fmt.Println("-----> generating dockerfile for go...")
 
 	workDir := "."
 
@@ -179,13 +179,13 @@ func (l *Golang) generateDockerfile(spec *BuildSpec, workDir, buildPath string) 
 			baseImage = fmt.Sprintf("golang:%s-alpine", block.Version)
 		} else {
 			baseImage = util.DetectGoVersion(".")
-			fmt.Printf("-----> Detected Go version: %s\n", baseImage)
+			fmt.Printf("-----> detected go version: %s\n", baseImage)
 		}
 	}
 
 	args := l.buildArgs(spec)
 
-	fmt.Printf("-----> Final build config: GOOS=%s GOARCH=%s CGO_ENABLED=%s\n", args["GOOS"], args["GOARCH"], args["CGO_ENABLED"])
+	fmt.Printf("-----> final build config: goos=%s goarch=%s cgo_enabled=%s\n", args["GOOS"], args["GOARCH"], args["CGO_ENABLED"])
 
 	return fmt.Sprintf(`# Generated Dockerfile for Go application
 FROM %s AS builder
@@ -266,7 +266,7 @@ func (l *Golang) buildArgs(spec *BuildSpec) map[string]string {
 	// BuildArgs — that map lives on the parent BuildSpec.
 	_ = block
 
-	fmt.Printf("-----> Build args: GOOS=%s GOARCH=%s CGO_ENABLED=%s GO_VERSION=%s\n", out["GOOS"], out["GOARCH"], out["CGO_ENABLED"], out["GO_VERSION"])
+	fmt.Printf("-----> build args: goos=%s goarch=%s cgo_enabled=%s go_version=%s\n", out["GOOS"], out["GOARCH"], out["CGO_ENABLED"], out["GO_VERSION"])
 
 	return out
 }

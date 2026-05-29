@@ -19,10 +19,10 @@ func (l *Ruby) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Ruby) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Building Ruby application...")
+	fmt.Println("-----> building ruby application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> Using pre-built image from registry...")
+		fmt.Println("-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -32,7 +32,7 @@ func (l *Ruby) Build(appName string, spec *BuildSpec, releaseDir string) error {
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> Pre-built image ready for deployment!")
+		fmt.Println("-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -45,13 +45,13 @@ func (l *Ruby) Build(appName string, spec *BuildSpec, releaseDir string) error {
 		return err
 	}
 
-	fmt.Println("-----> Ruby build complete!")
+	fmt.Println("-----> ruby build complete!")
 
 	return nil
 }
 
 func (l *Ruby) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> Deploying Ruby application...")
+	fmt.Println("-----> deploying ruby application...")
 	return deployContainer(appName, spec, releaseDir)
 }
 
@@ -84,11 +84,11 @@ func (l *Ruby) EnsureDockerfile(releaseDir string, appName string, spec *BuildSp
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> Using existing Dockerfile")
+		fmt.Println("-----> using existing dockerfile")
 		return nil
 	}
 
-	fmt.Println("-----> Generating Dockerfile for Ruby...")
+	fmt.Println("-----> generating dockerfile for ruby...")
 
 	dockerfileContent := l.generateDockerfile(spec, appName)
 
@@ -111,7 +111,7 @@ func (l *Ruby) generateDockerfile(spec *BuildSpec, appName string) string {
 			baseImage = fmt.Sprintf("ruby:%s-alpine", block.Version)
 		} else {
 			baseImage = util.DetectRubyVersion(".")
-			fmt.Printf("-----> Detected Ruby version: %s\n", baseImage)
+			fmt.Printf("-----> detected ruby version: %s\n", baseImage)
 		}
 	}
 

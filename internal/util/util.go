@@ -292,7 +292,7 @@ func GetCustomRegistries(appName string) []string {
 
 // PullRegistryImage pulls a pre-built image from a registry.
 func PullRegistryImage(image string) error {
-	fmt.Printf("-----> Pulling pre-built image: %s\n", image)
+	fmt.Printf("-----> pulling pre-built image: %s\n", image)
 
 	cmd := exec.Command("docker", "pull", image)
 	cmd.Stdout = os.Stdout
@@ -302,7 +302,7 @@ func PullRegistryImage(image string) error {
 		return fmt.Errorf("failed to pull image %s: %v", image, err)
 	}
 
-	fmt.Printf("-----> Successfully pulled image: %s\n", image)
+	fmt.Printf("-----> successfully pulled image: %s\n", image)
 
 	return nil
 }
@@ -310,7 +310,7 @@ func PullRegistryImage(image string) error {
 // TagImageForApp tags a pulled image with the app name for deployment.
 func TagImageForApp(image, appName string) error {
 	tag := fmt.Sprintf("%s:latest", appName)
-	fmt.Printf("-----> Tagging image %s as %s\n", image, tag)
+	fmt.Printf("-----> tagging image %s as %s\n", image, tag)
 
 	cmd := exec.Command("docker", "tag", image, tag)
 	cmd.Stdout = os.Stdout
@@ -320,7 +320,7 @@ func TagImageForApp(image, appName string) error {
 		return fmt.Errorf("failed to tag image %s as %s: %v", image, tag, err)
 	}
 
-	fmt.Printf("-----> Successfully tagged image as %s\n", tag)
+	fmt.Printf("-----> successfully tagged image as %s\n", tag)
 
 	return nil
 }
@@ -336,7 +336,7 @@ func RunDockerBuildWithTimeout(cmd *exec.Cmd, timeoutMinutes int) error {
 	defer cancel()
 
 	buildStartTime := time.Now()
-	fmt.Printf("-----> Starting Docker build (timeout: %d minutes)...\n", timeoutMinutes)
+	fmt.Printf("-----> starting docker build (timeout: %d minutes)...\n", timeoutMinutes)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start docker build: %v", err)
@@ -354,8 +354,8 @@ func RunDockerBuildWithTimeout(cmd *exec.Cmd, timeoutMinutes int) error {
 		select {
 		case <-ctx.Done():
 			elapsed := time.Since(buildStartTime)
-			fmt.Printf("-----> Build timeout reached after %s\n", elapsed.Round(time.Second))
-			fmt.Println("-----> Terminating build process...")
+			fmt.Printf("-----> build timeout reached after %s\n", elapsed.Round(time.Second))
+			fmt.Println("-----> terminating build process...")
 
 			if cmd.Process != nil {
 				cmd.Process.Kill()
@@ -386,7 +386,7 @@ func RunDockerBuildWithTimeout(cmd *exec.Cmd, timeoutMinutes int) error {
 			remaining := timeout - elapsed
 
 			if remaining > 0 {
-				fmt.Printf("-----> Build still running... (elapsed: %s, remaining: %s)\n", elapsed.Round(time.Second), remaining.Round(time.Second))
+				fmt.Printf("-----> build still running... (elapsed: %s, remaining: %s)\n", elapsed.Round(time.Second), remaining.Round(time.Second))
 			}
 		}
 	}

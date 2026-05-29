@@ -105,21 +105,21 @@ func DetectLanguage(releaseDir string) (string, error) {
 	dockerfile := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfile); err == nil {
-		fmt.Printf("-----> Detected Dockerfile at %s → using 'docker' strategy\n", dockerfile)
+		fmt.Printf("-----> detected dockerfile at %s → using 'docker' strategy\n", dockerfile)
 		return "docker", nil
 	}
 
 	if lang := detectLanguageInDir(releaseDir); lang != "" {
-		fmt.Printf("-----> No Dockerfile at %s — detected '%s' from marker files\n", dockerfile, lang)
+		fmt.Printf("-----> no dockerfile at %s — detected '%s' from marker files\n", dockerfile, lang)
 		return lang, nil
 	}
 
 	if lang := detectLanguageRecursive(releaseDir, 2); lang != "" {
-		fmt.Printf("-----> No Dockerfile at release root — detected '%s' in subdirectory\n", lang)
+		fmt.Printf("-----> no dockerfile at release root — detected '%s' in subdirectory\n", lang)
 		return lang, nil
 	}
 
-	fmt.Printf("-----> No Dockerfile or language markers found — falling back to 'generic'\n")
+	fmt.Printf("-----> no dockerfile or language markers found — falling back to 'generic'\n")
 
 	return "generic", nil
 }
@@ -186,7 +186,7 @@ func NewLang(spec *BuildSpec, releaseDir string) (Lang, error) {
 	langType := spec.LangName()
 
 	if langType != "" {
-		fmt.Printf("-----> Using explicit lang strategy: %q (from manifest)\n", langType)
+		fmt.Printf("-----> using explicit lang strategy: %q (from manifest)\n", langType)
 	} else {
 		detected, err := DetectLanguage(releaseDir)
 		if err != nil {

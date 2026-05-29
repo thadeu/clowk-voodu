@@ -80,7 +80,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 	releaseDir := filepath.Join(paths.AppReleasesDir(app), buildID)
 
 	if existing, err := os.Stat(releaseDir); err == nil && existing.IsDir() && !opts.Force {
-		opts.log("-----> Release %s already exists — skipping rebuild (use --force to override)", buildID)
+		opts.log("-----> release %s already exists — skipping rebuild (use --force to override)", buildID)
 
 		// Same tarball → same image. Only repoint `current`; the
 		// controller reconciler is responsible for restarting the
@@ -381,7 +381,7 @@ func logReleaseSummary(releaseDir string, opts *Options) {
 		preview += fmt.Sprintf(", … (+%d more)", len(entries)-maxNames)
 	}
 
-	opts.log("-----> Release root has %d entries, Dockerfile=%v", len(entries), hasDockerfile)
+	opts.log("-----> release root has %d entries, dockerfile=%v", len(entries), hasDockerfile)
 	opts.log("       contents: %s", preview)
 }
 
