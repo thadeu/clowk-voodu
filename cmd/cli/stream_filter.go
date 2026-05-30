@@ -304,7 +304,7 @@ func (f *progressFilter) processLineLocked(line string) {
 				fmt.Fprint(f.out, "\r\x1b[2K")
 			}
 
-			fmt.Fprintf(f.out, "%s %s\n", check(), msg)
+			fmt.Fprintf(f.out, "%s %s\n", checkFlow(), msg)
 
 		default:
 			// Unknown `-----> ` banner — neither in stepBanners nor
@@ -399,8 +399,12 @@ func (f *progressFilter) renderSpinnerLocked() {
 	fmt.Fprint(f.out, "\r\x1b[2K")
 	f.paintBrailleLocked()
 
+	// stepLabel (not paintLabel) so the live label previews the committed
+	// tier color: a "checking …" spinner reads gray while it ticks and
+	// stays gray when it commits, instead of jumping white→gray. The glyph
+	// itself stays mint (paintBrailleLocked) — the "working" signal.
 	fmt.Fprintf(f.out, " %s %s\n\x1b[2K\x1b[1A",
-		paintLabel(f.currentStep),
+		stepLabel(f.currentStep),
 		descText(fmt.Sprintf("(%s)", elapsed)),
 	)
 }
@@ -415,10 +419,11 @@ func (f *progressFilter) paintBrailleLocked() {
 	fmt.Fprint(f.out, colorize(cMint400, string(frame)))
 }
 
-// closeCurrentStepLocked commits the currently-open step as a green
-// `✓ <step> (Ns)` line and leaves the cursor on a fresh row so the
-// spinner's next tick renders below. No-op when no step is open.
-// Caller must hold f.mu.
+// closeCurrentStepLocked commits the currently-open step as a tier-
+// colored `✓ <step> (Ns)` line (gray for the checking phase, white for
+// the central deploy flow — see stepGlyph/stepLabel) and leaves the
+// cursor on a fresh row so the spinner's next tick renders below. No-op
+// when no step is open. Caller must hold f.mu.
 func (f *progressFilter) closeCurrentStepLocked() {
 	if f.currentStep == "" {
 		return
@@ -427,7 +432,7 @@ func (f *progressFilter) closeCurrentStepLocked() {
 	elapsed := time.Since(f.stepStarted).Round(time.Second)
 
 	fmt.Fprintf(f.out, "\r\x1b[2K%s %s %s\n",
-		check(), paintLabel(f.currentStep), descText(fmt.Sprintf("(%s)", elapsed)))
+		stepGlyph(f.currentStep), stepLabel(f.currentStep), descText(fmt.Sprintf("(%s)", elapsed)))
 
 	f.currentStep = ""
 }
@@ -678,7 +683,7 @@ type applyResultFilter struct {
 
 	// resourceCount tracks how many per-manifest result lines we've
 	// emitted. Read after Close() by the apply orchestrator to render
-	// the aurora `✓ apply complete (N resources)` terminus. Mutually
+	// the mint `✓ apply complete (N resources)` terminus. Mutually
 	// exclusive with eventRenderer.resourceCount — the negotiatingWriter
 	// only feeds bytes to one of us per run, so the orchestrator can
 	// just sum both counters and one will be zero.

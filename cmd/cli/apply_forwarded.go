@@ -207,8 +207,8 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 			reasons = append(reasons, "checking asset content drift")
 		}
 
-		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m no spec changes. %s.\n",
-			strings.Join(reasons, "; "))
+		fmt.Fprintf(os.Stdout, "%s no spec changes. %s.\n",
+			checkFlow(), strings.Join(reasons, "; "))
 	}
 
 	// Phase 2: push source tarballs for build-mode deployments *now*,
@@ -264,12 +264,13 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 
 	_ = resultFilter.Close()
 
-	// Emit the aurora terminus when the apply actually landed cleanly
-	// (no SSH error, server exit 0). Aurora ✓ is the brand-kit's
-	// "everything's done" marker reserved exclusively for this line —
-	// every other ✓ in the output is mint. The renderers themselves
-	// can't paint this: they don't know when the stream is "done", only
-	// that another event might come. The orchestrator does.
+	// Emit the mint terminus when the apply actually landed cleanly
+	// (no SSH error, server exit 0). Mint ✓ + mint text is the brand's
+	// vivid "everything's done" marker reserved for this line — the
+	// central deploy flow above is default-fg "white", the checking
+	// phase gray. The renderers themselves can't paint this: they don't
+	// know when the stream is "done", only that another event might
+	// come. The orchestrator does.
 	//
 	// Suppressed on:
 	//   - verbose / non-TTY (passthrough mode, both renderers skipped)
@@ -285,8 +286,8 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 				word = "resource"
 			}
 
-			fmt.Fprintf(os.Stdout, "%s apply complete (%d %s)\n",
-				checkFinal(), total, word)
+			fmt.Fprintf(os.Stdout, "%s %s\n",
+				checkFinal(), mintText(fmt.Sprintf("apply complete (%d %s)", total, word)))
 		}
 
 		// Post-apply reconcile visibility — see apply_poll_reconcile.go.
@@ -294,7 +295,7 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		// pod-bearing applied resource, surfaces reconciler errors
 		// that would otherwise live only in journald. Best-effort:
 		// any failure path silently degrades to no warning. Skipped
-		// for verbose / non-TTY (same posture as the aurora terminus).
+		// for verbose / non-TTY (same posture as the mint terminus).
 		if warnings := pollReconcileErrors(info, identity, plan.Data.Applied, applyStartedAt); len(warnings) > 0 {
 			renderReconcileWarnings(os.Stdout, warnings)
 		}

@@ -313,7 +313,7 @@ func TestProgressFilterCloseClearsDanglingSpinner(t *testing.T) {
 }
 
 // TestApplyResultFilterResourceCount pins the counter that drives the
-// aurora `✓ apply complete (N resources)` terminus on the legacy text
+// mint `✓ apply complete (N resources)` terminus on the legacy text
 // path. apply_forwarded.go reads ResourceCount() after Close() to
 // decide whether to emit the final line and what number goes in
 // parens. Regression here would either drop the terminus or print the

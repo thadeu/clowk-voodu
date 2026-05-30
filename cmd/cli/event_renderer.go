@@ -20,18 +20,18 @@ import (
 //
 // Output anatomy (matches the landing page mockup):
 //
-//   <spinner> packing context           ← in-progress, redraws in place
-//   ✓ packing context (1.4 MB)          ← frozen above when complete
-//   <spinner> streaming over ssh
-//   ✓ streaming over ssh ubuntu@prod-1  (1s)
-//   <spinner> controller: planning ...
-//   ✓ controller: planning (0s)
-//   + deployment/prod/api  replicas=3 image=ghcr.io/myorg/api:1.7
-//   ~ ingress/prod/api     tls.email=ops@example.com
-//   + redis/clowk-lp/redis-ha sentinel.monitor=clowk-lp/redis
-//   <spinner> build → swap current → reconcile caddy
-//   ✓ apply complete in 11.8s            ← aurora-colored terminus
-//   ✓ https://api.example.com · 3/3 healthy
+//	<spinner> packing context           ← in-progress, redraws in place
+//	✓ packing context (1.4 MB)          ← frozen above when complete
+//	<spinner> streaming over ssh
+//	✓ streaming over ssh ubuntu@prod-1  (1s)
+//	<spinner> controller: planning ...
+//	✓ controller: planning (0s)
+//	+ deployment/prod/api  replicas=3 image=ghcr.io/myorg/api:1.7
+//	~ ingress/prod/api     tls.email=ops@example.com
+//	+ redis/clowk-lp/redis-ha sentinel.monitor=clowk-lp/redis
+//	<spinner> build → swap current → reconcile caddy
+//	✓ apply complete in 11.8s            ← mint-colored terminus
+//	✓ https://api.example.com · 3/3 healthy
 //
 // In-progress line uses a brand-kit braille frame in mint-400 (see
 // spinner.go for the 8-frame, 80ms/frame pattern). We tried inline-
@@ -87,7 +87,7 @@ type eventRenderer struct {
 
 	// resourceCount tracks per-manifest result events emitted by
 	// handleResultLocked. Read after Close() by the apply orchestrator
-	// to render the aurora `✓ apply complete (N resources)` terminus.
+	// to render the mint `✓ apply complete (N resources)` terminus.
 	// Sibling of applyResultFilter.resourceCount — the negotiatingWriter
 	// picks one renderer per run, so the orchestrator sums both counters
 	// safely (one will always be zero).
@@ -243,9 +243,10 @@ func (r *eventRenderer) handleStepEndLocked(e progress.Event) {
 
 	switch e.Status {
 	case progress.StatusOK:
-		// Success collapses the block — just the green ✓ line remains.
+		// Success collapses the block — just the ✓ line remains, tier-
+		// colored by label (gray checking phase / white central flow).
 		fmt.Fprintf(r.out, "%s %s %s\n",
-			check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
+			stepGlyph(r.currentStepLabel), stepLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
 
 	case progress.StatusFail:
 		// Failure keeps the build tail: the last few lines are usually
@@ -270,7 +271,7 @@ func (r *eventRenderer) handleStepEndLocked(e progress.Event) {
 
 	default:
 		fmt.Fprintf(r.out, "%s %s %s\n",
-			check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
+			stepGlyph(r.currentStepLabel), stepLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
 	}
 
 	r.tail = nil
@@ -339,9 +340,9 @@ func (r *eventRenderer) ResourceCount() int {
 }
 
 // handleSummaryLocked emits the terminus lines — the ones that close
-// out an apply. These use the aurora variant of ✓ per brand kit:
-// aurora is reserved for "active states" and the final "everything's
-// good" terminal.
+// out an apply. The success terminus uses the mint variant of ✓
+// (checkFinal) — the brand's vivid "done" green; the Pruned/passthrough
+// summaries are central-flow white (checkFlow).
 func (r *eventRenderer) handleSummaryLocked(e progress.Event) {
 	r.closeCurrentStepLocked()
 
@@ -366,13 +367,14 @@ func (r *eventRenderer) handleSummaryLocked(e progress.Event) {
 			return
 		}
 
-		// Pure-image-pull deploy path: this IS the terminus. Aurora ✓.
+		// Pure-image-pull deploy path: this IS the terminus. Mint ✓ +
+		// mint text — the brand's "done" green.
 		if r.active {
 			r.stopSpinnerLocked()
 			r.active = false
 		}
 
-		fmt.Fprintf(r.out, "%s %s\n", checkFinal(), e.Text)
+		fmt.Fprintf(r.out, "%s %s\n", checkFinal(), mintText(e.Text))
 
 	case strings.HasPrefix(e.Text, "Pruned "):
 		// Pruned N old release(s) — passthrough ✓ line, no spinner
@@ -381,14 +383,14 @@ func (r *eventRenderer) handleSummaryLocked(e progress.Event) {
 			fmt.Fprint(r.out, "\r\x1b[2K")
 		}
 
-		fmt.Fprintf(r.out, "%s %s\n", check(), e.Text)
+		fmt.Fprintf(r.out, "%s %s\n", checkFlow(), e.Text)
 
 	default:
 		if r.active {
 			fmt.Fprint(r.out, "\r\x1b[2K")
 		}
 
-		fmt.Fprintf(r.out, "%s %s\n", check(), e.Text)
+		fmt.Fprintf(r.out, "%s %s\n", checkFlow(), e.Text)
 	}
 }
 
@@ -411,11 +413,13 @@ func (r *eventRenderer) renderBlockLocked() {
 
 	var b strings.Builder
 
-	// Row 0 — spinner glyph + label + elapsed.
+	// Row 0 — spinner glyph + label + elapsed. stepLabel previews the
+	// committed tier color (gray for a checking step, default fg for the
+	// central flow); the glyph stays mint as the "working" signal.
 	b.WriteString("\r\x1b[2K")
 	b.WriteString(colorize(cMint400, string(frames[r.frame%len(frames)])))
 	b.WriteString(" ")
-	b.WriteString(paintLabel(r.currentStepLabel))
+	b.WriteString(stepLabel(r.currentStepLabel))
 	b.WriteString(" ")
 	b.WriteString(descText(fmt.Sprintf("(%s)", elapsed)))
 
@@ -499,7 +503,7 @@ func (r *eventRenderer) closeCurrentStepLocked() {
 	r.clearBlockLocked()
 
 	fmt.Fprintf(r.out, "%s %s %s\n",
-		check(), paintLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
+		stepGlyph(r.currentStepLabel), stepLabel(r.currentStepLabel), descText(fmt.Sprintf("(%s)", elapsed)))
 
 	r.tail = nil
 	r.currentStepID = ""

@@ -370,14 +370,14 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 	// any filter — otherwise it would race with the server's first
 	// line for the negotiator's "line one" peek.
 	//
-	// We commit it as a mint ✓ right away instead of opening a spinner:
-	// from the client's point of view packing is a one-shot act ("we
-	// kicked off the tar stream"), and visually it aligns with the ✓
+	// We commit it as a central-flow ✓ right away instead of opening a
+	// spinner: from the client's point of view packing is a one-shot act
+	// ("we kicked off the tar stream"), and visually it aligns with the ✓
 	// cascade that follows (streaming over ssh, extracting release,
-	// building release, Built X in Ns). Label uses the landing-style
-	// vocabulary — "packing <name>" — and trades the verbose
-	// "(scope: X, context: Y)" suffix for a cleaner one-line.
-	fmt.Fprintf(os.Stdout, "%s packing %s\n", check(), d.Name)
+	// building release, Built X in Ns) — all default-fg "white". Label
+	// uses the landing-style vocabulary — "packing <name>" — and trades
+	// the verbose "(scope: X, context: Y)" suffix for a cleaner one-line.
+	fmt.Fprintf(os.Stdout, "%s packing %s\n", checkFlow(), d.Name)
 
 	// Two renderers are pre-built and handed to a negotiatingWriter
 	// that picks between them based on the server's first stdout line.

@@ -40,27 +40,83 @@ func TestColorize_EmitsTruecolor(t *testing.T) {
 	}
 }
 
-// TestCheckVsCheckFinal pins the brand kit's "aurora reserved for
-// terminal success" rule: check() uses mint-400, checkFinal() uses
-// aurora. Two visually distinct ✓s — operator scanning a long apply
-// can tell intermediate step completions from the final "everything's
-// done" line at a glance.
-func TestCheckVsCheckFinal(t *testing.T) {
+// TestCheckTiers pins the three-tier ✓ vocabulary the apply flow speaks:
+// the preliminary remote-state probe recedes to gray (checkChecking), the
+// central deploy narrative is terminal-default "white" (checkFlow, no ANSI
+// escape), and the final "apply complete" terminus is mint-400 (checkFinal).
+// The three must read distinctly so an operator scanning a long apply can
+// tell setup from story from done at a glance. check() (the generic command
+// ✓ used outside the apply flow) stays mint and is distinct from checkFlow.
+func TestCheckTiers(t *testing.T) {
 	noColor = false
 
-	intermediate := check()
+	checking := checkChecking()
+	flow := checkFlow()
 	final := checkFinal()
+	generic := check()
 
-	if !strings.Contains(intermediate, "111;226;166") {
-		t.Errorf("check() should use mint-400 #6FE2A6, got: %q", intermediate)
+	// checking phase → gray #949494.
+	if !strings.Contains(checking, "148;148;148") {
+		t.Errorf("checkChecking() should use gray #949494, got: %q", checking)
 	}
 
-	if !strings.Contains(final, "199;245;221") {
-		t.Errorf("checkFinal() should use aurora #C7F5DD, got: %q", final)
+	// central deploy flow → terminal default fg, no ANSI escape at all.
+	if strings.Contains(flow, "\x1b") {
+		t.Errorf("checkFlow() should be default-fg (no ANSI escape), got: %q", flow)
 	}
 
-	if intermediate == final {
-		t.Error("check() and checkFinal() must produce visually distinct output")
+	// terminus → mint-400 #6FE2A6.
+	if !strings.Contains(final, "111;226;166") {
+		t.Errorf("checkFinal() should use mint-400 #6FE2A6, got: %q", final)
+	}
+
+	// generic command ✓ → mint-400, and distinct from the white central-flow ✓.
+	if !strings.Contains(generic, "111;226;166") {
+		t.Errorf("check() should use mint-400 #6FE2A6, got: %q", generic)
+	}
+
+	// The three apply-flow tiers must be visually distinct from each other.
+	if checking == flow || flow == final || checking == final {
+		t.Errorf("the three ✓ tiers must be distinct: checking=%q flow=%q final=%q", checking, flow, final)
+	}
+}
+
+// TestStepTierRouting pins which committed step lines recede to gray vs.
+// render white: only the "checking …" probe is gray; every other step
+// (the central deploy flow) is default-fg white.
+func TestStepTierRouting(t *testing.T) {
+	noColor = false
+
+	cases := []struct {
+		label    string
+		checking bool
+	}{
+		{"checking remote state...", true},
+		{"Checking remote state", true}, // legacy capital-C
+		{"packing controller", false},
+		{"streaming over ssh — fsw-controller", false},
+		{"extracting release 5b4cb322d427", false},
+		{"building release", false},
+	}
+
+	for _, tc := range cases {
+		if got := isCheckingLabel(tc.label); got != tc.checking {
+			t.Errorf("isCheckingLabel(%q) = %v, want %v", tc.label, got, tc.checking)
+		}
+
+		glyph := stepGlyph(tc.label)
+
+		if tc.checking {
+			if !strings.Contains(glyph, "148;148;148") {
+				t.Errorf("checking glyph should be gray, got: %q", glyph)
+			}
+
+			if lbl := stepLabel(tc.label); !strings.Contains(lbl, "148;148;148") {
+				t.Errorf("checking label should be fully gray, got: %q", lbl)
+			}
+		} else if strings.Contains(glyph, "\x1b") {
+			t.Errorf("central-flow glyph should be default-fg (no ANSI), got: %q", glyph)
+		}
 	}
 }
 

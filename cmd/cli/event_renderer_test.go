@@ -237,7 +237,7 @@ func TestEventRendererResultLineIsAmber(t *testing.T) {
 }
 
 // TestEventRendererResourceCount pins the counter that drives the
-// aurora `✓ apply complete (N resources)` terminus. The orchestrator
+// mint `✓ apply complete (N resources)` terminus. The orchestrator
 // reads ResourceCount() after Close() to decide whether to emit the
 // final line and what number to put in parens. Regression here would
 // either drop the terminus entirely or print the wrong count.

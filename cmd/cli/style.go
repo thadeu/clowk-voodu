@@ -32,11 +32,21 @@ import (
 	"strings"
 )
 
-// Brand palette — values mirror brand_v1/spec.json. Aurora (slit) is
-// reserved per the brand kit's "active states only" rule: voodu uses
-// it ONLY on the final success line (✓ apply complete) and on the
-// terminal "everything healthy" summary. Every other ✓ along the way
-// is mint-400.
+// Brand palette — values mirror brand_v1/spec.json. The apply flow
+// speaks a three-tier ✓ vocabulary so an operator can scan setup vs.
+// story vs. done at a glance:
+//
+//	checking phase (remote-state probe) → gray   (checkChecking) — recedes
+//	central deploy flow (pack/stream/    → white  (checkFlow)     — the story
+//	  extract/build/prune)                 (terminal default fg)
+//	terminus (✓ apply complete)          → mint-400 (checkFinal)  — done
+//
+// "White" is the terminal's default foreground, not a hardcoded #FFFFFF:
+// it reads white on a dark theme and stays legible on a light one — the
+// same trick paintLabel uses for the action head. mint-400 stays the
+// generic command ✓ (check(), used outside the apply flow). Aurora was
+// the old terminus color; the terminus is mint now, so aurora is a
+// reserved palette token.
 const (
 	// Truecolor escape prefix template — fill in via fmt.Sprintf if
 	// you need ad-hoc colors; the named constants below pre-bake the
@@ -51,9 +61,11 @@ const (
 	cMint300 = "\x1b[38;2;131;234;180m" // #83EAB4 Spring — softer mint, currently unused but reserved
 	cMint600 = "\x1b[38;2;61;190;133m"  // #3DBE85 Moss — darker variant, reserved
 
-	// Aurora — eye-slit signal color. Reserved for the final
-	// success terminus per brand kit page 6.
-	cAurora = "\x1b[38;2;199;245;221m" // #C7F5DD
+	// Aurora — eye-slit signal color (brand kit page 6). Formerly the
+	// final-success terminus; the terminus is mint-400 now (operators
+	// asked for a vivid green "done"), so aurora is a reserved palette
+	// token like mint-300/600 above.
+	cAurora = "\x1b[38;2;199;245;221m" // #C7F5DD — reserved
 
 	// Status colors for resource diffs (kind/scope/name + key=value).
 	// Amber for modify (~) and rose for remove (-) give each diff
@@ -99,15 +111,34 @@ var noColor = os.Getenv("NO_COLOR") != ""
 // returns "symbol + space" so the call site reads as `out.Write(arrow() +
 // "label\n")` rather than threading color codes by hand.
 
-func arrow() string         { return colorize(cMint400, symArrow) }
-func check() string         { return colorize(cMint400, symCheck) }
-func checkApplied() string  { return colorize(cAmber, symCheck) }
-func checkFinal() string    { return colorize(cAurora, symCheck) }
-func cross() string         { return colorize(cRose, symCross) }
-func plus() string          { return colorize(cMint400, symPlus) }
-func tilde() string         { return colorize(cAmber, symTilde) }
-func minusPruned() string   { return colorize(cRoseDim, symMinus) }
-func warn() string          { return colorize(cAmber, symWarn) }
+func arrow() string        { return colorize(cMint400, symArrow) }
+func check() string        { return colorize(cMint400, symCheck) }
+func checkApplied() string { return colorize(cAmber, symCheck) }
+func cross() string        { return colorize(cRose, symCross) }
+func plus() string         { return colorize(cMint400, symPlus) }
+func tilde() string        { return colorize(cAmber, symTilde) }
+func minusPruned() string  { return colorize(cRoseDim, symMinus) }
+func warn() string         { return colorize(cAmber, symWarn) }
+
+// The apply flow's three-tier ✓ vocabulary — see the palette comment
+// above. checkChecking (gray) recedes the preliminary remote-state
+// probe; checkFlow (terminal default fg, "white" on dark) carries the
+// central deploy narrative; checkFinal (mint-400) marks the terminus.
+
+// checkChecking is the gray ✓ for the preliminary remote-state probe —
+// setup work that recedes behind the deploy narrative that follows.
+func checkChecking() string { return colorize(cGray, symCheck) }
+
+// checkFlow is the central-flow ✓ — packing, streaming, extracting,
+// building, pruning. It carries NO color escape, so it renders in the
+// terminal's default foreground: "white" on a dark theme, legible on a
+// light one. Distinct from check()'s mint ✓ used outside the apply flow.
+func checkFlow() string { return symCheck }
+
+// checkFinal is the terminus ✓ — the "apply complete" line. Mint-400,
+// the brand's vivid "done" green. (Was aurora; operators asked for a
+// punchier terminus, so the pale aurora moved to a reserved token.)
+func checkFinal() string { return colorize(cMint400, symCheck) }
 
 // dim wraps text in ANSI dim (\x1b[2m). Used for elapsed-time tails
 // like `(11.8s)` after step labels.
@@ -122,11 +153,6 @@ func dim(s string) string {
 // diff lines and the final URL line.
 func mintText(s string) string {
 	return colorize(cMint400, s)
-}
-
-// auroraText wraps a string in aurora — terminus lines only.
-func auroraText(s string) string {
-	return colorize(cAurora, s)
 }
 
 // descText colors secondary "description" text gray — a step's target,
@@ -170,6 +196,37 @@ func paintLabel(label string) string {
 	}
 
 	return action + descText(detail)
+}
+
+// isCheckingLabel reports whether a committed step label is the
+// preliminary remote-state probe (the phase-1 diff spinner: "checking
+// remote state…"). It's the one step that recedes to gray — every other
+// step is part of the central deploy flow and renders in default fg.
+// Case-insensitive so the legacy capital-C "Checking " banner matches too.
+func isCheckingLabel(label string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "checking")
+}
+
+// stepGlyph picks the committed-step ✓ by tier: gray for the checking
+// phase, terminal-default "white" for the central deploy flow. Failure
+// (✗ rose) and the terminus (mint ✓) are rendered by their own helpers.
+func stepGlyph(label string) string {
+	if isCheckingLabel(label) {
+		return checkChecking()
+	}
+
+	return checkFlow()
+}
+
+// stepLabel paints a committed step label by tier: the checking phase
+// goes fully gray (the whole line recedes); the central flow keeps its
+// action in default fg with the detail tail gray (paintLabel).
+func stepLabel(label string) string {
+	if isCheckingLabel(label) {
+		return descText(label)
+	}
+
+	return paintLabel(label)
 }
 
 // colorize is the inner primitive. NO_COLOR strips escapes; otherwise
