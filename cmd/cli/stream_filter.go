@@ -61,7 +61,8 @@ var endMarkers = []string{
 // net — a future caller that writes `-----> Shipping …` through
 // progressFilter should still see the spinner.
 var stepBanners = []string{
-	"Checking ",
+	"checking ",
+	"Checking ", // capital kept for older servers/clients
 
 	// Legacy labels — kept for older servers that still emit the
 	// pre-rebrand banners. Modern voodu speaks NDJSON and skips this
@@ -88,7 +89,8 @@ var stepBanners = []string{
 // directly so the output stays stylistically consistent with the
 // step-closing ✓ lines above it.
 var passthroughBanners = []string{
-	"Pruned ",
+	"pruned ",
+	"Pruned ", // capital kept for older servers
 }
 
 // spinnerFrames is deprecated — the legacy classic-braille rotation

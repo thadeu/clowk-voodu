@@ -136,7 +136,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		// naturally carries (text reporter emits it with the `----->`
 		// prefix, NDJSON clients render it as a ✓ from the typed
 		// event).
-		opts.reporter().Summary(fmt.Sprintf("Pruned %d old release(s)", pruned))
+		opts.reporter().Summary(fmt.Sprintf("pruned %d old release(s)", pruned))
 	}
 
 	return nil

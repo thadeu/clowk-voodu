@@ -79,7 +79,7 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// "is it frozen?" silence. Open a spinner up front so the terminal
 	// shows immediate life, and commit it as a ✓ when the plan lands.
 	checking := newProgressFilter(os.Stdout, flags.verbose)
-	fmt.Fprintln(checking, "-----> Checking remote state...")
+	fmt.Fprintln(checking, "-----> checking remote state...")
 
 	var planBuf bytes.Buffer
 
@@ -207,7 +207,7 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 			reasons = append(reasons, "checking asset content drift")
 		}
 
-		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m No spec changes. %s.\n",
+		fmt.Fprintf(os.Stdout, "\x1b[32m✓\x1b[0m no spec changes. %s.\n",
 			strings.Join(reasons, "; "))
 	}
 

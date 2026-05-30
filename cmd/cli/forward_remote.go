@@ -445,6 +445,13 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 		Stdin:    pr,
 		Stdout:   filter,
 		Stderr:   filter,
+		// VOODU_PROTOCOL makes the server's receive-pack speak NDJSON,
+		// so the build streams through the eventRenderer (✓ vocabulary
+		// + live build-tail block) instead of the legacy progressFilter
+		// — which has no tail block. Without this the HCL build-mode
+		// push rendered fine but never showed the collapsing build
+		// preview; the Procfile path set it and the HCL path didn't.
+		Env: remoteEnv(),
 	})
 
 	// Always flush the filter, even on error — otherwise a build that
