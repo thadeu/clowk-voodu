@@ -113,27 +113,36 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 		return err
 	}
 
-	// 3. Build each generated resource's image from the same source.
-	for _, m := range mans {
-		appID := controller.AppID(m.Scope, m.Name)
+	// 3. Build ONCE, reuse for the rest. Every Procfile process shares one
+	// source tree and Spec=nil (auto-detect), so they all resolve to the
+	// SAME runtime image — only the tag differs. We build the first
+	// buildable resource normally, then retag that image for the others
+	// instead of rebuilding N times. Ingress manifests carry no source and
+	// are skipped here; they're persisted in step 4 like everything else.
+	primary, reuse := buildPlan(mans)
+	if primary == "" {
+		// A parsed Procfile always yields >=1 deployment/job, so this is
+		// defensive — only reachable if ToManifests ever emits an
+		// ingress-only set.
+		return fmt.Errorf("procfile produced no buildable resource (deployment/job)")
+	}
 
-		f, err := os.Open(tmpPath)
-		if err != nil {
-			return fmt.Errorf("reopen tarball for %s: %w", appID, err)
-		}
+	// Primary: full build (extract + docker build + :latest/:<buildID>
+	// tags + current symlink). Unchanged path — byte-identical to a
+	// single-deployment build today. Spec nil → auto-detect language.
+	if err := withTarball(tmpPath, func(f *os.File) error {
+		return deploy.RunFromTarball(primary, f, deploy.Options{Reporter: reporter, Force: force})
+	}); err != nil {
+		return fmt.Errorf("build %s: %w", primary, err)
+	}
 
-		buildErr := deploy.RunFromTarball(appID, f, deploy.Options{
-			Reporter: reporter,
-			Force:    force,
-			// Spec nil → the build pipeline auto-detects the language
-			// from the extracted tree. All processes share one source,
-			// so every build resolves to the same runtime; the per-
-			// process command is set on the manifest, not baked in.
-		})
-		f.Close()
-
-		if buildErr != nil {
-			return fmt.Errorf("build %s: %w", appID, buildErr)
+	// Remaining processes: reuse the primary's image (retag) + own release
+	// dir + symlink. No rebuild — that's the win.
+	for _, appID := range reuse {
+		if err := withTarball(tmpPath, func(f *os.File) error {
+			return deploy.MaterializeFromBuilt(appID, f, primary, deploy.Options{Reporter: reporter, Force: force})
+		}); err != nil {
+			return fmt.Errorf("reuse build for %s: %w", appID, err)
 		}
 	}
 
@@ -142,6 +151,13 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 		return err
 	}
 
+	// Blank line: separate the build/stream block above from the per-
+	// resource result block below — the third visual context (packing |
+	// build | results). The build spinner has stopped by now (active=false
+	// after "Build completed"), so the renderer prints this empty log
+	// verbatim as a clean gap.
+	reporter.Log(progress.LevelInfo, "")
+
 	for _, m := range mans {
 		reporter.Result(string(m.Kind), m.Scope, m.Name, "applied")
 	}
@@ -149,6 +165,47 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	reporter.Summary(fmt.Sprintf("procfile applied: %d resource(s) under scope %q", len(mans), scope))
 
 	return nil
+}
+
+// buildPlan splits generated manifests into the single build target
+// (primary) and the reuse targets for the build-once Procfile fan-out.
+// Only deployment/job kinds carry source and need an image; ingress (and
+// any other kind) is excluded — it's persisted later but never built.
+// Declaration order is preserved, so the first Procfile process line
+// becomes the primary that actually runs `docker build`.
+func buildPlan(mans []controller.Manifest) (primary string, reuse []string) {
+	for _, m := range mans {
+		if m.Kind != controller.KindDeployment && m.Kind != controller.KindJob {
+			continue
+		}
+
+		appID := controller.AppID(m.Scope, m.Name)
+
+		if primary == "" {
+			primary = appID
+
+			continue
+		}
+
+		reuse = append(reuse, appID)
+	}
+
+	return primary, reuse
+}
+
+// withTarball opens the buffered tarball, runs fn against the fresh
+// reader, and always closes it — so each build/reuse step replays the
+// same source from the top. Centralizes the reopen+close so the build
+// loop reads as intent, not file plumbing.
+func withTarball(tmpPath string, fn func(*os.File) error) error {
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("reopen tarball: %w", err)
+	}
+
+	defer f.Close()
+
+	return fn(f)
 }
 
 // fetchScopeConfig returns the scope-level config bucket (the vars set

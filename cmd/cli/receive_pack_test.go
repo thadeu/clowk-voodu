@@ -158,3 +158,72 @@ func TestResolveReceivePackSpec_MalformedInline(t *testing.T) {
 		t.Fatal("expected decode error for malformed --spec, got nil")
 	}
 }
+
+// TestBuildPlan pins the build-once fan-out selection: the FIRST
+// deployment/job becomes the single build target (primary), every other
+// deployment/job reuses its image, and ingress (no source) is excluded.
+// Declaration order is load-bearing — the primary is always the first
+// Procfile line.
+func TestBuildPlan(t *testing.T) {
+	dep := func(scope, name string) controller.Manifest {
+		return controller.Manifest{Kind: controller.KindDeployment, Scope: scope, Name: name}
+	}
+	job := func(scope, name string) controller.Manifest {
+		return controller.Manifest{Kind: controller.KindJob, Scope: scope, Name: name}
+	}
+	ing := func(scope, name string) controller.Manifest {
+		return controller.Manifest{Kind: controller.KindIngress, Scope: scope, Name: name}
+	}
+
+	cases := []struct {
+		name        string
+		mans        []controller.Manifest
+		wantPrimary string
+		wantReuse   []string
+	}{
+		{
+			name:        "web+worker+sync with web ingress",
+			mans:        []controller.Manifest{dep("clowk", "web"), dep("clowk", "worker"), dep("clowk", "sync"), ing("clowk", "web")},
+			wantPrimary: "clowk-web",
+			wantReuse:   []string{"clowk-worker", "clowk-sync"},
+		},
+		{
+			name:        "release job first, order preserved",
+			mans:        []controller.Manifest{job("clowk", "release"), dep("clowk", "web")},
+			wantPrimary: "clowk-release",
+			wantReuse:   []string{"clowk-web"},
+		},
+		{
+			name:        "single deployment, no reuse",
+			mans:        []controller.Manifest{dep("clowk", "web")},
+			wantPrimary: "clowk-web",
+			wantReuse:   nil,
+		},
+		{
+			name:        "ingress only yields no buildable",
+			mans:        []controller.Manifest{ing("clowk", "web")},
+			wantPrimary: "",
+			wantReuse:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			primary, reuse := buildPlan(tc.mans)
+
+			if primary != tc.wantPrimary {
+				t.Errorf("primary = %q, want %q", primary, tc.wantPrimary)
+			}
+
+			if len(reuse) != len(tc.wantReuse) {
+				t.Fatalf("reuse = %v, want %v", reuse, tc.wantReuse)
+			}
+
+			for i := range reuse {
+				if reuse[i] != tc.wantReuse[i] {
+					t.Errorf("reuse[%d] = %q, want %q", i, reuse[i], tc.wantReuse[i])
+				}
+			}
+		})
+	}
+}

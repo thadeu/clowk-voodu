@@ -438,6 +438,12 @@ func pushProcfileTarball(info *remote.Info, identity string, pa procfileApply, s
 
 	fmt.Fprintf(os.Stdout, "%s packing %s (procfile → scope %s)\n", check(), dir, scope)
 
+	// Blank line: the packing line is the client-side context; the forward
+	// below renders the server's build/stream context. Separate the two
+	// groups so the output reads as packing | build | results. (The next
+	// spinner lands on the line after this newline, preserving the gap.)
+	fmt.Fprintln(os.Stdout)
+
 	legacy := newProgressFilter(os.Stdout, pa.verbose)
 	nd := newEventRenderer(os.Stdout, pa.verbose)
 	filter := newNegotiatingWriter(legacy, nd)
