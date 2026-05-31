@@ -1,5 +1,5 @@
 {
   "title": "Reference",
   "icon": "BookOpen",
-  "pages": ["faq", "security", "cron", "errors", "contributing"]
+  "pages": ["faq", "migrate-from-procfile", "migrate-from-kamal", "security", "cron", "errors", "contributing"]
 }

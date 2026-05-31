@@ -1,0 +1,4 @@
+web: env RUBYOPT="-W0" bundle exec puma -p $PORT
+worker: env RUBYOPT="-W0" bundle exec sidekiq -C config/sidekiq.yml
+sync: env RUBYOPT="-W0" bundle exec bin/sync
+release: env RUBYOPT="-W0" bundle exec rails db:migrate

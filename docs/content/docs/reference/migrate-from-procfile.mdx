@@ -1,0 +1,191 @@
+---
+title: Migrate from Procfile
+description: Take a Heroku, Dokku, or foreman app with an existing Procfile and run it on voodu unchanged.
+---
+
+If you already have a `Procfile` — from Heroku, Dokku, or foreman — voodu runs it natively. No rewrite, no HCL to start.
+
+## TL;DR
+
+```sh
+vd apply -f Procfile
+```
+
+voodu ships the Procfile's directory to the controller, reads the Procfile, auto-detects the language, builds one image, and applies a deployment per process line. Each process becomes a long-running deployment with `PORT` wired in. That's the whole on-ramp — you graduate to HCL later, only when you need replicas, a release phase, or stateful plugins.
+
+A realistic Rails Procfile:
+
+```
+web: env RUBYOPT="-W0" bundle exec puma -p $PORT
+worker: env RUBYOPT="-W0" bundle exec sidekiq -C config/sidekiq.yml
+sync: env RUBYOPT="-W0" bundle exec bin/sync
+```
+
+`vd apply -f Procfile` from that directory gives you three running deployments (`web`, `worker`, `sync`), one shared image, one scope.
+
+## What maps 1:1
+
+Each non-`release:` line becomes a `deployment "<scope>" "<type>"` with `replicas=1`, `restart="on-failure"`, and `command = /bin/sh -c "<your raw command>"`. The command is shell-wrapped, so `VAR=val` prefixes, `$PORT`, `$((...))`, and pipes expand exactly like they do under foreman or Heroku.
+
+| Heroku / foreman concept | voodu |
+|---|---|
+| Process line `web: <cmd>` | `deployment "<scope>" "web"` running `/bin/sh -c "<cmd>"` |
+| `$PORT` per process | Auto-assigned from `5000`, incrementing per process; injected as `env = { PORT }` and published |
+| `release: <cmd>` | One-shot `job "<scope>" "release"` |
+| `heroku config:set KEY=val` | `vd config <scope> set KEY=val` (merges into every resource in the scope) |
+| Shell semantics (`VAR=v`, pipes, `$(...)`) | Preserved — every command runs under `/bin/sh -c` |
+| `foreman start` formation | One replica per process (scale comes after eject) |
+
+Ports auto-assign from `5000` and increment per deployment. The same value is set as `PORT`, published, and (if you add ingress) routed — they always agree. Bind your server to `$PORT` and it just works.
+
+A note on `restart`: Procfile mode uses `on-failure`, **not** the HCL default `unless-stopped`. A process that deliberately exits `0` (a misplaced one-shot) sits `Exited` instead of looping forever.
+
+App-wide config is the Heroku `config:set` equivalent:
+
+```sh
+vd config ws set DATABASE_URL=postgres://... RAILS_ENV=production
+```
+
+Scope-level config merges into **every** resource in the scope automatically — `web`, `worker`, and `sync` all see it. Don't reach for `env_from` here; the merge is automatic. See [`config`](/docs/manifests/config).
+
+## What's different
+
+**No buildpacks.** Heroku detects your stack with a buildpack; voodu auto-detects the language from the source tree and builds a Docker image. Ruby/Rails, Node, Python, and Go are all detected — the same auto-detect as HCL [build mode](/docs/examples/build-modes). All processes share one source tree, so voodu builds **one** image and retags it for each process (one image ID, N tags) instead of building N times.
+
+**Routing isn't automatic.** Heroku's `web` dyno got a magic router and a `*.herokuapp.com` hostname for free. voodu has no magic router. A Procfile alone **never** creates an ingress. To expose a process publicly you add an ingress entry to `.voodu/app.json`, keyed by process name:
+
+```json title=".voodu/app.json"
+{
+  "scope": "ws",
+  "ingress": {
+    "web": {
+      "host": "app.example.com",
+      "tls": { "enabled": true, "email": "ops@example.com" }
+    }
+  }
+}
+```
+
+This emits `ingress "ws" "web"` routing to the `web` deployment; the port defaults to that process's assigned port. `host` is required. `${VAR}` in `app.json` is interpolated from the scope config bucket at apply time, so one file serves multiple stages (set the var per server with `vd config ws set`). See [`ingress`](/docs/manifests/ingress) and the [`app.json` reference](/docs/manifests/procfile#routing).
+
+**Release phase.** Heroku's release phase (and Dokku's `release` Procfile entry) maps to a one-shot `job "<scope>" "release"` in Procfile mode — it runs once per apply. Once you [eject](#step-4-eject-to-hcl) you get the richer [`release {}`](/docs/manifests/release) block: `pre_command` / `command` / `post_command`, a `timeout`, and gating of the rolling restart. The Procfile-mode release job cannot be rolled back — `release {}` after eject can.
+
+**Addons become plugins.** Heroku/Dokku addons (Postgres, Redis) aren't part of Procfile mode. After eject, declare them as first-class resources: [`postgres`](/docs/plugins/postgres) and [`redis`](/docs/plugins/redis). They live in the same HCL and apply together with your app.
+
+**Scaling.** A Procfile gives you exactly one replica per process. Formation (`heroku ps:scale web=3`) lives in HCL after eject — set `replicas` on the deployment. statefulset is **not** available via Procfile (deployments + a release job only).
+
+## Step-by-step
+
+### Step 1: apply the Procfile as-is
+
+```sh
+vd apply -f Procfile
+```
+
+If you don't pass `--app`, voodu generates a random 3-char scope and writes `.voodu/app.json` so re-applies are idempotent (no duplicate pods). Pin a scope explicitly with `--app`:
+
+```sh
+vd apply -f Procfile --app ws
+```
+
+`--app ws` uses the scope and persists it to `.voodu/app.json`. From now on, bare `vd apply` in this directory reuses that scope.
+
+### Step 2: add a domain via `app.json`
+
+Procfile mode never creates routing on its own. Add an ingress entry keyed by the process you want public (usually `web`):
+
+```json title=".voodu/app.json"
+{
+  "scope": "ws",
+  "ingress": {
+    "web": {
+      "host": "app.example.com",
+      "tls": { "enabled": true, "email": "ops@example.com" }
+    }
+  }
+}
+```
+
+Re-apply. `.voodu/` is excluded from the build context **except** `app.json`, which is re-included so the controller reads your ingress.
+
+```sh
+vd apply -f Procfile
+```
+
+### Step 3: set config
+
+```sh
+vd config ws set DATABASE_URL=postgres://... RAILS_ENV=production RUBYOPT="-W0"
+```
+
+These merge into every deployment and the release job in scope `ws`. Secrets set this way live outside the manifest and override any `env = {}`.
+
+### Step 4: eject to HCL
+
+When you need replicas, a real release block, or stateful plugins, eject. This renders the Procfile to HCL — no server contact:
+
+```sh
+vd apply -f Procfile --eject
+```
+
+That writes `.voodu/ws.voodu` (your scope) with a deployment per process and a commented ingress stub. Now you own full HCL: bump `replicas` on `web`, turn the release job into a [`release {}`](/docs/manifests/release) block, add [`postgres`](/docs/plugins/postgres) / [`redis`](/docs/plugins/redis). Then apply the HCL by name:
+
+```sh
+vd apply -f ws
+```
+
+A post-eject Rails shape looks roughly like:
+
+```hcl title=".voodu/ws.voodu"
+deployment "ws" "web" {
+  replicas = 3
+  command  = ["/bin/sh", "-c", "env RUBYOPT=\"-W0\" bundle exec puma -p $PORT"]
+  env      = { PORT = "5000" }
+  ports    = ["5000"]
+
+  release {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+  }
+}
+
+deployment "ws" "worker" {
+  command = ["/bin/sh", "-c", "env RUBYOPT=\"-W0\" bundle exec sidekiq -C config/sidekiq.yml"]
+}
+
+deployment "ws" "sync" {
+  command = ["/bin/sh", "-c", "env RUBYOPT=\"-W0\" bundle exec bin/sync"]
+}
+```
+
+Eject is one-way in spirit — it's the "graduate to full HCL control" path. You don't have to eject; many apps live happily in Procfile mode forever.
+
+### Step 5: commit `.voodu/`
+
+Commit `.voodu/app.json` (and `.voodu/ws.voodu` if you ejected). `app.json` pins your scope and routing, so the same repo applies identically from any machine or CI runner — the same idea as Vercel's `.vercel/project.json`. Without it, a fresh checkout generates a new random scope and you get duplicate pods.
+
+## Coming from Dokku specifically
+
+The mental model carries over almost directly:
+
+| Dokku | voodu |
+|---|---|
+| `git push dokku main` | `vd apply -f Procfile` |
+| `dokku config:set app KEY=val` | `vd config <scope> set KEY=val` |
+| `dokku domains:add app app.example.com` | `ingress` entry in `.voodu/app.json` |
+| `release:` Procfile entry | one-shot `job "<scope>" "release"` (→ `release {}` after eject) |
+| `dokku ps:scale web=3` | `replicas = 3` on the deployment (after eject) |
+| Postgres/Redis plugins (`dokku postgres:create`) | [`postgres`](/docs/plugins/postgres) / [`redis`](/docs/plugins/redis) plugins after eject |
+
+Two differences worth internalizing. Dokku reads your Procfile and routes the `web` process automatically; voodu reads the Procfile but **routing is explicit** — host and TLS live in `app.json` (or in HCL after eject), never inferred. And where Dokku is git-push-driven, voodu is declarative: `vd apply` ships your current source and the controller reconciles toward it.
+
+## See also
+
+- [Procfile manifest](/docs/manifests/procfile) — the full mapping reference
+- [Procfile example](/docs/examples/procfile) — a complete walkthrough
+- [`.voodu/app.json`](/docs/manifests/procfile#routing) — scope + per-process ingress
+- [`vd apply`](/docs/cli/apply) — flags, prune, output
+- [`config`](/docs/manifests/config) — scope-level and per-resource env
+- [`release`](/docs/manifests/release) — once-per-release hooks after eject
+- [postgres](/docs/plugins/postgres) · [redis](/docs/plugins/redis) — stateful plugins
+- [Migrate from Kamal](/docs/reference/migrate-from-kamal) — for apps with a `config/deploy.yml`

@@ -4,6 +4,7 @@
   "pages": [
     "overview",
     "hello-world",
+    "procfile",
     "ingress-routing",
     "build-modes",
     "private-registry",

@@ -1,0 +1,200 @@
+---
+title: Procfile
+description: Deploy a Heroku/Dokku-style Procfile with zero HCL — voodu generates the manifests, builds once, and applies.
+---
+
+A `Procfile` is the zero-HCL on-ramp. If you already have a Heroku, Dokku, or foreman app, you can deploy it to voodu without writing a single line of HCL — voodu reads the Procfile, generates the manifests, auto-detects the language, builds the image, and applies the whole thing.
+
+```sh
+vd apply -f Procfile
+```
+
+That one command ships the Procfile's **directory** as a tarball to the controller over SSH. The server reads the Procfile, turns each line into a resource, builds the source tree, and reconciles the result — same pipeline as a hand-written [`deployment`](/docs/manifests/deployment) or [`job`](/docs/manifests/jobs), just generated for you.
+
+Bare `vd apply` (no `-f`) auto-discovers: it uses `./Procfile` if present, otherwise `.voodu/` manifests.
+
+A Procfile is a list of `type: command` lines:
+
+```
+web: env RUBYOPT="-W0" bundle exec puma -p $PORT
+worker: env RUBYOPT="-W0" bundle exec sidekiq -C config/sidekiq.yml
+sync: env RUBYOPT="-W0" bundle exec bin/sync
+release: env RUBYOPT="-W0" bundle exec bin/rails db:migrate
+```
+
+Blank lines and `#` comments are ignored. Duplicate process types are rejected, and an empty Procfile is rejected. Each process type must match `^[A-Za-z][A-Za-z0-9_-]*$`.
+
+## Mapping
+
+Each line becomes one resource. `release:` is special; everything else is a long-running deployment.
+
+| Procfile line | Generates | Notes |
+|---|---|---|
+| `release: <cmd>` | `job "<scope>" "release"` | One-shot. Runs once per apply, then sits Exited. |
+| `<type>: <cmd>` | `deployment "<scope>" "<type>"` | Long-running. One per non-release line. |
+
+The generated deployment carries these defaults:
+
+| Setting | Value | Why |
+|---|---|---|
+| `replicas` | `1` | Scale later in HCL after [eject](#eject-to-hcl). |
+| `restart` | `on-failure` | NOT the HCL default `unless-stopped`. A deliberate exit-0 (a misplaced one-shot) sits Exited instead of looping. |
+| `command` | `["/bin/sh", "-c", "<raw command>"]` | Shell-wrapped, so `VAR=val` prefixes, `$PORT`, `$((...))`, and pipes expand like Heroku/foreman. |
+| `env.PORT` | assigned port | Injected so `$PORT` in the command resolves. |
+| `ports` | `["<port>"]` | Published so the process is reachable. |
+
+**Port assignment** starts at `5000` and increments per deployment, in declaration order. For the example above:
+
+| Process | Resource | Port |
+|---|---|---|
+| `release` | `job "ws" "release"` | — (one-shot, no port) |
+| `web` | `deployment "ws" "web"` | 5000 |
+| `worker` | `deployment "ws" "worker"` | 5001 |
+| `sync` | `deployment "ws" "sync"` | 5002 |
+
+If an [app.json](#routing) ingress entry declares a port for a process, that **pins** the port — the `PORT` env, the published port, and the ingress all agree on it — and it does **not** consume an auto slot.
+
+## Scope identity
+
+The scope is the app's stable identity. A stable scope is what makes re-apply idempotent: applying the same Procfile twice updates the same deployments instead of spawning duplicate pods. Resolution order (`resolveProcfileScope`):
+
+| Source | Behavior |
+|---|---|
+| `--app <name>` | Use it, and persist it to `.voodu/app.json`. |
+| `.voodu/app.json` exists | Reuse its `scope`. |
+| neither | Generate a random 3-char scope and write `.voodu/app.json`. |
+
+```sh
+vd apply -f Procfile --app ws
+```
+
+The random scope is **not** derived from the directory name — that avoids collisions between two apps that happen to live in similarly named folders. It's the same idea as Vercel's `.vercel/project.json`.
+
+**Commit `.voodu/app.json`.** It pins the scope across machines and CI. Without it, a fresh clone generates a *new* random scope and your next apply creates a second set of pods instead of updating the first. Pin it by committing the file (or always passing `--app`).
+
+## Routing
+
+A Procfile alone **never** creates an [`ingress`](/docs/manifests/ingress). Host and TLS can't be expressed in a Procfile line, so routing comes only from the `ingress` block in `.voodu/app.json` — the project-link file:
+
+```json
+{
+  "scope": "ws",
+  "ingress": {
+    "web": {
+      "host": "app.example.com",
+      "tls": { "enabled": true, "email": "ops@example.com" }
+    }
+  }
+}
+```
+
+Each ingress entry is **keyed by process name** and emits `ingress "<scope>" "<proc>"` routing to that process's deployment.
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `host` | yes | — | The hostname to route. No default — required. |
+| `port` | no | the process's assigned port | Pins the port (see [Mapping](#mapping)). |
+| `service` | no | the process's deployment | Override the routing target. |
+| `tls` | no | — | `{ "enabled": true, "email": "..." }` flips on Let's Encrypt. |
+| `lb` | no | — | Load-balancing config. |
+| `location` | no | `/` | `{ "path": "/", "strip_prefix": false }`. |
+| `locations` | no | — | Multiple location blocks. |
+
+`${VAR}` in `app.json` is interpolated from the scope [config](/docs/manifests/config) bucket at apply time, so one `app.json` serves multiple stages — set the var per server:
+
+```json
+{
+  "scope": "ws",
+  "ingress": {
+    "web": { "host": "${APP_HOST}", "tls": { "enabled": true, "email": "ops@example.com" } }
+  }
+}
+```
+
+```sh
+vd config ws set APP_HOST=app.example.com -r prod
+vd config ws set APP_HOST=staging.example.com -r staging
+```
+
+`.voodu/` is excluded from the build context **except `app.json`**, which is re-included so the server can read the ingress. Commit it to keep scope and routing stable across machines and CI.
+
+## Config & secrets
+
+The Heroku `config:set` equivalent is `vd config <scope> set`:
+
+```sh
+vd config ws set DATABASE_URL=postgres://... -r prod
+vd config ws set SECRET_KEY_BASE=$(openssl rand -hex 32) -r prod
+```
+
+Scope-level config **merges into every resource in the scope automatically** — the reconciler builds each deployment's env as scope-level + app-level config. You do **not** use `env_from` for this. `env_from` would duplicate the merge and hard-fail if the bucket doesn't exist yet; scope-level config is the right tool because it's the same merge for `web`, `worker`, `sync`, and the `release` job all at once.
+
+## Build: one image, many processes
+
+There's no `image` or `build {}` in a Procfile. The spec is `nil`, so the build pipeline **auto-detects the language** from the source tree (Ruby/Rails, Python, Node, Go) — the same auto-detect as HCL [build-mode](/docs/manifests/build). All processes share one source tree, so they share **one runtime image**. The per-process command lives on the manifest, not baked into the image.
+
+Because it's one source → one image, voodu builds the **first** process and **retags** that image for the others (`docker tag`) instead of rebuilding N times. The result is N tags — each `<scope>-<proc>:latest` *and* `<scope>-<proc>:<buildID>` — all pointing at **one** image ID. Shared storage, not N×size.
+
+Each process still gets its own tags so the two consumers work independently:
+
+- The reconciler resolves `<scope>-<proc>:latest` per resource.
+- `vd rollback` needs the per-process `:<buildID>` tag.
+
+For the 3-deployment example, that's 6 tags pointing at 1 image:
+
+```sh
+docker images
+# REPOSITORY        TAG        IMAGE ID      ...
+# ws-web            latest     a1b2c3d4...   # ← same ID
+# ws-web            <buildID>  a1b2c3d4...   # ← same ID
+# ws-worker         latest     a1b2c3d4...   # ← same ID
+# ws-worker         <buildID>  a1b2c3d4...   # ← same ID
+# ws-sync           latest     a1b2c3d4...   # ← same ID
+# ws-sync           <buildID>  a1b2c3d4...   # ← same ID
+
+docker images -q | sort -u | wc -l
+# 1
+```
+
+`docker images` lists one row per tag and repeats the image size in each row — it looks like 6 images, but `docker images -q | sort -u | wc -l` confirms it's one. Pass `--force` (or set `VOODU_FORCE_REBUILD=1`) to rebuild even on a content-hash hit.
+
+The apply output is three visual groups separated by blank lines: packing (client) | streaming/extracting/building (build) | deployment results + `procfile applied`.
+
+## Eject to HCL
+
+When you outgrow the Procfile defaults — you need a statefulset, more replicas, probes, or fine-grained ingress — graduate to full HCL:
+
+```sh
+vd apply -f Procfile --eject
+```
+
+`--eject` renders the Procfile to HCL at `.voodu/<scope>.voodu` (with a commented ingress stub) and makes **no server contact**. Edit the HCL, then apply it directly:
+
+```sh
+vd apply -f ws
+```
+
+This is the one-way door from generated manifests to hand-authored ones — after ejecting, the `.voodu/<scope>.voodu` file is the source of truth.
+
+## Limits / trade-offs
+
+**No statefulset.** Procfile mode generates deployments and a release job only. For stateful workloads, declare a [`statefulset`](/docs/manifests/statefulset) — or a [`postgres`](/docs/manifests/postgres) / [`redis`](/docs/manifests/redis) plugin resource — in HCL.
+
+**The release job can't be rolled back.** `vd rollback` is for deployments and statefulsets. The `release:` line is a one-shot job, so it has no release history to revert to.
+
+**`release:` runs once per apply.** It's a one-shot, not a recurring process. For a cron schedule, eject to HCL and use a [`cronjob`](/docs/manifests/jobs).
+
+**Routing only via `app.json`.** A Procfile can't express a host or TLS. If you need ingress, add an entry to `.voodu/app.json`, or eject to HCL.
+
+**`restart = on-failure`, not `unless-stopped`.** A process that exits 0 stays Exited. That's deliberate (it catches misplaced one-shots), but if you have a long-running process that legitimately exits and should restart, eject and set the policy you want.
+
+## See also
+
+- [`vd apply`](/docs/cli/apply) — the apply pipeline and flags
+- [`deployment`](/docs/manifests/deployment) — what each Procfile line becomes
+- [`release`](/docs/manifests/release) — the `release:` line's richer HCL counterpart
+- [`ingress`](/docs/manifests/ingress) — what `app.json` ingress entries emit
+- [`config`](/docs/manifests/config) — scope-level config and secrets
+- [`build`](/docs/manifests/build) — language auto-detect and build-mode
+- [Procfile example](/docs/examples/procfile) — a full Rails walkthrough
+- [Migrate from Procfile](/docs/reference/migrate-from-procfile) — Heroku/Dokku → voodu

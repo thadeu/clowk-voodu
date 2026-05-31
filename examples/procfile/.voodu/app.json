@@ -1,0 +1,12 @@
+{
+  "scope": "ws",
+  "ingress": {
+    "web": {
+      "host": "app.example.com",
+      "tls": {
+        "enabled": true,
+        "email": "ops@example.com"
+      }
+    }
+  }
+}

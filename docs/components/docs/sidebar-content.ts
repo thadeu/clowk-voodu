@@ -88,6 +88,7 @@ export const contents: SidebarSection[] = [
     list: [
       { title: 'Overview', href: '/docs/examples/overview', icon: Layers },
       { title: 'Hello world', href: '/docs/examples/hello-world', icon: Sparkle },
+      { title: 'Procfile deploy', href: '/docs/examples/procfile', icon: ScrollText },
       { title: 'Ingress routing', href: '/docs/examples/ingress-routing', icon: Network },
       { title: 'Build modes', href: '/docs/examples/build-modes', icon: Hammer },
       { title: 'Private registry', href: '/docs/examples/private-registry', icon: Lock },
@@ -113,6 +114,7 @@ export const contents: SidebarSection[] = [
       // ── Workloads: what runs ──────────────────────────────
       { title: 'deployment', href: '/docs/manifests/deployment', icon: Server },
       { title: 'app', href: '/docs/manifests/app', icon: Box },
+      { title: 'Procfile', href: '/docs/manifests/procfile', icon: ScrollText },
       { title: 'statefulset', href: '/docs/manifests/statefulset', icon: Disc3 },
       { title: 'jobs & cronjobs', href: '/docs/manifests/jobs', icon: Workflow },
 
@@ -172,6 +174,8 @@ export const contents: SidebarSection[] = [
     icon: BookOpen,
     list: [
       { title: 'FAQ', href: '/docs/reference/faq', icon: HelpCircle },
+      { title: 'Migrate from Procfile', href: '/docs/reference/migrate-from-procfile', icon: GitMerge },
+      { title: 'Migrate from Kamal', href: '/docs/reference/migrate-from-kamal', icon: GitFork },
       { title: 'Security', href: '/docs/reference/security', icon: ShieldCheck },
       { title: 'Cron syntax', href: '/docs/reference/cron', icon: Clock },
       { title: 'Errors', href: '/docs/reference/errors', icon: AlertTriangle },

@@ -1,0 +1,216 @@
+---
+title: Migrate from Kamal
+description: Map a Kamal config/deploy.yml onto voodu HCL manifests and the vd CLI.
+---
+
+You have a `config/deploy.yml` and the `kamal` CLI. This guide maps every Kamal concept onto its voodu equivalent so you can move an app over without re-learning the whole model.
+
+## TL;DR
+
+Both tools deploy Docker containers over SSH. No Kubernetes, no agents on a control plane you don't own. The difference is *how* state is managed:
+
+- **Kamal is imperative.** `config/deploy.yml` describes intent, but the `kamal` CLI is what orchestrates: it SSHes to each host, pulls images, boots containers, runs hooks. Nothing reconciles after the command exits — if a container dies, it stays dead until you run `kamal` again.
+- **voodu is declarative.** Your HCL manifests are the desired state. `vd apply` ships them to a controller that runs on each host. The controller reconciles: it keeps replicas at the declared count, restarts crashed containers, re-derives ingress routes, and re-runs probes. You describe the end state once; the controller holds it.
+
+Practically: you stop hand-orchestrating rollouts. You declare what should be true and let the controller converge on it.
+
+## deploy.yml -> voodu HCL
+
+| Kamal (`config/deploy.yml`) | voodu |
+|---|---|
+| `service:` + `image:` (registry image) | `deployment "<scope>" "web" { image = "ghcr.io/org/app:tag" }` |
+| `builder: { dockerfile, context, args }` | `build { context, dockerfile, args, lang {} }` on the deployment |
+| `servers.web.hosts: [ip1, ip2]` | `vd remote add prod ubuntu@ip1` (one remote per host) + `replicas = 2` for scale within a host |
+| `servers.job: { hosts, cmd: "bin/jobs" }` (worker role) | a second `deployment "<scope>" "worker" { command = ["bin/jobs"] }` — each role becomes its own deployment |
+| a periodic role / cron | `cronjob "<scope>" "<name>" { schedule = "..." command = [...] }` |
+| `registry: { server, username, password: <ENV> }` | `registry "<name>" { url = "..." username = "..." token = "..." }` (declared once per host) |
+| `env.clear: { K: v }` | `env = { K = "v" }` in HCL, or `vd config <scope> set K=v` |
+| `env.secret: [NAMES]` (from `.kamal/secrets`) | `vd config <ref> set NAME=val` — secrets live outside the manifest and override `env = {}` |
+| `proxy: { ssl: true, host: app.example.com }` | `ingress "<scope>" "web" { host = "app.example.com" tls { email = "ops@example.com" } }` |
+| `accessories.db: { image: postgres:16, ... }` | `postgres "<scope>" "db" {}` (the [voodu-postgres](/docs/plugins/postgres) plugin) |
+| `accessories.redis: { image: redis }` | `redis "<scope>" "cache" {}` (the [voodu-redis](/docs/plugins/redis) plugin) |
+| `aliases: { console: "app exec -i bin/rails console" }` | run directly: `vd exec <ref> -- bin/rails console` (no alias layer) |
+| pre-deploy hook / `kamal app exec rails db:migrate` | `release { command = ["bin/rails","db:migrate"] }` — runs once per release, gates the rollout |
+
+Two structural shifts to internalize:
+
+- **Roles become deployments.** Kamal's `web` and `job` roles are two entries under `servers:` sharing one image. In voodu they're two `deployment` resources in the same scope. They still share an image if you point both at the same `image` (or build once and tag — see [build-modes](/docs/examples/build-modes)).
+- **Accessories become plugin resources.** Kamal accessories are sidecar containers you `kamal accessory boot`. voodu stateful services are first-class plugin-managed resources: you declare `postgres {}` / `redis {}` in the same HCL and they're applied together with the rest. The plugin owns provisioning, health, and lifecycle.
+
+## A worked example
+
+A representative `config/deploy.yml` — web + job roles, a registry, clear and secret env, proxy SSL, postgres and redis accessories, a builder:
+
+```yaml
+service: shop
+image: ghcr.io/acme/shop
+
+servers:
+  web:
+    hosts:
+      - 203.0.113.10
+  job:
+    hosts:
+      - 203.0.113.10
+    cmd: bundle exec sidekiq -C config/sidekiq.yml
+
+registry:
+  server: ghcr.io
+  username: acme-ci
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+env:
+  clear:
+    RAILS_ENV: production
+    RUBYOPT: -W0
+  secret:
+    - RAILS_MASTER_KEY
+    - DATABASE_URL
+
+proxy:
+  ssl: true
+  host: shop.example.com
+
+builder:
+  arch: amd64
+  dockerfile: Dockerfile
+  context: .
+
+accessories:
+  db:
+    image: postgres:16
+    host: 203.0.113.10
+    env:
+      clear:
+        POSTGRES_DB: shop_production
+  redis:
+    image: redis:7
+    host: 203.0.113.10
+```
+
+The equivalent `voodu.hcl` — scope `shop`, a built `web` deployment, a `worker` deployment for Sidekiq, an ingress with TLS, a registry, and the postgres + redis plugins:
+
+```hcl
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "acme-ci"
+  token    = "${GHCR_TOKEN}"
+}
+
+deployment "shop" "web" {
+  replicas = 1
+
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+    args       = { arch = "amd64" }
+  }
+
+  command = ["bundle", "exec", "puma", "-p", "8080"]
+
+  env = {
+    RAILS_ENV = "production"
+    RUBYOPT   = "-W0"
+    PORT      = "8080"
+  }
+
+  ports = ["8080"]
+
+  release {
+    command = ["bin/rails", "db:migrate"]
+    timeout = "10m"
+  }
+}
+
+deployment "shop" "worker" {
+  replicas = 1
+  build {
+    context    = "."
+    dockerfile = "Dockerfile"
+  }
+
+  command = ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+
+  env = {
+    RAILS_ENV = "production"
+    RUBYOPT   = "-W0"
+  }
+}
+
+ingress "shop" "web" {
+  host    = "shop.example.com"
+  service = "web"
+  port    = 8080
+
+  tls {
+    email = "ops@example.com"
+  }
+}
+
+postgres "shop" "db" {}
+
+redis "shop" "cache" {}
+```
+
+Secrets stay out of the manifest. Set them once per host with `vd config` — scope-level config merges into every resource in the scope automatically:
+
+```sh
+vd config shop set RAILS_MASTER_KEY=... -r prod
+vd config shop set DATABASE_URL=postgres://... -r prod
+vd config ghcr set GHCR_TOKEN=... -r prod
+```
+
+Then deploy:
+
+```sh
+vd remote add prod ubuntu@203.0.113.10
+vd apply -f voodu.hcl -r prod
+```
+
+The `release {}` block runs `db:migrate` once against the new image before the rolling restart, and aborts the rollout if it fails — the same gate Kamal's pre-deploy hook gives you, but declared in the manifest. See [release](/docs/manifests/release).
+
+If you'd rather skip the build and deploy a pre-built image (closer to Kamal's `image:` default), drop the `build {}` block and set `image = "ghcr.io/acme/shop:<tag>"` instead.
+
+## Command cheatsheet
+
+| Kamal | voodu |
+|---|---|
+| `kamal setup` | `vd apply -f voodu.hcl -r prod` (first apply provisions everything declared, including plugins) |
+| `kamal deploy` | `vd apply -f voodu.hcl -r prod` |
+| `kamal redeploy` | `vd apply -f voodu.hcl -r prod` (or `--force` to rebuild on a content-hash hit) |
+| `kamal rollback <version>` | `vd rollback shop/web` |
+| `kamal app exec 'CMD'` | `vd exec shop/web -- CMD` (running container) or `vd run shop/web -- CMD` (fresh one-shot) |
+| `kamal app logs -f` | `vd logs -f shop/web` |
+| `kamal accessory boot db` | declare `postgres "shop" "db" {}` and apply — no separate boot step |
+| `kamal env push` | `vd config shop set KEY=val` |
+| `kamal details` | `vd get` / `vd describe deployment shop/web` |
+
+## What you gain / what changes
+
+What you gain:
+
+- **Self-healing.** The controller reconciles to the declared `replicas`. A crashed container comes back without you running anything. Under Kamal a dead container stays dead until the next `kamal deploy`.
+- **Probes gate the rollout.** Declare a readiness probe and the controller won't shift traffic to a replica until it's healthy — and won't complete a release if the new image won't come up.
+- **Ingress is first-class.** Hosts, TLS, and routing are declared resources the controller reconciles, not a proxy you boot and configure imperatively. Change the host in HCL, re-apply, the route updates.
+- **Accessories are managed.** Postgres and Redis are plugin-owned resources with their own provisioning and health, not raw sidecar containers you keep alive yourself.
+
+What changes:
+
+- **You stop hand-orchestrating.** There's no `kamal deploy` that walks hosts in sequence. You `vd apply` the desired state; the controller on each host converges. For multiple hosts you apply to each remote.
+- **One controller per host.** voodu runs a long-lived controller; Kamal has nothing resident. That's the price of reconciliation — a process that's always there to hold state.
+- **Desired state, not commands.** Manifests describe the end state. There's no imperative `boot this accessory` or `exec that migration as a deploy step` — migrations are a `release {}` block, accessories are declared resources. The shift is from a sequence of actions to a description of what should be true.
+
+None of this is free: a resident controller is more than a CLI that exits. The trade is operational — you give up imperative control of each step in exchange for a system that keeps the declared state without you in the loop.
+
+## See also
+
+- [Procfile mode](/docs/manifests/procfile) — if your app is foreman/Heroku-shaped, you may not need HCL at all
+- [deployment](/docs/manifests/deployment) — the core long-running resource
+- [ingress](/docs/manifests/ingress) — hosts, TLS, routing
+- [release](/docs/manifests/release) — once-per-release migration gate
+- [registry](/docs/manifests/registry) — private image pulls
+- [config](/docs/manifests/config) — env and secrets
+- [build](/docs/manifests/build) and [build-modes](/docs/examples/build-modes) — building from source
+- [voodu-postgres](/docs/plugins/postgres), [voodu-redis](/docs/plugins/redis) — the accessory replacements
+- [vd apply](/docs/cli/apply), [vd remote](/docs/cli/remote)

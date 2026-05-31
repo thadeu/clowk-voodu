@@ -6,6 +6,7 @@ End-to-end manifest examples grouped by what they showcase. Each subdirectory is
 
 | dir | what it shows |
 |---|---|
+| [`procfile/`](./procfile) | The zero-HCL on-ramp — `vd apply -f Procfile`. Heroku/Dokku-style process lines become deployments (+ a release job), build once and retag across processes, optional ingress via `.voodu/app.json`, eject to HCL when you outgrow it |
 | [`asset/`](./asset) | Standalone `asset` blocks with `file()`, `url()`, and inline string sources; scoped (`asset "scope" "name"`) and unscoped (`asset "name"`) shapes; combination with a `deployment` mounting the materialised paths via `${asset.…}` |
 | [`build/`](./build) | `build {}` block — build images from source instead of pulling from a registry. docker-compose-shaped (`context`, `dockerfile`, `args`). Covers auto-detect, custom Dockerfile, Go monorepo, statefulset build |
 | [`statefulset/`](./statefulset) | Single-node and multi-replica statefulsets (postgres, redis) with per-pod ordinal identity and persistent volume claims |
