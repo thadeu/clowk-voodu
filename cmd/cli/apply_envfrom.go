@@ -36,8 +36,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -47,7 +48,102 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/manifest"
+	"go.voodu.clowk.in/internal/remote"
 )
+
+// bucketFetcher resolves an env_from ref ("scope" or "scope/name") to
+// its config-bucket KV map. The interpolation context that feeds
+// `${VAR}` substitution is layered from these.
+//
+// Two transports back it, depending on how the CLI reaches the
+// controller for this invocation:
+//
+//   - cmdBucketFetcher: HTTP via controllerDo. Used when a cobra
+//     command with controller wiring is in hand — the local apply
+//     path against a controller URL, and the server side of an
+//     SSH-forwarded apply (where the controller is localhost).
+//   - sshBucketFetcher: runs `voodu config <ref> get -o json` on the
+//     remote over SSH. Used by the CLIENT side of an SSH-forwarded
+//     apply, where manifests are parsed on the dev machine but the
+//     buckets live on the remote controller the client can only reach
+//     through ssh.
+//
+// A nil bucketFetcher means "offline": env_from enrichment is skipped
+// and `${VAR}` resolves against the operator's shell only.
+type bucketFetcher func(ref string) (map[string]string, error)
+
+// cmdBucketFetcher backs env_from resolution with the HTTP /config
+// endpoint via controllerDo. Returns nil (offline) when cmd is nil, so
+// callers can pass it through unconditionally.
+func cmdBucketFetcher(cmd *cobra.Command) bucketFetcher {
+	if cmd == nil {
+		return nil
+	}
+
+	return func(ref string) (map[string]string, error) {
+		scope, name, err := parseEnvFromRef(ref)
+		if err != nil {
+			return nil, err
+		}
+
+		return configFetch(cmd, scope, name, "")
+	}
+}
+
+// sshBucketFetcher backs env_from resolution by running
+// `voodu config <ref> get -o json` on the remote over SSH and decoding
+// the flat KV map it prints. This is what lets an SSH-forwarded
+// `vd apply` resolve `${VAR}` from controller buckets even though the
+// HCL is parsed on the dev machine. Returns nil (offline) when info is
+// nil so the as-is forward path is unaffected.
+func sshBucketFetcher(info *remote.Info, identity string) bucketFetcher {
+	if info == nil {
+		return nil
+	}
+
+	return func(ref string) (map[string]string, error) {
+		return fetchBucketOverSSH(info, identity, ref)
+	}
+}
+
+// fetchBucketOverSSH runs the remote `voodu config <ref> get -o json`
+// and parses its output. The `-o json` form prints a flat
+// {"KEY":"VAL"} object (see runConfigGet), so a single map decode
+// covers it. An empty bucket prints `{}` and decodes to an empty map —
+// the same no-op env_from layering the runtime path uses.
+//
+// An empty stdin reader is passed so remote.Forward skips TTY
+// allocation (a -tt session would corrupt the captured JSON); config
+// get reads no stdin, so the empty reader is harmless.
+func fetchBucketOverSSH(info *remote.Info, identity, ref string) (map[string]string, error) {
+	var out bytes.Buffer
+
+	code, err := remote.Forward(info, []string{"config", ref, "get", "-o", "json"}, remote.ForwardOptions{
+		Identity: identity,
+		Stdin:    bytes.NewReader(nil),
+		Stdout:   &out,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if code != 0 {
+		return nil, fmt.Errorf("remote `config %s get` exited %d", ref, code)
+	}
+
+	vars := map[string]string{}
+
+	trimmed := bytes.TrimSpace(out.Bytes())
+	if len(trimmed) == 0 {
+		return vars, nil
+	}
+
+	if err := json.Unmarshal(trimmed, &vars); err != nil {
+		return nil, fmt.Errorf("decode remote config %q: %w", ref, err)
+	}
+
+	return vars, nil
+}
 
 // envFromScanner walks raw HCL bytes and extracts every
 // `env_from = [...]` attribute it finds at the top level of any
@@ -179,29 +275,22 @@ func newBucketCache() *bucketCache {
 	return &bucketCache{entries: map[string]map[string]string{}}
 }
 
-// fetch reads one bucket from the controller, using the cache
-// on subsequent hits. Empty bucket (key not yet set) returns an
+// fetch reads one bucket through the supplied fetcher, using the
+// cache on subsequent hits. Empty bucket (key not yet set) returns an
 // empty map without error — that matches the runtime semantics
 // (env_from to an empty bucket layers nothing).
 //
-// Errors here are network / 5xx — the operator's manifest
-// references config the CLI can't reach, and we'd rather fail
-// the apply than silently interpolate against incomplete data.
-func (c *bucketCache) fetch(cmd *cobra.Command, ref string) (map[string]string, error) {
+// Errors here are network / 5xx (or a dead SSH hop) — the operator's
+// manifest references config the CLI can't reach, and we'd rather fail
+// the apply than silently interpolate against incomplete data. A cache
+// hit never invokes the fetcher, so a nil fetcher is safe for
+// pre-populated entries.
+func (c *bucketCache) fetch(fetch bucketFetcher, ref string) (map[string]string, error) {
 	if cached, ok := c.entries[ref]; ok {
 		return cached, nil
 	}
 
-	scope, name, err := parseEnvFromRef(ref)
-	if err != nil {
-		return nil, err
-	}
-
-	// configFetch wants name="" for the scope-level bucket; we
-	// pass the parsed name verbatim (which is "" when the ref is
-	// scope-only like "monitoring", or the bucket name like
-	// "shared" for "prod/shared").
-	vars, err := configFetch(cmd, scope, name, "")
+	vars, err := fetch(ref)
 	if err != nil {
 		return nil, fmt.Errorf("env_from %q: %w", ref, err)
 	}
@@ -246,14 +335,15 @@ func mergeBucketEnv(refs []string, buckets map[string]map[string]string, shellEn
 // refs from raw, fetches via cache, merges with shellEnv,
 // returns the merged map ready to feed manifest.ParseFile.
 //
-// cmd == nil short-circuits to shellEnv unchanged — used by
-// tests that exercise pure-shell interpolation.
-func enrichEnvFor(cmd *cobra.Command, filename string, raw []byte, shellEnv map[string]string, cache *bucketCache) (map[string]string, error) {
-	if cmd == nil {
+// A nil fetcher short-circuits to shellEnv unchanged — the offline
+// case (no controller wired) and the path tests that exercise
+// pure-shell interpolation.
+func enrichEnvFor(fetch bucketFetcher, filename string, raw []byte, shellEnv map[string]string, cache *bucketCache) (map[string]string, error) {
+	if fetch == nil {
 		return shellEnv, nil
 	}
 
-	return enrichEnv(cmd, filename, raw, shellEnv, cache)
+	return enrichEnv(fetch, filename, raw, shellEnv, cache)
 }
 
 // enrichEnv combines bucket-sourced and shell-sourced
@@ -272,7 +362,7 @@ func enrichEnvFor(cmd *cobra.Command, filename string, raw []byte, shellEnv map[
 // the source-of-truth bucket can't be reached, rather than
 // silently apply with `${VAR}` resolved to its shell-only value
 // (or worse, fail later with "undefined variable").
-func enrichEnv(cmd *cobra.Command, filename string, raw []byte, shellEnv map[string]string, cache *bucketCache) (map[string]string, error) {
+func enrichEnv(fetch bucketFetcher, filename string, raw []byte, shellEnv map[string]string, cache *bucketCache) (map[string]string, error) {
 	if cache == nil {
 		cache = newBucketCache()
 	}
@@ -289,7 +379,7 @@ func enrichEnv(cmd *cobra.Command, filename string, raw []byte, shellEnv map[str
 	buckets := make(map[string]map[string]string, len(refs))
 
 	for _, ref := range refs {
-		vars, ferr := cache.fetch(cmd, ref)
+		vars, ferr := cache.fetch(fetch, ref)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -310,7 +400,7 @@ func enrichEnv(cmd *cobra.Command, filename string, raw []byte, shellEnv map[str
 // Mirrors manifest.ParseDir's walk shape but doesn't reach for
 // that function directly — we need to interpose enrichEnvFor
 // per file, which ParseDir's signature can't accept.
-func loadDir(cmd *cobra.Command, root string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
+func loadDir(fetch bucketFetcher, root string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
 	var files []string
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -342,7 +432,7 @@ func loadDir(cmd *cobra.Command, root string, shellEnv map[string]string, cache 
 			return nil, fmt.Errorf("read %s: %w", f, rerr)
 		}
 
-		env, eerr := enrichEnvFor(cmd, f, raw, shellEnv, cache)
+		env, eerr := enrichEnvFor(fetch, f, raw, shellEnv, cache)
 		if eerr != nil {
 			return nil, eerr
 		}
@@ -380,9 +470,3 @@ func parseEnvFromRef(ref string) (scope, name string, err error) {
 
 	return ref, "", nil
 }
-
-// Compile-time check that net/http is referenced — keeps the
-// import stable when this file evolves to send custom auth
-// headers via controllerDo. Without this, gofmt would strip
-// the import on the next refactor.
-var _ = http.MethodGet

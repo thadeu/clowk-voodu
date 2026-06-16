@@ -330,9 +330,9 @@ func TestBucketCache_DedupFetch(t *testing.T) {
 
 	c.entries["prod/shared"] = map[string]string{"A": "1"}
 
-	// Pre-populated — the fetcher shouldn't be invoked. Calling
-	// fetch with nil cmd would panic if it actually tried the
-	// network; the cache short-circuit prevents that.
+	// Pre-populated — the fetcher shouldn't be invoked. A nil fetcher
+	// would panic if the cache actually called it; the short-circuit
+	// prevents that.
 	got, err := c.fetch(nil, "prod/shared")
 	if err != nil {
 		t.Fatal(err)
@@ -340,5 +340,73 @@ func TestBucketCache_DedupFetch(t *testing.T) {
 
 	if got["A"] != "1" {
 		t.Errorf("cache hit returned wrong data: %v", got)
+	}
+}
+
+// TestEnrichEnv_InvokesFetcher pins the core of the SSH-forward fix:
+// a declared env_from ref must actually be resolved through the
+// injected fetcher and layered into the interpolation context. The
+// SSH-forward path regressed precisely because it passed no fetcher,
+// so env_from was silently never read and `${FS_IMAGE}` surfaced as
+// "undefined variable".
+func TestEnrichEnv_InvokesFetcher(t *testing.T) {
+	raw := []byte(`statefulset "fsw" "freeswitch" {
+  env_from = ["fsw/freeswitch"]
+  image    = "${FS_IMAGE}"
+}`)
+
+	var seen []string
+
+	fetch := func(ref string) (map[string]string, error) {
+		seen = append(seen, ref)
+
+		return map[string]string{"FS_IMAGE": "registry/fsw:bookworm"}, nil
+	}
+
+	env, err := enrichEnv(fetch, "fsw.voodu", raw, map[string]string{}, newBucketCache())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(seen) != 1 || seen[0] != "fsw/freeswitch" {
+		t.Errorf("fetcher refs = %v, want [fsw/freeswitch]", seen)
+	}
+
+	if env["FS_IMAGE"] != "registry/fsw:bookworm" {
+		t.Errorf("FS_IMAGE = %q, want bucket value", env["FS_IMAGE"])
+	}
+}
+
+// TestEnrichEnv_ShellWinsOverBucket pins the documented precedence:
+// an operator's shell var overrides the bucket on collision (ad-hoc
+// `FS_IMAGE=... vd apply` testing must beat the source-of-truth bucket).
+func TestEnrichEnv_ShellWinsOverBucket(t *testing.T) {
+	raw := []byte(`deployment "p" "api" { env_from = ["p/shared"] image = "${X}" }`)
+
+	fetch := func(string) (map[string]string, error) {
+		return map[string]string{"X": "from-bucket"}, nil
+	}
+
+	env, err := enrichEnv(fetch, "api.voodu", raw, map[string]string{"X": "from-shell"}, newBucketCache())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if env["X"] != "from-shell" {
+		t.Errorf("X = %q, want from-shell (shell must win)", env["X"])
+	}
+}
+
+// TestBucketFetcherConstructors_NilIsOffline pins that both fetcher
+// constructors degrade to nil (offline / shell-only interpolation)
+// when handed no transport — the as-is forward path and offline dev
+// rely on this.
+func TestBucketFetcherConstructors_NilIsOffline(t *testing.T) {
+	if cmdBucketFetcher(nil) != nil {
+		t.Error("cmdBucketFetcher(nil) should be nil (offline)")
+	}
+
+	if sshBucketFetcher(nil, "") != nil {
+		t.Error("sshBucketFetcher(nil, \"\") should be nil (offline)")
 	}
 }

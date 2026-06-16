@@ -9,6 +9,7 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/manifest"
+	"go.voodu.clowk.in/internal/remote"
 )
 
 // manifestStreamCmds are the commands whose `-f PATH` arguments reference
@@ -58,7 +59,13 @@ type streamResult struct {
 // `-f - --format json` plus a reader carrying the serialized manifests.
 //
 // A nil stdin means "forward the argv as-is" — no rewrite was needed.
-func rewriteForStdinStream(args []string) (streamResult, error) {
+//
+// info/identity address the remote controller: when a manifest declares
+// `env_from = [...]`, the buckets are fetched from it over SSH so
+// `${VAR}` resolves against the source-of-truth bucket even though the
+// HCL is parsed here on the dev machine. nil info → offline (shell-only
+// interpolation), which is what the path tests exercise.
+func rewriteForStdinStream(info *remote.Info, identity string, args []string) (streamResult, error) {
 	cmdIdx := findPrimaryCommand(args)
 	if cmdIdx < 0 {
 		return streamResult{args: args}, nil
@@ -97,15 +104,15 @@ func rewriteForStdinStream(args []string) (streamResult, error) {
 		formatSet = "hcl"
 	}
 
-	// nil cmd: the SSH-forward path runs before cobra parses args
-	// (it's the argv rewriter). env_from bucket enrichment is
-	// skipped here — operator-supplied `${VAR}` in the manifest
-	// still resolves against the LOCAL shell. For remote applies
-	// that want bucket-sourced interpolation, the operator points
-	// the controller URL at the remote and runs without -r so the
-	// local apply path (which does have cmd) is taken. SSH-forward
-	// for env_from is a deferred milestone.
-	mans, err := loadManifests(nil, applyFlags{files: paths, format: formatSet})
+	// The SSH-forward path runs before cobra parses args (it's the
+	// argv rewriter), so there's no cobra command to back an HTTP
+	// /config read. Instead we hand loadManifests an sshBucketFetcher:
+	// when a manifest declares `env_from = [...]`, each bucket is read
+	// from the remote via `voodu config <ref> get -o json` over SSH and
+	// layered into the `${VAR}` interpolation context here on the dev
+	// machine — operator shell still wins on collision. nil info (no
+	// remote) yields a nil fetcher, i.e. shell-only interpolation.
+	mans, err := loadManifests(sshBucketFetcher(info, identity), applyFlags{files: paths, format: formatSet})
 	if err != nil {
 		return streamResult{}, err
 	}

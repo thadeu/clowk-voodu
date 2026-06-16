@@ -131,7 +131,7 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 	// Manifest commands (apply/diff/delete) consume local files. We
 	// parse them here — on the dev machine where ${VAR} can resolve —
 	// and forward the result as JSON on stdin.
-	stream, err := rewriteForStdinStream(forwardArgs)
+	stream, err := rewriteForStdinStream(info, identity, forwardArgs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1, true

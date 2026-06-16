@@ -274,7 +274,7 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		return fmt.Errorf("Procfile apply requires a configured remote: run `vd remote add <user@host>` then `vd apply -f %s`, or pass --eject to scaffold an HCL file locally", path)
 	}
 
-	mans, err := loadManifests(cmd, f)
+	mans, err := loadManifests(cmdBucketFetcher(cmd), f)
 	if err != nil {
 		return err
 	}
@@ -471,7 +471,7 @@ func splitManifestRef(ref string) (kind, scope, name string) {
 }
 
 func runDiff(cmd *cobra.Command, f applyFlags) error {
-	local, err := loadManifests(cmd, f)
+	local, err := loadManifests(cmdBucketFetcher(cmd), f)
 	if err != nil {
 		return err
 	}
@@ -829,7 +829,7 @@ func runDelete(cmd *cobra.Command, f applyFlags) error {
 	// f.autoApprove is accepted on the cobra surface so the flag can
 	// appear in argv without erroring out, but is otherwise ignored
 	// here — same dance as runApply uses for its own --auto-approve.
-	mans, err := loadManifests(cmd, f)
+	mans, err := loadManifests(cmdBucketFetcher(cmd), f)
 	if err != nil {
 		return err
 	}
@@ -1273,11 +1273,11 @@ func promptDeleteConfirm(in io.Reader, out io.Writer) (bool, error) {
 // where spec.env overrides env_from layers. See apply_envfrom.go for
 // the bucket-fetch + merge mechanics.
 //
-// `cmd` is the apply cobra.Command — needed to talk to the controller
-// for bucket reads. nil-tolerant for tests that exercise pure-shell
-// interpolation; the env_from enrichment is skipped when cmd is nil
-// (no controller wired, treat as offline).
-func loadManifests(cmd *cobra.Command, f applyFlags) ([]controller.Manifest, error) {
+// `fetch` resolves env_from buckets for interpolation — cmdBucketFetcher
+// (HTTP) for the local/server-side path, sshBucketFetcher for the
+// client side of an SSH-forwarded apply. nil-tolerant: a nil fetcher
+// skips env_from enrichment (offline / pure-shell interpolation).
+func loadManifests(fetch bucketFetcher, f applyFlags) ([]controller.Manifest, error) {
 	if len(f.files) == 0 {
 		return nil, fmt.Errorf("at least one -f is required")
 	}
@@ -1288,7 +1288,7 @@ func loadManifests(cmd *cobra.Command, f applyFlags) ([]controller.Manifest, err
 	var out []controller.Manifest
 
 	for _, path := range f.files {
-		mans, err := loadOne(cmd, path, f.format, shellEnv, cache)
+		mans, err := loadOne(fetch, path, f.format, shellEnv, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -1299,7 +1299,7 @@ func loadManifests(cmd *cobra.Command, f applyFlags) ([]controller.Manifest, err
 	return out, nil
 }
 
-func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
+func loadOne(fetch bucketFetcher, path, stdinFormat string, shellEnv map[string]string, cache *bucketCache) ([]controller.Manifest, error) {
 	if path == "-" {
 		if stdinFormat == "" {
 			return nil, fmt.Errorf("-f -: --format hcl is required for stdin")
@@ -1310,7 +1310,7 @@ func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]s
 			return nil, fmt.Errorf("read stdin: %w", err)
 		}
 
-		env, err := enrichEnvFor(cmd, "<stdin>", raw, shellEnv, cache)
+		env, err := enrichEnvFor(fetch, "<stdin>", raw, shellEnv, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -1341,7 +1341,7 @@ func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]s
 		// "prod/shared", another "prod/worker-creds"; we don't want
 		// to globally union them across the whole dir). The cache
 		// dedup across files in the same apply session anyway.
-		mans, err := loadDir(cmd, resolved, shellEnv, cache)
+		mans, err := loadDir(fetch, resolved, shellEnv, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -1354,7 +1354,7 @@ func loadOne(cmd *cobra.Command, path, stdinFormat string, shellEnv map[string]s
 		return nil, fmt.Errorf("read %s: %w", resolved, err)
 	}
 
-	env, err := enrichEnvFor(cmd, resolved, raw, shellEnv, cache)
+	env, err := enrichEnvFor(fetch, resolved, raw, shellEnv, cache)
 	if err != nil {
 		return nil, err
 	}

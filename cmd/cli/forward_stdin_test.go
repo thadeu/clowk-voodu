@@ -14,7 +14,7 @@ import (
 func TestRewriteForStdinStream_NoRewriteForNonManifestCmd(t *testing.T) {
 	args := []string{"config", "set", "FOO=bar", "-a", "api"}
 
-	got, err := rewriteForStdinStream(args)
+	got, err := rewriteForStdinStream(nil, "", args)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestRewriteForStdinStream_NoFilesNoStdin(t *testing.T) {
 	// `apply` with no -f — let the remote emit its own error.
 	args := []string{"apply"}
 
-	got, err := rewriteForStdinStream(args)
+	got, err := rewriteForStdinStream(nil, "", args)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestRewriteForStdinStream_NoFilesNoStdin(t *testing.T) {
 func TestRewriteForStdinStream_StdinPassthrough(t *testing.T) {
 	args := []string{"apply", "-f", "-", "--format", "yaml"}
 
-	got, err := rewriteForStdinStream(args)
+	got, err := rewriteForStdinStream(nil, "", args)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestRewriteForStdinStream_ReadsFileAndEmitsJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "api"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "api"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ deployment "prod" "api" {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "prod"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ deployment "prod" "api" {
 	// diff and delete must NEVER trigger a push, even if the manifest is
 	// build-mode — they don't need source on the server.
 	for _, cmd := range []string{"diff", "delete"} {
-		r, err := rewriteForStdinStream([]string{cmd, "-f", path, "-a", "prod"})
+		r, err := rewriteForStdinStream(nil, "", []string{cmd, "-f", path, "-a", "prod"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -208,7 +208,7 @@ func TestRewriteForStdinStream_BuildModeShipsSpecJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "prod"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestRewriteForStdinStream_BuildModeStatefulset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "prod"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestRewriteForStdinStream_RegistryModeStatefulsetSkipsPush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "prod"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ statefulset "prod" "db" {
 		t.Fatal(err)
 	}
 
-	got, err := rewriteForStdinStream([]string{"apply", "-f", path, "-a", "prod"})
+	got, err := rewriteForStdinStream(nil, "", []string{"apply", "-f", path, "-a", "prod"})
 	if err != nil {
 		t.Fatal(err)
 	}
