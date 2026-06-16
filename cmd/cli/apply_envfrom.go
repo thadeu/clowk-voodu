@@ -260,6 +260,56 @@ func extractEnvFromRefs(filename string, raw []byte) ([]string, error) {
 	return refs, nil
 }
 
+// extractResourceRefs returns the `scope/name` of every top-level
+// resource block (those with the canonical two labels, e.g.
+// `statefulset "fsw" "freeswitch"`). These are auto-consulted as
+// interpolation sources so a resource resolves `${VAR}` from its own
+// config bucket without declaring env_from — mirroring the controller's
+// implicit (scope,name) bind for runtime container env.
+//
+// Same partial-parse posture as extractEnvFromRefs: ParseConfig returns
+// a usable tree even when voodu's `${VAR:-default}` tokens trip HCL's
+// native template parser, and block labels parse cleanly regardless.
+// Blocks without exactly two labels (or with an empty label) are skipped
+// — they carry no (scope,name) bucket. Deduplicated, in declared order.
+func extractResourceRefs(filename string, raw []byte) []string {
+	file, _ := hclsyntax.ParseConfig(raw, filename, hcl.Pos{Line: 1, Column: 1})
+	if file == nil {
+		return nil
+	}
+
+	body, ok := file.Body.(*hclsyntax.Body)
+	if !ok {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+
+	var refs []string
+
+	for _, blk := range body.Blocks {
+		if len(blk.Labels) != 2 {
+			continue
+		}
+
+		scope, name := blk.Labels[0], blk.Labels[1]
+		if scope == "" || name == "" {
+			continue
+		}
+
+		ref := scope + "/" + name
+		if _, dup := seen[ref]; dup {
+			continue
+		}
+
+		seen[ref] = struct{}{}
+
+		refs = append(refs, ref)
+	}
+
+	return refs
+}
+
 // bucketCache memoises configFetch results across a single
 // `vd apply` invocation. Applying a 20-file directory where
 // every manifest does `env_from = ["prod/shared"]` should
@@ -292,7 +342,7 @@ func (c *bucketCache) fetch(fetch bucketFetcher, ref string) (map[string]string,
 
 	vars, err := fetch(ref)
 	if err != nil {
-		return nil, fmt.Errorf("env_from %q: %w", ref, err)
+		return nil, fmt.Errorf("config %q: %w", ref, err)
 	}
 
 	c.entries[ref] = vars
@@ -346,39 +396,66 @@ func enrichEnvFor(fetch bucketFetcher, filename string, raw []byte, shellEnv map
 	return enrichEnv(fetch, filename, raw, shellEnv, cache)
 }
 
-// enrichEnv combines bucket-sourced and shell-sourced
-// interpolation vars for one manifest source. The full pipeline:
+// enrichEnv combines bucket-sourced and shell-sourced interpolation
+// vars for one manifest source. The full pipeline:
 //
 //   1. extractEnvFromRefs scans the raw bytes for env_from refs
 //      (statically, pre-interpolation).
-//   2. cache.fetch reads each bucket from the controller, with
-//      memoisation across the apply session.
-//   3. mergeBucketEnv layers buckets + shell into one map.
+//   2. extractResourceRefs scans for each resource block's OWN
+//      (scope,name) — auto-consulted so a resource resolves `${VAR}`
+//      from its own config bucket without an explicit env_from, the
+//      same implicit bind the controller does for runtime container
+//      env (resolveAppEnv). Skipped when the source has no `${...}`
+//      token at all (nothing to interpolate → no round-trip).
+//   3. cache.fetch reads each bucket through the fetcher, memoised
+//      across the apply session.
+//   4. mergeBucketEnv layers buckets + shell into one map.
 //
-// Returns the merged map. When no env_from is declared, returns
-// shellEnv unchanged (cheap path; no controller round-trip).
+// Layer precedence (later wins): env_from refs, then the resource's
+// own bucket, then the operator shell. This mirrors the runtime order
+// where a resource's own (scope,name) config overrides inherited
+// env_from, and an explicit shell override beats everything.
 //
-// Network errors propagate — the operator needs to know when
-// the source-of-truth bucket can't be reached, rather than
-// silently apply with `${VAR}` resolved to its shell-only value
-// (or worse, fail later with "undefined variable").
+// Returns shellEnv unchanged when there's nothing to resolve (cheap
+// path; no controller round-trip). Network errors propagate — the
+// operator needs to know when the source-of-truth bucket can't be
+// reached, rather than silently apply with `${VAR}` resolved to its
+// shell-only value (or worse, fail later with "undefined variable").
 func enrichEnv(fetch bucketFetcher, filename string, raw []byte, shellEnv map[string]string, cache *bucketCache) (map[string]string, error) {
 	if cache == nil {
 		cache = newBucketCache()
 	}
 
-	refs, err := extractEnvFromRefs(filename, raw)
+	envFromRefs, err := extractEnvFromRefs(filename, raw)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(refs) == 0 {
+	// Own-bucket auto-resolution only matters when the source actually
+	// interpolates something. `${` is the cheap gate — no token, no
+	// fetch (server-side ${ref.…}/${asset.…} may over-trigger it, but
+	// the fetch is bounded and an absent bucket is a no-op).
+	var ownRefs []string
+	if bytes.Contains(raw, []byte("${")) {
+		ownRefs = extractResourceRefs(filename, raw)
+	}
+
+	if len(envFromRefs) == 0 && len(ownRefs) == 0 {
 		return shellEnv, nil
 	}
 
-	buckets := make(map[string]map[string]string, len(refs))
+	// env_from first, own bucket after (so it overrides on collision),
+	// then shell wins in mergeBucketEnv. A ref appearing in both lists
+	// is fetched once (cache) and merged twice (harmless, same data).
+	allRefs := make([]string, 0, len(envFromRefs)+len(ownRefs))
+	allRefs = append(allRefs, envFromRefs...)
+	allRefs = append(allRefs, ownRefs...)
 
-	for _, ref := range refs {
+	buckets := make(map[string]map[string]string, len(allRefs))
+
+	// env_from is an explicit contract: a fetch failure is fatal, the
+	// operator asked for that bucket.
+	for _, ref := range envFromRefs {
 		vars, ferr := cache.fetch(fetch, ref)
 		if ferr != nil {
 			return nil, ferr
@@ -387,7 +464,25 @@ func enrichEnv(fetch bucketFetcher, filename string, raw []byte, shellEnv map[st
 		buckets[ref] = vars
 	}
 
-	return mergeBucketEnv(refs, buckets, shellEnv), nil
+	// The resource's own bucket is an implicit convenience — most
+	// resources have no dedicated bucket. Tolerate a missing/unreachable
+	// one (best-effort) so auto-resolution never introduces a failure
+	// mode that didn't exist before: an actually-needed `${VAR}` left
+	// unresolved still surfaces a precise "undefined variable" later.
+	for _, ref := range ownRefs {
+		if _, already := buckets[ref]; already {
+			continue
+		}
+
+		vars, ferr := cache.fetch(fetch, ref)
+		if ferr != nil {
+			continue
+		}
+
+		buckets[ref] = vars
+	}
+
+	return mergeBucketEnv(allRefs, buckets, shellEnv), nil
 }
 
 // loadDir walks `root` collecting every manifest-shaped file

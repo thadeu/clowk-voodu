@@ -16,6 +16,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -374,6 +375,128 @@ func TestEnrichEnv_InvokesFetcher(t *testing.T) {
 
 	if env["FS_IMAGE"] != "registry/fsw:bookworm" {
 		t.Errorf("FS_IMAGE = %q, want bucket value", env["FS_IMAGE"])
+	}
+}
+
+// TestExtractResourceRefs pins that every resource block's own
+// (scope,name) is surfaced — these are auto-consulted as interpolation
+// sources so a resource resolves ${VAR} from its own bucket without
+// declaring env_from. Survives voodu's ${VAR:-default} tokens via the
+// same partial-parse posture as extractEnvFromRefs.
+func TestExtractResourceRefs(t *testing.T) {
+	src := `
+statefulset "fsw" "freeswitch" {
+  image   = "${FS_IMAGE}"
+  volumes = ["${FS_CONFIG_DIR:-/opt/x}:/y:ro"]
+}
+
+deployment "fsw" "api" {
+  image = "nginx:1.27"
+}
+`
+	refs := extractResourceRefs("f.voodu", []byte(src))
+
+	want := []string{"fsw/freeswitch", "fsw/api"}
+	if len(refs) != len(want) {
+		t.Fatalf("refs = %v, want %v", refs, want)
+	}
+
+	for i, w := range want {
+		if refs[i] != w {
+			t.Errorf("refs[%d] = %q, want %q", i, refs[i], w)
+		}
+	}
+}
+
+// TestEnrichEnv_AutoFetchesOwnBucket is the core of the auto-resolve
+// feature: with NO env_from declared, ${FS_IMAGE} resolves from the
+// resource's own (scope,name) bucket.
+func TestEnrichEnv_AutoFetchesOwnBucket(t *testing.T) {
+	raw := []byte(`statefulset "fsw" "freeswitch" { image = "${FS_IMAGE}" }`)
+
+	fetch := func(ref string) (map[string]string, error) {
+		if ref != "fsw/freeswitch" {
+			t.Fatalf("unexpected ref %q", ref)
+		}
+
+		return map[string]string{"FS_IMAGE": "registry/fsw:bookworm"}, nil
+	}
+
+	env, err := enrichEnv(fetch, "fsw.voodu", raw, map[string]string{}, newBucketCache())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if env["FS_IMAGE"] != "registry/fsw:bookworm" {
+		t.Errorf("FS_IMAGE = %q, want own-bucket value", env["FS_IMAGE"])
+	}
+}
+
+// TestEnrichEnv_OwnBucketErrorTolerated pins that a failing own-bucket
+// fetch (e.g. the resource has no dedicated bucket) is best-effort: it
+// must NOT fail the apply, so auto-resolution never introduces a new
+// failure mode. A genuinely needed var stays unresolved and surfaces a
+// precise "undefined variable" downstream instead.
+func TestEnrichEnv_OwnBucketErrorTolerated(t *testing.T) {
+	raw := []byte(`deployment "p" "api" { image = "${X}" }`)
+
+	fetch := func(string) (map[string]string, error) {
+		return nil, fmt.Errorf("controller returned 404")
+	}
+
+	env, err := enrichEnv(fetch, "api.voodu", raw, map[string]string{}, newBucketCache())
+	if err != nil {
+		t.Fatalf("own-bucket fetch error must be tolerated, got: %v", err)
+	}
+
+	if _, ok := env["X"]; ok {
+		t.Errorf("X should be unresolved, got %q", env["X"])
+	}
+}
+
+// TestEnrichEnv_EnvFromErrorStaysFatal pins the asymmetry: an explicit
+// env_from is a contract, so its fetch error remains fatal (unlike the
+// implicit own bucket).
+func TestEnrichEnv_EnvFromErrorStaysFatal(t *testing.T) {
+	raw := []byte(`deployment "p" "api" { env_from = ["other/bucket"] image = "${X}" }`)
+
+	fetch := func(ref string) (map[string]string, error) {
+		if ref == "other/bucket" {
+			return nil, fmt.Errorf("boom")
+		}
+
+		return map[string]string{}, nil
+	}
+
+	if _, err := enrichEnv(fetch, "api.voodu", raw, map[string]string{}, newBucketCache()); err == nil {
+		t.Fatal("env_from fetch error must be fatal")
+	}
+}
+
+// TestEnrichEnv_OwnBucketOverridesEnvFrom pins layer precedence: the
+// resource's own bucket wins over an inherited env_from on collision,
+// matching the runtime ordering in resolveAppEnv.
+func TestEnrichEnv_OwnBucketOverridesEnvFrom(t *testing.T) {
+	raw := []byte(`deployment "p" "api" { env_from = ["shared/x"] image = "${IMG}" }`)
+
+	fetch := func(ref string) (map[string]string, error) {
+		switch ref {
+		case "shared/x":
+			return map[string]string{"IMG": "from-envfrom"}, nil
+		case "p/api":
+			return map[string]string{"IMG": "from-own"}, nil
+		}
+
+		return map[string]string{}, nil
+	}
+
+	env, err := enrichEnv(fetch, "api.voodu", raw, map[string]string{}, newBucketCache())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if env["IMG"] != "from-own" {
+		t.Errorf("IMG = %q, want from-own (own bucket overrides env_from)", env["IMG"])
 	}
 }
 
