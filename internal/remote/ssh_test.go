@@ -309,3 +309,58 @@ func TestForwardSetsLogLevelQuiet(t *testing.T) {
 		}
 	}
 }
+
+// TestControlMasterArgs pins the multiplexing flags so a single apply's
+// many round-trips (preflight, env_from reads, diff, apply) share ONE
+// connection instead of paying the cold-connect cost each time. HOME is
+// redirected to a temp dir so the test doesn't touch the real ~/.ssh.
+func TestControlMasterArgs(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("VOODU_SSH_NO_MULTIPLEX", "")
+
+	joined := strings.Join(ControlMasterArgs(), " ")
+
+	for _, want := range []string{"ControlMaster=auto", "ControlPath=", "ControlPersist=", "cm-%C"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ControlMasterArgs missing %q: %q", want, joined)
+		}
+	}
+}
+
+// TestControlMasterArgs_OptOut pins the VOODU_SSH_NO_MULTIPLEX escape
+// hatch — returns nil so ssh falls back to a plain (non-multiplexed)
+// connection, for environments whose ssh_config already manages it.
+func TestControlMasterArgs_OptOut(t *testing.T) {
+	t.Setenv("VOODU_SSH_NO_MULTIPLEX", "1")
+
+	if args := ControlMasterArgs(); args != nil {
+		t.Errorf("opt-out should disable multiplexing, got %v", args)
+	}
+}
+
+// TestForwardSkipsMultiplexForStubSSH guards the test-injection path:
+// when a fake ssh binary is supplied (as every Forward test does), the
+// multiplexing flags are omitted so argv assertions stay stable and no
+// stray control socket is created.
+func TestForwardSkipsMultiplexForStubSSH(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "args.txt")
+	stub := filepath.Join(tmp, "ssh-stub")
+
+	script := "#!/bin/bash\nprintf '%s\\n' \"$@\" > " + out + "\n"
+	if err := os.WriteFile(stub, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	force := false
+
+	if _, err := Forward(&Info{Host: "u@h"}, []string{"version"}, ForwardOptions{SSHBin: stub, ForceTTY: &force}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(out)
+
+	if strings.Contains(string(raw), "ControlMaster") {
+		t.Errorf("stub ssh should not get ControlMaster args: %s", raw)
+	}
+}

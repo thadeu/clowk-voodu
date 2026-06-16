@@ -5,11 +5,65 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"golang.org/x/term"
 )
+
+// ControlMasterArgs returns the `-o` flags that enable SSH connection
+// multiplexing, or nil to disable it. A single `vd apply` makes several
+// round-trips to the same host — preflight probe, env_from bucket
+// reads, diff, then apply — and on a remote VM each fresh TCP+auth
+// handshake costs seconds. Multiplexing lets the first connection open
+// a master socket the rest reuse, so only the first pays the latency.
+//
+// Both remote.Forward and the CLI's raw-ssh preflight call this with
+// the SAME ControlPath template (%C hashes host/port/user), so whoever
+// connects first opens the master and the others share it. ControlPersist
+// keeps it warm briefly past the last session — long enough to span one
+// command's round-trips without leaving a connection open indefinitely.
+//
+// Opt out with VOODU_SSH_NO_MULTIPLEX (e.g. when an ssh_config already
+// manages ControlMaster and a second layer would fight it).
+func ControlMasterArgs() []string {
+	if os.Getenv("VOODU_SSH_NO_MULTIPLEX") != "" {
+		return nil
+	}
+
+	dir := controlSocketDir()
+	if dir == "" {
+		return nil
+	}
+
+	// ssh won't create the parent dir of ControlPath; do it ourselves.
+	// On failure, fall back to no multiplexing rather than breaking ssh.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil
+	}
+
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + filepath.Join(dir, "cm-%C"),
+		"-o", "ControlPersist=30s",
+	}
+}
+
+// controlSocketDir picks a short, user-private dir for multiplexing
+// sockets. ~/.ssh keeps the unix-socket path well under its ~104-char
+// cap; fall back to the OS temp dir when HOME is unavailable.
+func controlSocketDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".ssh", "voodu-cm")
+	}
+
+	if tmp := os.TempDir(); tmp != "" {
+		return filepath.Join(tmp, "voodu-cm")
+	}
+
+	return ""
+}
 
 // ForwardOptions tweaks how the SSH invocation is shaped. The zero
 // value is the normal case (TTY auto-detected, identity from SSH
@@ -82,6 +136,13 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 	// lets real errors (auth failures, host key changes, network drops)
 	// reach the user — it only suppresses the INFO/banner chatter.
 	sshArgs := []string{"-o", "LogLevel=QUIET"}
+
+	// Connection multiplexing — only for the real ssh binary. Tests
+	// inject a fake SSHBin and assert on exact argv; the master socket
+	// is meaningless to them, so skip it there.
+	if opts.SSHBin == "" {
+		sshArgs = append(sshArgs, ControlMasterArgs()...)
+	}
 
 	if opts.Identity != "" {
 		sshArgs = append(sshArgs, "-i", opts.Identity)

@@ -48,6 +48,11 @@ func probeRemote(host, identity string) (preflightProbe, error) {
 
 	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=5"}
 
+	// Share the multiplexing master with remote.Forward (same ControlPath
+	// template), so this probe — the first round-trip of an apply — opens
+	// the connection the env_from reads, diff and apply then reuse.
+	args = append(args, remote.ControlMasterArgs()...)
+
 	if identity != "" {
 		args = append(args, "-i", identity)
 	}

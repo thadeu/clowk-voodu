@@ -34,12 +34,23 @@ import (
 // one through SSH, and wouldn't want to (see ssh.go: -tt suppressed
 // when Stdin is a stream). Non-interactive callers must pass
 // --auto-approve or the orchestrator refuses to proceed.
-func runApplyForwarded(info *remote.Info, identity string, stream streamResult, flags applyClientFlags) (int, error) {
+func runApplyForwarded(info *remote.Info, identity string, stream streamResult, flags applyClientFlags, checking *progressFilter) (int, error) {
+	// checking is normally raised by the caller BEFORE the manifest parse
+	// + env_from bucket reads, so the spinner already covers that SSH
+	// work. Fall back to creating it here for any caller that passes nil,
+	// keeping the function self-contained.
+	if checking == nil {
+		checking = newProgressFilter(os.Stdout, flags.verbose)
+		fmt.Fprintln(checking, "-----> checking remote state...")
+	}
+
 	// No manifest resolved (`vd apply -f` with no value, no `-f` at all,
 	// or `-f <path>` that matched no file). rewriteForStdinStream leaves
 	// stdin nil in that case; reading it would SIGSEGV. Fail with a clear
 	// message instead of a panic.
 	if stream.stdin == nil {
+		_ = checking.Close()
+
 		return 1, fmt.Errorf("nothing to apply: pass a manifest with -f " +
 			"(e.g. `vd apply -f Procfile`, `vd apply -f web`, or `vd apply -f ./dir`)")
 	}
@@ -49,6 +60,8 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// removes the "user edits the HCL between diff and apply" gotcha.
 	body, err := io.ReadAll(stream.stdin)
 	if err != nil {
+		_ = checking.Close()
+
 		return 1, fmt.Errorf("buffer manifest: %w", err)
 	}
 
@@ -64,6 +77,8 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// usual diff/apply continues. Confirm gate matches the
 	// destructive-op pattern (autoApprove / VOODU_AUTO_APPROVE).
 	if err := ensureRemoteReady(info, identity, flags.autoApprove); err != nil {
+		_ = checking.Close()
+
 		return 1, err
 	}
 
@@ -72,15 +87,9 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	// Phase 1: diff with -o json, capture stdout.
 	diffArgs := rewriteApplyToDiffJSON(stream.args)
 
-	// The SSH round-trip for the remote diff is the first — and
-	// slowest — thing that happens after the user hits Enter: handshake
-	// plus the server parsing the manifest and diffing it against live
-	// controller state. On a cold connection this can read as 1–3s of
-	// "is it frozen?" silence. Open a spinner up front so the terminal
-	// shows immediate life, and commit it as a ✓ when the plan lands.
-	checking := newProgressFilter(os.Stdout, flags.verbose)
-	fmt.Fprintln(checking, "-----> checking remote state...")
-
+	// The spinner is already up (raised before the parse + env_from
+	// reads), so it spans the diff round-trip too — committed as a ✓
+	// when the plan lands.
 	var planBuf bytes.Buffer
 
 	code, err := remote.Forward(info, diffArgs, remote.ForwardOptions{

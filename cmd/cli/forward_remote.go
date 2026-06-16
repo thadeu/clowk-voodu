@@ -128,24 +128,30 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		}
 	}
 
-	// Manifest commands (apply/diff/delete) consume local files. We
-	// parse them here — on the dev machine where ${VAR} can resolve —
-	// and forward the result as JSON on stdin.
-	stream, err := rewriteForStdinStream(info, identity, forwardArgs)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1, true
-	}
-
 	// `voodu apply` takes the two-phase orchestrated flow: diff, prompt,
-	// apply. The orchestrator handles its own tarball push *after* the
-	// prompt so a canceled apply doesn't upload source for nothing.
-	// See runApplyForwarded for the full dance.
-	if isApplyCommand(stream.args) {
-		flags, cleanedArgs := extractApplyClientFlags(stream.args)
-		stream.args = cleanedArgs
+	// apply. We raise the spinner BEFORE parsing — manifest parse plus
+	// env_from bucket reads are SSH round-trips that used to run in
+	// silence here, reading as a multi-second freeze before any output.
+	// The spinner gives the operator immediate life; with connection
+	// multiplexing the first round-trip also warms the master that the
+	// diff and apply reuse. The orchestrator handles its own tarball
+	// push *after* the prompt so a canceled apply doesn't upload source
+	// for nothing. See runApplyForwarded for the full dance.
+	if isApplyCommand(forwardArgs) {
+		flags, cleanedArgs := extractApplyClientFlags(forwardArgs)
 
-		code, err := runApplyForwarded(info, identity, stream, flags)
+		checking := newProgressFilter(os.Stdout, flags.verbose)
+		fmt.Fprintln(checking, "-----> checking remote state...")
+
+		stream, err := rewriteForStdinStream(info, identity, cleanedArgs)
+		if err != nil {
+			_ = checking.Close()
+			fmt.Fprintln(os.Stderr, err)
+
+			return 1, true
+		}
+
+		code, err := runApplyForwarded(info, identity, stream, flags, checking)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 
@@ -155,6 +161,15 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 		}
 
 		return code, true
+	}
+
+	// Other manifest commands (diff/delete) and plugin downloads consume
+	// local files too. We parse them here — on the dev machine where
+	// ${VAR} can resolve — and forward the result as JSON on stdin.
+	stream, err := rewriteForStdinStream(info, identity, forwardArgs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1, true
 	}
 
 	// `vd pg:backups:download` (and any future plugin :download)
