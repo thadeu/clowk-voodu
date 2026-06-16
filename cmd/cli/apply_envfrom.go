@@ -71,11 +71,22 @@ import (
 // here. Document that env_from refs must be literal — same
 // posture the existing runtime path already takes.
 func extractEnvFromRefs(filename string, raw []byte) ([]string, error) {
-	file, diags := hclsyntax.ParseConfig(raw, filename, hcl.Pos{Line: 1, Column: 1})
-	if diags.HasErrors() {
-		// Don't fail the whole apply just because the HCL has
-		// syntax issues at this stage — the full parser will
-		// produce a better diagnostic later. Skip extraction.
+	file, _ := hclsyntax.ParseConfig(raw, filename, hcl.Pos{Line: 1, Column: 1})
+
+	// Proceed even when diags has errors. ParseConfig still returns a
+	// PARTIAL syntax tree, and we deliberately walk it: voodu's own
+	// `${VAR}` / `${VAR:-default}` tokens are NOT valid HCL-native
+	// template expressions — the `:-` default is voodu syntax resolved
+	// in manifest.Interpolate BEFORE the HCL parser ever runs — so a
+	// perfectly valid voodu manifest raises diagnostics here (e.g. a
+	// `${FS_CONFIG_DIR:-/default}` in a volumes string). Bailing on the
+	// first such diag silently dropped every env_from ref in the file,
+	// which then surfaced downstream as a bogus "undefined variable"
+	// for vars the env_from bucket would have supplied. env_from values
+	// are pure string literals and parse cleanly regardless, so the
+	// partial tree still exposes them. A genuinely broken file is
+	// reported with a proper diagnostic later by manifest.ParseFile.
+	if file == nil {
 		return nil, nil
 	}
 

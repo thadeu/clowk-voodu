@@ -95,6 +95,34 @@ deployment "prod" "api" {
 	}
 }
 
+// TestExtractEnvFromRefs_VooduDefaultSyntax pins the regression where
+// a voodu-only `${VAR:-default}` token anywhere in the file raised an
+// HCL-native template diagnostic during the light parse, causing the
+// extractor to silently drop EVERY env_from ref — which then surfaced
+// downstream as a bogus "undefined variable(s)" for the vars the bucket
+// would have supplied. The `:-` default is resolved in
+// manifest.Interpolate before the HCL parser runs, so its presence must
+// not interfere with static env_from extraction.
+func TestExtractEnvFromRefs_VooduDefaultSyntax(t *testing.T) {
+	src := `
+statefulset "fsw" "freeswitch" {
+  env_from = ["fsw/freeswitch"]
+  image    = "${FS_IMAGE}"
+  volumes = [
+    "${FS_CONFIG_DIR:-/opt/voodu/volumes/fsw/overlay}:/mnt/fs-config:ro",
+  ]
+}
+`
+	refs, err := extractEnvFromRefs("test.voodu", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(refs) != 1 || refs[0] != "fsw/freeswitch" {
+		t.Errorf("got %v, want [fsw/freeswitch]", refs)
+	}
+}
+
 // TestExtractEnvFromRefs_MultilineList accepts the canonical
 // HCL multi-line list shape.
 func TestExtractEnvFromRefs_MultilineList(t *testing.T) {
