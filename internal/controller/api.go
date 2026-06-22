@@ -158,6 +158,19 @@ type API struct {
 	// JIT install — operators must pre-install plugins in that
 	// case via `vd plugins:install <name>`.
 	PluginInstaller *plugins.Installer
+
+	// PluginRoutes resolves a PAT-plane URL prefix to a plugin's
+	// declared reverse-proxy route (HP0). Nil disables the plugin
+	// route plane entirely — the PAT mux serves only its core
+	// routes. Production wires dirPluginRouteLookup over PluginsRoot.
+	PluginRoutes PluginRouteLookup
+
+	// ContainerIPs resolves a resource's (scope, name) to its voodu0
+	// container IP, used by the plugin route proxy to reach an
+	// internal-only port from the host-process controller. Nil
+	// disables the plugin route plane (see PluginRoutes). Production
+	// wires dockerResourceIPResolver.
+	ContainerIPs ResourceIPResolver
 }
 
 // LogStreamer is the seam /logs dispatches through. The production

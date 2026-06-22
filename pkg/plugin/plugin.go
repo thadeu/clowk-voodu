@@ -86,10 +86,10 @@ type Envelope struct {
 // Manifest is the parsed shape of plugin.yml. All fields are optional;
 // missing values are filled from directory conventions at load time.
 type Manifest struct {
-	Name        string            `yaml:"name"                  json:"name"`
-	Version     string            `yaml:"version,omitempty"     json:"version,omitempty"`
-	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
-	Homepage    string            `yaml:"homepage,omitempty"    json:"homepage,omitempty"`
+	Name        string `yaml:"name"                  json:"name"`
+	Version     string `yaml:"version,omitempty"     json:"version,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	Homepage    string `yaml:"homepage,omitempty"    json:"homepage,omitempty"`
 
 	// Aliases are alternate names operators can type instead of
 	// Name on `vd <name>:<command>`. Each alias resolves to the
@@ -126,7 +126,50 @@ type Manifest struct {
 
 	Commands []Command         `yaml:"commands,omitempty" json:"commands,omitempty"`
 	Env      map[string]string `yaml:"env,omitempty"      json:"env,omitempty"`
-	Source   string            `yaml:"-"                  json:"source,omitempty"`
+
+	// Routes, when set, asks the controller to expose this plugin's
+	// container over the authenticated PAT plane via a reverse proxy.
+	// See RouteConfig. Plugins that only add CLI commands leave it nil.
+	Routes *RouteConfig `yaml:"routes,omitempty" json:"routes,omitempty"`
+
+	Source string `yaml:"-" json:"source,omitempty"`
+}
+
+// RouteConfig declares an HTTP route the controller mounts under the PAT
+// plane and reverse-proxies to a plugin's container on the voodu0
+// network. When a plugin's manifest carries one, the controller serves:
+//
+//	/api/pat/v1/<Prefix>/<scope>/<name>/<rest...>
+//
+// It authenticates the PAT (read scope), resolves the (scope, name)
+// container's voodu0 IP, and proxies to <container-ip>:<Port>/<rest>,
+// preserving method, query and body. The upstream port is NEVER
+// published to the host — the container stays internal and the
+// controller is the single authenticated door, so a plugin's API needs
+// no extra firewall opening.
+//
+// Prefix defaults to the plugin Name when empty. A Prefix that collides
+// with a core PAT route (stats, system, pods, logs, metrics, pats) is
+// ignored — a plugin cannot shadow a built-in endpoint.
+//
+// The upstream port is resolved one of two ways:
+//
+//   - Port: a fixed container port (simplest, when the plugin always
+//     listens on the same internal port).
+//   - PortEnv: the name of an env var in the resource's expanded spec
+//     whose host:port value carries the port (e.g. "HEP_API_ADDR" →
+//     "0.0.0.0:8080" → 8080). This makes the port DYNAMIC: whatever the
+//     operator set in the HCL block (which the plugin propagated into
+//     that env var) is what the proxy targets — no static coupling
+//     between plugin.yml and the manifest. PortEnv wins when both are set.
+//
+// Reference consumer: voodu-hep3 declares `routes: { prefix: hep3,
+// port_env: HEP_API_ADDR }` so the WebUI reaches the clowk-hep3 capture
+// API on whatever api_port the operator configured, without exposing it.
+type RouteConfig struct {
+	Prefix  string `yaml:"prefix,omitempty"   json:"prefix,omitempty"`
+	Port    int    `yaml:"port,omitempty"     json:"port,omitempty"`
+	PortEnv string `yaml:"port_env,omitempty" json:"port_env,omitempty"`
 }
 
 // HasAlias reports whether the given name appears in the plugin's

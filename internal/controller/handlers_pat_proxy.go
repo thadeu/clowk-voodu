@@ -119,11 +119,19 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("DELETE /api/pat/v1/pats/{id}",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATRevoke)))
 
+	// Plugin route plane (HP0): wrap the mux so a plugin's declared
+	// reverse-proxy routes are intercepted (with PAT auth) before the
+	// mux. A front layer — not another mux pattern — so there's no
+	// ServeMux conflict with the core routes above, and any non-plugin
+	// path falls straight through to the mux's existing 404. No-op when
+	// the proxy seams aren't wired (PluginRoutes/ContainerIPs nil).
+	handler := a.withPluginRoutes(mux, auth)
+
 	// Reuse the existing log-requests middleware so PAT-plane
 	// requests get the same access log line shape as the
 	// orchestration plane. logRequests audited: never logs the
 	// Authorization header (regression test in pat_middleware_test.go).
-	return logRequests(mux)
+	return logRequests(handler)
 }
 
 // handlePATStats is the proxy for the host/pod stats endpoint.

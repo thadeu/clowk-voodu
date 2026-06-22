@@ -256,6 +256,14 @@ func (s *Server) Start(ctx context.Context) error {
 		// repo is `thadeu/voodu-<kind>`; operators override per
 		// block via `_repo` attribute or per-server via env.
 		PluginInstaller: &plugins.Installer{Root: s.cfg.PluginsRoot},
+
+		// Plugin route plane (HP0): resolve a plugin's declared
+		// reverse-proxy route by scanning PluginsRoot, and resolve a
+		// resource's (scope, name) to its voodu0 container IP so the
+		// host-process controller can bridge to an internal-only
+		// upstream port.
+		PluginRoutes: dirPluginRouteLookup{Root: s.cfg.PluginsRoot},
+		ContainerIPs: dockerResourceIPResolver{Pods: DockerPodsLister{}},
 	}
 
 	depHandler := &DeploymentHandler{
