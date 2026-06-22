@@ -162,4 +162,4 @@ Releases are cut by pushing a `v*` tag — GoReleaser builds cross-platform bina
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE).
