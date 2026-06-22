@@ -13,9 +13,16 @@ import (
 // on so tests can exercise the state machine even though the test
 // binary writes to a pipe. Mirrors forceFilter in
 // stream_filter_test.go.
-func forceEventRenderer(out *bytes.Buffer, verbose bool) *eventRenderer {
+func forceEventRenderer(t *testing.T, out *bytes.Buffer, verbose bool) *eventRenderer {
+	t.Helper()
+
 	r := newEventRenderer(out, verbose)
 	r.tty = true
+
+	// Reap the spinner goroutine even when a test starts a step but never
+	// drives it to StepEnd/Close: a leaked spinner keeps reading the
+	// noColor global and races the next test that writes it.
+	t.Cleanup(func() { _ = r.Close() })
 
 	return r
 }
@@ -46,7 +53,7 @@ func writeEvents(t *testing.T, r *eventRenderer, events []progress.Event) {
 func TestEventRendererVerboseIsPassthrough(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, true)
+	r := forceEventRenderer(t, &buf, true)
 
 	payload := `{"type":"step_start","id":"build","label":"Building release..."}` + "\n"
 	if _, err := r.Write([]byte(payload)); err != nil {
@@ -87,7 +94,7 @@ func TestEventRendererNonTTYIsPassthrough(t *testing.T) {
 func TestEventRendererRenderStepLifecycle(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	rememberShippedTag("web")
 
@@ -113,7 +120,7 @@ func TestEventRendererRenderStepLifecycle(t *testing.T) {
 func TestEventRendererBuildSummaryReplacesText(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	rememberShippedTag("api")
 
@@ -150,7 +157,7 @@ func TestEventRendererBuildSummaryReplacesText(t *testing.T) {
 func TestEventRendererDeployCompletedDroppedAfterBuild(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	rememberShippedTag("web")
 
@@ -186,7 +193,7 @@ func TestEventRendererDeployCompletedDroppedAfterBuild(t *testing.T) {
 func TestEventRendererResultIsStyled(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -216,7 +223,7 @@ func TestEventRendererResultLineIsAmber(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -244,7 +251,7 @@ func TestEventRendererResultLineIsAmber(t *testing.T) {
 func TestEventRendererResourceCount(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -268,7 +275,7 @@ func TestEventRendererResourceCount(t *testing.T) {
 func TestEventRendererWarnEscapesSpinner(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -297,7 +304,7 @@ func TestEventRendererWarnEscapesSpinner(t *testing.T) {
 func TestEventRendererStepFailCommitsRed(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -324,7 +331,7 @@ func TestEventRendererStepFailCommitsRed(t *testing.T) {
 func TestEventRendererCloseClearsDanglingSpinner(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	rememberShippedTag("api")
 
@@ -348,7 +355,7 @@ func TestEventRendererCloseClearsDanglingSpinner(t *testing.T) {
 func TestEventRendererUnknownTypeIgnored(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	if _, err := r.Write([]byte(`{"type":"future_thing","payload":"whatever"}` + "\n")); err != nil {
 		t.Fatal(err)
@@ -368,7 +375,7 @@ func TestEventRendererUnknownTypeIgnored(t *testing.T) {
 func TestEventRendererNonJSONPrintsVerbatim(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	if _, err := r.Write([]byte("panic: runtime error: nil map\n")); err != nil {
 		t.Fatal(err)

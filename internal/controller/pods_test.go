@@ -23,9 +23,8 @@ type fakePodsLister struct {
 
 	// describe lookup table keyed by container name. Tests populate
 	// this for the GetPod path; ListPods ignores it.
-	details   map[string]*PodDetail
-	getErr    error
-	getCalled []string
+	details map[string]*PodDetail
+	getErr  error
 }
 
 func (f *fakePodsLister) ListPods() ([]Pod, error) {
@@ -37,8 +36,6 @@ func (f *fakePodsLister) ListPods() ([]Pod, error) {
 }
 
 func (f *fakePodsLister) GetPod(name string) (*PodDetail, error) {
-	f.getCalled = append(f.getCalled, name)
-
 	if f.getErr != nil {
 		return nil, f.getErr
 	}

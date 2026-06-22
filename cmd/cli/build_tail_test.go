@@ -44,7 +44,7 @@ func TestTruncateVisible(t *testing.T) {
 func TestEventRendererBuildTailRing(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -79,7 +79,7 @@ func TestEventRendererBuildTailRing(t *testing.T) {
 func TestEventRendererFailureKeepsBuildTail(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -112,7 +112,7 @@ func TestEventRendererFailureKeepsBuildTail(t *testing.T) {
 func TestEventRendererBlankLineSwallowedDuringStep(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -134,7 +134,7 @@ func TestEventRendererBlankLineSwallowedDuringStep(t *testing.T) {
 func TestEventRendererBlankLinePassthroughWhenIdle(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
@@ -156,7 +156,7 @@ func TestEventRendererBlankLinePassthroughWhenIdle(t *testing.T) {
 func TestEventRendererSuccessShowsOnlyCheckLine(t *testing.T) {
 	var buf bytes.Buffer
 
-	r := forceEventRenderer(&buf, false)
+	r := forceEventRenderer(t, &buf, false)
 
 	writeEvents(t, r, []progress.Event{
 		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
