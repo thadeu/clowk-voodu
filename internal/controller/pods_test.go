@@ -602,7 +602,10 @@ func TestPods_DegradedExcludesClearedErrors(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	resp, _ := http.Get(ts.URL + "/pods")
+	resp, err := http.Get(ts.URL + "/pods")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	var env struct {
@@ -655,7 +658,10 @@ func TestPods_DegradedReportsRunningReplicas(t *testing.T) {
 	ts := httptest.NewServer(api.Handler())
 	defer ts.Close()
 
-	resp, _ := http.Get(ts.URL + "/pods")
+	resp, err := http.Get(ts.URL + "/pods")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	var env struct {

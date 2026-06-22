@@ -150,7 +150,10 @@ func TestHandlePATRevoke_LifecyclePin(t *testing.T) {
 	// Create.
 	create := func() string {
 		body := `{"scopes":["read"]}`
-		resp, _ := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+		resp, err := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer resp.Body.Close()
 
 		var env struct {
@@ -172,7 +175,10 @@ func TestHandlePATRevoke_LifecyclePin(t *testing.T) {
 
 	// List sees it.
 	{
-		resp, _ := http.Get(ts.URL + "/pats")
+		resp, err := http.Get(ts.URL + "/pats")
+		if err != nil {
+			t.Fatal(err)
+		}
 		body := readAll(t, resp.Body)
 
 		if !strings.Contains(body, id) {
@@ -183,7 +189,10 @@ func TestHandlePATRevoke_LifecyclePin(t *testing.T) {
 	// Revoke.
 	{
 		req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/pats/"+id, nil)
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
@@ -193,7 +202,10 @@ func TestHandlePATRevoke_LifecyclePin(t *testing.T) {
 
 	// List does NOT see it.
 	{
-		resp, _ := http.Get(ts.URL + "/pats")
+		resp, err := http.Get(ts.URL + "/pats")
+		if err != nil {
+			t.Fatal(err)
+		}
 		body := readAll(t, resp.Body)
 
 		if strings.Contains(body, id) {
@@ -204,7 +216,10 @@ func TestHandlePATRevoke_LifecyclePin(t *testing.T) {
 	// Revoke again → 404.
 	{
 		req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/pats/"+id, nil)
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusNotFound {
@@ -223,7 +238,10 @@ func TestHandlePATList_SortedByCreatedAtDesc(t *testing.T) {
 
 	mk := func(name string) {
 		body := `{"scopes":["read"],"name":"` + name + `"}`
-		resp, _ := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+		resp, err := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 	}
 
@@ -231,7 +249,10 @@ func TestHandlePATList_SortedByCreatedAtDesc(t *testing.T) {
 	mk("second")
 	mk("third")
 
-	resp, _ := http.Get(ts.URL + "/pats")
+	resp, err := http.Get(ts.URL + "/pats")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	var env struct {
@@ -265,7 +286,10 @@ func TestHandlePATCreate_TokenNeverInResponseAfterCreate(t *testing.T) {
 	defer ts.Close()
 
 	body := `{"scopes":["read"]}`
-	resp, _ := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+	resp, err := http.Post(ts.URL+"/pats", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	var env struct {
@@ -281,7 +305,10 @@ func TestHandlePATCreate_TokenNeverInResponseAfterCreate(t *testing.T) {
 	}
 
 	// List endpoint must not contain the plain.
-	lr, _ := http.Get(ts.URL + "/pats")
+	lr, err := http.Get(ts.URL + "/pats")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer lr.Body.Close()
 
 	listBody := readAll(t, lr.Body)
