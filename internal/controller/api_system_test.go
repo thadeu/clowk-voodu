@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go.voodu.clowk.in/internal/systemstats"
@@ -139,5 +141,62 @@ func mustHave(t *testing.T, root map[string]any, path ...string) {
 		}
 
 		cur = next
+	}
+}
+
+// /system carries the installed-plugin summaries so the WebUI can gate
+// plugin-specific features on the locally-synced row (no extra call).
+// Pins name + aliases — the gate identity — so a wire regression that
+// would silently disable HEP3 in the UI fails here first.
+func TestSystem_CarriesPluginSummaries(t *testing.T) {
+	root := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(root, "hep3"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "hep3", "plugin.yml"),
+		[]byte("name: hep3\nversion: 0.5.0\naliases: [hep]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	api, _ := newTestAPI(t)
+	api.PluginsRoot = root
+	api.System = &fakeSystemCollector{snap: systemstats.Snapshot{}}
+
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Plugins []struct {
+				Name    string   `json:"name"`
+				Version string   `json:"version"`
+				Aliases []string `json:"aliases"`
+			} `json:"plugins"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(env.Data.Plugins) != 1 {
+		t.Fatalf("plugins: got %d want 1 (%+v)", len(env.Data.Plugins), env.Data.Plugins)
+	}
+
+	p := env.Data.Plugins[0]
+	if p.Name != "hep3" || p.Version != "0.5.0" {
+		t.Errorf("plugin summary: got %+v", p)
+	}
+
+	if len(p.Aliases) != 1 || p.Aliases[0] != "hep" {
+		t.Errorf("aliases: got %v want [hep]", p.Aliases)
 	}
 }

@@ -1875,6 +1875,39 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 // IO + Net rates are deltas between consecutive calls — the first
 // request after process start returns 0 for those fields (no
 // baseline to diff against). Subsequent calls populate them.
+// pluginSummary is the compact installed-plugin shape carried in the
+// /system payload — just enough for a client to gate plugin-specific
+// features on locally-synced data (name + aliases identity, version for
+// display). The full Manifest (commands/env/routes) stays on /plugins.
+type pluginSummary struct {
+	Name    string   `json:"name"`
+	Version string   `json:"version,omitempty"`
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+// pluginSummaries returns the installed plugins as compact summaries.
+// Empty when no plugins root is configured. Load errors are swallowed:
+// a single broken plugin must not blank the whole system view, and the
+// CLI's /plugins endpoint already surfaces them.
+func (a *API) pluginSummaries() []pluginSummary {
+	if a.PluginsRoot == "" {
+		return nil
+	}
+
+	loaded, _ := plugins.LoadAll(a.PluginsRoot)
+
+	out := make([]pluginSummary, 0, len(loaded))
+	for _, p := range loaded {
+		out = append(out, pluginSummary{
+			Name:    p.Manifest.Name,
+			Version: p.Manifest.Version,
+			Aliases: p.Manifest.Aliases,
+		})
+	}
+
+	return out
+}
+
 func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	if a.System == nil {
 		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("system collector not configured"))
@@ -1891,13 +1924,21 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	// preserved verbatim, then tack on a "voodu" sub-object. Same
 	// pattern any future top-level addition can follow without
 	// touching the systemstats package.
+	//
+	// `plugins` rides along so clients (the WebUI) can gate
+	// plugin-specific features on the locally-synced /system row
+	// instead of a separate call — the list is small and changes
+	// rarely, so folding it into the 10s sync is cheaper than a
+	// dedicated endpoint + poller.
 	resp := struct {
 		systemstats.Snapshot
 		Voodu struct {
 			Version string `json:"version"`
 		} `json:"voodu"`
+		Plugins []pluginSummary `json:"plugins"`
 	}{Snapshot: snap}
 	resp.Voodu.Version = a.Version
+	resp.Plugins = a.pluginSummaries()
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",
