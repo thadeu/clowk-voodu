@@ -1,8 +1,10 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -138,7 +140,7 @@ func (i *Installer) Install(ctx context.Context, source, version string) (*Loade
 		// failure means a broken plugin, so surface it instead of
 		// reporting a false success. The copied dir is left in place so a
 		// manual hook re-run can finish without re-fetching the source.
-		return nil, fmt.Errorf("plugin %q install hook: %w", name, err)
+		return nil, fmt.Errorf("plugin %q: %w", name, err)
 	}
 
 	return loaded, nil
@@ -249,16 +251,13 @@ func normaliseGitURL(s string) string {
 	return s
 }
 
-// runLifecycle runs `install` or `uninstall` in the plugin dir if
-// that script exists. Failures are logged to the caller's stderr
-// but do not abort the operation — lifecycle scripts are advisory,
-// the plugin's commands/* are the contract.
 // lifecycleTimeout bounds an install/uninstall hook. Hooks fetch binaries
 // and build images — minutes, not the lifetime of the HTTP request that
 // triggered them.
 const lifecycleTimeout = 10 * time.Minute
 
-// runLifecycle runs a plugin's install/uninstall hook, returning its error.
+// runLifecycle runs a plugin's install/uninstall hook, returning its error
+// (with the hook's output tail attached so failures are self-explanatory).
 func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name string) error {
 	path := filepath.Join(p.Dir, name)
 
@@ -276,15 +275,45 @@ func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name stri
 
 	cmd := exec.CommandContext(hookCtx, path, p.Manifest.Name)
 	cmd.Dir = p.Dir
-	cmd.Env = buildEnv(p, nil)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+
+	// Point TMPDIR at the (writable) plugin dir. The controller may run
+	// under a systemd sandbox with a read-only /tmp, where the hooks'
+	// `mktemp` fails ("Read-only file system"); the plugin dir is writable
+	// (we install into it), so this keeps the sandbox intact and the hook
+	// working.
+	cmd.Env = buildEnv(p, map[string]string{"TMPDIR": p.Dir})
+
+	// Stream the hook's output to the log AND capture it, so a failure
+	// surfaces the reason in `vd plugins:install` (not just "exit status 1").
+	var buf bytes.Buffer
+	out := io.MultiWriter(os.Stderr, &buf)
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	if err := cmd.Run(); err != nil {
+		if tail := lastLines(buf.String(), 8); tail != "" {
+			return fmt.Errorf("%s hook: %w\n%s", name, err, tail)
+		}
+
 		return fmt.Errorf("%s hook: %w", name, err)
 	}
 
 	return nil
+}
+
+// lastLines returns the final n non-empty-trailing lines of s.
+func lastLines(s string, n int) string {
+	s = strings.TrimRight(s, "\n")
+	if s == "" {
+		return ""
+	}
+
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // makeExecutable sets 0755 on every file under commands/ and bin/.
