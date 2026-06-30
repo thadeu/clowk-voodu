@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // InstallSource describes where a plugin's files come from. The source
@@ -132,7 +133,13 @@ func (i *Installer) Install(ctx context.Context, source, version string) (*Loade
 		loaded.Commands[k] = filepath.Join(final, rel)
 	}
 
-	i.runLifecycle(ctx, loaded, "install")
+	if err := i.runLifecycle(ctx, loaded, "install"); err != nil {
+		// The install hook fetches the binary / builds the image — a
+		// failure means a broken plugin, so surface it instead of
+		// reporting a false success. The copied dir is left in place so a
+		// manual hook re-run can finish without re-fetching the source.
+		return nil, fmt.Errorf("plugin %q install hook: %w", name, err)
+	}
 
 	return loaded, nil
 }
@@ -156,7 +163,7 @@ func (i *Installer) Remove(ctx context.Context, name string) (bool, error) {
 	}
 
 	if p, err := LoadFromDir(dir); err == nil {
-		i.runLifecycle(ctx, p, "uninstall")
+		_ = i.runLifecycle(ctx, p, "uninstall") // best-effort; never blocks Remove
 	}
 
 	if err := os.RemoveAll(dir); err != nil {
@@ -246,21 +253,38 @@ func normaliseGitURL(s string) string {
 // that script exists. Failures are logged to the caller's stderr
 // but do not abort the operation — lifecycle scripts are advisory,
 // the plugin's commands/* are the contract.
-func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name string) {
+// lifecycleTimeout bounds an install/uninstall hook. Hooks fetch binaries
+// and build images — minutes, not the lifetime of the HTTP request that
+// triggered them.
+const lifecycleTimeout = 10 * time.Minute
+
+// runLifecycle runs a plugin's install/uninstall hook, returning its error.
+func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name string) error {
 	path := filepath.Join(p.Dir, name)
 
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return
+		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, path, p.Manifest.Name)
+	// Detach from the request context: a finished or timed-out
+	// plugins:install request must NOT SIGKILL the hook mid-download (which
+	// left the plugin binary-less, and silently). Bound it so a genuinely
+	// hung hook can't run forever.
+	hookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(hookCtx, path, p.Manifest.Name)
 	cmd.Dir = p.Dir
 	cmd.Env = buildEnv(p, nil)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s hook: %w", name, err)
+	}
+
+	return nil
 }
 
 // makeExecutable sets 0755 on every file under commands/ and bin/.
