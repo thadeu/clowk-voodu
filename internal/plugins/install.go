@@ -276,12 +276,13 @@ func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name stri
 	cmd := exec.CommandContext(hookCtx, path, p.Manifest.Name)
 	cmd.Dir = p.Dir
 
-	// Point TMPDIR at the (writable) plugin dir. The controller may run
-	// under a systemd sandbox with a read-only /tmp, where the hooks'
-	// `mktemp` fails ("Read-only file system"); the plugin dir is writable
-	// (we install into it), so this keeps the sandbox intact and the hook
-	// working.
-	cmd.Env = buildEnv(p, map[string]string{"TMPDIR": p.Dir})
+	// Point HOME and TMPDIR at the (writable) plugin dir. The controller may
+	// run under a systemd sandbox with a read-only / and /tmp, where the
+	// hooks' `mktemp` (→/tmp) and `docker build` (→ ~/.docker) fail with
+	// "read-only file system". The plugin dir is writable (we install into
+	// it), so this keeps the sandbox intact and the hook working — and HOME
+	// also covers XDG caches/config that default under $HOME.
+	cmd.Env = buildEnv(p, map[string]string{"TMPDIR": p.Dir, "HOME": p.Dir})
 
 	// Stream the hook's output to the log AND capture it, so a failure
 	// surfaces the reason in `vd plugins:install` (not just "exit status 1").
