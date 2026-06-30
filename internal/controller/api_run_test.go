@@ -6,13 +6,20 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // fakeRunner stubs both JobRunner and CronJobRunner with the same
 // canned response. Records the (scope, name) it received so tests
 // can assert the API forwarded the resolved tuple correctly.
+//
+// run_job dispatch invokes RunOnce on a BACKGROUND goroutine
+// (applyDispatchRunJob), so the recorded fields are written off the
+// request thread. The mutex + called() getter let the asserting test
+// read them race-free; honor the real runner's concurrency contract.
 type fakeRunner struct {
+	mu       sync.Mutex
 	gotScope string
 	gotName  string
 
@@ -21,17 +28,31 @@ type fakeRunner struct {
 }
 
 func (f *fakeRunner) RunOnce(_ context.Context, scope, name string) (JobRun, error) {
+	f.mu.Lock()
 	f.gotScope = scope
 	f.gotName = name
+	f.mu.Unlock()
 
 	return f.run, f.err
 }
 
 func (f *fakeRunner) Tick(_ context.Context, scope, name string) (JobRun, error) {
+	f.mu.Lock()
 	f.gotScope = scope
 	f.gotName = name
+	f.mu.Unlock()
 
 	return f.run, f.err
+}
+
+// called returns the (scope, name) the runner last recorded, read under
+// the lock so it's safe to poll while RunOnce runs on the dispatch's
+// async goroutine.
+func (f *fakeRunner) called() (scope, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.gotScope, f.gotName
 }
 
 // TestCronJobRun_ForwardsScopeAndName confirms /cronjobs/run pulls
@@ -58,9 +79,8 @@ func TestCronJobRun_ForwardsScopeAndName(t *testing.T) {
 		t.Fatalf("status=%d want 200", resp.StatusCode)
 	}
 
-	if runner.gotScope != "ops" || runner.gotName != "purge" {
-		t.Errorf("runner got scope=%q name=%q, want ops/purge",
-			runner.gotScope, runner.gotName)
+	if scope, name := runner.called(); scope != "ops" || name != "purge" {
+		t.Errorf("runner got scope=%q name=%q, want ops/purge", scope, name)
 	}
 }
 
@@ -90,8 +110,8 @@ func TestCronJobRun_ResolvesUnambiguousBareName(t *testing.T) {
 		t.Fatalf("status=%d want 200", resp.StatusCode)
 	}
 
-	if runner.gotScope != "ops" {
-		t.Errorf("scope should auto-resolve to ops, got %q", runner.gotScope)
+	if scope, _ := runner.called(); scope != "ops" {
+		t.Errorf("scope should auto-resolve to ops, got %q", scope)
 	}
 }
 

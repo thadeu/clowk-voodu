@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writePluginYAML drops a minimal plugin.yml + bin script under
@@ -1119,19 +1120,23 @@ EOF
 		t.Errorf("expected 'queued' summary, got: %v", out.Data.Applied)
 	}
 
-	// Goroutine ran in the background; runner saw the call. Use
-	// Eventually-style poll because the goroutine fires off the
-	// HTTP-handler thread.
-	deadline := 0
-	for runner.gotScope == "" && deadline < 50 {
-		// busy-wait briefly — fakeRunner.RunOnce returns instantly,
-		// but goroutine scheduling has a few microseconds of slop.
-		deadline++
+	// run_job fires RunOnce on a background goroutine, so poll the
+	// runner's recorded tuple (through its lock) until it lands or we
+	// time out — a bare busy-spin both races on the fields and can
+	// exit before the goroutine has scheduled.
+	var scope, name string
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if scope, name = runner.called(); scope != "" {
+			break
+		}
+
+		time.Sleep(time.Millisecond)
 	}
 
-	if runner.gotScope != "clowk-lp" || runner.gotName != "db-backup-b008" {
-		t.Errorf("runner called with scope=%q name=%q, want clowk-lp/db-backup-b008",
-			runner.gotScope, runner.gotName)
+	if scope != "clowk-lp" || name != "db-backup-b008" {
+		t.Errorf("runner called with scope=%q name=%q, want clowk-lp/db-backup-b008", scope, name)
 	}
 }
 
