@@ -105,6 +105,83 @@ func TestEventRendererFailureKeepsBuildTail(t *testing.T) {
 	}
 }
 
+// Trailing BuildKit lines that race in AFTER the build step_end already
+// closed must NOT leak inline. docker buildx writes its "#N naming/
+// unpacking/DONE" export progress to stderr, which the SSH forwarder
+// merges into the same filter as the stdout NDJSON with no cross-channel
+// ordering — so the build's final lines can arrive after the step's ✓ has
+// committed. Covers both race orderings: residue before AND after the
+// "Build completed" summary flips r.active off.
+func TestEventRendererTrailingBuildResidueSwallowed(t *testing.T) {
+	// Ordering A — residue lands while still active (between step_end and
+	// the Build completed summary).
+	t.Run("between steps still active", func(t *testing.T) {
+		var buf bytes.Buffer
+
+		r := forceEventRenderer(t, &buf, false)
+
+		writeEvents(t, r, []progress.Event{
+			{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
+			{Type: progress.EventStepStart, ID: "build", Label: "building release"},
+			{Type: progress.EventStepEnd, ID: "build", Status: progress.StatusOK},
+		})
+
+		for _, ln := range []string{
+			"#17 naming to docker.io/library/fsw-controller:0eb6ee6b3335 done",
+			"#17 unpacking to docker.io/library/fsw-controller:0eb6ee6b3335 done",
+			"#17 DONE 1.5s",
+		} {
+			_, _ = r.Write([]byte(ln + "\n"))
+		}
+
+		writeEvents(t, r, []progress.Event{
+			{Type: progress.EventSummary, Text: "pruned 1 old release(s)"},
+		})
+
+		_ = r.Close()
+
+		got := stripANSI(buf.String())
+
+		if strings.Contains(got, "#17") {
+			t.Errorf("trailing BuildKit residue leaked inline:\n%s", got)
+		}
+
+		if !strings.Contains(got, "✓ building release") || !strings.Contains(got, "pruned 1 old release(s)") {
+			t.Errorf("expected the ✓ build line and pruned summary to survive:\n%s", got)
+		}
+	})
+
+	// Ordering B — the "Build completed" summary flips r.active off first,
+	// then the residue arrives. buildClosed must keep swallowing it.
+	t.Run("after build completed idle", func(t *testing.T) {
+		var buf bytes.Buffer
+
+		r := forceEventRenderer(t, &buf, false)
+
+		writeEvents(t, r, []progress.Event{
+			{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
+			{Type: progress.EventStepStart, ID: "build", Label: "building release"},
+			{Type: progress.EventStepEnd, ID: "build", Status: progress.StatusOK},
+			{Type: progress.EventSummary, Text: "Build completed"},
+		})
+
+		for _, ln := range []string{
+			"#17 naming to docker.io/library/fsw-controller:0eb6ee6b3335 done",
+			"#17 DONE 1.5s",
+		} {
+			_, _ = r.Write([]byte(ln + "\n"))
+		}
+
+		_ = r.Close()
+
+		got := stripANSI(buf.String())
+
+		if strings.Contains(got, "#17") {
+			t.Errorf("trailing BuildKit residue leaked inline after Build completed:\n%s", got)
+		}
+	})
+}
+
 // A blank line in the build output during an active step must be
 // swallowed — a bare newline would push the cursor below the live block
 // and the next redraw would paint the spinner one row lower (the stacked-

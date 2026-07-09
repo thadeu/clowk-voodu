@@ -162,14 +162,29 @@ func (r *eventRenderer) processLineLocked(line []byte) {
 		// Non-JSON frame: during a build it's the docker/BuildKit
 		// sub-output (and lang banners) interleaved on the stream — feed
 		// it to the live tail block instead of printing inline, so it
-		// shows the current phase and collapses on step end. Outside an
-		// active step it's a stderr leak / legacy line → print clean.
+		// shows the current phase and collapses on step end.
 		if r.active && r.currentStepLabel != "" {
 			r.pushTailLocked(string(line))
 
 			return
 		}
 
+		// No live step but we're mid-flow (r.active, between steps) or a
+		// build has already closed (r.buildClosed): this is trailing
+		// BuildKit residue. docker buildx writes its "#N naming/unpacking/
+		// DONE" progress to STDERR, which the SSH forwarder funnels into
+		// this same filter as the stdout NDJSON with no ordering guarantee
+		// between the two channels (forward_remote.go wires Stdout and
+		// Stderr to one writer). The build's final export lines routinely
+		// race in AFTER their step_end already committed the ✓ line — so
+		// they'd leak inline here. Swallow them; the ✓ already reported the
+		// phase.
+		if r.active || r.buildClosed {
+			return
+		}
+
+		// Fully idle and no build has happened → pre-handshake / non-NDJSON
+		// server output: surface the raw line clean.
 		fmt.Fprintln(r.out, string(line))
 
 		return
