@@ -3546,3 +3546,32 @@ registry "r" {
 		})
 	}
 }
+
+// TestRequireSingleLabelErrorShowsTheShape — an operator who writes
+// `registry { ... }` from memory gets told the rule; without an
+// example they still have to go find the docs to learn the label is a
+// quoted string before the brace. The message carries the answer.
+func TestRequireSingleLabelErrorShowsTheShape(t *testing.T) {
+	src := `
+registry {
+  url    = "example.com"
+  helper = "ecr-login"
+}
+`
+	tmp := writeTemp(t, "registry_nolabel.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected an error for a registry block with no label")
+	}
+
+	for _, want := range []string{
+		`registry "name"`, // the shape
+		`registry "ecr"`,  // a concrete example
+		"got 0",           // what was actually found
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}

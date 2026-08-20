@@ -720,3 +720,119 @@ registry "ghcr" {
 		t.Fatal("no registry manifest parsed")
 	}
 }
+
+// TestRegistryResolvesFromOwnBucketOfSibling is the shape a real
+// manifest takes: no env_from anywhere, vars set with
+// `vd config fsw/freeswitch set ...`, and a registry block that has no
+// scope/name of its own to key a bucket on.
+//
+// Two mechanisms have to compose for this to work. The two-label
+// statefulset causes its OWN (scope,name) bucket to be fetched, and
+// the resulting interpolation context is file-global — so the registry
+// block resolves against a bucket named after a completely different
+// resource. Break either one and the operator gets "undefined
+// variable: FS_ECR_URL" on a file that reads as though it should work.
+func TestRegistryResolvesFromOwnBucketOfSibling(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "freeswitch.voodu"), `
+registry "ecr" {
+  url    = "${FS_ECR_URL}"
+  helper = "ecr-login"
+}
+
+statefulset "fsw" "freeswitch" {
+  image    = "${FS_ECR_URL}/freeswitch:${FS_IMAGE_TAG:-bookworm}"
+  replicas = 1
+}
+`)
+
+	var gotQueries []string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQueries = append(gotQueries, r.URL.RawQuery)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data": map[string]any{
+				"vars": map[string]string{
+					"FS_ECR_URL":   "889332165767.dkr.ecr.sa-east-1.amazonaws.com",
+					"FS_IMAGE_TAG": "bookworm",
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mans, err := loadManifests(cmdBucketFetcher(cmd), applyFlags{files: []string{dir}})
+	if err != nil {
+		t.Fatalf("loadManifests: %v", err)
+	}
+
+	const wantHost = "889332165767.dkr.ecr.sa-east-1.amazonaws.com"
+
+	var sawRegistry, sawStatefulset bool
+
+	for _, m := range mans {
+		switch m.Kind {
+		case controller.KindRegistry:
+			sawRegistry = true
+
+			var spec struct {
+				URL    string `json:"url"`
+				Helper string `json:"helper"`
+			}
+
+			if err := json.Unmarshal(m.Spec, &spec); err != nil {
+				t.Fatalf("decode registry: %v", err)
+			}
+
+			if spec.URL != wantHost {
+				t.Errorf("registry url = %q, want %q — the sibling's own bucket did not reach this block", spec.URL, wantHost)
+			}
+
+			if spec.Helper != "ecr-login" {
+				t.Errorf("registry helper = %q", spec.Helper)
+			}
+
+		case controller.KindStatefulset:
+			sawStatefulset = true
+
+			var spec struct {
+				Image string `json:"image"`
+			}
+
+			_ = json.Unmarshal(m.Spec, &spec)
+
+			if spec.Image != wantHost+"/freeswitch:bookworm" {
+				t.Errorf("statefulset image = %q", spec.Image)
+			}
+		}
+	}
+
+	if !sawRegistry || !sawStatefulset {
+		t.Fatalf("missing manifests: registry=%v statefulset=%v", sawRegistry, sawStatefulset)
+	}
+
+	// The bucket must have been fetched from the resource's own
+	// (scope,name), with no env_from declared anywhere in the file.
+	var askedOwnBucket bool
+
+	for _, q := range gotQueries {
+		if strings.Contains(q, "scope=fsw") && strings.Contains(q, "name=freeswitch") {
+			askedOwnBucket = true
+		}
+	}
+
+	if !askedOwnBucket {
+		t.Errorf("never fetched the fsw/freeswitch bucket; queries=%v", gotQueries)
+	}
+}

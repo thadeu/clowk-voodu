@@ -1705,12 +1705,18 @@ func (b hclRegistry) spec() (RegistrySpec, error) {
 // the single label (`registry "ghcr"`) — there's no scope segment
 // because the underlying ~/.docker/config.json is global per host.
 func requireSingleLabel(blk *hclsyntax.Block) (name string, err error) {
+	// The example is not decoration. "needs exactly one label" states
+	// the rule without showing the shape, and an operator who wrote
+	// the block from memory has to go find the docs to learn that the
+	// label goes in quotes before the brace. One line of the answer
+	// costs nothing and ends the round-trip here.
 	if len(blk.Labels) != 1 {
-		return "", fmt.Errorf("%s block needs exactly one label (the registry name), got %d", blk.Type, len(blk.Labels))
+		return "", fmt.Errorf("%s block needs exactly one label (its name), got %d — write `%s \"name\" { ... }`, e.g. `%s \"ecr\" { ... }`",
+			blk.Type, len(blk.Labels), blk.Type, blk.Type)
 	}
 
 	if blk.Labels[0] == "" {
-		return "", fmt.Errorf("%s block: name label must be non-empty", blk.Type)
+		return "", fmt.Errorf("%s block: name label must be non-empty — write `%s \"name\" { ... }`", blk.Type, blk.Type)
 	}
 
 	return blk.Labels[0], nil
