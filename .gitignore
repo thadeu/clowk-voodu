@@ -6,6 +6,14 @@ dist/
 *.so
 *.dylib
 
+# Stray binaries from `go build ./cmd/<x>/`, which writes them to the
+# CWD instead of bin/ and names them after the DIRECTORY — so the
+# leftovers are `controller` and `cli`, not the `voodu-controller` /
+# `voodu` names the Makefile and goreleaser produce. Anchored to the
+# repo root so they can never shadow a real path deeper in the tree.
+/controller
+/cli
+
 # Test and coverage artifacts
 coverage.out
 coverage.html
