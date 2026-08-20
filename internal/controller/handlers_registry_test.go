@@ -359,3 +359,160 @@ func TestRegistryHandlerExplicitPathWins(t *testing.T) {
 		t.Errorf("ensureConfigPath() = %q, want the injected %q", got, explicit)
 	}
 }
+
+// seedRegistry puts one registry manifest and reconciles it, returning
+// the raw config.json the handler produced.
+func seedRegistry(t *testing.T, configPath string, specs map[string]registrySpec) map[string]json.RawMessage {
+	t.Helper()
+
+	store := newMemStore()
+
+	h := &RegistryHandler{Store: store, Log: quietLogger(), DockerConfigPath: configPath}
+
+	var last string
+
+	for name, spec := range specs {
+		blob, _ := json.Marshal(spec)
+
+		m := &Manifest{Kind: KindRegistry, Name: name, Spec: blob}
+		if _, err := store.Put(context.Background(), m); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+
+		last = name
+	}
+
+	ev := WatchEvent{Type: WatchPut, Kind: KindRegistry, Name: last}
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("decode config: %v\n%s", err, raw)
+	}
+
+	return top
+}
+
+// TestRegistryHandler_HelperModeWritesCredHelpers is the EC2
+// instance-role path: no credential in the manifest at all, docker
+// execs the helper and it resolves the host's own identity.
+func TestRegistryHandler_HelperModeWritesCredHelpers(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	top := seedRegistry(t, configPath, map[string]registrySpec{
+		"ecr": {URL: "889332165767.dkr.ecr.sa-east-1.amazonaws.com", Helper: "ecr-login"},
+	})
+
+	var helpers map[string]string
+	if err := json.Unmarshal(top["credHelpers"], &helpers); err != nil {
+		t.Fatalf("decode credHelpers: %v (config: %v)", err, top)
+	}
+
+	if got := helpers["889332165767.dkr.ecr.sa-east-1.amazonaws.com"]; got != "ecr-login" {
+		t.Errorf("credHelpers entry = %q, want ecr-login", got)
+	}
+
+	// No auths entry — there is no credential to encode, and an empty
+	// one would shadow nothing but confuse anyone reading the file.
+	var auths map[string]any
+	_ = json.Unmarshal(top["auths"], &auths)
+
+	if len(auths) != 0 {
+		t.Errorf("auths = %v, want empty in helper mode", auths)
+	}
+}
+
+// TestRegistryHandler_MixedHelperAndToken — a host can pull ECR off
+// its instance role AND ghcr.io with a bot token. The two sections
+// must not interfere.
+func TestRegistryHandler_MixedHelperAndToken(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	top := seedRegistry(t, configPath, map[string]registrySpec{
+		"ecr":  {URL: "123.dkr.ecr.sa-east-1.amazonaws.com", Helper: "ecr-login"},
+		"ghcr": {URL: "ghcr.io", Username: "bot", Token: "ghp_x"},
+	})
+
+	var helpers map[string]string
+	_ = json.Unmarshal(top["credHelpers"], &helpers)
+
+	if len(helpers) != 1 || helpers["123.dkr.ecr.sa-east-1.amazonaws.com"] != "ecr-login" {
+		t.Errorf("credHelpers = %v, want exactly the ECR entry", helpers)
+	}
+
+	var auths map[string]dockerAuth
+	_ = json.Unmarshal(top["auths"], &auths)
+
+	if len(auths) != 1 || auths["ghcr.io"].Auth == "" {
+		t.Errorf("auths = %v, want exactly the ghcr entry", auths)
+	}
+}
+
+// TestRegistryHandler_CredHelpersOmittedWhenEmpty keeps the file clean
+// on the overwhelmingly common host that uses no helper at all.
+func TestRegistryHandler_CredHelpersOmittedWhenEmpty(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	top := seedRegistry(t, configPath, map[string]registrySpec{
+		"ghcr": {URL: "ghcr.io", Username: "bot", Token: "ghp_x"},
+	})
+
+	if _, present := top["credHelpers"]; present {
+		t.Errorf("credHelpers emitted with no helper-mode registry: %s", top["credHelpers"])
+	}
+}
+
+// TestRegistryHandler_CredHelpersIsOwned — the ownership contract.
+// A helper entry voodu did not declare is removed, exactly as an
+// undeclared auths entry is. Asymmetric ownership between the two
+// sibling keys would be impossible to reason about.
+func TestRegistryHandler_CredHelpersIsOwned(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	stale := `{"credHelpers":{"stale.example.com":"someone-elses-helper"},"auths":{}}`
+	if err := os.WriteFile(configPath, []byte(stale), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	top := seedRegistry(t, configPath, map[string]registrySpec{
+		"ecr": {URL: "123.dkr.ecr.sa-east-1.amazonaws.com", Helper: "ecr-login"},
+	})
+
+	var helpers map[string]string
+	_ = json.Unmarshal(top["credHelpers"], &helpers)
+
+	if _, survived := helpers["stale.example.com"]; survived {
+		t.Errorf("undeclared helper survived the reconcile: %v", helpers)
+	}
+}
+
+// TestRegistryHandler_PreservesUnknownTopLevelKeys — voodu claims
+// auths and credHelpers, nothing else. An operator's credsStore or
+// HTTPHeaders must round-trip.
+func TestRegistryHandler_PreservesUnknownTopLevelKeys(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	existing := `{"auths":{},"credsStore":"osxkeychain","HTTPHeaders":{"X-Foo":"bar"}}`
+	if err := os.WriteFile(configPath, []byte(existing), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	top := seedRegistry(t, configPath, map[string]registrySpec{
+		"ecr": {URL: "123.dkr.ecr.sa-east-1.amazonaws.com", Helper: "ecr-login"},
+	})
+
+	if string(top["credsStore"]) != `"osxkeychain"` {
+		t.Errorf("credsStore = %s, want it preserved", top["credsStore"])
+	}
+
+	if _, ok := top["HTTPHeaders"]; !ok {
+		t.Errorf("HTTPHeaders dropped: %v", top)
+	}
+}

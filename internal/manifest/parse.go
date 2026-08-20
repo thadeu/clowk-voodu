@@ -1629,6 +1629,22 @@ type hclRegistry struct {
 	Username string `hcl:"username,optional"`
 	Token    string `hcl:"token,optional"`
 	Password string `hcl:"password,optional"`
+	Helper   string `hcl:"helper,optional"`
+}
+
+// helperAliases maps names operators reach for first onto docker's
+// actual binary suffix. Docker execs `docker-credential-<helper>`, so
+// the value has to be the suffix exactly — `ecr` would look for
+// `docker-credential-ecr`, which does not exist. We do NOT silently
+// rewrite these: a manifest that says one thing and does another is
+// worse than a one-line error. The map exists to make that error
+// name the fix.
+var helperAliases = map[string]string{
+	"ecr":         "ecr-login",
+	"aws":         "ecr-login",
+	"gcr":         "gcloud",
+	"artifactory": "gcloud",
+	"acr":         "acr-env",
 }
 
 // spec validates the required field set and folds the password
@@ -1647,12 +1663,29 @@ func (b hclRegistry) spec() (RegistrySpec, error) {
 		return RegistrySpec{}, fmt.Errorf("url is required")
 	}
 
+	// Helper mode: the host's own identity authenticates the pull, so
+	// there is no credential in the manifest at all.
+	if b.Helper != "" {
+		if b.Username != "" || token != "" {
+			return RegistrySpec{}, fmt.Errorf("`helper` and `username`/`token` are mutually exclusive: a credHelpers entry supersedes the matching auths entry, so docker would ignore the username/token half")
+		}
+
+		if want, aliased := helperAliases[b.Helper]; aliased {
+			return RegistrySpec{}, fmt.Errorf("unknown credential helper %q — did you mean %q? docker execs `docker-credential-<helper>`, so the value is the binary suffix", b.Helper, want)
+		}
+
+		return RegistrySpec{
+			URL:    b.URL,
+			Helper: b.Helper,
+		}, nil
+	}
+
 	if b.Username == "" {
-		return RegistrySpec{}, fmt.Errorf("username is required")
+		return RegistrySpec{}, fmt.Errorf("username is required (or use `helper` for a credential helper)")
 	}
 
 	if token == "" {
-		return RegistrySpec{}, fmt.Errorf("token (or password) is required")
+		return RegistrySpec{}, fmt.Errorf("token (or password) is required (or use `helper` for a credential helper)")
 	}
 
 	return RegistrySpec{

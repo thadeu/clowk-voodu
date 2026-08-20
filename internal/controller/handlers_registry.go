@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"go.voodu.clowk.in/internal/paths"
@@ -80,6 +81,16 @@ type RegistryHandler struct {
 type dockerConfig struct {
 	Auths map[string]dockerAuth `json:"auths"`
 
+	// CredHelpers is docker's per-host credential-helper map:
+	// {"<registry-host>": "ecr-login"} makes docker exec
+	// `docker-credential-ecr-login` for that host instead of reading
+	// an `auths` entry. Owned by voodu on the same terms as Auths —
+	// declared registries produce entries, undeclared ones are
+	// removed — because partial ownership of one key and full
+	// ownership of its sibling is the kind of asymmetry nobody
+	// remembers correctly at 3am.
+	CredHelpers map[string]string `json:"credHelpers,omitempty"`
+
 	// Extra captures every other top-level key in the file so the
 	// reconciler can round-trip them without knowing their shape.
 	// Populated by load(); emitted by save() interleaved with the
@@ -95,6 +106,17 @@ type dockerConfig struct {
 // doesn't authenticate any registry we know of in 2026.
 type dockerAuth struct {
 	Auth string `json:"auth"`
+}
+
+// newDockerConfig is the empty-but-usable shape every load path
+// converges on. Both owned sections start non-nil so regenerate can
+// assign into them without a nil-map panic on a first reconcile.
+func newDockerConfig() dockerConfig {
+	return dockerConfig{
+		Auths:       map[string]dockerAuth{},
+		CredHelpers: map[string]string{},
+		Extra:       map[string]json.RawMessage{},
+	}
 }
 
 // Handle dispatches per WatchEvent type. Mirrors every other
@@ -137,6 +159,7 @@ func (h *RegistryHandler) regenerate(ctx context.Context, ev WatchEvent) error {
 	// "voodu owns config.json entirely" stance the type's
 	// godoc documents.
 	cfg.Auths = make(map[string]dockerAuth, len(all))
+	cfg.CredHelpers = make(map[string]string, len(all))
 
 	for _, m := range all {
 		if m == nil {
@@ -150,6 +173,33 @@ func (h *RegistryHandler) regenerate(ctx context.Context, ev WatchEvent) error {
 			// other registry. The reconciler will retry the
 			// bad manifest on its next watch event.
 			h.logf("registry/%s: decode spec: %v (skipping in auth file)", m.Name, derr)
+			continue
+		}
+
+		// Helper mode: no credential to encode. docker execs
+		// `docker-credential-<helper>` for this host and the helper
+		// resolves the identity itself (EC2 instance role, workload
+		// identity, keychain). The parser guarantees Helper and
+		// Username/Token are never both set.
+		if spec.Helper != "" {
+			if existing, dupe := cfg.CredHelpers[spec.URL]; dupe {
+				h.logf("registry/%s: URL %q already claimed (helper=%q); overwriting with this manifest's helper",
+					m.Name, spec.URL, existing)
+			}
+
+			cfg.CredHelpers[spec.URL] = spec.Helper
+
+			// Warn, don't fail. The binary may legitimately be
+			// installed after the manifest lands, and a hard error
+			// here would wedge auth for every OTHER registry in the
+			// file. Without the warning the operator gets docker's
+			// own message, which reports the missing helper as an
+			// authorization failure.
+			if bin := "docker-credential-" + spec.Helper; !binaryOnPath(bin) {
+				h.logf("registry/%s: %s not found on PATH — pulls from %s will fail until it is installed",
+					m.Name, bin, spec.URL)
+			}
+
 			continue
 		}
 
@@ -167,10 +217,18 @@ func (h *RegistryHandler) regenerate(ctx context.Context, ev WatchEvent) error {
 		return fmt.Errorf("write docker config: %w", err)
 	}
 
-	h.logf("registry: regenerated %s with %d auth(s) (event=%s name=%s)",
-		h.ensureConfigPath(), len(cfg.Auths), ev.Type, ev.Name)
+	h.logf("registry: regenerated %s with %d auth(s) and %d helper(s) (event=%s name=%s)",
+		h.ensureConfigPath(), len(cfg.Auths), len(cfg.CredHelpers), ev.Type, ev.Name)
 
 	return nil
+}
+
+// binaryOnPath reports whether name resolves to an executable on the
+// controller's PATH. Used only to turn a missing credential helper
+// into a log line that names the actual problem.
+func binaryOnPath(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 // registrySpec mirrors manifest.RegistrySpec — the controller
@@ -181,6 +239,7 @@ type registrySpec struct {
 	URL      string `json:"url"`
 	Username string `json:"username"`
 	Token    string `json:"token"`
+	Helper   string `json:"helper,omitempty"`
 }
 
 func decodeRegistrySpec(m *Manifest) (registrySpec, error) {
@@ -198,8 +257,25 @@ func decodeRegistrySpec(m *Manifest) (registrySpec, error) {
 		return s, err
 	}
 
-	if s.URL == "" || s.Username == "" || s.Token == "" {
-		return s, fmt.Errorf("registry spec missing required field(s) (url=%q username=%q token=%t)",
+	if s.URL == "" {
+		return s, fmt.Errorf("registry spec missing url")
+	}
+
+	// Two valid shapes, and the parser already rejects the overlap.
+	// Re-checked here because this decoder also runs against specs
+	// that reached the store by other routes (a plugin, a direct
+	// /apply POST), and a spec with neither half would otherwise
+	// produce an auth entry encoding two empty strings.
+	if s.Helper != "" {
+		if s.Username != "" || s.Token != "" {
+			return s, fmt.Errorf("registry spec sets both helper=%q and username/token — they are mutually exclusive", s.Helper)
+		}
+
+		return s, nil
+	}
+
+	if s.Username == "" || s.Token == "" {
+		return s, fmt.Errorf("registry spec missing credentials: set username+token, or helper (url=%q username=%q token=%t)",
 			s.URL, s.Username, s.Token != "")
 	}
 
@@ -236,7 +312,7 @@ func (h *RegistryHandler) loadOrInit() (dockerConfig, error) {
 		// MkdirAll's the parent on its own, so a missing
 		// ~/.docker/ on first apply is fine.
 		if os.IsNotExist(err) {
-			return dockerConfig{Auths: map[string]dockerAuth{}, Extra: map[string]json.RawMessage{}}, nil
+			return newDockerConfig(), nil
 		}
 
 		return dockerConfig{}, err
@@ -251,15 +327,21 @@ func (h *RegistryHandler) loadOrInit() (dockerConfig, error) {
 		// the file or accept the rewrite.
 		h.logf("registry: existing %s is unparseable (%v); rewriting from scratch", path, err)
 
-		return dockerConfig{Auths: map[string]dockerAuth{}, Extra: map[string]json.RawMessage{}}, nil
+		return newDockerConfig(), nil
 	}
 
-	cfg := dockerConfig{
-		Auths: map[string]dockerAuth{},
-		Extra: make(map[string]json.RawMessage, len(top)),
-	}
+	cfg := newDockerConfig()
+	cfg.Extra = make(map[string]json.RawMessage, len(top))
 
 	for k, v := range top {
+		if k == "credHelpers" {
+			// Same best-effort posture as auths below: voodu rebuilds
+			// this section from manifests, so a malformed one costs
+			// nothing to discard.
+			_ = json.Unmarshal(v, &cfg.CredHelpers)
+			continue
+		}
+
 		if k == "auths" {
 			// Best-effort decode: a malformed auths block
 			// gets wiped and rebuilt rather than blocking
@@ -314,6 +396,23 @@ func (h *RegistryHandler) save(cfg dockerConfig) error {
 	}
 
 	out["auths"] = authsBlob
+
+	// credHelpers is emitted only when populated. An empty map is
+	// legal JSON that docker tolerates, but writing `"credHelpers":
+	// {}` into every config on a host that uses none is noise in a
+	// file operators read during incident response. Absent when
+	// empty also means the key vanishes when the last helper-mode
+	// registry is deleted, which is the ownership contract.
+	if len(cfg.CredHelpers) > 0 {
+		helpersBlob, herr := json.Marshal(cfg.CredHelpers)
+		if herr != nil {
+			return fmt.Errorf("marshal credHelpers: %w", herr)
+		}
+
+		out["credHelpers"] = helpersBlob
+	} else {
+		delete(out, "credHelpers")
+	}
 
 	body, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

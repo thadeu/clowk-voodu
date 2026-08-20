@@ -1402,6 +1402,25 @@ type RegistrySpec struct {
 	// The HCL parser ALSO accepts `password = "..."` as an alias
 	// and decodes into this same field — see RegistrySpec doc.
 	Token string `yaml:"token" json:"token"`
+
+	// Helper names a docker credential helper for this host, as an
+	// alternative to carrying a static Username/Token pair. The value
+	// is docker's own suffix convention: `helper = "ecr-login"` makes
+	// docker exec `docker-credential-ecr-login` on every pull.
+	//
+	// This is the shape to reach for when the HOST's identity is
+	// already granted — an EC2 instance with an ECR policy on its
+	// instance role, a GCE VM with Artifact Registry access. The
+	// helper reads that identity at pull time, so there is no
+	// credential to put in a manifest and nothing to rotate. A
+	// username/token pair, by contrast, obliges someone to keep it
+	// fresh; ECR tokens in particular expire every 12 hours.
+	//
+	// Mutually exclusive with Username/Token: an entry in docker's
+	// `credHelpers` supersedes the matching `auths` entry, so
+	// accepting both would silently ignore half of what the operator
+	// wrote. The parser rejects the combination instead.
+	Helper string `yaml:"helper,omitempty" json:"helper,omitempty"`
 }
 
 type IngressTLS struct {

@@ -3395,3 +3395,113 @@ func writeAt(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// TestParseHCLRegistryHelper pins the credential-helper shape: url +
+// helper, no username/token. This is what an EC2 host with an ECR
+// policy on its instance role declares — the identity is already
+// granted, so there is no secret to put in the manifest and nothing
+// to rotate.
+func TestParseHCLRegistryHelper(t *testing.T) {
+	src := `
+registry "ecr" {
+  url    = "889332165767.dkr.ecr.sa-east-1.amazonaws.com"
+  helper = "ecr-login"
+}
+`
+	tmp := writeTemp(t, "registry_helper.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mans) != 1 {
+		t.Fatalf("want 1 manifest, got %d", len(mans))
+	}
+
+	var spec RegistrySpec
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatalf("decode spec: %v", err)
+	}
+
+	if spec.Helper != "ecr-login" {
+		t.Errorf("helper = %q, want ecr-login", spec.Helper)
+	}
+
+	if spec.URL != "889332165767.dkr.ecr.sa-east-1.amazonaws.com" {
+		t.Errorf("url = %q", spec.URL)
+	}
+
+	if spec.Username != "" || spec.Token != "" {
+		t.Errorf("username/token should stay empty in helper mode, got %q/%q", spec.Username, spec.Token)
+	}
+}
+
+// TestParseHCLRegistryHelperRejectsCredentials — docker's credHelpers
+// entry supersedes the matching auths entry, so accepting both would
+// silently ignore half of what the operator wrote.
+func TestParseHCLRegistryHelperRejectsCredentials(t *testing.T) {
+	src := `
+registry "ecr" {
+  url      = "123.dkr.ecr.sa-east-1.amazonaws.com"
+  helper   = "ecr-login"
+  username = "AWS"
+  token    = "leftover"
+}
+`
+	tmp := writeTemp(t, "registry_both.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected an error when helper and username/token are both set")
+	}
+
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %v, want it to say the two are mutually exclusive", err)
+	}
+}
+
+// TestParseHCLRegistryHelperAliasHint — `ecr` is the name everyone
+// reaches for, but docker execs `docker-credential-<helper>` and
+// `docker-credential-ecr` does not exist. Silently rewriting it would
+// make the manifest say one thing and do another, so the parser errors
+// with the fix in the message.
+func TestParseHCLRegistryHelperAliasHint(t *testing.T) {
+	src := `
+registry "ecr" {
+  url    = "123.dkr.ecr.sa-east-1.amazonaws.com"
+  helper = "ecr"
+}
+`
+	tmp := writeTemp(t, "registry_alias.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected an error for helper = \"ecr\"")
+	}
+
+	if !strings.Contains(err.Error(), "ecr-login") {
+		t.Errorf("error = %v, want it to name ecr-login as the fix", err)
+	}
+}
+
+// TestParseHCLRegistryRequiresOneMode — neither credentials nor a
+// helper is not a valid registry; the error has to point at both
+// escape routes.
+func TestParseHCLRegistryRequiresOneMode(t *testing.T) {
+	src := `
+registry "bare" {
+  url = "example.com"
+}
+`
+	tmp := writeTemp(t, "registry_bare.hcl", src)
+
+	_, err := ParseFile(tmp, nil)
+	if err == nil {
+		t.Fatal("expected an error for a registry with no credentials and no helper")
+	}
+
+	if !strings.Contains(err.Error(), "helper") {
+		t.Errorf("error = %v, want it to mention helper as an option", err)
+	}
+}

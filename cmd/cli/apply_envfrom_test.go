@@ -16,9 +16,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.voodu.clowk.in/internal/controller"
 )
 
 // TestExtractEnvFromRefs_Basic pins the happy path: a single
@@ -531,5 +537,102 @@ func TestBucketFetcherConstructors_NilIsOffline(t *testing.T) {
 
 	if sshBucketFetcher(nil, "") != nil {
 		t.Error("sshBucketFetcher(nil, \"\") should be nil (offline)")
+	}
+}
+
+// TestRegistryURLResolvesFromSiblingBucket is the one-file-N-servers
+// shape: the ECR hostname differs per environment, so it lives in a
+// shared config bucket alongside the image tag rather than in the
+// manifest. The interpolation context is FILE-global — built from
+// every env_from in the file, fetched before the HCL parser runs — so
+// a `registry` block picks up a bucket a sibling deployment declared,
+// even though `registry` has no env_from of its own.
+//
+// Without this the operator would need one manifest per server.
+func TestRegistryURLResolvesFromSiblingBucket(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "stack.hcl"), `
+deployment "fsw" "freeswitch" {
+  env_from = ["fsw/freeswitch"]
+  image    = "${FS_ECR_URL}/freeswitch:bookworm"
+}
+
+registry "ecr" {
+  url    = "${FS_ECR_URL}"
+  helper = "ecr-login"
+}
+`)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data": map[string]any{
+				"vars": map[string]string{
+					"FS_ECR_URL": "889332165767.dkr.ecr.sa-east-1.amazonaws.com",
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mans, err := loadManifests(cmdBucketFetcher(cmd), applyFlags{files: []string{dir}})
+	if err != nil {
+		t.Fatalf("loadManifests: %v", err)
+	}
+
+	const wantHost = "889332165767.dkr.ecr.sa-east-1.amazonaws.com"
+
+	var sawRegistry, sawDeployment bool
+
+	for _, m := range mans {
+		switch m.Kind {
+		case controller.KindRegistry:
+			sawRegistry = true
+
+			var spec struct {
+				URL    string `json:"url"`
+				Helper string `json:"helper"`
+			}
+
+			if err := json.Unmarshal(m.Spec, &spec); err != nil {
+				t.Fatalf("decode registry spec: %v", err)
+			}
+
+			if spec.URL != wantHost {
+				t.Errorf("registry url = %q, want %q (bucket var did not reach the registry block)", spec.URL, wantHost)
+			}
+
+			if spec.Helper != "ecr-login" {
+				t.Errorf("registry helper = %q, want ecr-login", spec.Helper)
+			}
+
+		case controller.KindDeployment:
+			sawDeployment = true
+
+			var spec struct {
+				Image string `json:"image"`
+			}
+
+			_ = json.Unmarshal(m.Spec, &spec)
+
+			// Both must resolve to the SAME host — that identity is the
+			// whole reason the URL is a variable and not a literal.
+			if spec.Image != wantHost+"/freeswitch:bookworm" {
+				t.Errorf("deployment image = %q, want it to share the registry host", spec.Image)
+			}
+		}
+	}
+
+	if !sawRegistry || !sawDeployment {
+		t.Fatalf("missing manifests: registry=%v deployment=%v", sawRegistry, sawDeployment)
 	}
 }

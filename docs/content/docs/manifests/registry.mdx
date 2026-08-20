@@ -176,20 +176,53 @@ sudo apt install amazon-ecr-credential-helper
 sudo dnf install -y amazon-ecr-credential-helper
 ```
 
-Then name the helper for your registry host in the config voodu owns,
-`$VOODU_ROOT/docker/config.json`:
+Then declare it with `helper` instead of `username`/`token`:
 
-```json
-{
-  "credHelpers": {
-    "123456789012.dkr.ecr.sa-east-1.amazonaws.com": "ecr-login"
-  }
+```hcl
+registry "ecr" {
+  url    = "123456789012.dkr.ecr.sa-east-1.amazonaws.com"
+  helper = "ecr-login"
 }
 ```
 
-Voodu preserves `credHelpers` verbatim across reconciles — it claims
-only the `auths` section — so this coexists with `registry` blocks for
-other hosts, and survives an apply that touches none.
+That becomes a `credHelpers` entry in `$VOODU_ROOT/docker/config.json`.
+`helper` and `username`/`token` are mutually exclusive — docker's
+`credHelpers` entry supersedes the matching `auths` entry, so accepting
+both would silently ignore half of what you wrote. The parser rejects
+the combination.
+
+The value is docker's binary suffix, not a friendly name: docker execs
+`docker-credential-<helper>`, so it is `ecr-login`, not `ecr`. Writing
+`ecr` gets you an error naming the fix rather than a rewrite behind
+your back.
+
+Helper-mode registries mix freely with token-mode ones — pull ECR off
+the instance role and `ghcr.io` with a bot token in the same file.
+
+### One file, many servers
+
+The registry hostname usually varies per environment, which would
+otherwise force one manifest per server. It does not: `${VAR}`
+interpolation runs against a **file-global** context built from every
+`env_from` in the file, so a `registry` block picks up a bucket a
+sibling resource declared even though `registry` takes no `env_from`
+of its own.
+
+```hcl
+deployment "fsw" "freeswitch" {
+  env_from = ["fsw/freeswitch"]
+  image    = "${FS_ECR_URL}/freeswitch:bookworm"
+}
+
+registry "ecr" {
+  url    = "${FS_ECR_URL}"
+  helper = "ecr-login"
+}
+```
+
+`vd config fsw/freeswitch set FS_ECR_URL=...` per server, then ship the
+same file everywhere. The deployment's image and the registry's URL
+resolve from one value, so they cannot drift apart.
 
 The controller exports `AWS_ECR_CACHE_DIR` to a directory under
 `$VOODU_ROOT` at boot. That matters: the helper caches issued tokens
