@@ -96,10 +96,12 @@ credentials is a clean re-apply. The one exception: when the image is
 already on the host, the failure degrades to a warning and the apply
 proceeds with the local copy.
 
-Private registries authenticate through the `auths` entries a
+Private registries authenticate through the entries a
 [`registry`](/docs/manifests/registry) manifest writes, the same ones
-the container-create path uses. ECR tokens expire every 12 hours — see
-the [token-rotation cronjob](/docs/manifests/registry#token-rotation-via-cronjob-ecr).
+the container-create path uses. For ECR on an EC2 instance role there
+is no token to manage at all — see
+[ECR + instance role](/docs/examples/ecr-instance-role) for the whole
+flow, `--force` included.
 
 ## Variable interpolation
 

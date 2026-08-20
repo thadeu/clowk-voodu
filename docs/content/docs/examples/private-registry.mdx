@@ -75,9 +75,28 @@ If two devs each apply with their personal GHCR PAT, the last applier wins — a
 
 4. Every `voodu apply` substitutes the same value, regardless of who runs it. Rotation = one password-manager update + every dev's next `direnv reload`.
 
-## Why not `env_from`?
+## Config buckets instead of per-dev `.envrc`
 
-`registry` does NOT support `env_from` (config buckets) — by design. The bootstrap order is wrong: voodu needs the credential **before** any container can pull, including the controller's own first reconcile. Use shell env via `${VAR}`.
+`registry` takes no `env_from` attribute of its own — but a bucket still reaches it. `${VAR}` interpolation runs against a **file-global** context assembled from every `env_from` in the file (and from each two-label resource's own `scope/name` bucket) before parsing, so a bucket a sibling resource declares feeds the registry block's `url`, `username` and `token` alike.
+
+```hcl
+deployment "acme" "api" {
+  env_from = ["acme/shared"]
+  image    = "ghcr.io/acme/private-api:${TAG}"
+}
+
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"      # from acme/shared
+}
+```
+
+```bash
+vd config acme/shared set GHCR_USER=acme-deploy-bot GHCR_TOKEN=ghp_xxx
+```
+
+There is no bootstrap cycle: the CLI fetches the bucket over the controller API at **apply time**, long before any container starts. The credential becomes one value on the controller instead of a copy in every developer's `.envrc`, and rotating it is `vd config set` plus a re-apply — no `direnv reload` on every machine.
 
 ## Token alias
 
