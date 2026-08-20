@@ -57,6 +57,135 @@ Both registries coexist. `config.json` ends up with two entries under `auths`; d
 
 Notice the deployments live in different scopes (`public`, `internal`). `registry` is **host-wide, not scoped** — you declare it once, anywhere, and every deployment on the host can pull from any of the configured registries.
 
+## ECR with an EC2 instance role
+
+ECR is the case where a `registry` block carrying a token is the wrong
+tool, for two unrelated reasons:
+
+1. **Its tokens expire every 12 hours**, so a token pair obliges
+   someone — or some cronjob — to keep it fresh.
+2. **Its hostname is per-account and per-region**, so a literal URL
+   means one manifest per environment.
+
+Both go away. The host already has an identity, so `helper` replaces
+the credential entirely, and the hostname comes from a config bucket.
+
+```hcl title="freeswitch.voodu"
+registry "ecr" {
+  url    = "${FS_ECR_URL}"
+  helper = "ecr-login"
+}
+
+statefulset "fsw" "freeswitch" {
+  image    = "${FS_ECR_URL}/freeswitch:${FS_IMAGE_TAG:-bookworm}"
+  replicas = 1
+}
+```
+
+No token. No `env_from`. No hostname.
+
+**`helper = "ecr-login"`** writes a `credHelpers` entry instead of an
+`auths` one, so docker execs `docker-credential-ecr-login` on every
+pull and the helper reads the instance role off IMDS. Nothing expires
+because nothing was stored. The value is docker's binary suffix, not a
+friendly name — `ecr-login`, not `ecr`.
+
+**`${FS_ECR_URL}` resolves with no `env_from` anywhere.** The
+two-label statefulset causes its own `fsw/freeswitch` bucket to be
+fetched, and that interpolation context is file-global, so the
+`registry` block resolves against a bucket named after a different
+resource. One file, N servers.
+
+### Host setup
+
+```bash
+sudo apt install amazon-ecr-credential-helper       # Debian 13: in main, 0.7.1
+sudo dnf install -y amazon-ecr-credential-helper    # Amazon Linux 2023
+```
+
+The instance role needs `ecr:GetAuthorizationToken`,
+`ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer`.
+
+Prove the role reaches ECR **before** involving voodu. This one command
+separates an IAM problem from a platform problem:
+
+```bash
+sudo docker-credential-ecr-login get <<< "123456789012.dkr.ecr.sa-east-1.amazonaws.com"
+```
+
+`{"Username":"AWS",...}` means the role works. An error here is IAM or
+IMDS, and no voodu configuration will fix it.
+
+### Per-server values, then apply
+
+```bash
+vd config fsw/freeswitch set \
+  FS_ECR_URL=123456789012.dkr.ecr.sa-east-1.amazonaws.com \
+  FS_IMAGE_TAG=bookworm
+
+vd apply -f freeswitch.voodu -r prod
+```
+
+Run the `config set` once per server with that server's account and
+region. The manifest never changes.
+
+### Updating a mutable tag
+
+CI overwrites `…/freeswitch:bookworm` with new bytes. The HCL is
+byte-identical, so the diff is empty and a plain apply reports:
+
+```
+No changes. Nothing to apply.
+```
+
+Docker only fetches a tag it does not already have locally, so the host
+keeps serving the digest it cached on first deploy. Nothing is broken —
+there is genuinely no *declared* change. Pass `--force`:
+
+```bash
+vd apply -f freeswitch.voodu --force -r prod
+```
+
+```
+✓ pulling images (--force) (12s)
+✓ pulled 123456789012.dkr.ecr.sa-east-1.amazonaws.com/freeswitch:bookworm
+✓ statefulset/fsw/freeswitch applied
+```
+
+`--force` bypasses the "No changes" short-circuit **and** makes the
+controller `docker pull` every image the manifests name before
+reconciling. If the pull moves the tag, the handler sees the running
+container on a different image ID than the tag now resolves to and
+rolls the replicas. If the tag was already current you get `already up
+to date` and **nothing restarts** — the correct outcome, not a
+swallowed apply.
+
+A recreate is a real restart. For a media server with live calls or a
+database, pick the window.
+
+### When it fails
+
+| Symptom | Cause |
+|---|---|
+| `No changes. Nothing to apply.` | Missing `--force`. The tag moved in the registry, not in the manifest. |
+| `already up to date`, no restart | The tag did not move. The push went elsewhere, or to another tag. |
+| `pull access denied … no basic auth credentials` | The helper is not resolving — see the log check below. |
+| `registry block needs exactly one label` | Write `registry "ecr" {`, not `registry {`. |
+| `unknown shorthand flag: 'f' in -f` during a build | **Not about `-f`.** Docker could not read `$VOODU_ROOT/docker/config.json`, which takes its CLI-plugin discovery down with it — and where `build` comes from the buildx plugin, the subcommand stops existing. |
+
+```bash
+# Why the helper is not resolving
+journalctl -u voodu-controller -n 30 | grep -iE "docker config|docker-credential|registry"
+
+# Permissions, for the build-side failure
+ls -la /opt/voodu/docker/     # want: drwxr-x--- root:docker, -rw-r----- root:docker
+id | grep -o docker           # the SSH user must be in the docker group
+```
+
+`docker-credential-ecr-login not found on PATH` means the package is
+not installed. Restarting the controller repairs owner and mode on the
+config directory.
+
 ## Service account tokens — not personal PATs
 
 `$VOODU_ROOT/docker/config.json` is singular per registry, per host. Every apply that includes a `registry` block rewrites the file with **whatever token is in the operator's shell at the time**.

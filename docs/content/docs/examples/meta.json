@@ -8,7 +8,6 @@
     "ingress-routing",
     "build-modes",
     "private-registry",
-    "ecr-instance-role",
     "assets",
     "health-checks",
     "init-containers",

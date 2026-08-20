@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-20T19:06:20.846Z
+Last built: 2026-08-20T19:20:13.553Z
 
 ---
 # Introduction
@@ -5039,7 +5039,7 @@ Personal PATs in `voodu apply` flow are antipattern.
 
 ## See also
 
-- [`ECR + instance role`](/docs/examples/ecr-instance-role) — the complete flow end to end: helper install, dynamic hostname, `--force`, and every failure mode with its diagnostic
+- [Private registry → ECR with an EC2 instance role](/docs/examples/private-registry#ecr-with-an-ec2-instance-role) — the complete flow end to end: helper install, dynamic hostname, `--force`, and every failure mode with its diagnostic
 
 - [`config & secrets`](/docs/manifests/config) — for `${VAR}` interpolation context
 
@@ -6167,8 +6167,8 @@ Private registries authenticate through the entries a
 [`registry`](/docs/manifests/registry) manifest writes, the same ones
 the container-create path uses. For ECR on an EC2 instance role there
 is no token to manage at all — see
-[ECR + instance role](/docs/examples/ecr-instance-role) for the whole
-flow, `--force` included.
+[Private registry → ECR with an EC2 instance role](/docs/examples/private-registry#ecr-with-an-ec2-instance-role)
+for the whole flow, `--force` included.
 
 ## Variable interpolation
 
@@ -7775,7 +7775,7 @@ The order goes from **one file, one resource** (a single web app) to **per-servi
 | Route multiple paths or hosts to different services | [Ingress routing](/docs/examples/ingress-routing) |
 | Build images on the server instead of pulling from a registry | [Build modes](/docs/examples/build-modes) |
 | Pull from a private registry (GHCR, GitLab, Harbor) | [Private registry](/docs/examples/private-registry) |
-| Pull from ECR with an instance role — no token, no rotation | [ECR + instance role](/docs/examples/ecr-instance-role) |
+| Pull from ECR with an instance role — no token, no rotation | [Private registry → ECR](/docs/examples/private-registry#ecr-with-an-ec2-instance-role) |
 | Mount config files / certs / templates into containers | [Assets](/docs/examples/assets) |
 | Gate ingress traffic on real readiness checks | [Health checks](/docs/examples/health-checks) |
 | Run migrations or warmup before the main container boots | [Init containers](/docs/examples/init-containers) |
@@ -8700,197 +8700,6 @@ VOODU_FORCE_REBUILD=1 voodu apply -f voodu.hcl
 
 - [`build` manifest reference](/docs/manifests/build) — full field list
 - [`statefulset` reference](/docs/manifests/statefulset) — for the pgvector example
-
----
-
-# ECR + instance role
-
-URL: https://voodu.clowk.in/docs/examples/ecr-instance-role/
-> Pull from a private ECR with no token, no rotation, and one manifest for N servers.
-
-The registry that gives operators the most trouble is ECR, for two
-reasons that have nothing to do with each other:
-
-1. **Its tokens expire every 12 hours.** A `registry` block carrying a
-   `username`/`token` pair obliges someone to keep that pair fresh.
-2. **Its hostname is per-account and per-region.** A literal URL in the
-   manifest means one manifest per environment.
-
-Both go away. The host already has an identity — the EC2 instance role
-— so a credential helper authenticates with nothing declared, and the
-hostname comes from a config bucket so the same file ships everywhere.
-
-## The manifest
-
-```hcl title="freeswitch.voodu"
-registry "ecr" {
-  url    = "${FS_ECR_URL}"
-  helper = "ecr-login"
-}
-
-statefulset "fsw" "freeswitch" {
-  image    = "${FS_ECR_URL}/freeswitch:${FS_IMAGE_TAG:-bookworm}"
-  replicas = 1
-}
-```
-
-No token. No `env_from`. No hostname.
-
-**`helper = "ecr-login"`** writes a `credHelpers` entry instead of an
-`auths` one, so docker execs `docker-credential-ecr-login` on every
-pull and the helper reads the instance role off IMDS. Nothing expires
-because nothing was stored.
-
-**`${FS_ECR_URL}` resolves without `env_from`.** Two mechanisms
-compose: a two-label resource causes its own `(scope, name)` bucket to
-be fetched — here `fsw/freeswitch` — and the resulting interpolation
-context is **file-global**, so the `registry` block resolves against a
-bucket named after the statefulset. That is what lets one file serve N
-servers whose ECR hostname differs.
-
-**`registry` takes exactly one label** — its name. `registry { ... }`
-is a parse error; `registry "ecr" { ... }` is the shape.
-
-## Set up the host once
-
-```bash
-sudo apt install amazon-ecr-credential-helper
-```
-
-Debian 13 (trixie) carries it in `main` as version 0.7.1, and it
-installs `docker-credential-ecr-login`. Amazon Linux 2023:
-`sudo dnf install -y amazon-ecr-credential-helper`.
-
-The instance role needs three actions:
-
-```
-ecr:GetAuthorizationToken
-ecr:BatchGetImage
-ecr:GetDownloadUrlForLayer
-```
-
-Prove the role works **before** involving voodu. This single command
-is what separates an IAM problem from a platform problem:
-
-```bash
-sudo docker-credential-ecr-login get <<< "123456789012.dkr.ecr.sa-east-1.amazonaws.com"
-```
-
-A JSON object with `"Username": "AWS"` means the role reaches ECR. An
-error here is IAM or IMDS, and no amount of voodu configuration will
-fix it.
-
-## Set the per-server values
-
-```bash
-vd config fsw/freeswitch set \
-  FS_ECR_URL=123456789012.dkr.ecr.sa-east-1.amazonaws.com \
-  FS_IMAGE_TAG=bookworm
-```
-
-Run this once per server, with that server's account and region. The
-manifest never changes.
-
-## Deploy
-
-```bash
-vd apply -f freeswitch.voodu -r prod
-```
-
-The apply writes `credHelpers` into
-`$VOODU_ROOT/docker/config.json`, and the reconciler pulls the image
-through the helper.
-
-## Updating a mutable tag
-
-This is the part that surprises people. CI overwrites
-`…/freeswitch:bookworm` with new bytes. The HCL is byte-identical, so
-the diff is empty and a plain apply reports:
-
-```
-No changes. Nothing to apply.
-```
-
-Docker only fetches a tag it does not already have locally, so the host
-keeps serving the digest it cached on first deploy. Nothing is broken —
-there is genuinely no *declared* change. Pass `--force`:
-
-```bash
-vd apply -f freeswitch.voodu --force -r prod
-```
-
-```
-✓ pulling images (--force) (12s)
-✓ pulled 123456789012.dkr.ecr.sa-east-1.amazonaws.com/freeswitch:bookworm
-✓ statefulset/fsw/freeswitch applied
-```
-
-`--force` does two things here: it bypasses the "No changes"
-short-circuit, and it makes the controller `docker pull` every image
-the manifests name before reconciling. If the pull moves the tag, the
-handler sees the running container on a different image ID than the tag
-now resolves to and rolls the replicas. If the tag was already current
-you get `already up to date` and **nothing restarts** — that is the
-correct outcome, not a swallowed apply.
-
-A recreate is a real restart. For a stateful workload — a media server
-with live calls, a database — pick the window.
-
-## When it fails
-
-**`No changes. Nothing to apply.`** — you forgot `--force`. The tag
-moved in the registry, not in the manifest, and only `--force` looks.
-
-**`already up to date` and no restart** — the tag did not move. The
-push went somewhere else, or to a different tag.
-
-**`pull access denied … no basic auth credentials`** — the helper is
-not resolving. Check the controller log:
-
-```bash
-journalctl -u voodu-controller -n 30 | grep -iE "docker config|docker-credential|registry"
-```
-
-`docker-credential-ecr-login not found on PATH` means the package is
-not installed. Anything else, re-run the `docker-credential-ecr-login
-get` probe above.
-
-**`registry block needs exactly one label`** — write `registry "ecr" {`.
-
-**`unknown shorthand flag: 'f' in -f` during a build** — this is not
-about the `-f` flag. Docker could not read
-`$VOODU_ROOT/docker/config.json`, which takes its CLI-plugin discovery
-down with it, and on a host where `build` comes from the buildx plugin
-the subcommand stops existing. Check the permissions:
-
-```bash
-ls -la /opt/voodu/docker/
-# want: drwxr-x--- root:docker  and  -rw-r----- root:docker
-id | grep -o docker   # the SSH user must be in the docker group
-```
-
-Restarting the controller repairs owner and mode.
-
-## Why the credential is not in `~/.docker`
-
-The controller runs as root under a systemd unit with
-`ProtectHome=yes`, which makes `/root` empty and inaccessible for the
-whole service cgroup — the `docker` processes it forks included. A
-`docker login` you run in a shell writes into *your* home directory and
-the controller never sees it. That is why the pull works when you type
-it and fails when voodu runs it.
-
-Voodu owns `$VOODU_ROOT/docker/config.json` and points `DOCKER_CONFIG`
-at it for every docker process it spawns. See
-[where the credentials live](/docs/manifests/registry#where-the-credentials-live)
-for the full posture, including why the directory is shared with the
-`docker` group.
-
-## Related
-
-- [`registry` manifest reference](/docs/manifests/registry) — helper vs token, which registries need which
-- [`voodu apply`](/docs/cli/apply#forcing-a-redeploy) — what `--force` covers in build mode and registry mode
-- [Private registry](/docs/examples/private-registry) — the token-carrying shape, for registries with no ambient identity
 
 ---
 
@@ -9872,6 +9681,135 @@ deployment "internal" "backend" {
 Both registries coexist. `config.json` ends up with two entries under `auths`; docker matches the image hostname against the keys.
 
 Notice the deployments live in different scopes (`public`, `internal`). `registry` is **host-wide, not scoped** — you declare it once, anywhere, and every deployment on the host can pull from any of the configured registries.
+
+## ECR with an EC2 instance role
+
+ECR is the case where a `registry` block carrying a token is the wrong
+tool, for two unrelated reasons:
+
+1. **Its tokens expire every 12 hours**, so a token pair obliges
+   someone — or some cronjob — to keep it fresh.
+2. **Its hostname is per-account and per-region**, so a literal URL
+   means one manifest per environment.
+
+Both go away. The host already has an identity, so `helper` replaces
+the credential entirely, and the hostname comes from a config bucket.
+
+```hcl title="freeswitch.voodu"
+registry "ecr" {
+  url    = "${FS_ECR_URL}"
+  helper = "ecr-login"
+}
+
+statefulset "fsw" "freeswitch" {
+  image    = "${FS_ECR_URL}/freeswitch:${FS_IMAGE_TAG:-bookworm}"
+  replicas = 1
+}
+```
+
+No token. No `env_from`. No hostname.
+
+**`helper = "ecr-login"`** writes a `credHelpers` entry instead of an
+`auths` one, so docker execs `docker-credential-ecr-login` on every
+pull and the helper reads the instance role off IMDS. Nothing expires
+because nothing was stored. The value is docker's binary suffix, not a
+friendly name — `ecr-login`, not `ecr`.
+
+**`${FS_ECR_URL}` resolves with no `env_from` anywhere.** The
+two-label statefulset causes its own `fsw/freeswitch` bucket to be
+fetched, and that interpolation context is file-global, so the
+`registry` block resolves against a bucket named after a different
+resource. One file, N servers.
+
+### Host setup
+
+```bash
+sudo apt install amazon-ecr-credential-helper       # Debian 13: in main, 0.7.1
+sudo dnf install -y amazon-ecr-credential-helper    # Amazon Linux 2023
+```
+
+The instance role needs `ecr:GetAuthorizationToken`,
+`ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer`.
+
+Prove the role reaches ECR **before** involving voodu. This one command
+separates an IAM problem from a platform problem:
+
+```bash
+sudo docker-credential-ecr-login get <<< "123456789012.dkr.ecr.sa-east-1.amazonaws.com"
+```
+
+`{"Username":"AWS",...}` means the role works. An error here is IAM or
+IMDS, and no voodu configuration will fix it.
+
+### Per-server values, then apply
+
+```bash
+vd config fsw/freeswitch set \
+  FS_ECR_URL=123456789012.dkr.ecr.sa-east-1.amazonaws.com \
+  FS_IMAGE_TAG=bookworm
+
+vd apply -f freeswitch.voodu -r prod
+```
+
+Run the `config set` once per server with that server's account and
+region. The manifest never changes.
+
+### Updating a mutable tag
+
+CI overwrites `…/freeswitch:bookworm` with new bytes. The HCL is
+byte-identical, so the diff is empty and a plain apply reports:
+
+```
+No changes. Nothing to apply.
+```
+
+Docker only fetches a tag it does not already have locally, so the host
+keeps serving the digest it cached on first deploy. Nothing is broken —
+there is genuinely no *declared* change. Pass `--force`:
+
+```bash
+vd apply -f freeswitch.voodu --force -r prod
+```
+
+```
+✓ pulling images (--force) (12s)
+✓ pulled 123456789012.dkr.ecr.sa-east-1.amazonaws.com/freeswitch:bookworm
+✓ statefulset/fsw/freeswitch applied
+```
+
+`--force` bypasses the "No changes" short-circuit **and** makes the
+controller `docker pull` every image the manifests name before
+reconciling. If the pull moves the tag, the handler sees the running
+container on a different image ID than the tag now resolves to and
+rolls the replicas. If the tag was already current you get `already up
+to date` and **nothing restarts** — the correct outcome, not a
+swallowed apply.
+
+A recreate is a real restart. For a media server with live calls or a
+database, pick the window.
+
+### When it fails
+
+| Symptom | Cause |
+|---|---|
+| `No changes. Nothing to apply.` | Missing `--force`. The tag moved in the registry, not in the manifest. |
+| `already up to date`, no restart | The tag did not move. The push went elsewhere, or to another tag. |
+| `pull access denied … no basic auth credentials` | The helper is not resolving — see the log check below. |
+| `registry block needs exactly one label` | Write `registry "ecr" {`, not `registry {`. |
+| `unknown shorthand flag: 'f' in -f` during a build | **Not about `-f`.** Docker could not read `$VOODU_ROOT/docker/config.json`, which takes its CLI-plugin discovery down with it — and where `build` comes from the buildx plugin, the subcommand stops existing. |
+
+```bash
+# Why the helper is not resolving
+journalctl -u voodu-controller -n 30 | grep -iE "docker config|docker-credential|registry"
+
+# Permissions, for the build-side failure
+ls -la /opt/voodu/docker/     # want: drwxr-x--- root:docker, -rw-r----- root:docker
+id | grep -o docker           # the SSH user must be in the docker group
+```
+
+`docker-credential-ecr-login not found on PATH` means the package is
+not installed. Restarting the controller repairs owner and mode on the
+config directory.
 
 ## Service account tokens — not personal PATs
 
