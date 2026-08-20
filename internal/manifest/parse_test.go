@@ -3505,3 +3505,44 @@ registry "bare" {
 		t.Errorf("error = %v, want it to mention helper as an option", err)
 	}
 }
+
+// TestParseHCLRegistryHelperAllowsRealHelpers guards the alias map
+// from over-reach. Every name it holds is a name this parser REFUSES,
+// so a wrong entry blocks a working configuration — worse than the
+// missing hint it was meant to provide. These all ship a real
+// `docker-credential-<name>` binary and must pass through untouched.
+func TestParseHCLRegistryHelperAllowsRealHelpers(t *testing.T) {
+	for _, helper := range []string{
+		"gcr",           // GoogleCloudPlatform/docker-credential-gcr
+		"gcloud",        // gcloud auth configure-docker
+		"acr-env",       // Azure
+		"osxkeychain",   // docker/docker-credential-helpers
+		"pass",          // docker/docker-credential-helpers
+		"secretservice", // docker/docker-credential-helpers
+		"ghcr-login",    // community GHCR helper
+	} {
+		t.Run(helper, func(t *testing.T) {
+			src := `
+registry "r" {
+  url    = "example.com"
+  helper = "` + helper + `"
+}
+`
+			tmp := writeTemp(t, "registry_"+helper+".hcl", src)
+
+			mans, err := ParseFile(tmp, nil)
+			if err != nil {
+				t.Fatalf("helper %q rejected: %v", helper, err)
+			}
+
+			var spec RegistrySpec
+			if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+				t.Fatal(err)
+			}
+
+			if spec.Helper != helper {
+				t.Errorf("helper = %q, want %q unchanged", spec.Helper, helper)
+			}
+		})
+	}
+}

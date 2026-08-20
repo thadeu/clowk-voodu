@@ -199,6 +199,29 @@ your back.
 Helper-mode registries mix freely with token-mode ones — pull ECR off
 the instance role and `ghcr.io` with a bot token in the same file.
 
+### Which registries need a helper
+
+Helpers exist to bridge an **ambient host identity** to a short-lived
+registry token. That is a narrow set:
+
+| Registry | Mechanism | Why |
+|---|---|---|
+| ECR | `helper = "ecr-login"` | EC2/ECS identity via IMDS; tokens expire every 12h |
+| GCR / Artifact Registry | `helper = "gcr"` or `"gcloud"` | GCE/workload identity |
+| ACR | `helper = "acr-env"` | Azure managed identity |
+| **GHCR** | `username` + `token` | A PAT is long-lived, and there is no ambient identity on a generic host. GitHub ships no official helper. |
+| **Docker Hub** | `username` + `token` | Same — a PAT, long-lived. |
+| **DigitalOcean (DOCR)** | `username` + `token` | The DO API token *is* the credential and does not expire unless you opt in with `doctl registry login --expiry-seconds`. No helper exists. |
+
+For the bottom three there is nothing to rotate on a 12-hour clock, so
+a token is the right answer — put it in a config bucket (above) rather
+than in every developer's shell.
+
+`helper` accepts any value: docker execs `docker-credential-<helper>`,
+so a community or in-house helper works with no change to voodu. The
+only names the parser refuses are ones with no such binary — today
+`ecr` and `aws`, both of which mean `ecr-login`.
+
 ### One file, many servers
 
 The registry hostname usually varies per environment, which would
@@ -253,7 +276,7 @@ error there is an IAM or IMDS problem — the required actions are
 
 Personal PATs in `voodu apply` flow are antipattern.
 
-**No `env_from`.** The bootstrap order is wrong — voodu needs the credential before any container (including the controller's own pull) runs. There's no way to pull registry creds from a config bucket. Use shell env via `${VAR}`.
+**No `env_from` on the block itself** — but a bucket still reaches it. `registry` takes no `env_from` attribute, yet `${VAR}` interpolation runs against a file-global context assembled from every `env_from` in the file before parsing, so a bucket a sibling resource declares feeds the registry block too. There is no bootstrap cycle: the CLI fetches the bucket over the controller API at apply time, long before any container starts. Use it — the credential becomes one value on the controller instead of a copy in every developer's `.envrc`, and rotating it is `vd config set` plus a re-apply.
 
 **Host-wide, not per-resource.** A `registry "ghcr" {}` block authenticates every `docker pull` on that host. There's no per-deployment override — voodu trusts docker's credential resolution.
 

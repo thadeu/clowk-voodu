@@ -1639,12 +1639,17 @@ type hclRegistry struct {
 // rewrite these: a manifest that says one thing and does another is
 // worse than a one-line error. The map exists to make that error
 // name the fix.
+//
+// Kept deliberately SHORT. Every entry here is a name this parser
+// refuses, so a wrong entry blocks a working configuration — a much
+// worse failure than the missing hint it was meant to provide. Only
+// names verified to have no `docker-credential-<name>` binary belong
+// here. `gcr` is the cautionary example and is absent on purpose:
+// GoogleCloudPlatform/docker-credential-gcr ships exactly that
+// binary, so `helper = "gcr"` is valid and must pass through.
 var helperAliases = map[string]string{
-	"ecr":         "ecr-login",
-	"aws":         "ecr-login",
-	"gcr":         "gcloud",
-	"artifactory": "gcloud",
-	"acr":         "acr-env",
+	"ecr": "ecr-login",
+	"aws": "ecr-login",
 }
 
 // spec validates the required field set and folds the password

@@ -636,3 +636,87 @@ registry "ecr" {
 		t.Fatalf("missing manifests: registry=%v deployment=%v", sawRegistry, sawDeployment)
 	}
 }
+
+// TestRegistryTokenResolvesFromSiblingBucket — the same file-global
+// interpolation that carries a registry URL carries its token. That
+// matters for every registry WITHOUT an ambient host identity (GHCR,
+// Docker Hub, DOCR): the credential is one value on the controller
+// instead of a copy in every developer's .envrc, and rotating it is
+// `vd config set` plus a re-apply.
+//
+// The registry block still takes no `env_from` of its own — it does
+// not need to. The bucket a sibling declares feeds the whole file.
+func TestRegistryTokenResolvesFromSiblingBucket(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "stack.hcl"), `
+deployment "app" "web" {
+  env_from = ["app/shared"]
+  image    = "ghcr.io/acme/web:${TAG}"
+}
+
+registry "ghcr" {
+  url      = "ghcr.io"
+  username = "${GHCR_USER}"
+  token    = "${GHCR_TOKEN}"
+}
+`)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data": map[string]any{
+				"vars": map[string]string{
+					"GHCR_USER":  "acme-bot",
+					"GHCR_TOKEN": "ghp_from_bucket",
+					"TAG":        "v1.4.2",
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mans, err := loadManifests(cmdBucketFetcher(cmd), applyFlags{files: []string{dir}})
+	if err != nil {
+		t.Fatalf("loadManifests: %v", err)
+	}
+
+	var found bool
+
+	for _, m := range mans {
+		if m.Kind != controller.KindRegistry {
+			continue
+		}
+
+		found = true
+
+		var spec struct {
+			Username string `json:"username"`
+			Token    string `json:"token"`
+		}
+
+		if err := json.Unmarshal(m.Spec, &spec); err != nil {
+			t.Fatalf("decode registry spec: %v", err)
+		}
+
+		if spec.Username != "acme-bot" {
+			t.Errorf("username = %q, want acme-bot", spec.Username)
+		}
+
+		if spec.Token != "ghp_from_bucket" {
+			t.Errorf("token = %q, want it resolved from the bucket", spec.Token)
+		}
+	}
+
+	if !found {
+		t.Fatal("no registry manifest parsed")
+	}
+}
