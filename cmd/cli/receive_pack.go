@@ -10,6 +10,7 @@ import (
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/deploy"
+	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/progress"
 )
 
@@ -69,6 +70,21 @@ auto-detection if neither resolves.`,
 		// per-(scope,name) mode takes exactly one.
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// receive-pack only ever runs ON the server (it is the far
+			// end of the SSH tarball stream), so it is safe — and
+			// necessary — to adopt the controller's docker credentials
+			// here. `docker build` pulls the Dockerfile's FROM image,
+			// and a private base image needs the same auths the
+			// registry manifests wrote. Without this the build would
+			// look at root's ~/.docker instead, which the controller no
+			// longer writes to.
+			//
+			// Best-effort: a build from a public base image must not be
+			// blocked because the credential dir could not be prepared.
+			if _, _, err := docker.UseVooduDockerConfig(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: docker config: %v\n", err)
+			}
+
 			// Procfile fan-out: read the Procfile from the shipped tree,
 			// generate + persist + build every process. See
 			// runProcfileReceive.

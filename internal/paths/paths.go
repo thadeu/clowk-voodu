@@ -25,6 +25,27 @@ func Root() string {
 	return DefaultRoot
 }
 
+// DockerConfigDir is the directory voodu points `DOCKER_CONFIG` at for
+// every `docker` process it spawns — the controller's pulls, the
+// build-mode builds, and plugin lifecycle hooks alike.
+//
+// It deliberately does NOT live under $HOME. The controller runs as
+// root under a systemd unit that sets `ProtectHome=yes`, which makes
+// /root inaccessible AND empty for the whole service cgroup — child
+// `docker` processes included. A credential written to
+// /root/.docker/config.json is therefore invisible to exactly the
+// process that needs it, and RegistryHandler's write to that path
+// fails outright on a `ProtectSystem=strict` host.
+//
+// VOODU_ROOT is in the unit's `ReadWritePaths`, so a config here is
+// both writable by the controller and readable by the docker CLI it
+// forks, with the sandbox left intact.
+func DockerConfigDir() string { return filepath.Join(Root(), "docker") }
+
+// DockerConfigFile is the `config.json` inside DockerConfigDir —
+// the file RegistryHandler owns and the docker CLI reads.
+func DockerConfigFile() string { return filepath.Join(DockerConfigDir(), "config.json") }
+
 func AppsDir() string     { return filepath.Join(Root(), "apps") }
 func ServicesDir() string { return filepath.Join(Root(), "services") }
 func PluginsDir() string  { return filepath.Join(Root(), "plugins") }

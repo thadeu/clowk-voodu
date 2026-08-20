@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.voodu.clowk.in/internal/paths"
 )
 
 // TestRegistryHandler_WritesConfigJSON pins the happy path: one
@@ -315,5 +317,45 @@ func TestRegistryHandler_CreatesParentDir(t *testing.T) {
 
 	if _, err := os.Stat(configPath); err != nil {
 		t.Fatalf("config.json not created under fresh parent: %v", err)
+	}
+}
+
+// TestRegistryHandlerDefaultsToVooduRoot pins the path contract. The
+// handler and docker.UseVooduDockerConfig() must resolve to the SAME
+// file: the handler writes the auths, DOCKER_CONFIG tells the docker
+// CLI where to read them. If these two ever diverge the symptom is
+// silent — every `registry {}` reconciles green while every private
+// pull fails with "no basic auth credentials".
+//
+// It must NOT be $HOME/.docker/config.json. The controller runs as
+// root under a unit with ProtectHome=yes, so /root is empty and
+// unwritable for the whole service cgroup.
+func TestRegistryHandlerDefaultsToVooduRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv("HOME", "/root")
+
+	h := &RegistryHandler{}
+
+	want := filepath.Join(root, "docker", "config.json")
+	if got := h.ensureConfigPath(); got != want {
+		t.Errorf("ensureConfigPath() = %q, want %q", got, want)
+	}
+
+	if got := h.ensureConfigPath(); got != paths.DockerConfigFile() {
+		t.Errorf("ensureConfigPath() = %q, drifted from paths.DockerConfigFile() = %q", got, paths.DockerConfigFile())
+	}
+}
+
+// TestRegistryHandlerExplicitPathWins keeps the test seam intact —
+// production leaves DockerConfigPath empty, tests inject a tempdir.
+func TestRegistryHandlerExplicitPathWins(t *testing.T) {
+	t.Setenv(paths.EnvRoot, t.TempDir())
+
+	explicit := filepath.Join(t.TempDir(), "injected.json")
+	h := &RegistryHandler{DockerConfigPath: explicit}
+
+	if got := h.ensureConfigPath(); got != explicit {
+		t.Errorf("ensureConfigPath() = %q, want the injected %q", got, explicit)
 	}
 }

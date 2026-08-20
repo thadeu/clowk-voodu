@@ -3,7 +3,7 @@ title: Private registry
 description: Pull from GHCR, ECR, Harbor — credentials declared once, host-wide.
 ---
 
-The `registry` block configures docker credentials so deployments can pull from private repositories. Voodu rewrites `~/.docker/config.json` on every apply — atomic, host-wide, no per-deployment dance.
+The `registry` block configures docker credentials so deployments can pull from private repositories. Voodu rewrites `$VOODU_ROOT/docker/config.json` on every apply — atomic, host-wide, no per-deployment dance. It is not `~/.docker/config.json`: the controller runs sandboxed under systemd and cannot read a home directory. See [where the credentials live](/docs/manifests/registry#where-the-credentials-live).
 
 Source: [`examples/registry/`](https://github.com/thadeu/clowk-voodu/tree/main/examples/registry)
 
@@ -59,7 +59,7 @@ Notice the deployments live in different scopes (`public`, `internal`). `registr
 
 ## Service account tokens — not personal PATs
 
-`~/.docker/config.json` is singular per registry, per host. Every apply that includes a `registry` block rewrites the file with **whatever token is in the operator's shell at the time**.
+`$VOODU_ROOT/docker/config.json` is singular per registry, per host. Every apply that includes a `registry` block rewrites the file with **whatever token is in the operator's shell at the time**.
 
 If two devs each apply with their personal GHCR PAT, the last applier wins — and the other dev's deploys break when the controller next pulls. The right shape for a team:
 

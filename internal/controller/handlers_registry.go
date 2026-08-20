@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"go.voodu.clowk.in/internal/paths"
 )
 
 // RegistryHandler reconciles `registry "name" { url, username, token }`
@@ -370,16 +372,19 @@ func (h *RegistryHandler) ensureConfigPath() string {
 		return h.DockerConfigPath
 	}
 
-	home := os.Getenv("HOME")
-	if home == "" {
-		// Last-ditch fallback so the reconcile doesn't NPE on
-		// a HOME-less environment. The path won't be writable
-		// in most realistic deployments, but the save() error
-		// will be clear about what went wrong.
-		home = "/root"
-	}
-
-	return filepath.Join(home, ".docker", "config.json")
+	// <VOODU_ROOT>/docker/config.json, NOT ~/.docker/config.json.
+	// The controller runs as root under a systemd unit with
+	// ProtectHome=yes, which makes /root empty and unwritable for the
+	// whole service cgroup — so a write there fails, and even a
+	// credential an operator put there by hand with `docker login` is
+	// invisible to the `docker pull` this handler exists to
+	// authenticate. VOODU_ROOT is in the unit's ReadWritePaths.
+	//
+	// docker.UseVooduDockerConfig() exports DOCKER_CONFIG to the same
+	// directory at boot, so the file written here is the file the
+	// docker CLI reads. The two MUST stay in lock-step; both derive
+	// the path from paths.DockerConfigDir() for that reason.
+	return paths.DockerConfigFile()
 }
 
 func (h *RegistryHandler) logf(format string, args ...any) {

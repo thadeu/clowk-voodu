@@ -3,7 +3,7 @@ title: registry
 description: Private image pull credentials, host-wide.
 ---
 
-`registry` declares credentials for a private container registry. Voodu rewrites `~/.docker/config.json` atomically on every apply, so any subsequent `docker pull` uses them.
+`registry` declares credentials for a private container registry. Voodu rewrites `$VOODU_ROOT/docker/config.json` atomically on every apply, so any subsequent `docker pull` uses them.
 
 Unlike most kinds, `registry`:
 
@@ -86,7 +86,7 @@ registry "gitlab" {
 }
 ```
 
-Each block writes its own entry in `~/.docker/config.json`.
+Each block writes its own entry in `$VOODU_ROOT/docker/config.json`.
 
 ### Token rotation via cronjob (ECR)
 
@@ -108,9 +108,56 @@ cronjob "infra" "ecr-refresh" {
 
 Then your `registry` block reads `${ECR_TOKEN}` from shell env at next apply.
 
+## Where the credentials live
+
+Voodu writes `$VOODU_ROOT/docker/config.json` (default:
+`/opt/voodu/docker/config.json`) — **not** `~/.docker/config.json` —
+and exports `DOCKER_CONFIG` to every `docker` process it forks, so the
+file it writes is the file the docker CLI reads.
+
+The reason is the controller's systemd unit:
+
+```ini
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${VOODU_ROOT}
+```
+
+`ProtectHome=yes` makes `/home` and `/root` empty and inaccessible for
+the entire service cgroup — the forked `docker` processes included. So
+`~/.docker/config.json` is both unwritable by the reconciler and
+unreadable by the pull it is meant to authenticate. `$VOODU_ROOT` is in
+`ReadWritePaths`, which makes it the one location that works with the
+hardening left intact.
+
+This is why `docker login` in an interactive shell does not fix a
+failing deployment pull. That writes the credential into *your* home
+directory; the controller runs as root under the unit above and never
+sees it. The symptom is a pull that works when you type it and fails
+when voodu runs it:
+
+```
+pull access denied, repository does not exist or may require
+authorization: authorization failed: no basic auth credentials
+```
+
+Declare a `registry` block instead — it is the only mechanism that
+puts the credential where the controller can read it.
+
+The controller logs the path it settled on at boot:
+
+```
+docker config at /opt/voodu/docker
+```
+
+On first boot after upgrading, an existing `$HOME/.docker/config.json`
+is copied over once so credentials from a pre-upgrade `docker login`
+are not lost. It is a one-time seed, never a sync — once the file
+exists, `registry` manifests own it.
+
 ## Trade-offs
 
-**One credential per registry host.** Voodu rewrites `~/.docker/config.json` atomically per apply — there's exactly one entry per registry hostname. Two operators each pushing their personal PAT will trample each other.
+**One credential per registry host.** Voodu rewrites `$VOODU_ROOT/docker/config.json` atomically per apply — there's exactly one entry per registry hostname. Two operators each pushing their personal PAT will trample each other.
 
 **Use a bot / service-account token.** Distribute via:
 

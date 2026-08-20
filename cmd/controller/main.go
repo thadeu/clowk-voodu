@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.voodu.clowk.in/internal/controller"
+	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/metrics"
 	"go.voodu.clowk.in/internal/paths"
 )
@@ -75,6 +76,25 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
+
+	// Point this process — and every `docker` it forks — at
+	// <VOODU_ROOT>/docker/config.json before anything can pull. Done
+	// here rather than inside the server so the env var is set once,
+	// by the process owner, ahead of the reconciler's first replay.
+	//
+	// Non-fatal: a controller that cannot prepare the directory still
+	// reconciles everything that does not need a private registry, and
+	// the log line tells the operator exactly why the pulls that do
+	// need one are failing.
+	if dir, seeded, err := docker.UseVooduDockerConfig(); err != nil {
+		logger.Printf("docker config: %v (private registry pulls will fail)", err)
+	} else {
+		logger.Printf("docker config at %s", dir)
+
+		if seeded {
+			logger.Printf("docker config seeded from $HOME/.docker/config.json")
+		}
+	}
 
 	srv := controller.NewServer(controller.Config{
 		DataDir:          *dataDir,
