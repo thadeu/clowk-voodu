@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -483,6 +484,14 @@ func (DockerContainerManager) ImageIDsDiffer(container, tag string) (bool, error
 
 func (DockerContainerManager) ImageExists(ref string) bool {
 	return docker.ImageExists(ref)
+}
+
+func (DockerContainerManager) Pull(ctx context.Context, ref string) error {
+	return docker.PullImage(ctx, ref)
+}
+
+func (DockerContainerManager) ImageID(ref string) (string, error) {
+	return docker.GetImageID(ref)
 }
 
 func (DockerContainerManager) TagImage(src, dst string) error {

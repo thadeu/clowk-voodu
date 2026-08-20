@@ -256,25 +256,32 @@ func isApplyCommand(args []string) bool {
 	return args[idx] == "apply"
 }
 
-// applyClientFlags is the small bag of apply-only flags that the
-// client *consumes* before forwarding. The server ignores all of them
-// — they drive client-side control flow (the y/N prompt, the force
-// bit on the receive-pack push, the spinner/verbose presentation
-// mode) — so we pull them out once here and pass the parsed result
-// to the orchestrator, keeping the forwarded SSH argv tidy.
+// applyClientFlags is the small bag of apply-only flags the client
+// orchestrator reads before forwarding. Two of them (-y, -v) drive
+// client-side control flow alone — the y/N prompt and the spinner
+// presentation mode — so they're stripped from the SSH argv to keep
+// logs and `ssh -v` output tidy.
+//
+// --force is the exception: it steers the client (rebuild bit on the
+// receive-pack push, "No changes" short-circuit bypass) AND the
+// server (re-pull of registry-mode images inside /apply), so the
+// token stays in argv. `rewriteApplyToDiffJSON` drops it for phase 1
+// — a plan must not pull.
 type applyClientFlags struct {
 	autoApprove bool // -y / --auto-approve: skip the interactive prompt
-	force       bool // --force: rebuild build-mode deploys on hash hit
+	force       bool // --force: rebuild build-mode deploys on hash hit + re-pull registry images
 	verbose     bool // -v / --verbose: disable spinner, passthrough raw build output
 }
 
 // extractApplyClientFlags walks argv once, pulling out the bool flags
-// that are meaningful only to the client-side orchestrator. Returns
-// the parsed flags struct and a copy of argv with those tokens
-// removed. Cosmetic for the server (its apply would ignore them
-// anyway), but keeps logs and `ssh -v` output readable. Any future
-// client-only apply flag should join this function, not spawn a
-// second walker.
+// the client-side orchestrator branches on. Returns the parsed flags
+// struct and a copy of argv with the client-only tokens removed.
+//
+// VOODU_FORCE_REBUILD=1 is folded in here rather than at each call
+// site: the env var is the flag's twin, and the server-side apply
+// reads argv, not the client's environment (remoteEnv forwards only
+// the protocol / color vars). Injecting the token is what makes the
+// env var reach the far end.
 func extractApplyClientFlags(args []string) (applyClientFlags, []string) {
 	var f applyClientFlags
 
@@ -284,13 +291,21 @@ func extractApplyClientFlags(args []string) (applyClientFlags, []string) {
 		switch tok {
 		case "-y", "--auto-approve":
 			f.autoApprove = true
-		case "--force":
-			f.force = true
 		case "-v", "--verbose":
 			f.verbose = true
+		case "--force":
+			f.force = true
+
+			out = append(out, tok)
 		default:
 			out = append(out, tok)
 		}
+	}
+
+	if !f.force && forceRequested(false) {
+		f.force = true
+
+		out = append(out, "--force")
 	}
 
 	return f, out
@@ -438,7 +453,7 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 	}
 
 	args := []string{"receive-pack", ref}
-	if force || os.Getenv("VOODU_FORCE_REBUILD") == "1" {
+	if forceRequested(force) {
 		args = append(args, "--force")
 	}
 

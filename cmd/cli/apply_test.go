@@ -399,3 +399,144 @@ func TestResolveManifestPath(t *testing.T) {
 		}
 	})
 }
+
+// TestApplyForceFlagPropagatesQuery — --force has to reach the
+// controller, because the registry half of force (re-pull every image
+// the batch names) runs there. The build half was already consumed
+// upstream by receive-pack.
+func TestApplyForceFlagPropagatesQuery(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "ghcr.io/clowk/lp:1"
+}
+`)
+
+	var (
+		mu          sync.Mutex
+		gotRawQuery string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotRawQuery = r.URL.RawQuery
+		mu.Unlock()
+
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runApply(cmd, applyFlags{files: []string{dir}, force: true}); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if gotRawQuery != "force=true" {
+		t.Errorf("raw query = %q, want force=true", gotRawQuery)
+	}
+}
+
+// TestApplyForceEnvPropagatesQuery — VOODU_FORCE_REBUILD=1 is the
+// flag's twin for CI runners. Both spellings must land on the same
+// query param.
+func TestApplyForceEnvPropagatesQuery(t *testing.T) {
+	t.Setenv(envForceRebuild, "1")
+
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "ghcr.io/clowk/lp:1"
+}
+`)
+
+	var (
+		mu          sync.Mutex
+		gotRawQuery string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotRawQuery = r.URL.RawQuery
+		mu.Unlock()
+
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runApply(cmd, applyFlags{files: []string{dir}}); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if gotRawQuery != "force=true" {
+		t.Errorf("raw query = %q, want force=true", gotRawQuery)
+	}
+}
+
+// TestApplyRendersImagePulls — the operator has to be able to tell
+// "the registry had something new" (replicas will roll) from "the tag
+// was already current" (nothing restarts, and that's not a bug).
+func TestApplyRendersImagePulls(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "ghcr.io/clowk/lp:1"
+}
+`)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","data":{"image_pulls":[
+			{"image":"ghcr.io/clowk/lp:1","updated":true},
+			{"image":"postgres:16","updated":false},
+			{"image":"ghcr.io/clowk/old:1","warning":"registry unreachable"}
+		]}}`))
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runApply(cmd, applyFlags{files: []string{dir}, force: true}); err != nil {
+			t.Errorf("runApply: %v", err)
+		}
+	})
+
+	for _, want := range []string{
+		"pulled ghcr.io/clowk/lp:1",
+		"postgres:16 already up to date",
+		"registry unreachable",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}

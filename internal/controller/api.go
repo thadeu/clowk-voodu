@@ -171,6 +171,13 @@ type API struct {
 	// disables the plugin route plane (see PluginRoutes). Production
 	// wires dockerResourceIPResolver.
 	ContainerIPs ResourceIPResolver
+
+	// Images is the force-pull seam `POST /apply?force=true` uses to
+	// refresh registry-mode images before the manifests land in the
+	// store. Production wires DockerContainerManager; nil (tests, and
+	// any host without a runtime) makes --force a no-op for registry
+	// images without failing the apply.
+	Images ImagePuller
 }
 
 // LogStreamer is the seam /logs dispatches through. The production
@@ -456,6 +463,16 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	// own the entire scope).
 	prune := r.URL.Query().Get("prune") == "true"
 
+	// force=true (CLI: `vd apply --force`) skips the "the tag on the
+	// host is already the right bytes" assumption. Build-mode gets its
+	// force at receive-pack time (rebuild on a tarball-hash hit);
+	// registry-mode gets it here, as a `docker pull` of every image the
+	// batch names. Without it a mutable tag — `:latest`, `:main`, the
+	// ECR tag CI overwrites on every push — never moves on the host,
+	// so the reconciler sees no drift and the old container keeps
+	// running the old digest.
+	force := r.URL.Query().Get("force") == "true"
+
 	// Plugin-block expansion: any manifest whose Kind is not a
 	// core kind gets expanded by an installed plugin into one or
 	// more core-kind manifests. Operator wrote `postgres "data"
@@ -505,6 +522,26 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	if err := StampAssetDigests(r.Context(), a.Store, nil, nil, manifests); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("asset stamping: %w", err))
 		return
+	}
+
+	// Force-pull runs BEFORE the first Store.Put on purpose. Landing
+	// the new image first means the Put's watch event finds the tag
+	// already re-pointed, so the deployment handler's image-id drift
+	// check fires on the very same reconcile and rolls the replicas.
+	// Pull-after-Put would need a second apply to take effect.
+	//
+	// Skipped on dry-run: `vd diff` must not mutate the host, and
+	// pulling gigabytes to render a plan would be a surprising cost.
+	var imagePulls []ImagePullResult
+
+	if force && !dryRun {
+		pulls, err := a.forcePullImages(r.Context(), manifests)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err)
+			return
+		}
+
+		imagePulls = pulls
 	}
 
 	var (
@@ -579,6 +616,14 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 
 	if len(expansions) > 0 {
 		data["plugin_expansions"] = expansions
+	}
+
+	// Force-pull bookkeeping — the CLI turns each entry into a
+	// `pulled <image>` / `<image> already up to date` line so the
+	// operator can tell "the registry had something new" from "the
+	// apply was a genuine no-op".
+	if len(imagePulls) > 0 {
+		data["image_pulls"] = imagePulls
 	}
 
 	// `current` is only meaningful for dry-run — it's the "before"

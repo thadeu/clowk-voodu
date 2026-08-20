@@ -95,22 +95,22 @@ func TestExtractApplyClientFlags(t *testing.T) {
 			wantRest: []string{"apply", "-f", "-"},
 		},
 		{
-			name:     "--force alone",
+			name:     "--force survives into the forwarded argv",
 			in:       []string{"apply", "--force", "-f", "-"},
 			want:     applyClientFlags{force: true},
-			wantRest: []string{"apply", "-f", "-"},
+			wantRest: []string{"apply", "--force", "-f", "-"},
 		},
 		{
 			name:     "--force and -y together",
 			in:       []string{"apply", "-y", "--force", "-f", "-"},
 			want:     applyClientFlags{autoApprove: true, force: true},
-			wantRest: []string{"apply", "-f", "-"},
+			wantRest: []string{"apply", "--force", "-f", "-"},
 		},
 		{
 			name:     "both --auto-approve and --force (idempotent, order preserved)",
 			in:       []string{"apply", "--auto-approve", "-f", "infra/dev", "--force"},
 			want:     applyClientFlags{autoApprove: true, force: true},
-			wantRest: []string{"apply", "-f", "infra/dev"},
+			wantRest: []string{"apply", "-f", "infra/dev", "--force"},
 		},
 		{
 			name:     "-v short form",
@@ -128,7 +128,7 @@ func TestExtractApplyClientFlags(t *testing.T) {
 			name:     "all three flags together",
 			in:       []string{"apply", "-y", "--force", "--verbose", "-f", "infra/dev"},
 			want:     applyClientFlags{autoApprove: true, force: true, verbose: true},
-			wantRest: []string{"apply", "-f", "infra/dev"},
+			wantRest: []string{"apply", "--force", "-f", "infra/dev"},
 		},
 	}
 
@@ -451,3 +451,66 @@ func TestRunDiffYAMLEmitsMachineReadable(t *testing.T) {
 	}
 }
 
+// TestExtractApplyClientFlags_EnvInjectsForce covers the CI shape:
+// VOODU_FORCE_REBUILD=1 with no --force on the command line. The env
+// var must reach the SERVER-side apply (which re-pulls registry
+// images), and the only channel is argv — remoteEnv forwards the
+// protocol and color vars, nothing else.
+func TestExtractApplyClientFlags_EnvInjectsForce(t *testing.T) {
+	t.Setenv(envForceRebuild, "1")
+
+	got, rest := extractApplyClientFlags([]string{"apply", "-f", "-"})
+
+	if !got.force {
+		t.Fatalf("force = false, want true (VOODU_FORCE_REBUILD=1)")
+	}
+
+	want := []string{"apply", "-f", "-", "--force"}
+	if !reflect.DeepEqual(rest, want) {
+		t.Errorf("rest = %v, want %v", rest, want)
+	}
+}
+
+// TestExtractApplyClientFlags_EnvDoesNotDuplicateForce guards against
+// the double-token shape when the operator passes BOTH the flag and
+// the env var. Cobra tolerates a repeated bool flag, but a duplicated
+// token in `ssh -v` output reads like a bug.
+func TestExtractApplyClientFlags_EnvDoesNotDuplicateForce(t *testing.T) {
+	t.Setenv(envForceRebuild, "1")
+
+	_, rest := extractApplyClientFlags([]string{"apply", "--force", "-f", "-"})
+
+	want := []string{"apply", "--force", "-f", "-"}
+	if !reflect.DeepEqual(rest, want) {
+		t.Errorf("rest = %v, want %v", rest, want)
+	}
+}
+
+// TestApplyHasWork pins the "No changes. Nothing to apply." gate. The
+// --force row is the ECR shape: CI overwrote the tag, the HCL is
+// byte-identical, the diff is empty — and short-circuiting there would
+// swallow the exact apply the operator forced.
+func TestApplyHasWork(t *testing.T) {
+	cases := []struct {
+		name                                               string
+		specChanges, sourcePush, assetSensitive, forcePull bool
+		want                                               bool
+	}{
+		{name: "true no-op", want: false},
+		{name: "spec delta", specChanges: true, want: true},
+		{name: "build-mode source to re-push", sourcePush: true, want: true},
+		{name: "asset content may have drifted", assetSensitive: true, want: true},
+		{name: "--force with an empty diff", forcePull: true, want: true},
+		{name: "--force on top of a spec delta", specChanges: true, forcePull: true, want: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := applyHasWork(c.specChanges, c.sourcePush, c.assetSensitive, c.forcePull)
+			if got != c.want {
+				t.Errorf("applyHasWork(%v, %v, %v, %v) = %v, want %v",
+					c.specChanges, c.sourcePush, c.assetSensitive, c.forcePull, got, c.want)
+			}
+		})
+	}
+}

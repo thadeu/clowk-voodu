@@ -996,6 +996,32 @@ func TagImage(src, dst string) error {
 	return nil
 }
 
+// PullImage fetches ref from its registry via `docker pull`. Wraps the
+// CLI rather than the SDK on purpose: the CLI reads
+// `$HOME/.docker/config.json`, which is the file RegistryHandler owns,
+// so a `registry "ghcr" { … }` manifest authenticates the pull with no
+// extra wiring. The SDK would require us to re-read and re-encode that
+// auth per registry host.
+//
+// A tag that already points at the newest digest is a cheap no-op on
+// the daemon side ("Image is up to date"), so callers may call this
+// unconditionally. Compare GetImageID before and after to learn whether
+// the tag moved.
+//
+// ctx bounds the pull — a caller serving an HTTP request passes the
+// request context so a disconnected client doesn't leave a multi-GB
+// download running.
+func PullImage(ctx context.Context, ref string) error {
+	cmd := exec.CommandContext(ctx, "docker", "pull", ref)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker pull %s: %s", ref, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
 // ImageExists reports whether a local image matches `ref`. Same
 // shape as GetImageID's "missing" path (empty string == not
 // present), but expressed as a bool so callers don't have to write

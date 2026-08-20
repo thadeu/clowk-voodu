@@ -213,6 +213,13 @@ func (s *Server) Start(ctx context.Context) error {
 		// Same instance — its Exec method satisfies the Execer seam.
 		Execer: DockerContainerManager{},
 
+		// Same instance — its Pull / ImageID methods satisfy the
+		// ImagePuller seam `vd apply --force` uses to re-pull
+		// registry-mode images. Sharing the instance keeps the pull
+		// on the same docker config.json (and therefore the same
+		// registry credentials) the container-create path uses.
+		Images: DockerContainerManager{},
+
 		// Same instance — its Stop / Start / InspectLabels methods
 		// satisfy the PodLifecycler seam used by `vd stop` /
 		// `vd start`.

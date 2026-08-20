@@ -126,6 +126,13 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	needsSourcePush := len(stream.buildModeDeploys) > 0
 	hasAssetSensitive := planContainsAssetSensitive(plan)
 
+	// --force is itself a reason to proceed. The registry-mode case is
+	// invisible to the diff by construction: CI overwrites the ECR tag,
+	// the HCL still reads `image = "…:latest"`, so the plan is empty
+	// while the bytes behind the tag are new. Short-circuiting on "no
+	// spec changes" would swallow exactly the apply the operator forced.
+	forcePull := flags.force
+
 	// Four cases worth distinguishing:
 	//
 	//  1. No spec changes AND no build-mode deploys AND no
@@ -154,7 +161,12 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	//     handler re-fetches, and downstream consumers (statefulset
 	//     specs that fold the asset digest into their own hash)
 	//     get the rolling restart they need.
-	if !hasSpecChanges && !needsSourcePush && !hasAssetSensitive {
+	//  5. No spec changes BUT --force → re-pull every registry-mode
+	//     image and reconcile against whatever the tag now resolves
+	//     to. Same "the manifest can't see it" rationale as case 4,
+	//     one layer lower: the drift is in the registry, not the
+	//     asset store.
+	if !applyHasWork(hasSpecChanges, needsSourcePush, hasAssetSensitive, forcePull) {
 		fmt.Fprintln(os.Stdout, "No changes. Nothing to apply.")
 		return 0, nil
 	}
@@ -214,6 +226,10 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 
 		if hasAssetSensitive {
 			reasons = append(reasons, "checking asset content drift")
+		}
+
+		if forcePull {
+			reasons = append(reasons, "forcing an image pull (--force)")
 		}
 
 		fmt.Fprintf(os.Stdout, "%s no spec changes. %s.\n",
@@ -311,6 +327,21 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 	}
 
 	return code, err
+}
+
+// applyHasWork answers the question the phase-1 plan alone can't:
+// is there anything left to do? A spec delta is the obvious yes, but
+// three other conditions carry an apply whose diff came back empty —
+// build-mode source to re-push, asset content that can drift behind an
+// unchanged manifest, and --force, whose registry-mode half re-pulls
+// images the HCL names with a tag it can't see behind.
+//
+// Extracted from the orchestrator so the four-way condition is
+// testable without an SSH round-trip: getting it wrong in either
+// direction is user-visible ("No changes" on an apply that had work,
+// or a pointless server round-trip on a true no-op).
+func applyHasWork(hasSpecChanges, needsSourcePush, hasAssetSensitive, forcePull bool) bool {
+	return hasSpecChanges || needsSourcePush || hasAssetSensitive || forcePull
 }
 
 // rewriteApplyToDiffJSON turns the forwarded `apply ...` argv into its

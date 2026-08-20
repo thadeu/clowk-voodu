@@ -26,7 +26,7 @@ voodu apply -f voodu -r prod-1 [flags]
 | `-r`, `--remote` | — | SSH alias from `voodu remote list`. |
 | `--prune` | `false` | **Opt-in.** Delete resources in the same `(scope, kind)` that aren't declared in this apply. Default is upsert-only — siblings stay put. |
 | `-y`, `--auto-approve` | `false` | Skip the interactive confirmation prompt (also `VOODU_AUTO_APPROVE=1`). |
-| `--force` | `false` | Rebuild build-mode deployments even when the tarball hash matches an existing release (also `VOODU_FORCE_REBUILD=1`). |
+| `--force` | `false` | Skip the up-to-date checks: rebuild build-mode deployments on a tarball-hash hit **and** re-pull every registry-mode image (also `VOODU_FORCE_REBUILD=1`). See [Forcing a redeploy](#forcing-a-redeploy). |
 | `-v`, `--verbose` | `false` | Show raw docker build output instead of collapsing to a spinner. |
 
 ## Examples
@@ -49,7 +49,57 @@ voodu diff -f voodu.hcl --detailed-exitcode -r prod-1
 
 # Opt-in cleanup of stale siblings (full source-of-truth apply)
 voodu apply -f voodu.hcl --prune -r prod-1
+
+# Re-pull a mutable tag CI just overwrote (ECR, GHCR, :latest)
+voodu apply -f voodu.hcl --force -r prod-1
 ```
+
+## Forcing a redeploy
+
+Apply is up-to-date-aware in two places, and `--force` skips both.
+
+**Build mode** ships the working directory as a content-addressed
+tarball. An identical tree skips the rebuild and just repoints the
+`current` symlink. `--force` rebuilds anyway — useful for a
+non-deterministic build cache, or to validate a CI image change.
+
+**Registry mode** names an image the host pulls. Docker only fetches a
+tag it doesn't already have locally, so a *mutable* tag — `:latest`,
+`:main`, the ECR tag your pipeline overwrites on every push — keeps
+resolving to the digest cached on first deploy. The manifest never
+changes, the diff comes back empty, and the old container keeps
+running. `--force` makes the controller `docker pull` every image the
+manifests name before reconciling:
+
+```bash
+voodu apply -f voodu.hcl --force -r prod-1
+
+✓ pulling images (--force) (12s)
+✓ pulled 123456789012.dkr.ecr.us-east-1.amazonaws.com/api:latest
+✓ deployment/prod/api applied
+```
+
+What follows the pull is the normal reconcile. If the tag moved, the
+controller sees the running container on a different image ID than the
+tag now resolves to and rolls the replicas one at a time. If the tag
+was already current you get `already up to date` and **nothing
+restarts** — that is the correct outcome, not a swallowed apply. To
+restart regardless of the image, use `voodu restart <scope>/<name>`.
+
+`--force` also bypasses the `No changes. Nothing to apply.`
+short-circuit, since a byte-identical manifest is exactly the shape
+that needs the pull.
+
+A pull that fails **aborts the apply before anything is written** —
+desired state is left untouched so a retry after fixing the registry
+credentials is a clean re-apply. The one exception: when the image is
+already on the host, the failure degrades to a warning and the apply
+proceeds with the local copy.
+
+Private registries authenticate through the `auths` entries a
+[`registry`](/docs/manifests/registry) manifest writes, the same ones
+the container-create path uses. ECR tokens expire every 12 hours — see
+the [token-rotation cronjob](/docs/manifests/registry#token-rotation-via-cronjob-ecr).
 
 ## Variable interpolation
 

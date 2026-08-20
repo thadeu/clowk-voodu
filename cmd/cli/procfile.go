@@ -470,7 +470,7 @@ func pushProcfileTarball(info *remote.Info, identity string, pa procfileApply, s
 	}()
 
 	args := []string{"receive-pack", "--procfile=" + scope}
-	if pa.force || os.Getenv("VOODU_FORCE_REBUILD") == "1" {
+	if forceRequested(pa.force) {
 		args = append(args, "--force")
 	}
 

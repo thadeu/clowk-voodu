@@ -26,6 +26,29 @@ import (
 
 const applyTimeout = 30 * time.Second
 
+// forceApplyTimeout is the budget for `vd apply --force`. The request
+// blocks while the controller re-pulls every registry image the batch
+// names, and a cold multi-GB layer set on a modest uplink outlasts the
+// 30s that a store-only apply needs. Generous rather than tuned: the
+// failure mode we care about is a timeout truncating a legitimate
+// pull, not an operator waiting too long for a wedged one (the pull
+// dies with the request context either way).
+const forceApplyTimeout = 30 * time.Minute
+
+// envForceRebuild is the escape hatch for CI runners that would rather
+// export a variable once than thread --force through every apply
+// invocation. Same meaning as the flag in both halves of force:
+// rebuild build-mode deployments, re-pull registry-mode images.
+const envForceRebuild = "VOODU_FORCE_REBUILD"
+
+// forceRequested folds the --force flag and its env-var twin into the
+// single bit the rest of the apply path reads. Every caller that
+// branches on force goes through here so the two spellings can never
+// drift apart.
+func forceRequested(flag bool) bool {
+	return flag || os.Getenv(envForceRebuild) == "1"
+}
+
 // controllerInstallRef mirrors controller.PluginInstallation —
 // what the server reports back when a plugin was JIT-installed
 // during apply. Decoded inline in runApply so the CLI can
@@ -46,13 +69,24 @@ type controllerExpansionRef struct {
 	To   []string `json:"to"`
 }
 
+// controllerImagePullRef mirrors controller.ImagePullResult — one
+// entry per image the controller re-pulled on a `--force` apply.
+// Rendered as `pulled <image>` when the tag moved, `already up to
+// date` when it didn't, and a warning line when the registry was
+// unreachable but a local copy carried the apply.
+type controllerImagePullRef struct {
+	Image   string `json:"image"`
+	Updated bool   `json:"updated"`
+	Warning string `json:"warning,omitempty"`
+}
+
 type applyFlags struct {
 	files            []string
 	format           string // stdin only: "hcl"
 	applyPrune       bool   // apply + diff: opt-in to delete siblings in the same (scope, kind) not declared in this apply
 	detailedExitcode bool   // diff only: exit 2 when there are changes, mirrors `terraform plan`
 	autoApprove      bool   // apply + delete: skip the interactive confirmation
-	force            bool   // apply only: force rebuild even when the tarball hash already has a release
+	force            bool   // apply only: rebuild on a tarball-hash hit AND re-pull registry-mode images
 	verbose          bool   // apply only: passthrough raw build output instead of collapsing to a spinner
 	dryRun           bool   // delete only: print the plan and exit without removing anything
 	prune            bool   // delete only: also wipe config + on-disk app/volume dirs
@@ -102,6 +136,16 @@ rebuild the image anyway (useful for non-deterministic build caches
 or when validating CI image changes). VOODU_FORCE_REBUILD=1 has the
 same effect.
 
+--force covers registry-mode deployments too: the controller runs a
+'docker pull' for every image the manifests name before reconciling.
+Without it a mutable tag (:latest, :main, the ECR tag CI overwrites
+on every push) keeps resolving to the copy already on the host, the
+reconciler sees no drift, and the old digest stays running. A pull
+that moves the tag rolls the replicas onto the new image; a tag that
+was already current reports 'already up to date' and nothing
+restarts. --force also bypasses the 'No changes. Nothing to apply.'
+short-circuit, so a byte-identical manifest still triggers the pull.
+
 Build output is collapsed into a spinner by default so docker buildx
 chatter stays out of the way. Pass --verbose (alias -v) to see the
 raw stream when debugging a failed build.`,
@@ -114,7 +158,7 @@ raw stream when debugging a failed build.`,
 	cmd.Flags().StringVar(&f.format, "format", "", "stdin format: hcl or json (required for -f -)")
 	cmd.Flags().BoolVar(&f.applyPrune, "prune", false, "delete sibling resources in the same (scope, kind) that aren't declared in this apply (default: upsert-only, leave existing siblings alone)")
 	cmd.Flags().BoolVarP(&f.autoApprove, "auto-approve", "y", false, "skip the interactive y/N confirmation (also VOODU_AUTO_APPROVE=1)")
-	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild build-mode deployments even when the tarball hash matches an existing release (also VOODU_FORCE_REBUILD=1)")
+	cmd.Flags().BoolVar(&f.force, "force", false, "skip the up-to-date checks: rebuild build-mode deployments on a tarball-hash hit AND re-pull every registry-mode image (also VOODU_FORCE_REBUILD=1)")
 	cmd.Flags().BoolVarP(&f.verbose, "verbose", "v", false, "show raw docker build output (default: collapse into a spinner)")
 	cmd.Flags().StringVar(&f.app, "app", "", "Procfile mode: scope for the generated resources (default: a random 3-char id)")
 	cmd.Flags().BoolVar(&f.eject, "eject", false, "Procfile mode: write an equivalent .voodu file instead of applying")
@@ -289,14 +333,9 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	// one-off operator commands where a prompt would get in the way.
 	// See runApplyForwarded for the two-phase orchestrated flow.
 	//
-	// `force` only has meaning when we push a tarball to receive-pack;
-	// the local path reconciles the controller directly and never
-	// touches the build cache. The flag is silently ignored here.
-	//
 	// `verbose` is a presentation knob for the forwarded path's
 	// spinner — local apply has no build output to collapse.
 	_ = f.autoApprove
-	_ = f.force
 	_ = f.verbose
 
 	root := cmd.Root()
@@ -306,21 +345,21 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 		return err
 	}
 
-	query := ""
+	// `force` reaches the controller as a query param. Build-mode
+	// deployments already consumed their half of the flag upstream
+	// (receive-pack rebuilds on a tarball-hash hit); this half is for
+	// registry-mode, where the controller re-pulls every image the
+	// batch names so a mutable tag actually moves on the host.
+	force := forceRequested(f.force)
+
+	params := url.Values{}
+
 	if f.applyPrune {
-		query = "prune=true"
+		params.Set("prune", "true")
 	}
 
-	resp, err := controllerDo(root, http.MethodPost, "/apply", query, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		return formatControllerError(resp.StatusCode, raw)
+	if force {
+		params.Set("force", "true")
 	}
 
 	// Route per-resource verdicts through progress.Reporter so NDJSON
@@ -329,28 +368,96 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 	// "deployment/softphone/web applied" wire format. The reporter
 	// kind is picked from VOODU_PROTOCOL env — set by forwarded apply
 	// clients speaking NDJSON, unset in local / legacy flows.
+	//
+	// Opened BEFORE the POST because a force apply blocks on the
+	// controller's image pull: the step_start frame is what gives the
+	// operator a live spinner instead of a silent multi-minute freeze.
+	// The hello frame must stay the first line on stdout for the
+	// client-side protocol negotiation to pick NDJSON.
 	reporter := progress.NewReporterFromEnv(os.Stdout)
 	reporter.Hello()
 
 	defer reporter.Close()
 
+	timeout := applyTimeout
+
+	if force {
+		timeout = forceApplyTimeout
+
+		reporter.StepStart("force-pull", "pulling images (--force)")
+	}
+
+	resp, err := controllerDoTimeout(root, http.MethodPost, "/apply", params.Encode(), bytes.NewReader(body), timeout)
+	if err != nil {
+		if force {
+			reporter.StepEnd("force-pull", progress.StatusFail, err)
+		}
+
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		err := formatControllerError(resp.StatusCode, raw)
+
+		if force {
+			reporter.StepEnd("force-pull", progress.StatusFail, err)
+		}
+
+		return err
+	}
+
+	// The controller returns {"data": {"applied": [...], "pruned":
+	// [...], "plugin_installs": [...], "plugin_expansions": [...],
+	// "image_pulls": [...]}}. Surface prune + plugin lifecycle +
+	// force-pull so operators see what happened beyond the
+	// per-manifest verdicts.
+	var env struct {
+		Data struct {
+			Pruned           []string                 `json:"pruned"`
+			PluginInstalls   []controllerInstallRef   `json:"plugin_installs,omitempty"`
+			PluginExpansions []controllerExpansionRef `json:"plugin_expansions,omitempty"`
+			ImagePulls       []controllerImagePullRef `json:"image_pulls,omitempty"`
+		} `json:"data"`
+	}
+
+	decoded := json.Unmarshal(raw, &env) == nil
+
+	if force {
+		reporter.StepEnd("force-pull", progress.StatusOK, nil)
+	}
+
+	// Force-pull verdicts land BEFORE the per-manifest lines: "pulled
+	// X" is the reason the replicas below are about to be recreated,
+	// so it reads in causal order. "already up to date" is just as
+	// important — it's the answer to "I forced and nothing restarted,
+	// why?".
+	//
+	// Summary rather than Result because these aren't manifests:
+	// Result feeds the `apply complete (N resources)` tally, and an
+	// image pull shouldn't inflate the resource count.
+	if decoded {
+		for _, ip := range env.Data.ImagePulls {
+			switch {
+			case ip.Warning != "":
+				reporter.Log("warn", fmt.Sprintf("could not refresh %s, keeping the local copy: %s", ip.Image, ip.Warning))
+
+			case ip.Updated:
+				reporter.Summary(fmt.Sprintf("pulled %s", ip.Image))
+
+			default:
+				reporter.Summary(fmt.Sprintf("%s already up to date", ip.Image))
+			}
+		}
+	}
+
 	for _, m := range mans {
 		reporter.Result(string(m.Kind), m.Scope, m.Name, "applied")
 	}
 
-	// The controller returns {"data": {"applied": [...], "pruned":
-	// [...], "plugin_installs": [...], "plugin_expansions": [...]}}.
-	// Surface prune + plugin lifecycle so operators see what
-	// happened beyond the per-manifest verdicts.
-	var env struct {
-		Data struct {
-			Pruned           []string                `json:"pruned"`
-			PluginInstalls   []controllerInstallRef  `json:"plugin_installs,omitempty"`
-			PluginExpansions []controllerExpansionRef `json:"plugin_expansions,omitempty"`
-		} `json:"data"`
-	}
-
-	if err := json.Unmarshal(raw, &env); err == nil {
+	if decoded {
 		// Plugin installs first — operators want to know "I got
 		// voodu-postgres v0.2.0" before the per-resource lines
 		// scroll past.
@@ -1431,6 +1538,15 @@ func envAsMap() map[string]string {
 // `context deadline exceeded`. Streaming callers should use
 // `controllerStream` below.
 func controllerDo(root *cobra.Command, method, path, rawQuery string, body io.Reader) (*http.Response, error) {
+	return controllerDoTimeout(root, method, path, rawQuery, body, applyTimeout)
+}
+
+// controllerDoTimeout is controllerDo with an explicit request budget.
+// Only `vd apply --force` needs it today — its POST carries a docker
+// pull on the far side, so the 30s default would cut a healthy
+// transfer short. Everything else goes through controllerDo and
+// inherits applyTimeout.
+func controllerDoTimeout(root *cobra.Command, method, path, rawQuery string, body io.Reader, timeout time.Duration) (*http.Response, error) {
 	base := strings.TrimRight(controllerURL(root), "/")
 	full := base + path
 
@@ -1449,7 +1565,7 @@ func controllerDo(root *cobra.Command, method, path, rawQuery string, body io.Re
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
 
-	client := &http.Client{Timeout: applyTimeout}
+	client := &http.Client{Timeout: timeout}
 
 	resp, err := client.Do(req)
 	if err != nil {
