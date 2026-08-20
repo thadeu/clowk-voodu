@@ -150,6 +150,41 @@ The controller logs the path it settled on at boot:
 docker config at /opt/voodu/docker
 ```
 
+### Permissions and the docker group
+
+Two processes need these credentials, and they do not run as the same
+user. The controller is root under systemd. `voodu receive-pack` — the
+far end of a build-mode deploy, which pulls the Dockerfile's `FROM`
+image — runs as whatever user your SSH remote is configured with,
+because no sane server allows SSH as root.
+
+So the tree is owned by root and shared with the `docker` group:
+
+```
+drwxr-x---  root:docker  /opt/voodu/docker/
+-rw-r-----  root:docker  /opt/voodu/docker/config.json
+drwxrwx---  root:docker  /opt/voodu/docker/ecr-cache/
+drwx------  <uid>        /opt/voodu/docker/ecr-cache/<uid>/
+```
+
+No world bits anywhere. Sharing with the `docker` group grants nothing
+new: its members can already run `docker run -v /:/host --privileged`
+and read every byte on the host, which is why Docker's own
+documentation treats the group as root-equivalent. Excluding them
+would buy no security and break every build-mode deploy — and the
+build user is necessarily in that group already, or it could not run
+docker at all.
+
+The ECR helper's cache is **per-uid** because the helper writes it
+`0600`. One shared directory would leave whichever process wrote
+second unable to read the other's file; separate subdirectories cost
+one extra token fetch and remove the failure mode.
+
+On a host with no `docker` group (rootless docker, or a socket guarded
+another way) the files stay owner-only — the safe direction to fail.
+Build-mode then falls back to docker's default credentials and prints
+a warning saying so; a public base image is unaffected.
+
 On first boot after upgrading, an existing `$HOME/.docker/config.json`
 is copied over once so credentials from a pre-upgrade `docker login`
 are not lost. It is a one-time seed, never a sync — once the file

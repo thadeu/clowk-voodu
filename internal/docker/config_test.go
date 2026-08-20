@@ -3,6 +3,8 @@ package docker
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"go.voodu.clowk.in/internal/paths"
@@ -41,10 +43,103 @@ func TestUseVooduDockerConfigExportsEnv(t *testing.T) {
 		t.Fatalf("stat %s: %v", dir, err)
 	}
 
-	// The directory holds registry credentials in the clear (docker's
-	// `auth` field is base64, not encryption).
-	if perm := info.Mode().Perm(); perm != 0700 {
-		t.Errorf("dir perm = %04o, want 0700", perm)
+	// 0750, not 0700: `voodu receive-pack` runs as the SSH remote's
+	// ordinary user (real servers do not allow SSH as root) and needs
+	// to read these auths to pull a private base image. That user is
+	// necessarily in the docker group — it could not run docker at all
+	// otherwise — and a docker-group member can already read every
+	// byte on the host through the socket. Still off-limits to
+	// everyone else: no world bit.
+	perm := info.Mode().Perm()
+	if perm != 0750 {
+		t.Errorf("dir perm = %04o, want 0750", perm)
+	}
+
+	if perm&0007 != 0 {
+		t.Errorf("dir perm = %04o, must not be world-accessible", perm)
+	}
+}
+
+// TestUseVooduDockerConfigECRCacheIsPerUID — two processes share this
+// tree (root controller, docker-group build user) and the ECR helper
+// writes its cache 0600. A single shared cache directory would leave
+// whichever process wrote second unable to read the other's file, so
+// each uid gets its own.
+func TestUseVooduDockerConfigECRCacheIsPerUID(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv(EnvECRCacheDir, "")
+	t.Setenv("HOME", t.TempDir())
+
+	if _, _, err := UseVooduDockerConfig(); err != nil {
+		t.Fatalf("UseVooduDockerConfig: %v", err)
+	}
+
+	want := filepath.Join(root, "docker", "ecr-cache", strconv.Itoa(os.Geteuid()))
+
+	if got := os.Getenv(EnvECRCacheDir); got != want {
+		t.Errorf("%s = %q, want the per-uid dir %q", EnvECRCacheDir, got, want)
+	}
+
+	// The shared parent must let the unprivileged build user create
+	// its own subdirectory.
+	parent, err := os.Stat(filepath.Join(root, "docker", "ecr-cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if perm := parent.Mode().Perm(); perm != 0770 {
+		t.Errorf("ecr-cache parent perm = %04o, want 0770", perm)
+	}
+
+	// The per-uid dir holds live tokens and is not shared at all.
+	mine, err := os.Stat(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if perm := mine.Mode().Perm(); perm != 0700 {
+		t.Errorf("per-uid cache perm = %04o, want 0700", perm)
+	}
+}
+
+// TestSeededConfigIsGroupReadable — the upgrade seed lands a file the
+// build-side user has to read too, same as every subsequent
+// RegistryHandler write.
+func TestSeededConfigIsGroupReadable(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(filepath.Join(home, ".docker"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(home, ".docker", "config.json"), []byte(`{"auths":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, seeded, err := UseVooduDockerConfig()
+	if err != nil || !seeded {
+		t.Fatalf("seed failed: seeded=%v err=%v", seeded, err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	perm := info.Mode().Perm()
+	if perm&0040 == 0 {
+		t.Errorf("seeded config perm = %04o, want group-readable", perm)
+	}
+
+	if perm&0007 != 0 {
+		t.Errorf("seeded config perm = %04o, must not be world-accessible", perm)
 	}
 }
 
@@ -65,24 +160,23 @@ func TestUseVooduDockerConfigRedirectsECRCache(t *testing.T) {
 		t.Fatalf("UseVooduDockerConfig: %v", err)
 	}
 
-	want := filepath.Join(root, "docker", "ecr-cache")
+	got := os.Getenv(EnvECRCacheDir)
 
-	if got := os.Getenv(EnvECRCacheDir); got != want {
-		t.Errorf("%s = %q, want %q", EnvECRCacheDir, got, want)
+	// Anywhere under VOODU_ROOT is the point — the exact per-uid shape
+	// is pinned by TestUseVooduDockerConfigECRCacheIsPerUID. What must
+	// never hold is a path under $HOME, which ProtectHome=yes makes
+	// unwritable for the whole service cgroup.
+	if !strings.HasPrefix(got, filepath.Join(root, "docker", "ecr-cache")) {
+		t.Errorf("%s = %q, want it under the voodu-owned tree", EnvECRCacheDir, got)
 	}
 
-	info, err := os.Stat(want)
+	info, err := os.Stat(got)
 	if err != nil {
-		t.Fatalf("stat %s: %v", want, err)
+		t.Fatalf("stat %s: %v", got, err)
 	}
 
 	if !info.IsDir() {
-		t.Errorf("%s is not a directory", want)
-	}
-
-	// Holds live ECR tokens — same posture as the config file itself.
-	if perm := info.Mode().Perm(); perm != 0700 {
-		t.Errorf("ecr-cache perm = %04o, want 0700", perm)
+		t.Errorf("%s is not a directory", got)
 	}
 }
 

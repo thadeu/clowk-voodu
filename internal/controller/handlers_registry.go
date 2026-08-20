@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/paths"
 )
 
@@ -445,8 +446,9 @@ func (h *RegistryHandler) save(cfg dockerConfig) error {
 		return fmt.Errorf("close temp: %w", err)
 	}
 
-	// 0600 matches what `docker login` writes natively. Tight
-	// perm because the file holds base64 creds.
+	// 0600 while it is still a temp file — the window between write
+	// and rename is the one moment the content is on disk under a
+	// name nothing else is expected to read.
 	if err := os.Chmod(tmpName, 0600); err != nil {
 		return fmt.Errorf("chmod temp: %w", err)
 	}
@@ -454,6 +456,18 @@ func (h *RegistryHandler) save(cfg dockerConfig) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
+
+	// Relax to 0640 <owner>:docker once it is in place. `voodu
+	// receive-pack` runs as the SSH remote's ordinary user — real
+	// servers do not allow SSH as root — and that user needs these
+	// auths to pull a private base image during `docker build`. It is
+	// already in the docker group (it could not run docker at all
+	// otherwise), and a docker-group member can read every byte on the
+	// host through the socket regardless, so this widens nothing.
+	//
+	// Best-effort: on a host with no docker group the file simply
+	// stays owner-only, which is the safe direction to fail.
+	docker.ShareConfigWithDockerGroup(path)
 
 	return nil
 }

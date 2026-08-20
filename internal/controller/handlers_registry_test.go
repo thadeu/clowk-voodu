@@ -74,15 +74,34 @@ func TestRegistryHandler_WritesConfigJSON(t *testing.T) {
 		t.Errorf("auths[ghcr.io].auth = %q, want %q (base64 of `username:token`)", got.Auth, wantAuth)
 	}
 
-	// Perm check: docker login writes 0600 to keep credentials
-	// out of world-readable land. We must match.
+	// Perm check. `docker login` writes 0600, and we started there —
+	// but two users need this file: the controller (root, systemd) and
+	// `voodu receive-pack`, which runs as the SSH remote's ordinary
+	// user because servers do not allow SSH as root. 0600 broke every
+	// build-mode deploy against a private base image.
+	//
+	// 0640 <owner>:docker is the resolution. The docker group is
+	// root-equivalent by construction — its members can `docker run -v
+	// /:/host --privileged` — so group-read grants nothing they could
+	// not already take. What must never appear is a world bit, and
+	// that is the assertion that actually protects anything here.
 	info, err := os.Stat(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("config.json mode = %o, want 0600 (matches docker login posture)", info.Mode().Perm())
+	perm := info.Mode().Perm()
+
+	if perm&0007 != 0 {
+		t.Errorf("config.json mode = %04o, must not be world-accessible", perm)
+	}
+
+	if perm&0400 == 0 {
+		t.Errorf("config.json mode = %04o, owner must be able to read it", perm)
+	}
+
+	if perm != 0640 {
+		t.Errorf("config.json mode = %04o, want 0640 (owner rw, docker group r)", perm)
 	}
 }
 
