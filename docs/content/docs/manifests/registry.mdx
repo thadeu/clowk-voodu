@@ -155,6 +155,60 @@ is copied over once so credentials from a pre-upgrade `docker login`
 are not lost. It is a one-time seed, never a sync — once the file
 exists, `registry` manifests own it.
 
+## No static credential: IAM roles and credential helpers
+
+`registry` carries a token, which means something has to keep that
+token fresh. On a host whose identity is already granted — an EC2
+instance with an ECR policy on its instance role, for example — that
+is work you should not have to do. Use a docker **credential helper**
+instead and skip `registry` entirely.
+
+The helper is a binary docker execs on every pull. It reads the
+standard AWS credential chain, which includes the EC2 instance role
+via IMDS, so there is no token to rotate and no secret in your
+manifests.
+
+```bash
+# Debian / Ubuntu
+sudo apt install amazon-ecr-credential-helper
+
+# Amazon Linux 2023
+sudo dnf install -y amazon-ecr-credential-helper
+```
+
+Then name the helper for your registry host in the config voodu owns,
+`$VOODU_ROOT/docker/config.json`:
+
+```json
+{
+  "credHelpers": {
+    "123456789012.dkr.ecr.sa-east-1.amazonaws.com": "ecr-login"
+  }
+}
+```
+
+Voodu preserves `credHelpers` verbatim across reconciles — it claims
+only the `auths` section — so this coexists with `registry` blocks for
+other hosts, and survives an apply that touches none.
+
+The controller exports `AWS_ECR_CACHE_DIR` to a directory under
+`$VOODU_ROOT` at boot. That matters: the helper caches issued tokens
+under `${HOME}/.ecr` by default, which `ProtectHome=yes` makes
+unwritable, and the resulting failure reads like an AWS problem rather
+than a sandbox one.
+
+Check the role reaches ECR before blaming voodu:
+
+```bash
+sudo docker-credential-ecr-login get \
+  <<< "123456789012.dkr.ecr.sa-east-1.amazonaws.com"
+```
+
+A JSON object with `Username: AWS` means the instance role works. An
+error there is an IAM or IMDS problem — the required actions are
+`ecr:GetAuthorizationToken`, `ecr:BatchGetImage` and
+`ecr:GetDownloadUrlForLayer`.
+
 ## Trade-offs
 
 **One credential per registry host.** Voodu rewrites `$VOODU_ROOT/docker/config.json` atomically per apply — there's exactly one entry per registry hostname. Two operators each pushing their personal PAT will trample each other.

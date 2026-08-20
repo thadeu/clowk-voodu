@@ -48,6 +48,44 @@ func TestUseVooduDockerConfigExportsEnv(t *testing.T) {
 	}
 }
 
+// TestUseVooduDockerConfigRedirectsECRCache covers the EC2
+// instance-role path. `docker-credential-ecr-login` needs no static
+// credential — it reads the role off IMDS — but it caches issued
+// tokens under ${HOME}/.ecr, which ProtectHome=yes makes unwritable.
+// Without the redirect the helper fails on its cache write, and the
+// error reads like an AWS problem rather than a sandbox one.
+func TestUseVooduDockerConfigRedirectsECRCache(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv(EnvECRCacheDir, "")
+	t.Setenv("HOME", t.TempDir())
+
+	if _, _, err := UseVooduDockerConfig(); err != nil {
+		t.Fatalf("UseVooduDockerConfig: %v", err)
+	}
+
+	want := filepath.Join(root, "docker", "ecr-cache")
+
+	if got := os.Getenv(EnvECRCacheDir); got != want {
+		t.Errorf("%s = %q, want %q", EnvECRCacheDir, got, want)
+	}
+
+	info, err := os.Stat(want)
+	if err != nil {
+		t.Fatalf("stat %s: %v", want, err)
+	}
+
+	if !info.IsDir() {
+		t.Errorf("%s is not a directory", want)
+	}
+
+	// Holds live ECR tokens — same posture as the config file itself.
+	if perm := info.Mode().Perm(); perm != 0700 {
+		t.Errorf("ecr-cache perm = %04o, want 0700", perm)
+	}
+}
+
 // TestUseVooduDockerConfigSeedsFromHome guards the upgrade path: an
 // operator who ran `docker login` as root before this change must not
 // silently lose those credentials when the lookup path moves.

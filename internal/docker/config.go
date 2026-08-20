@@ -14,6 +14,17 @@ import (
 // processes it forks agree on one credential file.
 const EnvDockerConfig = "DOCKER_CONFIG"
 
+// EnvECRCacheDir is the Amazon ECR credential helper's override for
+// where it caches issued tokens. Its default is ${HOME}/.ecr, which
+// ProtectHome=yes makes unwritable for the controller — so a helper
+// that would otherwise work off the EC2 instance role fails on its
+// cache write instead of on anything to do with AWS.
+//
+// Pointed at a subdirectory of the docker config dir for the same
+// reason DOCKER_CONFIG is: VOODU_ROOT is the one tree the unit grants
+// write access to.
+const EnvECRCacheDir = "AWS_ECR_CACHE_DIR"
+
 // UseVooduDockerConfig points this process — and therefore every
 // `docker` child it forks — at <VOODU_ROOT>/docker/config.json.
 //
@@ -58,6 +69,16 @@ func UseVooduDockerConfig() (dir string, seeded bool, err error) {
 
 	if err := os.Setenv(EnvDockerConfig, dir); err != nil {
 		return "", false, fmt.Errorf("set %s: %w", EnvDockerConfig, err)
+	}
+
+	// Credential helpers are exec'd by the docker CLI, which inherits
+	// this environment — so a helper that caches under $HOME by default
+	// needs redirecting the same way the config file did. Best-effort:
+	// the ECR helper degrades to an uncached (slower, but working) token
+	// fetch if the directory is missing, and every other helper ignores
+	// the variable outright.
+	if err := os.MkdirAll(filepath.Join(dir, "ecr-cache"), 0700); err == nil {
+		_ = os.Setenv(EnvECRCacheDir, filepath.Join(dir, "ecr-cache"))
 	}
 
 	seeded = seedFromHome(dir)
