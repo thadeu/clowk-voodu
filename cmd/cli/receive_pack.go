@@ -79,10 +79,17 @@ auto-detection if neither resolves.`,
 			// look at root's ~/.docker instead, which the controller no
 			// longer writes to.
 			//
-			// Best-effort: a build from a public base image must not be
-			// blocked because the credential dir could not be prepared.
+			// Best-effort, and it MUST stay that way: docker falls back
+			// to its own default when this is skipped, which is what
+			// every build did before the variable existed. The common
+			// skip is an SSH remote configured as a non-root user
+			// reading a config the root controller owns — harmless for
+			// a public base image, and the warning names the fix for a
+			// private one.
 			if _, _, err := docker.UseVooduDockerConfig(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: docker config: %v\n", err)
+				fmt.Fprintf(os.Stderr,
+					"warning: using docker's default credentials — %v\n"+
+						"         a private base image in FROM may fail to pull; run the voodu remote as root, or grant this user read access to the file\n", err)
 			}
 
 			// Procfile fan-out: read the Procfile from the shipped tree,

@@ -87,7 +87,7 @@ func main() {
 	// the log line tells the operator exactly why the pulls that do
 	// need one are failing.
 	if dir, seeded, err := docker.UseVooduDockerConfig(); err != nil {
-		logger.Printf("docker config: %v (private registry pulls will fail)", err)
+		logger.Printf("docker config: %v — falling back to docker's default; `registry` manifests will not authenticate pulls", err)
 	} else {
 		logger.Printf("docker config at %s", dir)
 

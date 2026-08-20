@@ -67,6 +67,24 @@ func UseVooduDockerConfig() (dir string, seeded bool, err error) {
 		return "", false, fmt.Errorf("ensure docker config dir %s: %w", dir, err)
 	}
 
+	// Adopt the directory ONLY if this process can actually read what
+	// is in it. The controller creates it 0700 as root; `voodu
+	// receive-pack` runs as whatever user the SSH remote is
+	// configured with, and pointing a non-root build at a root-owned
+	// credential file does not degrade — it breaks the build outright.
+	// Docker fails to load the config, which takes its CLI-plugin
+	// discovery with it, and since `build` is a plugin-provided
+	// command on modern Docker the operator gets
+	//
+	//	unknown shorthand flag: 'f' in -f
+	//
+	// naming a flag that was never the problem. Leaving DOCKER_CONFIG
+	// unset falls back to the docker default, which is exactly the
+	// behaviour that worked before this variable existed.
+	if err := readable(dir); err != nil {
+		return "", false, err
+	}
+
 	if err := os.Setenv(EnvDockerConfig, dir); err != nil {
 		return "", false, fmt.Errorf("set %s: %w", EnvDockerConfig, err)
 	}
@@ -84,6 +102,28 @@ func UseVooduDockerConfig() (dir string, seeded bool, err error) {
 	seeded = seedFromHome(dir)
 
 	return dir, seeded, nil
+}
+
+// readable reports whether this process can open the config file in
+// dir. A missing file is fine — nothing has written one yet, and
+// docker treats an absent config as "no credentials", the same as the
+// default path would.
+//
+// The probe opens the FILE rather than stat-ing the directory: a
+// 0700 directory owned by another user denies traversal, so the open
+// fails with EACCES either way, and one syscall covers both the
+// unreadable-directory and unreadable-file cases.
+func readable(dir string) error {
+	f, err := os.Open(filepath.Join(dir, "config.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return fmt.Errorf("cannot read %s as uid %d: %w", filepath.Join(dir, "config.json"), os.Geteuid(), err)
+	}
+
+	return f.Close()
 }
 
 // seedFromHome copies ~/.docker/config.json into dir the first time,

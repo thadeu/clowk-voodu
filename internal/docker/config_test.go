@@ -173,3 +173,70 @@ func TestUseVooduDockerConfigDoesNotClobber(t *testing.T) {
 		t.Errorf("config was clobbered: %q", got)
 	}
 }
+
+// TestUseVooduDockerConfigSkipsUnreadableConfig is the regression that
+// broke build-mode deploys: the controller creates the directory 0700
+// as root, `voodu receive-pack` runs as the SSH remote's user, and
+// pointing a non-root build at a root-owned credential file does not
+// degrade gracefully — docker fails to load the config, loses its
+// CLI-plugin discovery with it, and `docker build -f ...` dies with
+// "unknown shorthand flag: 'f' in -f", naming a flag that was never
+// the problem.
+//
+// Leaving DOCKER_CONFIG unset falls back to docker's default, which is
+// what every build did before the variable existed.
+func TestUseVooduDockerConfigSkipsUnreadableConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission checks (CAP_DAC_OVERRIDE)")
+	}
+
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv("HOME", t.TempDir())
+
+	dir := filepath.Join(root, "docker")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfg, []byte(`{"auths":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate "owned by another user": unreadable to us.
+	if err := os.Chmod(cfg, 0000); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(cfg, 0600) })
+
+	_, _, err := UseVooduDockerConfig()
+	if err == nil {
+		t.Fatal("adopted an unreadable config — docker would fail to load it and lose plugin discovery")
+	}
+
+	if got := os.Getenv(EnvDockerConfig); got != "" {
+		t.Errorf("%s = %q, want it left unset so docker uses its default", EnvDockerConfig, got)
+	}
+}
+
+// TestUseVooduDockerConfigAdoptsMissingConfig — an absent file is not
+// a failure. Nothing has written credentials yet, and docker treats a
+// missing config exactly as the default path would.
+func TestUseVooduDockerConfigAdoptsMissingConfig(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv("HOME", t.TempDir())
+
+	dir, _, err := UseVooduDockerConfig()
+	if err != nil {
+		t.Fatalf("UseVooduDockerConfig: %v", err)
+	}
+
+	if os.Getenv(EnvDockerConfig) != dir {
+		t.Errorf("%s = %q, want %q", EnvDockerConfig, os.Getenv(EnvDockerConfig), dir)
+	}
+}
