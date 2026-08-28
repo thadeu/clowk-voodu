@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-20T19:20:13.553Z
+Last built: 2026-08-28T02:07:23.193Z
 
 ---
 # Introduction
@@ -6205,6 +6205,10 @@ Caveat: bucket-fed interpolation is **local-apply only**. With `-r <remote>` the
 ✓ https://api.example.com  ·  3/3 healthy
 ```
 
+## From CI
+
+The same command runs from a GitHub workflow through [`clowk-in/voodu-gh`](https://github.com/clowk-in/voodu-gh) — it installs the CLI, prepares SSH, and calls `vd apply` with `--auto-approve`. See [GitHub Actions](/docs/examples/github-actions) for the wiring and for what the server does with the result.
+
 ---
 
 # voodu diff
@@ -8700,6 +8704,149 @@ VOODU_FORCE_REBUILD=1 voodu apply -f voodu.hcl
 
 - [`build` manifest reference](/docs/manifests/build) — full field list
 - [`statefulset` reference](/docs/manifests/statefulset) — for the pgvector example
+
+---
+
+# GitHub Actions
+
+URL: https://voodu.clowk.in/docs/examples/github-actions/
+> Deploy from CI with the official action — how to wire it, and what actually happens between the push and the running container.
+
+[`clowk-in/voodu-gh`](https://github.com/clowk-in/voodu-gh) runs `vd apply` from a GitHub workflow. It installs the CLI, prepares SSH, and calls the same command you would call from a laptop — there is no separate CI protocol to learn.
+
+```yaml title=".github/workflows/deploy.yml"
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+env:
+  VOODU_HOST:        ${{ secrets.VOODU_HOST }}
+  VOODU_SSH_KEY:     ${{ secrets.VOODU_SSH_KEY }}
+  VOODU_KNOWN_HOSTS: ${{ secrets.VOODU_KNOWN_HOSTS }}
+  VOODU_VERSION:     v0.9.3
+
+concurrency:
+  group: voodu-deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: clowk-in/voodu-gh@v1
+        with:
+          manifests: |
+            infra/web.voodu
+            infra/pwa.voodu
+```
+
+Every input falls back to an environment variable, so the values shared across steps are declared **once** and each `uses:` carries only what differs. A step that targets a second server overrides just that:
+
+```yaml
+      - uses: clowk-in/voodu-gh@v1
+        with:
+          host: ${{ secrets.VOODU_HOST_EU }}
+          known-hosts: ${{ secrets.VOODU_KNOWN_HOSTS_EU }}
+          manifests: infra/eu.voodu
+```
+
+## 1. What happens between push and container
+
+Five steps, and the interesting parts are the last two.
+
+**Checkout** puts the exact triggering commit in the workspace — `github.sha`, in detached HEAD. On a `pull_request` event the default is the **merge commit**, not the branch head, which is what you want a plan computed against.
+
+**Install** fetches the release archive for the runner's OS and architecture and verifies it against the release `checksums.txt`. The action deliberately does not pipe `voodu.clowk.in/install`: in CI the download must be verifiable, must not need `sudo`, and must land somewhere cacheable. An unpinned `version` resolves its real tag before the cache step, so the cache key names an immutable release and never needs an expiry.
+
+**SSH** writes the key under `$RUNNER_TEMP` (wiped between jobs), pins the host key from `known-hosts`, and adds a per-host block to `~/.ssh/config`.
+
+**The git remote** is the step people trip on. Voodu resolves its SSH target by reading a git remote — `git remote get-url voodu` — so the action writes the target into the checkout as a remote before calling the CLI. That is why the workspace must be a git repository, and why `actions/checkout` belongs in every workflow using this action.
+
+**Apply** passes every manifest as a repeatable `-f`, so several files reconcile in **one** plan instead of independent passes that cannot see each other. The confirmation prompt has no terminal to read from, so approval is always implied — `-y` plus `VOODU_AUTO_APPROVE=1`.
+
+## 2. What the server does with it
+
+The commit determines the manifest. Whether it determines the *code* depends on the build mode.
+
+In **build-mode** the workdir is packed and pushed, and the server builds. The tarball walk is deterministic, so identical directory state produces identical bytes, an identical build id, and the server **skips the rebuild**. A commit that only touches ignored files costs nothing. Set `VOODU_FORCE_REBUILD` to override.
+
+In **registry-mode** the manifest names an image and apply only tells the server which image to run. A fixed tag makes this a no-op — apply does not re-pull `:latest`. Pin the tag to the commit instead:
+
+```yaml
+      - uses: clowk-in/voodu-gh@v1
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        with:
+          manifests: infra/web.voodu
+```
+
+Manifests interpolate `${IMAGE_TAG}` from the environment, so the deployed image is unambiguous and rollback becomes a real option.
+
+**The server records no commit.** Voodu keys on content, not on git history — there is no "roll back to commit X" derived from the deploy. Traceability has to come from you, through the image tag or through a value carried into the manifest.
+
+What never reaches the server: `.git`, `.gitignore`, `node_modules`, `.voodu`, `.DS_Store`. Beyond that the `.dockerignore` rules, and when one exists it **replaces `.gitignore` entirely**, matching `docker build`. Two consequences in CI — a build input listed in `.gitignore` will not arrive unless a `.dockerignore` re-includes it, and submodules need `submodules: true` on the checkout.
+
+## 3. Plan on pull requests
+
+`dry-run` runs `vd diff` and changes nothing, so a reviewer reads the plan before the merge applies it:
+
+```yaml title=".github/workflows/plan.yml"
+on: [pull_request]
+
+concurrency:
+  group: voodu-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: clowk-in/voodu-gh@v1
+        with:
+          manifests: infra/web.voodu
+          dry-run: true
+```
+
+## 4. Concurrency
+
+Two pushes in quick succession start two runs, and nothing orders them — the older apply can arrive last and win.
+
+**Never cancel a deploy in flight.** The reconciler runs asynchronously to apply, so killing the runner drops the SSH connection while the server carries on with work it already accepted, leaving a half-applied older release racing a newer one. Keep `cancel-in-progress: false` on anything that applies.
+
+Queueing behaves the way a deploy wants. GitHub keeps at most one pending run per group and cancels the previously pending one, so three rapid pushes collapse to: finish what is running, apply the newest commit, skip the middle one.
+
+Group by **target**, not by branch — the point is to serialise everything aimed at the same server. Deploys to different servers keep separate groups and stay parallel. A plan job is the opposite case: `vd diff` changes nothing and a superseded plan is waste, so cancel those and scope the group to the pull request.
+
+## 5. What the credential is
+
+The action carries an **SSH key with shell access to your server**, and the deploy user is in the `docker` group — that is root in practice. The workflow file is not where you make that safe; the server is.
+
+**Pin the host key.** Without `known-hosts` the action falls back to trust-on-first-use, and on an ephemeral runner every run is the first — it accepts whatever key answers. Produce the value once with `ssh-keyscan -H your-server`.
+
+**Restrict the key.** A forced command in the server's `authorized_keys` stops it from opening a shell:
+
+```text title="~/.ssh/authorized_keys"
+command="voodu $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-port-forwarding,no-pty,no-X11-forwarding ssh-ed25519 AAAA...
+```
+
+Verify your own deploy still works afterwards — build-mode pushes a source tarball over the same connection.
+
+**Put the human gate on the environment.** Approval is always implied at the CLI level, so a GitHub Environment with required reviewers is where a person gets to say no.
+
+**Do not pass `--prune` from CI.** It is opt-in by default, which is the right setting for a pipeline. Deleting resources should stay a deliberate act at a keyboard.
+
+**Pin the action itself by commit SHA** if the repository consuming it is sensitive. A tag can be moved by whoever owns it; `@v1` is a statement of trust, not a guarantee.
+
+## Reference
+
+Full input table, caching behaviour, and runner hygiene notes live in the action's README: [`clowk-in/voodu-gh`](https://github.com/clowk-in/voodu-gh).
 
 ---
 

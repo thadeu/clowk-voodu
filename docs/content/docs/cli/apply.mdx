@@ -137,3 +137,7 @@ Caveat: bucket-fed interpolation is **local-apply only**. With `-r <remote>` the
 ✓ apply complete in 11.8s
 ✓ https://api.example.com  ·  3/3 healthy
 ```
+
+## From CI
+
+The same command runs from a GitHub workflow through [`clowk-in/voodu-gh`](https://github.com/clowk-in/voodu-gh) — it installs the CLI, prepares SSH, and calls `vd apply` with `--auto-approve`. See [GitHub Actions](/docs/examples/github-actions) for the wiring and for what the server does with the result.

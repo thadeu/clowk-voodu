@@ -16,6 +16,7 @@
     "stateful-services",
     "multi-environment",
     "shared-scope",
-    "production-stack"
+    "production-stack",
+    "github-actions"
   ]
 }
