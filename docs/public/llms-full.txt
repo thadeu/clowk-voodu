@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-28T02:23:12.248Z
+Last built: 2026-08-28T02:25:46.092Z
 
 ---
 # Introduction
@@ -8756,6 +8756,18 @@ Every input falls back to an environment variable, so the values shared across s
           known-hosts: ${{ secrets.VOODU_KNOWN_HOSTS_EU }}
           manifests: infra/eu.voodu
 ```
+
+`VOODU_HOST` is **`user@server_ip`**, never a bare address. There is no default user and the action never guesses `root` — a bare address fails before anything connects, which matches voodu's own remote parser refusing a target without a user. The right one depends on the image: `root` on a DigitalOcean droplet, `ubuntu` or `ec2-user` on AWS, or whatever user the installer set up for deploys.
+
+Pass the user separately when you want only the address to be a secret:
+
+```yaml
+env:
+  VOODU_USER: ubuntu
+  VOODU_HOST: ${{ secrets.VOODU_HOST }}
+```
+
+The port never goes in `host` — voodu reads everything after `:` as a path to a key — so use the `port` input instead.
 
 ## 1. What happens between push and container
 
