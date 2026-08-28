@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-28T02:25:46.092Z
+Last built: 2026-08-28T02:27:34.109Z
 
 ---
 # Introduction
@@ -50,13 +50,41 @@ voodu apply -f voodu -r prod-1
 - **Stateful services are first-class.** Postgres, Mongo, Redis (+ sentinel) declared like apps. Plugins ship backup, replicas, and test-restore.
 - **TLS out of the box.** Add `tls {}` and Voodu cuts a Let's Encrypt cert via Caddy. On-demand wildcards.
 - **k8s shape, not k8s ops.** Same reconciliation loop, none of the CNI/Helm/operator bill.
+- **Laptop or CI, same command.** The official GitHub Action is a thin wrapper around `voodu apply` — nothing to learn twice, and no drift between how you deploy and how the pipeline does.
 - **100% self-hosted, MIT.** Single Go binary, embedded etcd, no cloud tier, no telemetry.
+
+## Where apply runs
+
+`voodu apply` is the entire deploy. Where you run it from is your choice, and both places run the same command.
+
+**From your machine.** Edit, save, apply — nothing else in the loop:
+
+```bash
+voodu apply -f voodu -r prod-1
+```
+
+**From CI.** The [`clowk-in/voodu-gh`](https://github.com/clowk-in/voodu-gh) action installs the CLI, prepares SSH, and calls that same `voodu apply`:
+
+```yaml title=".github/workflows/deploy.yml"
+      - uses: actions/checkout@v4
+
+      - uses: clowk-in/voodu-gh@v1
+        with:
+          manifests: infra/web.voodu
+```
+
+A push can **trigger** the workflow, but the deploy underneath is still a declarative apply — there is no bare repo, no receive hook, no server-side git. That is what makes the two interchangeable: a laptop and a workflow produce the same result, so you can adopt CI gradually and still apply by hand when you need to.
+
+Pull requests get the plan instead of the deploy. `dry-run: true` runs `voodu diff` and changes nothing, so a reviewer reads what would happen before the merge makes it happen.
+
+Inputs, concurrency, and the security posture an SSH deploy key demands: [GitHub Actions](/docs/examples/github-actions).
 
 ## Quickstart
 
 1. [Install Voodu on your laptop](/docs/getting-started/install)
 2. [Bootstrap a remote](/docs/getting-started/remotes)
 3. [Ship your first app](/docs/getting-started/first-deploy)
+4. [Hand the apply to CI](/docs/examples/github-actions) — optional, and the same command
 
 ## Manifest reference
 
