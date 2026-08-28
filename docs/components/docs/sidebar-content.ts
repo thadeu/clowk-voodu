@@ -101,6 +101,7 @@ export const contents: SidebarSection[] = [
       { title: 'Multi-environment', href: '/docs/examples/multi-environment', icon: Layers3 },
       { title: 'Shared scope', href: '/docs/examples/shared-scope', icon: GitFork },
       { title: 'Production stack', href: '/docs/examples/production-stack', icon: Factory },
+      { title: 'GitHub Actions', href: '/docs/examples/github-actions', icon: Workflow },
     ],
   },
   {

@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-28T02:07:23.193Z
+Last built: 2026-08-28T02:23:12.248Z
 
 ---
 # Introduction
@@ -7789,6 +7789,7 @@ The order goes from **one file, one resource** (a single web app) to **per-servi
 | Deploy the same HCL to staging and prod | [Multi-environment](/docs/examples/multi-environment) |
 | Multiple repos applying into one logical scope | [Shared scope](/docs/examples/shared-scope) |
 | Translate a docker-compose stack into voodu (real-world) | [Production stack](/docs/examples/production-stack) |
+| Deploy from CI on every push, instead of running `vd apply` by hand | [GitHub Actions](/docs/examples/github-actions) |
 
 ## Complexity gradient
 
