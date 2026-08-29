@@ -162,4 +162,4 @@ Releases are cut by pushing a `v*` tag — GoReleaser builds cross-platform bina
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE).
+Elastic License 2.0 — see [LICENSE](LICENSE).
