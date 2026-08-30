@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/pkg/plugin"
 )
@@ -518,5 +519,96 @@ func TestFirstContainerPort(t *testing.T) {
 		if got != c.want || ok != c.ok {
 			t.Errorf("firstContainerPort(%v) = (%d, %v); want (%d, %v)", c.in, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+// TestDeploymentUpstreamsListsEveryReplica pins what the ingress plugin
+// is actually told about a deployment.
+//
+// The upstream list is what caddy load-balances over. Collapsing three
+// live replicas into one network alias hands caddy a single target, so
+// `lb { policy = "round_robin" }` distributes nothing — whatever spread
+// exists comes from docker's embedded DNS, which caddy cannot health
+// check, cannot weight, and cannot take one replica out of.
+func TestDeploymentUpstreamsListsEveryReplica(t *testing.T) {
+	fc := &fakeContainers{slots: map[string]*ContainerSlot{}}
+
+	for _, replica := range []string{"a1", "b2", "c3"} {
+		name := containers.ContainerName("clowk", "api", replica)
+
+		fc.slots[name] = &ContainerSlot{
+			Name: name,
+			Identity: containers.Identity{
+				Kind:      containers.KindDeployment,
+				Scope:     "clowk",
+				Name:      "api",
+				ReplicaID: replica,
+			},
+			Running: true,
+		}
+	}
+
+	h := &IngressHandler{Containers: fc, Log: quietLogger()}
+
+	got, err := h.deploymentUpstreams("clowk", "api", 8080, deploymentSpec{})
+
+	if err != nil {
+		t.Fatalf("deploymentUpstreams: %v", err)
+	}
+
+	want := []string{
+		containers.ContainerName("clowk", "api", "a1") + ":8080",
+		containers.ContainerName("clowk", "api", "b2") + ":8080",
+		containers.ContainerName("clowk", "api", "c3") + ":8080",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("got %d upstreams %v, want %d (one per live replica)", len(got), got, len(want))
+	}
+
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("upstream %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestDeploymentUpstreamsSkipsStoppedReplicas keeps a container that is
+// present but not running out of the rotation. Handing caddy an address
+// nothing is listening on turns a stopped replica into a share of
+// refused requests.
+func TestDeploymentUpstreamsSkipsStoppedReplicas(t *testing.T) {
+	fc := &fakeContainers{slots: map[string]*ContainerSlot{}}
+
+	for _, r := range []struct {
+		id      string
+		running bool
+	}{{"a1", true}, {"b2", false}} {
+		name := containers.ContainerName("clowk", "api", r.id)
+
+		fc.slots[name] = &ContainerSlot{
+			Name: name,
+			Identity: containers.Identity{
+				Kind:      containers.KindDeployment,
+				Scope:     "clowk",
+				Name:      "api",
+				ReplicaID: r.id,
+			},
+			Running: r.running,
+		}
+	}
+
+	h := &IngressHandler{Containers: fc, Log: quietLogger()}
+
+	got, err := h.deploymentUpstreams("clowk", "api", 8080, deploymentSpec{})
+
+	if err != nil {
+		t.Fatalf("deploymentUpstreams: %v", err)
+	}
+
+	want := containers.ContainerName("clowk", "api", "a1") + ":8080"
+
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("got %v, want exactly [%s]", got, want)
 	}
 }

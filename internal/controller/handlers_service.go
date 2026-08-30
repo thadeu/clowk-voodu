@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -505,13 +506,15 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 func (h *IngressHandler) deploymentUpstreams(scope, name string, port int, dep deploymentSpec) ([]string, error) {
 	app := AppID(scope, name)
 
-	upstream := upstreamForAlias(scope, name, app, port)
-
+	// No container manager wired (unit tests, and handlers constructed
+	// for validation only): fall back to the alias, which resolves to
+	// whatever docker's DNS has.
 	if h.Containers == nil {
-		return []string{upstream}, nil
+		return []string{upstreamForAlias(scope, name, app, port)}, nil
 	}
 
 	slots, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+
 	if err != nil {
 		return nil, Transient(fmt.Errorf("list deployment %s replicas: %w", app, err))
 	}
@@ -520,7 +523,42 @@ func (h *IngressHandler) deploymentUpstreams(scope, name string, port int, dep d
 		return nil, Transient(fmt.Errorf("ingress: deployment %s has no live replicas yet — will retry", app))
 	}
 
-	return []string{upstream}, nil
+	// One upstream per RUNNING replica, addressed by container name.
+	//
+	// This used to collapse to a single network alias, which meant the
+	// ingress plugin was handed one target no matter how many replicas
+	// existed. Everything downstream of that was decorative: caddy's
+	// `lb { policy = "round_robin" }` had nothing to rotate over, there
+	// was no per-replica health check, and taking one replica out of
+	// rotation was impossible without killing it. Whatever spread the
+	// operator observed came from docker's embedded DNS, which caddy
+	// cannot see, weight, or route around.
+	//
+	// Container names rather than IPs: docker's DNS resolves them on
+	// voodu0, where the ingress plugin runs, and a name survives the
+	// container being recreated with a different address.
+	upstreams := make([]string, 0, len(slots))
+
+	for _, s := range slots {
+		// A container that exists but is not running would be an
+		// address with nothing listening on it — a share of refused
+		// requests rather than a replica.
+		if !s.Running {
+			continue
+		}
+
+		upstreams = append(upstreams, fmt.Sprintf("%s:%d", s.Name, port))
+	}
+
+	if len(upstreams) == 0 {
+		return nil, Transient(fmt.Errorf("ingress: deployment %s has replicas but none running yet — will retry", app))
+	}
+
+	// Stable order so a reconcile that changes nothing produces the same
+	// upstream list, and the plugin's apply stays idempotent.
+	slices.Sort(upstreams)
+
+	return upstreams, nil
 }
 
 // upstreamForAlias picks the canonical network alias (e.g.
