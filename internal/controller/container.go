@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/docker"
@@ -109,6 +110,22 @@ type ContainerManager interface {
 	// filters as needed (the reconciler treats "stopped" as a slot
 	// to be revived; `voodu get pods` shows everything).
 	ListByIdentity(kind, scope, name string) ([]ContainerSlot, error)
+
+	// RemoveWithGrace is Remove with an explicit SIGTERM budget.
+	//
+	// Separate from Remove rather than a changed signature: the
+	// twenty-odd other call sites all want docker's default, and
+	// only the rollout knows what the workload asked for.
+	RemoveWithGrace(name string, grace time.Duration) error
+
+	// IP returns the container's address on voodu0.
+	//
+	// Needed by consumers that cannot use docker's embedded DNS —
+	// a plugin running on the host network resolves nothing docker
+	// knows, so it has to be handed an address. Consumers that sit
+	// on the bridge should keep using the container name, which
+	// survives the container being recreated at a new address.
+	IP(name string) (string, error)
 
 	// ListLegacyByApp finds pre-M0 containers (no voodu.* labels)
 	// whose docker name matches `<app>` or `<app>-<digits>`. Used by
@@ -512,6 +529,22 @@ func (DockerContainerManager) RemoveVolume(name string) error {
 
 func (DockerContainerManager) ListVolumesByLabels(filters []string) ([]string, error) {
 	return docker.ListVolumesByLabels(filters)
+}
+
+func (DockerContainerManager) RemoveWithGrace(name string, grace time.Duration) error {
+	if !docker.ContainerExists(name) {
+		return nil
+	}
+
+	if err := docker.StopContainerGrace(name, grace); err != nil {
+		return err
+	}
+
+	return docker.RemoveContainer(name, true)
+}
+
+func (DockerContainerManager) IP(name string) (string, error) {
+	return docker.ContainerIP(name)
 }
 
 func (DockerContainerManager) Remove(name string) error {

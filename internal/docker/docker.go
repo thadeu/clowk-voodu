@@ -1114,9 +1114,26 @@ func ContainerIsRunning(name string) bool {
 
 // StopContainer stops a running container.
 func StopContainer(name string) error {
-	cmd := exec.Command("docker", "stop", name)
+	return StopContainerGrace(name, 0)
+}
 
-	return cmd.Run()
+// StopContainerGrace is StopContainer with an explicit SIGTERM budget.
+//
+// `docker stop` sends SIGTERM, waits, then SIGKILL. The wait defaults
+// to 10 seconds, which is the whole reason a process that needs longer
+// to finish an in-flight write loses it on every deploy. A zero grace
+// keeps docker's default rather than passing -t 0, which would mean
+// "kill immediately" — the opposite of what an unset value asks for.
+func StopContainerGrace(name string, grace time.Duration) error {
+	args := []string{"stop"}
+
+	if grace > 0 {
+		args = append(args, "-t", strconv.Itoa(int(grace.Round(time.Second).Seconds())))
+	}
+
+	args = append(args, name)
+
+	return exec.Command("docker", args...).Run()
 }
 
 // RestartContainer runs `docker restart <name>` — SIGTERM, grace,

@@ -232,6 +232,42 @@ type hclDeployment struct {
 	Logs           *hclLogsBlock           `hcl:"logs,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
 	InitContainers []hclInitContainerBlock `hcl:"init,block"`
+	Drain          *hclDrainBlock          `hcl:"drain,block"`
+}
+
+// hclDrainBlock is the HCL surface for how a replica winds down.
+type hclDrainBlock struct {
+	Timeout string `hcl:"timeout,optional"`
+	Grace   string `hcl:"grace,optional"`
+}
+
+// drainBlockToSpec validates the durations and converts to the wire
+// shape.
+//
+// Validated here rather than deferred to the reader, unlike the other
+// durations in this package: a probe interval that falls back to a
+// default is a nuisance, while a drain timeout that does the same cuts
+// the work the operator wrote the block to protect, in production,
+// with no error anywhere.
+func drainBlockToSpec(b *hclDrainBlock, block string) (*DrainSpec, error) {
+	if b == nil {
+		return nil, nil
+	}
+
+	for _, f := range []struct{ name, value string }{
+		{"timeout", b.Timeout},
+		{"grace", b.Grace},
+	} {
+		if f.value == "" {
+			continue
+		}
+
+		if _, err := time.ParseDuration(f.value); err != nil {
+			return nil, fmt.Errorf("%s.drain.%s: %q is not a duration (want e.g. \"30s\", \"5m\", \"1h30m\")", block, f.name, f.value)
+		}
+	}
+
+	return &DrainSpec{Timeout: b.Timeout, Grace: b.Grace}, nil
 }
 
 // hclOnDeployBlock is the HCL surface for the on_deploy webhook
@@ -1008,6 +1044,13 @@ func (b hclDeployment) spec() (DeploymentSpec, error) {
 	s.Logs = logsBlockToSpec(b.Logs)
 	s.Probes = probesBlockToSpec(b.Probes)
 
+	drain, err := drainBlockToSpec(b.Drain, "deployment")
+	if err != nil {
+		return s, err
+	}
+
+	s.Drain = drain
+
 	if err := validateProbes(s.Probes); err != nil {
 		return DeploymentSpec{}, err
 	}
@@ -1269,6 +1312,7 @@ type hclStatefulset struct {
 	InitContainers []hclInitContainerBlock `hcl:"init,block"`
 	Probes         *hclProbesBlock         `hcl:"probes,block"`
 	OnProbe        *hclOnProbeBlock        `hcl:"on_probe,block"`
+	Drain          *hclDrainBlock          `hcl:"drain,block"`
 }
 
 // hclVolumeClaim is one per-pod volume template. The block label
@@ -1332,6 +1376,13 @@ func (b hclStatefulset) spec() (StatefulsetSpec, error) {
 	}
 
 	s.Probes = probesBlockToSpec(b.Probes)
+
+	drain, err := drainBlockToSpec(b.Drain, "statefulset")
+	if err != nil {
+		return StatefulsetSpec{}, err
+	}
+
+	s.Drain = drain
 
 	if err := validateProbes(s.Probes); err != nil {
 		return StatefulsetSpec{}, err
@@ -1793,8 +1844,13 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, err
 		}
 
+		body, pluginBlocks, err := extractPluginBlocks(blk.Body, &hclDeployment{})
+		if err != nil {
+			return nil, fmt.Errorf("deployment/%s/%s: %w", scope, name, err)
+		}
+
 		var d hclDeployment
-		if d2 := gohcl.DecodeBody(blk.Body, nil, &d); d2.HasErrors() {
+		if d2 := gohcl.DecodeBody(body, nil, &d); d2.HasErrors() {
 			return nil, d2
 		}
 
@@ -1802,6 +1858,8 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 		if err != nil {
 			return nil, fmt.Errorf("deployment/%s/%s: %w", scope, name, err)
 		}
+
+		spec.PluginBlocks = pluginBlocks
 
 		m, err := encode(controller.KindDeployment, scope, name, spec)
 		if err != nil {
@@ -1816,8 +1874,13 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 			return nil, err
 		}
 
+		body, pluginBlocks, err := extractPluginBlocks(blk.Body, &hclStatefulset{})
+		if err != nil {
+			return nil, fmt.Errorf("statefulset/%s/%s: %w", scope, name, err)
+		}
+
 		var s hclStatefulset
-		if d := gohcl.DecodeBody(blk.Body, nil, &s); d.HasErrors() {
+		if d := gohcl.DecodeBody(body, nil, &s); d.HasErrors() {
 			return nil, d
 		}
 
@@ -1825,6 +1888,8 @@ func dispatchHCLBlock(blk *hclsyntax.Block, source string) ([]controller.Manifes
 		if err != nil {
 			return nil, fmt.Errorf("statefulset/%s/%s: %w", scope, name, err)
 		}
+
+		spec.PluginBlocks = pluginBlocks
 
 		m, err := encode(controller.KindStatefulset, scope, name, spec)
 		if err != nil {

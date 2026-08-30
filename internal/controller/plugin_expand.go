@@ -46,6 +46,40 @@ type expandRequest struct {
 	// "first apply" and may regenerate state — operator
 	// observable, not silent).
 	Config map[string]string `json:"config,omitempty"`
+
+	// Position tells the plugin where its block was written. Empty
+	// (the default) is the historical top-level form, where the
+	// plugin owns a whole kind and answers with core manifests.
+	// "nested" means the block sat inside a core kind, where the
+	// plugin instead validates and normalises its own config — see
+	// expandNestedPluginBlocks for why it may not emit structure
+	// there.
+	Position string `json:"position,omitempty"`
+
+	// Parent is the core resource the block was written inside.
+	// Only set for nested position. A listener needs to know which
+	// workload's replicas it fronts, and asking the plugin to infer
+	// that from scope+name alone would break the moment a block
+	// names something other than its parent.
+	Parent *expandParent `json:"parent,omitempty"`
+}
+
+// expandPositionNested marks an expand request for a block written
+// inside a core kind rather than at the top level.
+const expandPositionNested = "nested"
+
+// expandParent is the core resource a nested block belongs to.
+type expandParent struct {
+	Kind  string          `json:"kind"`
+	Scope string          `json:"scope,omitempty"`
+	Name  string          `json:"name"`
+	Spec  json.RawMessage `json:"spec,omitempty"`
+
+	// HostPorts is how the parent publishes ports: "none",
+	// "ephemeral" or "fixed". Computed rather than left for the
+	// plugin to derive from Spec — deriving it means reimplementing
+	// normalizePort, and a reimplementation drifts.
+	HostPorts string `json:"host_ports,omitempty"`
 }
 
 // expandResponseData is the shape the plugin's envelope.Data must
@@ -114,6 +148,13 @@ func (a *API) expandPluginBlocks(ctx context.Context, mans []*Manifest) (out []*
 		}
 
 		if IsCoreKind(m.Kind) {
+			// A core kind can still carry blocks belonging to a
+			// plugin — the parser hands them through rather than
+			// refusing them, so this is where they find their owner.
+			if err := a.expandNestedPluginBlocks(ctx, m); err != nil {
+				return nil, nil, nil, err
+			}
+
 			out = append(out, m)
 			continue
 		}

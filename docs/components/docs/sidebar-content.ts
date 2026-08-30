@@ -135,6 +135,7 @@ export const contents: SidebarSection[] = [
       { title: 'resources', href: '/docs/manifests/resources', icon: Gauge },
       { title: 'logs', href: '/docs/manifests/logs', icon: FileText },
       { title: 'probes', href: '/docs/manifests/probes', icon: Activity },
+      { title: 'drain', href: '/docs/manifests/drain', icon: Clock },
       { title: 'init containers', href: '/docs/manifests/init', icon: Sparkles },
       { title: 'autoscale', href: '/docs/manifests/autoscale', icon: Scaling },
 
@@ -146,6 +147,9 @@ export const contents: SidebarSection[] = [
       // ── Cross-cutting: relations & config ─────────────────
       { title: 'depends_on', href: '/docs/manifests/depends-on', icon: Link2 },
       { title: 'config & secrets', href: '/docs/manifests/config', icon: KeyRound },
+
+      // ── Extension: blocks a plugin owns ───────────────────
+      { title: 'Plugin blocks', href: '/docs/manifests/plugin-blocks', icon: Plug },
     ],
   },
   {

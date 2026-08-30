@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.voodu.clowk.in/pkg/plugin"
@@ -43,6 +44,14 @@ type RunOptions struct {
 // usually quick (read config, docker inspect, a few HTTP calls), so a
 // generous default keeps everything simple without hanging forever.
 const DefaultTimeout = 60 * time.Second
+
+// pluginWaitDelay is how long Wait keeps reading after the context is
+// done before it gives up on the pipes and returns.
+//
+// Small on purpose: by the time it applies, the plugin has already been
+// killed and anything still holding the pipe is a survivor we are not
+// going to wait for.
+const pluginWaitDelay = 2 * time.Second
 
 // Run executes one command from a loaded plugin and captures its output.
 // The executable is resolved from the plugin's Commands map, which
@@ -92,6 +101,29 @@ func (p *LoadedPlugin) Run(ctx context.Context, opts RunOptions) (*Result, error
 	}
 
 	cmd := exec.CommandContext(runCtx, path, args...)
+
+	// A plugin is usually a shell script, and CommandContext only
+	// kills the process it started. Anything that script spawned keeps
+	// running — and, worse, keeps the inherited stdout pipe open, so
+	// Wait blocks on that pipe long after the deadline passed. Without
+	// the two lines below, every timeout in the controller is advisory:
+	// a plugin that shells out simply outlives it.
+	//
+	// Setpgid puts the plugin in its own process group so Cancel can
+	// signal the whole tree, and WaitDelay bounds the wait on pipes a
+	// survivor might still be holding.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+
+		// Negative pid = the whole process group.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	cmd.WaitDelay = pluginWaitDelay
 	cmd.Env = buildEnv(p, opts.Env)
 	cmd.Dir = p.Dir
 

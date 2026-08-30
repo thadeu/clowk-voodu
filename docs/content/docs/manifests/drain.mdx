@@ -1,0 +1,102 @@
+---
+title: drain
+description: How a replica winds down before it is taken away — SIGTERM grace, and waiting for work in flight to finish.
+---
+
+`drain {}` is how long a replica gets to finish what it was doing before the platform removes it. Declared on `deployment` and `statefulset`.
+
+```hcl
+deployment "prod" "api" {
+  image    = "ghcr.io/acme/api:1.4.2"
+  replicas = 3
+
+  drain {
+    grace   = "60s"
+    timeout = "30m"
+  }
+}
+```
+
+Two knobs, and most workloads want only one of them.
+
+## `grace` — the SIGTERM budget
+
+The gap between SIGTERM and SIGKILL, passed through to `docker stop -t`. Needs no load balancer and no plugin.
+
+This is the fix for the most common complaint about deploys: a worker that loses an in-flight write. Voodu already sends SIGTERM before removing a container — docker's default gives the process **10 seconds** — so a job that takes longer than that gets killed mid-write on every deploy.
+
+```hcl
+deployment "prod" "worker" {
+  image = "ghcr.io/acme/worker:2.1"
+
+  drain {
+    grace = "120s"
+  }
+}
+```
+
+Before reaching for anything else, check that SIGTERM is the problem. A process that loses work despite a generous grace is usually failing to receive the signal at all:
+
+- it ignores SIGTERM and only dies on SIGKILL
+- it is not PID 1 — an entrypoint wrapped in `sh -c` does not forward signals
+- it genuinely needs longer, which is what this knob is for
+
+Omitting `grace` keeps docker's own default. Voodu does not pass `-t 0`, which would mean "kill immediately" — the opposite of what an unset value asks for.
+
+## `timeout` — waiting for work in flight
+
+How long a rolling restart waits for a plugin to report that a replica has gone quiet.
+
+This one only does something when a plugin is watching the workload's replicas — [`trafik`](https://github.com/thadeu/voodu-trafik), for instance, which counts live connections and reports when the last one closes. Without such a plugin, `timeout` is inert and `grace` is the whole story.
+
+```hcl
+deployment "prod" "esl" {
+  image    = "ghcr.io/acme/esl:1.2"
+  replicas = 3
+  ports    = ["8084"]
+
+  drain {
+    timeout = "30m"   # an ESL call can run for a long time
+  }
+
+  trafik {
+    port = 8084
+  }
+}
+```
+
+Empty uses a two-minute default.
+
+**The wait never wedges a rollout.** A connection whose peer vanished without a FIN never closes, so the count never reaches zero. When the budget runs out the removal proceeds and the forced cut is logged — a deployment that cannot finish a roll is an outage of its own, and worse than the cut it was avoiding.
+
+## Both durations are validated at apply
+
+Unlike most durations in a manifest, an unparseable value here fails the parse instead of falling back:
+
+```
+deployment.drain.timeout: "30min" is not a duration (want e.g. "30s", "5m", "1h30m")
+```
+
+A probe interval quietly falling back to a default is a nuisance. A drain timeout doing the same would cut exactly the work the block was written to protect, in production, with nothing in the log.
+
+## What the rollout does with it
+
+With a `drain` block and a plugin watching, replacing one replica goes:
+
+```
+  bring the replacement up          ← deployment only, see below
+  wait for it to report ready
+  stop sending work to the old one
+  wait for its work to finish       ← drain.timeout
+  SIGTERM, then SIGKILL             ← drain.grace
+  remove
+```
+
+**Deployments bring the replacement up first** when nothing pins a host port — `ports = ["8080"]` publishes an ephemeral one, so replicas coexist. A pinned host port (`"3000:8080"`) means only one container can hold it, so the replacement waits for the old one to go.
+
+**Statefulsets never bring it up first, by design.** Each ordinal owns a named volume that survives container removal — that is what makes "a rolling restart preserves data" true. Two containers mounting one volume is corruption, not reduced downtime. They still drain and still honour `grace`; the ordinal is simply out of service while it is recreated.
+
+## See also
+
+- [probes](/docs/manifests/probes) — what "ready" means for the replacement
+- [Plugin blocks](/docs/manifests/plugin-blocks) — how a plugin comes to be watching a workload at all

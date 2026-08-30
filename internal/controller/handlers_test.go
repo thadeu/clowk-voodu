@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/plugins"
@@ -194,6 +195,22 @@ type fakeContainers struct {
 	// slots is the live runtime — the source of truth for what
 	// ListByIdentity returns. Keyed by container name.
 	slots map[string]*ContainerSlot
+
+	// ips is the voodu0 address per container name, for the IP
+	// addressing mode.
+	ips map[string]string
+
+	// removeHook lets a test observe when a container is removed,
+	// so the order of drain-then-remove can be asserted.
+	removeHook func(name string)
+
+	// removeGraces records the SIGTERM budget each removal was
+	// given, so a test can assert the manifest's grace arrived.
+	removeGraces map[string]time.Duration
+
+	// ops records create/remove calls in order, so a test can assert
+	// whether a rollout surged or replaced in place.
+	ops []string
 
 	// legacy tracks pre-M0 container names per AppID, exactly the
 	// shape ListLegacyByApp returns.
@@ -423,6 +440,7 @@ func (f *fakeContainers) Recreate(spec ContainerSpec) error {
 
 func (f *fakeContainers) Ensure(spec ContainerSpec) (bool, error) {
 	f.ensures = append(f.ensures, spec)
+	f.ops = append(f.ops, "ensure")
 
 	if f.ensureErr != nil {
 		return false, f.ensureErr
@@ -523,6 +541,7 @@ func (f *fakeContainers) Exec(name string, command []string, opts ExecOptions) (
 
 func (f *fakeContainers) Remove(name string) error {
 	f.removes = append(f.removes, name)
+	f.ops = append(f.ops, "remove")
 
 	delete(f.slots, name)
 
@@ -553,6 +572,25 @@ func (f *fakeContainers) ListByIdentity(kind, scope, name string) ([]ContainerSl
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 	return out, nil
+}
+
+// IP fakes the voodu0 address. Derived from the container name so a
+// test can assert which replica an address belongs to without keeping
+// a second map in sync.
+func (f *fakeContainers) RemoveWithGrace(name string, grace time.Duration) error {
+	if f.removeGraces != nil {
+		f.removeGraces[name] = grace
+	}
+
+	return f.Remove(name)
+}
+
+func (f *fakeContainers) IP(name string) (string, error) {
+	if ip, ok := f.ips[name]; ok {
+		return ip, nil
+	}
+
+	return "", fmt.Errorf("no ip for %s", name)
 }
 
 func (f *fakeContainers) Wait(name string) (int, error) {
@@ -624,8 +662,8 @@ func TestDeploymentHandler_SpawnsContainerWhenImageSet(t *testing.T) {
 	cm := &fakeContainers{}
 
 	h := &DeploymentHandler{
-		Store:       store,
-		Log:         quietLogger(),
+		Store: store,
+		Log:   quietLogger(),
 		WriteEnv: func(app string, pairs []string) (bool, error) {
 			writes = append(writes, envWrite{app, append([]string(nil), pairs...)})
 			return true, nil
@@ -738,9 +776,9 @@ func TestDeploymentHandler_InjectsAppIdentityEnv(t *testing.T) {
 
 func TestDeploymentHandler_DefaultsRestartPolicy(t *testing.T) {
 	cases := []struct {
-		name    string
-		input   string
-		want    string
+		name  string
+		input string
+		want  string
 	}{
 		{"unset → unless-stopped", "", "unless-stopped"},
 		{"explicit no preserved", "no", "no"},
@@ -951,7 +989,7 @@ func TestDeploymentHandler_NetworkModeExclusivity(t *testing.T) {
 		spec deploymentSpec
 	}{
 		{"host + networks", deploymentSpec{Image: "x:1", NetworkMode: "host", Networks: []string{"db"}}},
-		{"host + network",  deploymentSpec{Image: "x:1", NetworkMode: "host", Network:  "db"}},
+		{"host + network", deploymentSpec{Image: "x:1", NetworkMode: "host", Network: "db"}},
 		{"none + networks", deploymentSpec{Image: "x:1", NetworkMode: "none", Networks: []string{"voodu0"}}},
 	}
 

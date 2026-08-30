@@ -173,6 +173,15 @@ type deploymentSpec struct {
 	// refs the consumer touches. See statefulsetSpec.AssetDigests
 	// for the rationale and fallback behaviour.
 	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
+
+	// PluginBlocks are the blocks the core parser did not recognise,
+	// carried verbatim for the plugin that owns them. Decoded here so
+	// the rollout can ask those plugins to drain a replica before it
+	// is removed — see replicaDrainer.
+	PluginBlocks []nestedPluginBlock `json:"plugin_blocks,omitempty"`
+
+	// Drain is how long this workload's replicas get to wind down.
+	Drain *drainSpec `json:"drain,omitempty"`
 }
 
 // initContainerWireSpec mirrors manifest.InitContainerSpec. Lives
@@ -463,6 +472,16 @@ type DeploymentHandler struct {
 	// already-running release fails fast with a clear error
 	// instead of silently queueing.
 	releaseLocks sync.Map
+
+	// Drain takes a replica out of service before it is removed.
+	// Optional — nil skips the gate, which is the historical
+	// behaviour of removing first and hoping.
+	Drain *replicaDrainer
+
+	// PluginBlocks resolves a nested block to the plugin that owns
+	// it, so the reconcile can tell that plugin which replicas are
+	// live. Optional — nil means no workload here carries one.
+	PluginBlocks PluginBlockRegistry
 
 	// Webhooks is the on_deploy delivery seam. Optional —
 	// production wires HTTPWebhookPoster, tests pass a fake.
@@ -932,7 +951,185 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) (retErr er
 		webhookRelease = applyReleaseID
 	}
 
+	// Last thing, deliberately: whatever plugin claimed a block on this
+	// workload learns the replica set that survived this reconcile, not
+	// the one it started with.
+	//
+	// An error here fails the reconcile so it retries. The deployment
+	// itself is already correct, but a load balancer that never heard
+	// about the new replicas is a silent outage — better to be seen
+	// failing than to look finished.
+	if err := h.publishEndpoints(ctx, KindDeployment, ev.Scope, ev.Name, ev.Manifest.Spec); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// readinessWaitTimeout bounds how long a surging rollout waits for a
+// replacement replica before retiring the one it replaces.
+//
+// A replica that never reports ready is a deploy that is going to fail
+// anyway; waiting past this point only delays the operator finding
+// out. Deliberately not a knob yet — the probe spec already carries
+// the workload's own idea of how long startup takes, and a second
+// number that can disagree with it is worth avoiding until something
+// asks for one.
+var readinessWaitTimeout = 2 * time.Minute
+
+// awaitReplicaReady blocks until the replacement replica reports
+// ready, or the budget runs out.
+//
+// A deployment with no probes declared reports ready immediately —
+// that is the registry's own rule, and it is the honest answer: with
+// nothing to check, the platform cannot know more than "the container
+// started".
+//
+// Never fails the roll. A replacement that will not come up is a
+// problem the next reconcile and the probe alerts will surface;
+// wedging the rollout on it would turn a bad deploy into a stuck one.
+func (h *DeploymentHandler) awaitReplicaReady(ctx context.Context, containerName string) {
+	if h.Probes == nil {
+		return
+	}
+
+	deadline := time.Now().Add(readinessWaitTimeout)
+
+	for {
+		if st, ok := h.Probes.LookupReadiness(containerName); ok && st.Ready {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			h.logf("replica %s did not report ready within %s, retiring its predecessor anyway", containerName, readinessWaitTimeout)
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(readinessPollInterval):
+		}
+	}
+}
+
+// readinessPollInterval is how often the surge gate re-checks. Short
+// enough that a fast starter is not held back by the poll, long enough
+// that a slow one costs nothing.
+var readinessPollInterval = 250 * time.Millisecond
+
+// drainReplica runs the pre-removal gate for one replica.
+func (h *DeploymentHandler) drainReplica(ctx context.Context, kind Kind, scope, name string, spec deploymentSpec, replicaID string) error {
+	if h.Drain == nil || len(spec.PluginBlocks) == 0 {
+		return nil
+	}
+
+	// Re-encoded rather than threaded through as raw JSON: the rollout
+	// already works from the typed spec, and the drainer only reads the
+	// blocks it was handed.
+	payload, err := json.Marshal(struct {
+		PluginBlocks []nestedPluginBlock `json:"plugin_blocks"`
+	}{PluginBlocks: spec.PluginBlocks})
+
+	if err != nil {
+		return fmt.Errorf("encode plugin blocks for drain: %w", err)
+	}
+
+	return h.Drain.drain(ctx, kind, scope, name, payload, replicaID, h.drainBudget(spec))
+}
+
+// publishEndpoints hands the current live replicas to the plugins that
+// declared a block on this workload. No-op when nothing did.
+func (h *DeploymentHandler) publishEndpoints(ctx context.Context, kind Kind, scope, name string, spec json.RawMessage) error {
+	if h.PluginBlocks == nil || h.Containers == nil {
+		return nil
+	}
+
+	// Re-listed rather than reusing the slice from the top of apply:
+	// that one predates this reconcile's creates and recreates, and
+	// publishing it would hand the plugin a set that no longer exists.
+	live, err := h.Containers.ListByIdentity(string(kind), scope, name)
+
+	if err != nil {
+		return Transient(fmt.Errorf("list replicas for endpoint publish: %w", err))
+	}
+
+	pub := &endpointPublisher{
+		Registry:   h.PluginBlocks,
+		Containers: h.Containers,
+		logf:       h.logf,
+	}
+
+	return pub.publish(ctx, kind, scope, name, spec, live)
+}
+
+// drainSpec mirrors manifest.DrainSpec on the wire.
+//
+// Durations stay strings here because that is what the store holds.
+// The parser already rejected anything unparseable; a bad value
+// reaching this far came from an older CLI or a hand-written store
+// write, and is reported rather than obeyed.
+type drainSpec struct {
+	Timeout string `json:"timeout,omitempty"`
+	Grace   string `json:"grace,omitempty"`
+}
+
+// drainBudget is how long the rollout waits for plugins to drain one
+// replica. Zero lets the drainer apply its own default.
+func (h *DeploymentHandler) drainBudget(spec deploymentSpec) time.Duration {
+	return drainBudgetOf(spec.Drain, h.logf)
+}
+
+// drainBudgetOf and graceOf are shared by both rollouts. A statefulset
+// winds down the same way a deployment does; only the surge question
+// differs between them.
+func drainBudgetOf(spec *drainSpec, logf func(string, ...any)) time.Duration {
+	return parseDrainDuration(spec, func(d *drainSpec) string { return d.Timeout }, "drain.timeout", logf)
+}
+
+func graceOf(spec *drainSpec, logf func(string, ...any)) time.Duration {
+	return parseDrainDuration(spec, func(d *drainSpec) string { return d.Grace }, "drain.grace", logf)
+}
+
+// parseDrainDuration returns zero for absent or unparseable values, so
+// the caller falls back to its own default.
+//
+// The parser already rejects a bad duration; one reaching here came
+// from an older CLI or a hand-written store write, and is reported
+// rather than obeyed in silence.
+func parseDrainDuration(spec *drainSpec, pick func(*drainSpec) string, field string, logf func(string, ...any)) time.Duration {
+	if spec == nil {
+		return 0
+	}
+
+	raw := pick(spec)
+
+	if raw == "" {
+		return 0
+	}
+
+	d, err := time.ParseDuration(raw)
+
+	if err != nil {
+		if logf != nil {
+			logf("%s %q is not a duration, using the default", field, raw)
+		}
+
+		return 0
+	}
+
+	return d
+}
+
+// removeReplica takes a container away, giving the process whatever
+// SIGTERM grace the workload asked for.
+//
+// This is the knob that needs no load balancer and no plugin at all: a
+// worker that must finish an in-flight write on deploy is asking for a
+// longer gap between SIGTERM and SIGKILL, and nothing else.
+func (h *DeploymentHandler) removeReplica(spec deploymentSpec, name string) error {
+	return h.Containers.RemoveWithGrace(name, graceOf(spec.Drain, h.logf))
 }
 
 // setOf is the obvious string-slice → set helper. Used by apply() to
@@ -1360,6 +1557,16 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 	frozen, _ := h.Store.GetFrozenReplicaIDs(ctx, KindDeployment, scope, name)
 	frozenSet := buildFrozenSet(frozen)
 
+	// Surge — bringing the replacement up before retiring the replica
+	// it replaces — is only possible when nothing pins a host port.
+	// See canSurge; a deployment that pins one was already limited to
+	// a single replica, so it loses nothing here.
+	surge := canSurge(spec)
+
+	if !surge {
+		h.logf("deployment/%s pins a host port, replacing replicas in place (no surge)", name)
+	}
+
 	for i, s := range live {
 		// Frozen pod stays put across rolling restarts — same
 		// container, same data, same (now-stale) config.
@@ -1381,15 +1588,36 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 			ReleaseID:    releaseID,
 		})
 
-		// Stop the old container's probes BEFORE removing the
-		// container — otherwise the runner might fire one last
-		// restart against a container that's being deleted, and
-		// docker would error noisily.
-		h.Probes.MarkPlannedTeardown(app, s.Name)
-		h.Probes.Stop(app, s.Name)
+		// retireOld takes the outgoing replica out of service.
+		//
+		// Probes stop first: otherwise the runner might fire one last
+		// restart against a container being deleted, and docker would
+		// error noisily. Then whoever is sending work to this replica
+		// is asked to stop, and given time for what is already in
+		// flight to finish — the only moment that can happen, since a
+		// plugin cannot know a removal is coming and by the time it
+		// notices the container is gone the connections are cut.
+		retireOld := func() error {
+			h.Probes.MarkPlannedTeardown(app, s.Name)
+			h.Probes.Stop(app, s.Name)
 
-		if err := h.Containers.Remove(s.Name); err != nil {
-			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
+			if err := h.drainReplica(ctx, KindDeployment, scope, name, spec, s.Identity.ReplicaID); err != nil {
+				return err
+			}
+
+			if err := h.removeReplica(spec, s.Name); err != nil {
+				return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
+			}
+
+			return nil
+		}
+
+		// Without surge the old container has to go first, because it
+		// is holding something the new one needs — a pinned host port.
+		if !surge {
+			if err := retireOld(); err != nil {
+				return err
+			}
 		}
 
 		podEnv := MergePodEnv(
@@ -1472,9 +1700,21 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// config naturally.
 		h.Probes.Start(app, newName, spec.Probes, spec.OnProbe)
 
+		// With surge the old replica is still serving. Wait until the
+		// replacement can take over before taking it away — that wait
+		// IS the rollout gate, which is why the fixed pause below only
+		// applies to the path that has no gate.
+		if surge {
+			h.awaitReplicaReady(ctx, newName)
+
+			if err := retireOld(); err != nil {
+				return err
+			}
+		}
+
 		h.logf("deployment/%s replica %s replaced by %s", name, s.Name, newName)
 
-		if i < len(live)-1 {
+		if !surge && i < len(live)-1 {
 			time.Sleep(slotRolloutPause)
 		}
 	}

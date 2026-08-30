@@ -19,6 +19,8 @@
 // stay free of HCL-specific tags.
 package manifest
 
+import "encoding/json"
+
 // DeploymentSpec is an app the controller should run as a container.
 //
 // Shape: the root holds runtime concerns (replicas, env, networking,
@@ -254,6 +256,21 @@ type DeploymentSpec struct {
 	// this field — the apply pipeline stamps it post plugin-expand.
 	// Filtered out by `vd describe` (underscore prefix = internal).
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+
+	// PluginBlocks carries blocks the core parser does not recognise,
+	// verbatim, for the controller to route to the plugin that owns
+	// them. Order is the order the operator wrote them: two blocks of
+	// the same type are two distinct resources (two listeners on two
+	// ports), so a map keyed by type would silently drop one.
+	//
+	// The core never interprets Spec. That is what keeps a nested
+	// plugin block from becoming a core contract every plugin of that
+	// family has to satisfy — the core learns "this workload has a
+	// block belonging to plugin X", nothing about what X does.
+	PluginBlocks []PluginBlock `yaml:"plugin_blocks,omitempty" json:"plugin_blocks,omitempty"`
+
+	// Drain governs how a replica winds down before it is removed.
+	Drain *DrainSpec `yaml:"drain,omitempty" json:"drain,omitempty"`
 }
 
 // InitContainerSpec describes one ordered prep step that must run
@@ -1035,6 +1052,13 @@ type StatefulsetSpec struct {
 
 	// AssetDigests is server-stamped — see DeploymentSpec.AssetDigests.
 	AssetDigests map[string]string `yaml:"-" json:"_asset_digests,omitempty"`
+
+	// PluginBlocks — see DeploymentSpec.PluginBlocks. A statefulset
+	// rolls its replicas too, so it needs the same door.
+	PluginBlocks []PluginBlock `yaml:"plugin_blocks,omitempty" json:"plugin_blocks,omitempty"`
+
+	// Drain — see DeploymentSpec.Drain.
+	Drain *DrainSpec `yaml:"drain,omitempty" json:"drain,omitempty"`
 }
 
 // applyDefaults fills implicit values for the build-mode case (mirror
@@ -1432,4 +1456,51 @@ type IngressTLS struct {
 	// issue-cert-on-request behaviour; Ask is the gating callback URL.
 	OnDemand bool   `yaml:"on_demand,omitempty" json:"on_demand,omitempty"`
 	Ask      string `yaml:"ask,omitempty"       json:"ask,omitempty"`
+}
+
+// PluginBlock is one block found inside a core kind that the core
+// parser does not recognise — `trafik {}` inside a deployment, and
+// whatever a future plugin declares.
+//
+// It is carried, not interpreted. The controller looks up a plugin
+// named Type and hands it Spec; if no such plugin is installed, the
+// apply fails there with a message naming what is missing, which is
+// where a typo surfaces.
+type PluginBlock struct {
+	// Type is the block type, which is also the plugin name.
+	Type string `yaml:"type" json:"type"`
+
+	// Labels are the block's HCL labels, following the same
+	// convention plugin kinds use at the top level.
+	Labels []string `yaml:"labels,omitempty" json:"labels,omitempty"`
+
+	// Spec is the block body as JSON. Opaque to the core.
+	Spec json.RawMessage `yaml:"spec,omitempty" json:"spec,omitempty"`
+}
+
+// DrainSpec is how long a replica gets to finish what it was doing
+// before the platform takes it away.
+//
+// Two knobs, because there are two different waits and a workload
+// usually wants only one of them:
+//
+//   - Grace is the gap between SIGTERM and SIGKILL. It needs no load
+//     balancer and no plugin: a worker that must finish an in-flight
+//     write on deploy is asking for this and nothing else.
+//   - Timeout is how long the rollout waits for a plugin to report the
+//     replica has gone quiet — the connection-draining path.
+//
+// Both are time.ParseDuration strings, and unlike most durations in
+// this package they are validated at parse. Elsewhere an unparseable
+// value falls back to a default, which is harmless for a probe
+// interval; here it would silently cut exactly the work the operator
+// wrote the block to protect.
+type DrainSpec struct {
+	// Timeout bounds the wait for a plugin to finish draining one
+	// replica. Empty uses the platform default.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+
+	// Grace is what `docker stop` is given between SIGTERM and
+	// SIGKILL. Empty uses docker's own default of 10s.
+	Grace string `yaml:"grace,omitempty" json:"grace,omitempty"`
 }

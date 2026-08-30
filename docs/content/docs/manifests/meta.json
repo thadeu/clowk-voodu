@@ -18,12 +18,14 @@
     "resources",
     "logs",
     "probes",
+    "drain",
     "init",
     "autoscale",
     "release",
     "on-deploy",
     "on-probe",
     "depends-on",
-    "config"
+    "config",
+    "plugin-blocks"
   ]
 }

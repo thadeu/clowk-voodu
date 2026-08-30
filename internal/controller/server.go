@@ -274,8 +274,13 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	depHandler := &DeploymentHandler{
-		Store: store,
-		Log:   s.cfg.Logger,
+		Store:        store,
+		Log:          s.cfg.Logger,
+		PluginBlocks: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+		Drain: &replicaDrainer{
+			Registry: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+			logf:     s.cfg.Logger.Printf,
+		},
 		WriteEnv: func(app string, pairs []string) (bool, error) {
 			envFile := paths.AppEnvFile(app)
 			// Load pre-image first so we can diff against the merged
@@ -326,8 +331,13 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	stsHandler := &StatefulsetHandler{
-		Store: store,
-		Log:   s.cfg.Logger,
+		Store:        store,
+		Log:          s.cfg.Logger,
+		PluginBlocks: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+		Drain: &replicaDrainer{
+			Registry: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+			logf:     s.cfg.Logger.Printf,
+		},
 		WriteEnv: func(app string, pairs []string) (bool, error) {
 			envFile := paths.AppEnvFile(app)
 			before, _ := envfile.Load(envFile)

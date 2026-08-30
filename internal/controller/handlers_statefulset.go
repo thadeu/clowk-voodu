@@ -43,6 +43,16 @@ type StatefulsetHandler struct {
 
 	Containers ContainerManager
 
+	// PluginBlocks — see DeploymentHandler.PluginBlocks. A statefulset's
+	// replicas move too, so its consumers need the same notification.
+	PluginBlocks PluginBlockRegistry
+
+	// Drain — see DeploymentHandler.Drain. A statefulset cannot surge,
+	// since it reuses the ordinal-derived container name and two
+	// containers cannot share one, so draining before removal is the
+	// only protection its rollout can have.
+	Drain *replicaDrainer
+
 	// ControllerURL flows from the API server's wiring down to the
 	// per-pod env builder so every managed container can reach
 	// /describe, /config, /plugin/... without operator-set env.
@@ -155,6 +165,11 @@ type statefulsetSpec struct {
 	// otherwise it falls back to LookupAssetDigests (/status path)
 	// for legacy manifests applied before stamping was wired up.
 	AssetDigests map[string]string `json:"_asset_digests,omitempty"`
+
+	// PluginBlocks and Drain — see deploymentSpec. A statefulset
+	// carries the same two, and winds down the same way.
+	PluginBlocks []nestedPluginBlock `json:"plugin_blocks,omitempty"`
+	Drain        *drainSpec          `json:"drain,omitempty"`
 }
 
 type volumeClaim struct {
@@ -443,6 +458,27 @@ func (h *StatefulsetHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 		if err := h.appendReleaseRecord(ctx, app, record); err != nil {
 			h.logf("statefulset/%s release record persist failed: %v", ev.Name, err)
+		}
+	}
+
+	// See DeploymentHandler.apply: the plugins that claimed a block
+	// learn the replica set this reconcile produced, and a failure
+	// here retries rather than looking finished.
+	if h.PluginBlocks != nil && h.Containers != nil {
+		live, err := h.Containers.ListByIdentity(string(KindStatefulset), ev.Scope, ev.Name)
+
+		if err != nil {
+			return Transient(fmt.Errorf("list replicas for endpoint publish: %w", err))
+		}
+
+		pub := &endpointPublisher{
+			Registry:   h.PluginBlocks,
+			Containers: h.Containers,
+			logf:       h.logf,
+		}
+
+		if err := pub.publish(ctx, KindStatefulset, ev.Scope, ev.Name, ev.Manifest.Spec, live); err != nil {
+			return err
 		}
 	}
 
@@ -805,6 +841,31 @@ func (h *StatefulsetHandler) recreateOrdinalsIfSpecChanged(ctx context.Context, 
 	return true, h.writeStatus(ctx, app, spec.Image, hash, statefulsetReplicas(spec))
 }
 
+// drainReplica runs the pre-removal gate for one pod. No-op when
+// nothing declared a block.
+func (h *StatefulsetHandler) drainReplica(ctx context.Context, scope, name string, spec statefulsetSpec, replicaID string) error {
+	if h.Drain == nil || len(spec.PluginBlocks) == 0 {
+		return nil
+	}
+
+	payload, err := json.Marshal(struct {
+		PluginBlocks []nestedPluginBlock `json:"plugin_blocks"`
+	}{PluginBlocks: spec.PluginBlocks})
+
+	if err != nil {
+		return fmt.Errorf("encode plugin blocks for drain: %w", err)
+	}
+
+	return h.Drain.drain(ctx, KindStatefulset, scope, name, payload, replicaID, drainBudgetOf(spec.Drain, h.logf))
+}
+
+// removeReplica takes a pod away with whatever SIGTERM grace the
+// workload asked for. A database given ten seconds to flush is the
+// original version of the problem the drain block exists for.
+func (h *StatefulsetHandler) removeReplica(spec statefulsetSpec, name string) error {
+	return h.Containers.RemoveWithGrace(name, graceOf(spec.Drain, h.logf))
+}
+
 // rollingReplaceTopDown iterates ordinals from highest to lowest
 // and replaces each pod in place. Per-(scope,name) lock prevents
 // two concurrent reconciles from racing on the same fleet — a
@@ -885,7 +946,13 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 		// survive container removal, so the per-pod claims
 		// re-attach to the same data: this is what makes the
 		// "rolling restart preserves data" guarantee real.
-		if err := h.Containers.Remove(s.Name); err != nil {
+		// Ask whoever is sending work to this pod to stop, and wait
+		// for what is in flight to finish, before the pod goes away.
+		if err := h.drainReplica(ctx, scope, name, spec, s.Identity.ReplicaID); err != nil {
+			return err
+		}
+
+		if err := h.removeReplica(spec, s.Name); err != nil {
 			return fmt.Errorf("remove %s during rolling restart: %w", s.Name, err)
 		}
 

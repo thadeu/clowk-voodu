@@ -1,0 +1,93 @@
+---
+title: Plugin blocks
+description: A block a plugin owns, written inside the workload it configures — how it is validated, and what the controller tells the plugin at runtime.
+---
+
+A block voodu does not recognise inside a `deployment` or `statefulset` is not an error. It belongs to the plugin of the same name, and voodu carries it through untouched:
+
+```hcl
+deployment "prod" "esl" {
+  image    = "ghcr.io/acme/esl:1.2"
+  replicas = 3
+  ports    = ["8084"]
+
+  trafik {
+    port = 8084
+  }
+}
+```
+
+`trafik` is not a voodu kind. It is a block the [voodu-trafik](https://github.com/thadeu/voodu-trafik) plugin owns, and voodu knows only that it belongs to a plugin by that name.
+
+## Why inside the workload
+
+The alternative was a separate top-level resource pointing back at the deployment. Nesting removes three problems at once: there is no reference that can name a workload nobody applied, no ordering question between two resources at apply time, and no orphan left behind when the deployment goes away.
+
+It also puts the block in the right company. `probes`, `autoscale`, `resources` and `on_deploy` are all blocks on the workload they change, and for the same reason.
+
+## What voodu does and does not know
+
+Voodu never looks inside the block. It knows the block's name, its labels and its body as opaque JSON — enough to find the plugin that owns it, and nothing about what that plugin does with it.
+
+That line is what keeps a plugin block from becoming a contract every plugin of its family has to satisfy. A future `voodu-haproxy` declares `haproxy {}` and needs no change in voodu at all.
+
+## Validation happens at apply
+
+At apply time voodu hands the block to its plugin, which validates and normalises it. The plugin's refusal fails the apply, with the plugin's own message:
+
+```
+deployment/prod/esl: trafik block: prod/esl pins a host port, so it can only
+ever run one replica — a load balancer in front of it has nothing to balance
+```
+
+A block whose plugin is not installed also fails, naming what is missing:
+
+```
+deployment/prod/esl: block "trafik" belongs to a plugin named "trafik", which
+is not installed — run `vd plugins:install <source>` or remove the block
+```
+
+That second message is where a typo lands. `probs {}` is no longer "unexpected block" from the parser — it is "no plugin named probs", which is closer to what went wrong.
+
+The normalised block is what gets stored, so defaults the plugin filled in are visible in `vd describe` rather than recomputed on every reconcile.
+
+## What the plugin learns at runtime
+
+The manifest cannot describe which replicas are up. That set changes on every roll, every scale and every crash, and the plugin has no way to observe it. Voodu is the only place where the desired state and the running containers meet, so it publishes the live set after each reconcile:
+
+```json
+{
+  "kind": "deployment", "scope": "prod", "name": "esl",
+  "block": { "type": "trafik", "spec": { "port": 8084, "bind": "0.0.0.0:8084" } },
+  "endpoints": [
+    { "replica_id": "a1", "address": "172.18.0.5:8084" },
+    { "replica_id": "b2", "address": "172.18.0.6:8084" }
+  ]
+}
+```
+
+Replicas that exist but are not running are left out — an address with nothing listening is a share of refused requests, not a replica.
+
+Addresses are IPs by default, because a plugin running on the host network resolves nothing docker knows. A plugin that sits on `voodu0` asks for `addressing = "dns"` and gets container names instead, which survive a container being recreated at a different address.
+
+## Before a replica is removed
+
+A plugin cannot tell that a removal is coming, and by the time it notices the container is gone the work is already cut. So the rollout asks first, and waits — see [`drain`](/docs/manifests/drain) for the budget and what happens when it runs out.
+
+## Several blocks, and labels
+
+A block may appear more than once, and labels name each one:
+
+```hcl
+deployment "prod" "esl" {
+  trafik "sip"  { port = 5060 }
+  trafik "http" { port = 8084 }
+}
+```
+
+Order is preserved, because two blocks of the same type are two distinct things — collapsing them by name would silently drop one.
+
+## See also
+
+- [drain](/docs/manifests/drain) — the wind-down budget the rollout honours
+- [Build your own plugin](/docs/plugins/build-your-own)
