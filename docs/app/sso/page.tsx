@@ -260,6 +260,9 @@ function Handover() {
       <figure className="m-0">
         <img
           src="/sso/screen.png"
+          width={2000}
+          height={1131}
+          loading="lazy"
           alt="The Single sign-on screen: an Authentication card showing Anonymous with fields for a publishable key and the owner email, beside an Identity panel explaining Clowk"
           className="w-full h-auto rounded-2xl border border-voodu-line"
         />

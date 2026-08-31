@@ -137,8 +137,49 @@ function Hero() {
         <p className="mt-5 text-voodu-fg-mute font-mono text-[12px]">
           Offline licence · no phone-home · nothing to open outbound
         </p>
+
+        <ProductShot />
       </div>
     </section>
+  );
+}
+
+// The dashboard itself, under the pitch rather than beside it.
+//
+// A two-column hero would have put this in half the width, and at 2000px of
+// charts, pod rows and alert thresholds it is a picture whose whole argument is
+// the detail — shrunk, it becomes a grey rectangle that says "a dashboard
+// exists". Full width, directly after the CTA, is where it answers the question
+// the CTA just raised.
+//
+// The bottom fade hands the image off into the section below instead of
+// stopping at a hard edge. There was a radial glow above it too, and it went:
+// its brightest point sat over empty background ABOVE the figure, so it read as
+// a grey smudge floating between the footnote and the screenshot rather than as
+// light behind anything. The rest of this site is flat — borders, no glows —
+// and the flourish was mine, not the design's.
+function ProductShot() {
+  return (
+    <div className="relative mt-14 sm:mt-16">
+      <figure className="relative m-0 rounded-2xl border border-voodu-line overflow-hidden bg-voodu-code">
+        <img
+          src="/license/overview.png"
+          width={2000}
+          height={1200}
+          fetchPriority="high"
+          alt="The Voodu dashboard overview: CPU, memory and disk cards with sparklines, a table of running pods, recent incidents, alerts and dashboards"
+          className="block w-full h-auto"
+        />
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-20 sm:h-28 bg-gradient-to-b from-transparent to-voodu-bg"
+        />
+      </figure>
+
+      <figcaption className="mt-3.5 text-voodu-fg-mute text-[12.5px] font-mono">
+        One server, three pods. The same screen at forty.
+      </figcaption>
+    </div>
   );
 }
 
@@ -262,6 +303,9 @@ function Activation() {
       <figure className="m-0">
         <img
           src="/license/activate.png"
+          width={2000}
+          height={1010}
+          loading="lazy"
           alt="The License screen on the free tier: a Plan card showing Free with its limits and an Activate a licence field, beside an Enterprise panel"
           className="w-full h-auto rounded-2xl border border-voodu-line"
         />
