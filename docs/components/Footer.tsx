@@ -3,9 +3,9 @@ export default function Footer() {
     <footer className="border-t border-voodu-line py-10 pb-14 text-voodu-fg-mute font-mono text-[12.5px]">
       <div className="max-w-[1180px] mx-auto px-5 sm:px-8 md:px-10 lg:px-14 flex flex-wrap justify-between items-center gap-4">
         <div className="flex items-center gap-2.5">
-          <img src="icons/mono-white-512.png" alt="Voodu icon" className="w-10 h-10" />
+          <img src="/icons/mono-white-512.png" alt="Voodu icon" className="w-10 h-10" />
 
-          <span>voodu — self-hosted deploys, MIT.</span>
+          <span>voodu — self-hosted deploys, Elastic License 2.0.</span>
         </div>
         <div className="flex gap-5">
           <a

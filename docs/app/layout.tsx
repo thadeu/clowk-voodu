@@ -48,7 +48,7 @@ export const metadata: Metadata = {
   twitter: {
     card: 'summary_large_image',
     title: 'Voodu — Self-hosted PaaS, commitless deploys',
-    description: 'One HCL file. One voodu apply. No git push. 100% self-hosted, MIT.',
+    description: 'One HCL file. One voodu apply. No git push. 100% self-hosted, Elastic License 2.0.',
     images: [OG_IMAGE],
   },
   manifest: '/manifest.json',

@@ -59,7 +59,7 @@ const qs: { q: string; a: ReactNode }[] = [
   },
   {
     q: 'License?',
-    a: <>MIT. Self-hosted. No cloud tier, no usage telemetry, no rug pulls planned.</>,
+    a: <>Elastic License 2.0. Read it, run it, modify it for your own use, self-host it for free — the one thing it stops is reselling voodu as a competing hosted product. No cloud tier, no usage telemetry.</>,
   },
 ];
 

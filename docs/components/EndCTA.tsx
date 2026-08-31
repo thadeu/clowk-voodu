@@ -19,7 +19,7 @@ export default function EndCTA() {
           </a>
         </div>
         <p className="mt-4.5 text-voodu-fg-mute font-mono text-[12px]">
-          MIT · v0.9.2 · made by{' '}
+          Elastic License 2.0 · v0.18.8 · made by{' '}
           <a
             href="https://github.com/thadeu"
             target="_blank"

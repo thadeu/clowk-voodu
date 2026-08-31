@@ -14,7 +14,7 @@ export default function Hero() {
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] gap-12 items-end">
         <div>
           <span className="inline-flex items-center gap-2 font-mono text-[12px] tracking-[0.04em] text-voodu-fg-dim mb-6 py-1 pl-1.5 pr-2.5 border border-voodu-line rounded-full whitespace-nowrap">
-            <img src="icons/loading-64.gif" alt="Voodu icon" className="w-4 h-4" />
+            <img src="/icons/loading-64.gif" alt="Voodu icon" className="w-4 h-4" />
             {VOODU_VERSION} · <code className="font-mono text-voodu-fg ml-2">voodu apply</code>, no git push
           </span>
 
@@ -49,7 +49,7 @@ export default function Hero() {
           </div>
 
           <div className="mt-5 flex flex-wrap gap-2">
-            <Pill>MIT licensed</Pill>
+            <Pill>Elastic License 2.0</Pill>
             <Pill>Linux · macOS</Pill>
             <Pill>Go · Caddy · Docker</Pill>
             <Pill accent>100% self-hosted</Pill>

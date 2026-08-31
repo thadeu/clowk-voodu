@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-08-31T00:22:21.028Z
+Last built: 2026-08-31T16:54:12.746Z
 
 ---
 # Introduction
@@ -51,7 +51,7 @@ voodu apply -f voodu -r prod-1
 - **TLS out of the box.** Add `tls {}` and Voodu cuts a Let's Encrypt cert via Caddy. On-demand wildcards.
 - **k8s shape, not k8s ops.** Same reconciliation loop, none of the CNI/Helm/operator bill.
 - **Laptop or CI, same command.** The official GitHub Action is a thin wrapper around `voodu apply` — nothing to learn twice, and no drift between how you deploy and how the pipeline does.
-- **100% self-hosted, MIT.** Single Go binary, embedded etcd, no cloud tier, no telemetry.
+- **100% self-hosted, Elastic License 2.0.** Single Go binary, embedded etcd, no cloud tier, no telemetry.
 
 ## Where apply runs
 
@@ -11105,7 +11105,7 @@ No. Zero telemetry, zero analytics. There is no cloud control plane.
 
 ## What's the license?
 
-MIT. Self-hosted. No cloud tier, no usage telemetry, no rug pulls planned.
+Elastic License 2.0. Read it, run it, modify it for your own use, self-host it for free — the one thing it stops is reselling voodu as a competing hosted product. No cloud tier, no usage telemetry.
 
 ## How big can a deployment get?
 
