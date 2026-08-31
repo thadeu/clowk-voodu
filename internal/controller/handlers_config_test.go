@@ -58,9 +58,9 @@ func TestDeploymentHandler_LinkEnv_MergesEtcdConfig(t *testing.T) {
 	got := pairsToMap(captured[0].Pairs)
 
 	for _, c := range []struct{ key, want string }{
-		{"FOO", "manifest"},          // manifest wins
-		{"SCOPE_KEY", "scope-only"},  // unique to scope, kept
-		{"APP_KEY", "app-only"},      // unique to app, kept
+		{"FOO", "manifest"},         // manifest wins
+		{"SCOPE_KEY", "scope-only"}, // unique to scope, kept
+		{"APP_KEY", "app-only"},     // unique to app, kept
 		{"MANIFEST_KEY", "manifest-only"},
 	} {
 		if got[c.key] != c.want {

@@ -83,7 +83,7 @@ func TestPluginProxy_ForwardsGET(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/hep3/voip/main/calls?q=INVITE", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestPluginProxy_ForwardsPOSTBody(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/pat/v1/hep3/voip/main/ingest", strings.NewReader("payload-123"))
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestPluginProxy_RootPath(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/hep3/voip/main", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -202,7 +202,7 @@ func TestPluginProxy_ResolveError(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/hep3/voip/main/calls", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -227,7 +227,7 @@ func TestPluginProxy_UnknownPrefixFallsThrough(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/notaplugin/a/b", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -259,7 +259,7 @@ func TestPluginProxy_ReservedPrefixServesCore(t *testing.T) {
 
 	// /api/pat/v1/pods is the core pods list — must NOT be proxied.
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/pods", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -309,7 +309,7 @@ func TestPluginProxy_DynamicPortFromSpec(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/hep3/voip/main/calls", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -341,7 +341,7 @@ func TestPluginProxy_DynamicPortUnresolvable(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/hep3/voip/main/calls", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

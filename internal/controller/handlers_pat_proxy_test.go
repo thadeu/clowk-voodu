@@ -1,7 +1,14 @@
 package controller
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -55,8 +62,40 @@ func newTestPATAPI(t *testing.T) (api *API, plain string, pods *fakePodsLister, 
 }
 
 // patBearer returns the Authorization header value for a plain token.
-func patBearer(plain string) string {
-	return "Bearer " + plain
+// patSign signs a built request the way a real client does.
+//
+// Takes the request rather than just the token because a signature covers the
+// method, path and query — a helper that only saw the token could not produce
+// one, which is the point: there is no header a caller can craft without
+// knowing what the request is.
+func patSign(req *http.Request, plain string) *http.Request {
+	sum := sha256.Sum256([]byte(plain))
+	key := hex.EncodeToString(sum[:])
+	id, _ := ParsePATToken(plain)
+	ts := time.Now().Unix()
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	nonce := hex.EncodeToString(buf)
+
+	// Read the body to sign it, then put it back — signing nil while sending
+	// bytes is the bug this helper exists to not have.
+	var body []byte
+
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	canonical := signatureCanonical(req.Method, req.URL.Path, req.URL.Query(), body, ts, nonce)
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(canonical))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	req.Header.Set("Authorization",
+		fmt.Sprintf("Voodu id=%s, ts=%d, nonce=%s, sig=%s", id, ts, nonce, sig))
+
+	return req
 }
 
 // TestPATPlane_PodsRequiresAuth pins that the PAT plane refuses
@@ -88,7 +127,7 @@ func TestPATPlane_PodsHappyPath(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/pods", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -146,7 +185,7 @@ func TestPATPlane_ReadScopeCannotRestart(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/pat/v1/pods/x.1/restart", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -173,7 +212,7 @@ func TestPATPlane_RestartResolvesContainerName(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost,
 		ts.URL+"/api/pat/v1/pods/clowk-web.a3f9/restart", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -203,7 +242,7 @@ func TestPATPlane_RestartUnknownContainerName(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost,
 		ts.URL+"/api/pat/v1/pods/nonexistent.zzzz/restart", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -238,7 +277,7 @@ func TestPATPlane_RestartRejectsNonRestartableKind(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/pat/v1/pods/j-1/restart", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -273,7 +312,7 @@ func TestPATPlane_RestartRateLimit(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		req, _ := http.NewRequest(http.MethodPost, url, nil)
-		req.Header.Set("Authorization", patBearer(plain))
+		patSign(req, plain)
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -307,7 +346,7 @@ func TestPATPlane_StatsRouteReachable(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/stats", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -334,7 +373,7 @@ func TestPATPlane_MetricsRouteReachable(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/metrics?source=system&metric=cpu_percent&range=1h", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -361,7 +400,7 @@ func TestPATPlane_SystemRouteReachable(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/system", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -394,7 +433,7 @@ func TestPATPlane_RevokedTokenRejected(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/pat/v1/pods", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -432,7 +471,7 @@ func TestPATPlane_OrchestrationRoutesNotMounted(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			req, _ := http.NewRequest(tc.method, ts.URL+tc.path, nil)
-			req.Header.Set("Authorization", patBearer(plain))
+			patSign(req, plain)
 
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -466,7 +505,7 @@ func TestPATPlane_LogsRouteReachable(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet,
 		ts.URL+"/api/pat/v1/pods/clowk-web.a3f9/logs", nil)
-	req.Header.Set("Authorization", patBearer(plain))
+	patSign(req, plain)
 
 	// Short deadline so we don't hang if the logs streamer tries
 	// to actually exec docker.

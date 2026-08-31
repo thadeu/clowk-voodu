@@ -1109,4 +1109,3 @@ func TestStatefulsetHandler_NoControllerURLLeavesEnvUnset(t *testing.T) {
 		t.Errorf("VOODU_CONTROLLER_URL must NOT appear when handler.ControllerURL is empty (would leak empty string)")
 	}
 }
-

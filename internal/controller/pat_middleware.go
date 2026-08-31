@@ -6,12 +6,16 @@
 //
 // Verification flow per request:
 //
-//  1. Read `Authorization: Bearer <token>` header.
-//  2. ParsePATToken to extract the public 8-char ID. Malformed
+//  1. Parse `Authorization: Voodu id=…, ts=…, nonce=…, sig=…`. The token
+//     itself never arrives — the caller proves it holds one instead, so an
+//     intercepted request is one request rather than a credential.
+//  2. Reject a timestamp outside the clock window, then look the record
+//     up by the id in the header. Malformed
 //     tokens get 401 with a generic message — don't tell an
 //     attacker which side was wrong.
-//  3. Store.GetPAT(id) — fetch the stored record. nil = 401.
-//  4. crypto/subtle.ConstantTimeCompare against HashPAT(plain).
+//  3. Store.GetPAT(signed.ID) — fetch the stored record. nil = 401.
+//  4. Rebuild the canonical string from the request and verify the HMAC,
+//     keyed on the stored hash. Constant-time. Mismatch = 401.
 //     Mismatch = 401.
 //  5. p.HasScope(want) — scope gate. Insufficient = 403 with
 //     the scope it lacks (safe to disclose; it's the public
@@ -28,10 +32,8 @@ package controller
 
 import (
 	"context"
-	"crypto/subtle"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -80,6 +82,7 @@ type patAuthorizer struct {
 	logger    *log.Logger
 	touch     *touchCoalescer
 	now       func() time.Time // test seam — swap to a fixed clock in unit tests
+	nonces    *nonceCache      // replay refusal, bounded by the clock window
 	touchSink func(id string)  // optional — tests subscribe to verify async touch fired
 }
 
@@ -97,6 +100,7 @@ func newPATAuthorizer(store Store, logger *log.Logger) *patAuthorizer {
 		logger: logger,
 		touch:  newTouchCoalescer(touchCoalesceWindow),
 		now:    time.Now,
+		nonces: newNonceCache(),
 	}
 }
 
@@ -111,26 +115,28 @@ func newPATAuthorizer(store Store, logger *log.Logger) *patAuthorizer {
 // controller (envelope `{"status": "error", "error": "..."}`).
 func (a *patAuthorizer) Middleware(want Scope, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := extractBearer(r)
+		signed, ok := parseSignatureHeader(r.Header.Get("Authorization"))
 		if !ok {
 			writeErr(w, http.StatusUnauthorized, errAuth())
 
 			return
 		}
 
-		id, ok := ParsePATToken(token)
-		if !ok {
+		// Clock first: it is the cheapest check and the only failure an
+		// operator can act on, so it should not be masked by a lookup.
+		now := a.now()
+		if skew := now.Sub(time.Unix(signed.TS, 0)); skew > sigSkew || skew < -sigSkew {
 			writeErr(w, http.StatusUnauthorized, errAuth())
 
 			return
 		}
 
-		pat, err := a.store.GetPAT(r.Context(), id)
+		pat, err := a.store.GetPAT(r.Context(), signed.ID)
 		if err != nil {
 			// Storage error is internal — don't leak it to the
 			// caller. Log with a stable prefix so operators can
 			// search for "/api/pat auth" in journald.
-			a.logger.Printf("/api/pat auth: store lookup id=%s failed: %v", id, err)
+			a.logger.Printf("/api/pat auth: store lookup id=%s failed: %v", signed.ID, err)
 			writeErr(w, http.StatusInternalServerError, errAuth())
 
 			return
@@ -142,11 +148,27 @@ func (a *patAuthorizer) Middleware(want Scope, next http.HandlerFunc) http.Handl
 			return
 		}
 
-		// Constant-time compare on hex strings. ConstantTimeCompare
-		// returns 1 when equal — defaults to bytewise; treating
-		// strings as []byte is safe here (both inputs are hex,
-		// ASCII-only, fixed length 64).
-		if subtle.ConstantTimeCompare([]byte(HashPAT(token)), []byte(pat.HashHex)) != 1 {
+		// The body is buffered so it can be both hashed and handled — a
+		// signature that did not cover it would let an interceptor rewrite
+		// what a request does while keeping it valid.
+		body, err := drainBody(r)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, errAuth())
+
+			return
+		}
+
+		canonical := signatureCanonical(r.Method, r.URL.Path, r.URL.Query(), body, signed.TS, signed.Nonce)
+
+		if !verifySignature(pat.HashHex, canonical, signed.Sig) {
+			writeErr(w, http.StatusUnauthorized, errAuth())
+
+			return
+		}
+
+		// Last, and only once the signature held: an attacker must not be able
+		// to burn nonces they cannot sign for.
+		if !a.nonces.Use(signed.Nonce, now) {
 			writeErr(w, http.StatusUnauthorized, errAuth())
 
 			return
@@ -161,17 +183,17 @@ func (a *patAuthorizer) Middleware(want Scope, next http.HandlerFunc) http.Handl
 		// Touch LastUsedAt best-effort. Coalesced — see
 		// touchCoalesceWindow. Async so the request path doesn't
 		// wait on etcd; failure logs and continues.
-		if a.touch.shouldTouch(id, a.now()) {
+		if a.touch.shouldTouch(signed.ID, a.now()) {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 
-				if err := a.store.TouchPAT(ctx, id, a.now()); err != nil {
-					a.logger.Printf("/api/pat auth: TouchPAT id=%s failed: %v", id, err)
+				if err := a.store.TouchPAT(ctx, signed.ID, a.now()); err != nil {
+					a.logger.Printf("/api/pat auth: TouchPAT id=%s failed: %v", signed.ID, err)
 				}
 
 				if a.touchSink != nil {
-					a.touchSink(id)
+					a.touchSink(signed.ID)
 				}
 			}()
 		}
@@ -179,37 +201,10 @@ func (a *patAuthorizer) Middleware(want Scope, next http.HandlerFunc) http.Handl
 		// Inject the PAT ID for downstream middleware (rate limit)
 		// and handlers that want to attribute actions to the
 		// authenticated identity (audit logging, for example).
-		ctx := context.WithValue(r.Context(), patIDCtxKey{}, id)
+		ctx := context.WithValue(r.Context(), patIDCtxKey{}, signed.ID)
 
 		next(w, r.WithContext(ctx))
 	}
-}
-
-// extractBearer reads the `Authorization: Bearer <token>` header
-// and returns the token, or ("", false) when the header is
-// missing / malformed. Case-insensitive on the scheme word —
-// some clients send `bearer` (lowercase); we accept both.
-func extractBearer(r *http.Request) (string, bool) {
-	h := r.Header.Get("Authorization")
-	if h == "" {
-		return "", false
-	}
-
-	parts := strings.SplitN(h, " ", 2)
-	if len(parts) != 2 {
-		return "", false
-	}
-
-	if !strings.EqualFold(parts[0], "Bearer") {
-		return "", false
-	}
-
-	tok := strings.TrimSpace(parts[1])
-	if tok == "" {
-		return "", false
-	}
-
-	return tok, true
 }
 
 // errAuth and errInsufficientScope are the canonical error

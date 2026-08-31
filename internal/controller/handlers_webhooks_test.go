@@ -654,9 +654,9 @@ func TestWebhook_InlineBodyBytesReachPoster_ViaHTTP(t *testing.T) {
 			Success: []deployWebhookWireSpec{{
 				URL: srv.URL,
 				Body: map[string]any{
-					"text":         "✅ {{name}} {{image}}",
-					"release_id":   "{{release_id}}",
-					"environment":  "{{scope}}",
+					"text":        "✅ {{name}} {{image}}",
+					"release_id":  "{{release_id}}",
+					"environment": "{{scope}}",
 				},
 			}},
 		},
@@ -1033,11 +1033,11 @@ func TestFireProbeWebhook_TokensSubstitute(t *testing.T) {
 			{
 				URL: "https://example.com/hook",
 				Body: map[string]any{
-					"text":         "{{probe}} on {{pod}} failed: {{reason}}",
-					"transition":   "{{transition}}",
-					"key":          "{{transition_id}}",
-					"observed_at":  "{{timestamp}}",
-					"resource":     "{{kind}}/{{scope}}/{{name}}",
+					"text":        "{{probe}} on {{pod}} failed: {{reason}}",
+					"transition":  "{{transition}}",
+					"key":         "{{transition_id}}",
+					"observed_at": "{{timestamp}}",
+					"resource":    "{{kind}}/{{scope}}/{{name}}",
 				},
 			},
 		},

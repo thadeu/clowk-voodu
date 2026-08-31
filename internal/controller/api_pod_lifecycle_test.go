@@ -476,4 +476,3 @@ func TestPodStop_NotConfigured(t *testing.T) {
 		t.Errorf("status=%d want 503", resp.StatusCode)
 	}
 }
-

@@ -42,7 +42,7 @@ func TestInterpolateAssetRefs_ScopedAndUnscoped(t *testing.T) {
 		// 4-segment, scoped explicit
 		"${asset.data.redis.configuration}:/etc/redis/redis.conf:ro": "/opt/voodu/assets/data/redis/configuration:/etc/redis/redis.conf:ro",
 		// 3-segment, unscoped global
-		"${asset.redis-shared.cfg}:/etc/redis/redis.conf:ro":         "/opt/voodu/assets/redis-shared/cfg:/etc/redis/redis.conf:ro",
+		"${asset.redis-shared.cfg}:/etc/redis/redis.conf:ro": "/opt/voodu/assets/redis-shared/cfg:/etc/redis/redis.conf:ro",
 		// no refs — passthrough
 		"plain string with no refs": "plain string with no refs",
 		// mixed in one string

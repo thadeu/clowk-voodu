@@ -55,8 +55,8 @@ func TestAssetHandler_MaterialisesAllSources(t *testing.T) {
 	specJSON, _ := json.Marshal(spec)
 
 	ev := WatchEvent{
-		Type: WatchPut,
-		Kind: KindAsset,
+		Type:  WatchPut,
+		Kind:  KindAsset,
 		Scope: "data", Name: "redis",
 		Manifest: &Manifest{
 			Kind:  KindAsset,
@@ -132,8 +132,8 @@ func TestAssetHandler_SweepsStaleKeys(t *testing.T) {
 		spec, _ := json.Marshal(map[string]any{"files": files})
 
 		ev := WatchEvent{
-			Type: WatchPut,
-			Kind: KindAsset,
+			Type:  WatchPut,
+			Kind:  KindAsset,
 			Scope: "data", Name: "redis",
 			Manifest: &Manifest{
 				Kind:  KindAsset,
@@ -227,10 +227,10 @@ func TestAssetHandler_RejectsInvalidKey(t *testing.T) {
 	h := &AssetHandler{Store: store, Log: quietLogger()}
 
 	cases := []string{
-		"redis.conf",   // dot — would shadow the var separator
-		"with space",   // whitespace — illegal filename chars on some FS
-		"path/sub",     // slash — escapes the asset dir
-		"",             // empty — meaningless
+		"redis.conf", // dot — would shadow the var separator
+		"with space", // whitespace — illegal filename chars on some FS
+		"path/sub",   // slash — escapes the asset dir
+		"",           // empty — meaningless
 	}
 
 	for _, key := range cases {

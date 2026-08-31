@@ -452,4 +452,3 @@ func TestHealthReportsVersion(t *testing.T) {
 		t.Errorf("bad health response: %+v", got)
 	}
 }
-

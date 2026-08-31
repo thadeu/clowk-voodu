@@ -711,8 +711,8 @@ func TestJobHandler_RunOnceMergesSpecLabels(t *testing.T) {
 		"image":   "ghcr.io/acme/api:1.0.0",
 		"command": []string{"./run.sh"},
 		"labels": map[string]any{
-			"voodu.role":  "backup",
-			"team":        "platform",
+			"voodu.role": "backup",
+			"team":       "platform",
 		},
 	}
 	seedManifest(t, store, KindJob, "demo", spec)
@@ -770,9 +770,9 @@ func TestJobHandler_RunOnceRejectsReservedLabelKeys(t *testing.T) {
 		"image":   "ghcr.io/acme/api:1.0.0",
 		"command": []string{"./run.sh"},
 		"labels": map[string]any{
-			"voodu.scope": "evil-scope",   // reserved, must be ignored
-			"voodu.kind":  "deployment",   // reserved, must be ignored
-			"voodu.role":  "backup",       // not reserved, allowed
+			"voodu.scope": "evil-scope", // reserved, must be ignored
+			"voodu.kind":  "deployment", // reserved, must be ignored
+			"voodu.role":  "backup",     // not reserved, allowed
 		},
 	}
 	seedManifest(t, store, KindJob, "demo", spec)

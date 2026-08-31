@@ -728,13 +728,13 @@ func TestPodsGet_DetailTrue_EnrichesEachRow(t *testing.T) {
 		Status string
 		Data   struct {
 			Pods []struct {
-				Name       string                  `json:"name"`
-				Kind       string                  `json:"kind"`
-				Scope      string                  `json:"scope"`
-				Image      string                  `json:"image"`
-				Ports      []docker.ContainerPort  `json:"ports"`
-				Env        map[string]string       `json:"env"`
-				WorkingDir string                  `json:"working_dir"`
+				Name       string                 `json:"name"`
+				Kind       string                 `json:"kind"`
+				Scope      string                 `json:"scope"`
+				Image      string                 `json:"image"`
+				Ports      []docker.ContainerPort `json:"ports"`
+				Env        map[string]string      `json:"env"`
+				WorkingDir string                 `json:"working_dir"`
 			} `json:"pods"`
 		}
 	}
@@ -796,9 +796,9 @@ func TestPodsGet_SpecTrue_AttachesManifest(t *testing.T) {
 			{Name: "orphan.z", Kind: "deployment", Scope: "x", ResourceName: "orphan", ReplicaID: "z", Image: "old:1", Running: true},
 		},
 		details: map[string]*PodDetail{
-			"x-web.a":   {Pod: Pod{Name: "x-web.a", Image: "x-web:latest"}, ID: "1"},
-			"x-db.0":    {Pod: Pod{Name: "x-db.0", Image: "postgres:16"}, ID: "2"},
-			"orphan.z":  {Pod: Pod{Name: "orphan.z", Image: "old:1"}, ID: "3"},
+			"x-web.a":  {Pod: Pod{Name: "x-web.a", Image: "x-web:latest"}, ID: "1"},
+			"x-db.0":   {Pod: Pod{Name: "x-db.0", Image: "postgres:16"}, ID: "2"},
+			"orphan.z": {Pod: Pod{Name: "orphan.z", Image: "old:1"}, ID: "3"},
 		},
 	}
 

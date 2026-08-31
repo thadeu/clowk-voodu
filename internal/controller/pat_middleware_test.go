@@ -2,6 +2,12 @@ package controller
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -53,48 +59,113 @@ func nextOK(t *testing.T, called *bool) http.HandlerFunc {
 // A failing case here means an attacker either gets in with an
 // invalid token (Auth bypass) or a legit operator gets locked out
 // (denial of service). Both ship-blockers.
+// signRequest signs a built request the way a real client does.
+//
+// Every test below needs this and none of them cares how it works, which is
+// exactly why it is one function: six inline copies would drift, and a test
+// that signs differently from the product proves nothing about the product.
+func signRequest(req *http.Request, plain string) {
+	signRequestAt(req, plain, time.Now().Unix())
+}
+
+// signRequestAt is for tests that pin the middleware's clock. Signing with
+// time.Now() against a fixed clock is months of skew and a 401 that looks like
+// the feature under test is broken.
+func signRequestAt(req *http.Request, plain string, ts int64) {
+	sum := sha256.Sum256([]byte(plain))
+	id, _ := ParsePATToken(plain)
+	// Random, not clock-derived. A nonce from time.Now() repeats inside a
+	// tight loop, and the second request is then correctly refused as a
+	// replay — which reads as a broken product and is a broken test.
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	nonce := hex.EncodeToString(buf)
+
+	canonical := signatureCanonical(req.Method, req.URL.Path, req.URL.Query(), nil, ts, nonce)
+	mac := hmac.New(sha256.New, []byte(hex.EncodeToString(sum[:])))
+	mac.Write([]byte(canonical))
+
+	req.Header.Set("Authorization", fmt.Sprintf("Voodu id=%s, ts=%d, nonce=%s, sig=%s",
+		id, ts, nonce, base64.RawURLEncoding.EncodeToString(mac.Sum(nil))))
+}
+
 func TestAuthPAT_Matrix(t *testing.T) {
 	store := newMemStore()
 	plainRead, _ := seedTestPAT(t, store, []Scope{ScopeRead})
 	plainActions, _ := seedTestPAT(t, store, []Scope{ScopeActions})
-
 	auth := newPATAuthorizer(store, quietLogger())
+
+	// build returns the Authorization header for a request the test is about
+	// to make. Cases that want a BROKEN header return one directly.
+	sign := func(plain string, mutate func(*signedRequest)) func(*http.Request) string {
+		return func(req *http.Request) string {
+			sum := sha256.Sum256([]byte(plain))
+			id, _ := ParsePATToken(plain)
+			parsed := signedRequest{
+				ID:    id,
+				TS:    time.Now().Unix(),
+				Nonce: hex.EncodeToString([]byte(fmt.Sprintf("%016d", time.Now().UnixNano()))),
+			}
+
+			if mutate != nil {
+				mutate(&parsed)
+			}
+
+			canonical := signatureCanonical(req.Method, req.URL.Path, req.URL.Query(), nil, parsed.TS, parsed.Nonce)
+			mac := hmac.New(sha256.New, []byte(hex.EncodeToString(sum[:])))
+			mac.Write([]byte(canonical))
+
+			sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+			if parsed.Sig != "" {
+				sig = parsed.Sig
+			}
+
+			return fmt.Sprintf("Voodu id=%s, ts=%d, nonce=%s, sig=%s", parsed.ID, parsed.TS, parsed.Nonce, sig)
+		}
+	}
+
+	fixed := func(header string) func(*http.Request) string {
+		return func(*http.Request) string { return header }
+	}
 
 	cases := []struct {
 		name     string
-		header   string // raw Authorization header value
-		want     Scope  // scope the route requires
+		header   func(*http.Request) string
+		want     Scope
 		wantCode int
 		wantNext bool
 	}{
-		{"no header", "", ScopeRead, http.StatusUnauthorized, false},
-		{"empty bearer", "Bearer ", ScopeRead, http.StatusUnauthorized, false},
-		{"wrong scheme", "Basic " + plainRead, ScopeRead, http.StatusUnauthorized, false},
-		{"missing prefix", "Bearer DEADBEEF12345678901234567890", ScopeRead, http.StatusUnauthorized, false},
-		{"wrong prefix family", "Bearer ghp_DEADBEEF12345678901234567890", ScopeRead, http.StatusUnauthorized, false},
-		{"too short", "Bearer pat_SHORT", ScopeRead, http.StatusUnauthorized, false},
-		// 28 valid-alphabet chars but the ID prefix doesn't exist in store.
-		{"unknown id", "Bearer pat_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", ScopeRead, http.StatusUnauthorized, false},
-		// Real ID + garbled-but-base62 secret tail. Length matches; hash compare fails.
-		{"wrong hash (same prefix as real, garbled body)", "Bearer pat_" + plainRead[len("pat_"):len("pat_")+patTokenIDLen] + "WrongWrongWrongWrongWr", ScopeRead, http.StatusUnauthorized, false},
+		{"no header", fixed(""), ScopeRead, http.StatusUnauthorized, false},
 
-		// Real valid path: read PAT on read route → 200.
-		{"valid read PAT on read route", "Bearer " + plainRead, ScopeRead, http.StatusOK, true},
-		{"valid actions PAT on actions route", "Bearer " + plainActions, ScopeActions, http.StatusOK, true},
+		// The old scheme is gone, not deprecated. A Bearer token is refused
+		// even when the token itself is valid — which is the whole point:
+		// a captured token is no longer a way in.
+		{"bearer is no longer accepted", fixed("Bearer " + plainRead), ScopeRead, http.StatusUnauthorized, false},
+		{"wrong scheme", fixed("Basic " + plainRead), ScopeRead, http.StatusUnauthorized, false},
 
-		// Insufficient scope.
-		{"read PAT on actions route", "Bearer " + plainRead, ScopeActions, http.StatusForbidden, false},
-		{"actions PAT on read route", "Bearer " + plainActions, ScopeRead, http.StatusForbidden, false},
+		{"empty voodu", fixed("Voodu "), ScopeRead, http.StatusUnauthorized, false},
+		{"missing sig", fixed("Voodu id=abc123, ts=1788000000, nonce=deadbeef"), ScopeRead, http.StatusUnauthorized, false},
+		{"garbage ts", fixed("Voodu id=abc123, ts=nope, nonce=deadbeef, sig=x"), ScopeRead, http.StatusUnauthorized, false},
 
-		// Case insensitive bearer.
-		{"lowercase bearer", "bearer " + plainRead, ScopeRead, http.StatusOK, true},
+		{"unknown id", sign(plainRead, func(s *signedRequest) { s.ID = "ZZZZZZ" }), ScopeRead, http.StatusUnauthorized, false},
+		{"forged signature", sign(plainRead, func(s *signedRequest) { s.Sig = "not-the-right-signature" }), ScopeRead, http.StatusUnauthorized, false},
+
+		// Only possible under the new scheme, and the two reasons it exists.
+		{"stale timestamp", sign(plainRead, func(s *signedRequest) { s.TS = time.Now().Add(-time.Hour).Unix() }), ScopeRead, http.StatusUnauthorized, false},
+		{"timestamp from the future", sign(plainRead, func(s *signedRequest) { s.TS = time.Now().Add(time.Hour).Unix() }), ScopeRead, http.StatusUnauthorized, false},
+
+		{"valid read PAT on read route", sign(plainRead, nil), ScopeRead, http.StatusOK, true},
+		{"valid actions PAT on actions route", sign(plainActions, nil), ScopeActions, http.StatusOK, true},
+
+		{"read PAT on actions route", sign(plainRead, nil), ScopeActions, http.StatusForbidden, false},
+		{"actions PAT on read route", sign(plainActions, nil), ScopeRead, http.StatusForbidden, false},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-			if c.header != "" {
-				req.Header.Set("Authorization", c.header)
+			if header := c.header(req); header != "" {
+				req.Header.Set("Authorization", header)
 			}
 
 			rr := httptest.NewRecorder()
@@ -125,7 +196,7 @@ func TestAuthPAT_RevokedPAT(t *testing.T) {
 
 	// First request: 200.
 	req := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-	req.Header.Set("Authorization", "Bearer "+plain)
+	signRequest(req, plain)
 
 	rr := httptest.NewRecorder()
 	called := false
@@ -142,7 +213,7 @@ func TestAuthPAT_RevokedPAT(t *testing.T) {
 
 	// Second request: 401 — revoke is immediately effective.
 	req2 := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-	req2.Header.Set("Authorization", "Bearer "+plain)
+	signRequest(req2, plain)
 
 	rr2 := httptest.NewRecorder()
 	called2 := false
@@ -174,7 +245,7 @@ func TestAuthPAT_ContextCarriesPATID(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-	req.Header.Set("Authorization", "Bearer "+plain)
+	signRequest(req, plain)
 	handler(httptest.NewRecorder(), req)
 
 	if !gotOK {
@@ -205,12 +276,12 @@ func TestAuthPAT_LoggerNeverContainsToken(t *testing.T) {
 
 	// 1) Real-shaped but wrong-hash token.
 	req := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-	req.Header.Set("Authorization", "Bearer "+plain+"X")
+	signRequest(req, plain+"X") // signed with the wrong key
 	auth.Middleware(ScopeRead, nextOK(t, new(bool)))(httptest.NewRecorder(), req)
 
 	// 2) Insufficient scope.
 	req2 := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-	req2.Header.Set("Authorization", "Bearer "+plain)
+	signRequest(req2, plain)
 	auth.Middleware(ScopeActions, nextOK(t, new(bool)))(httptest.NewRecorder(), req2)
 
 	// Log must never contain the token prefix + token body.
@@ -248,7 +319,7 @@ func TestAuthPAT_TouchCoalesced(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/api/pat/v1/stats", nil)
-		req.Header.Set("Authorization", "Bearer "+plain)
+		signRequestAt(req, plain, fixedNow.Unix())
 		auth.Middleware(ScopeRead, nextOK(t, new(bool)))(httptest.NewRecorder(), req)
 	}
 
@@ -273,45 +344,6 @@ func TestAuthPAT_TouchCoalesced(t *testing.T) {
 	}
 
 	_ = id // id unused but retained for future extension
-}
-
-// TestExtractBearer covers the header parser directly so we have
-// a hot signal where extraction breaks vs middleware behaviour
-// changes.
-func TestExtractBearer(t *testing.T) {
-	cases := []struct {
-		name      string
-		header    string
-		wantToken string
-		wantOK    bool
-	}{
-		{"happy path", "Bearer abc123", "abc123", true},
-		{"lowercase bearer", "bearer abc123", "abc123", true},
-		{"with surrounding spaces", "Bearer   abc123  ", "abc123", true},
-		{"no header", "", "", false},
-		{"no scheme", "abc123", "", false},
-		{"wrong scheme", "Basic abc123", "", false},
-		{"empty token", "Bearer ", "", false},
-		{"bearer only", "Bearer", "", false},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "/", nil)
-			if c.header != "" {
-				r.Header.Set("Authorization", c.header)
-			}
-
-			tok, ok := extractBearer(r)
-			if ok != c.wantOK {
-				t.Errorf("ok: got %v, want %v", ok, c.wantOK)
-			}
-
-			if tok != c.wantToken {
-				t.Errorf("token: %q, want %q", tok, c.wantToken)
-			}
-		})
-	}
 }
 
 // TestTouchCoalescer pins the in-memory dampener directly so a

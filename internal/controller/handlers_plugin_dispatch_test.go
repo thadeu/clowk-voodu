@@ -1236,8 +1236,8 @@ EOF
 
 	var out struct {
 		Data struct {
-			Message   string                  `json:"message"`
-			Applied   []string                `json:"applied"`
+			Message   string                    `json:"message"`
+			Applied   []string                  `json:"applied"`
 			ExecLocal []pluginDispatchExecLocal `json:"exec_local"`
 		} `json:"data"`
 	}

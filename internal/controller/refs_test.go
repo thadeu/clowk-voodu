@@ -42,9 +42,9 @@ func TestInterpolateRefsMapLeavesPlainValuesAlone(t *testing.T) {
 	}
 
 	in := map[string]string{
-		"STATIC":       "hello",
-		"FROM_REF":     "${ref.database.main.url}",
-		"WITH_PREFIX":  "prefix:${ref.database.main.user}",
+		"STATIC":         "hello",
+		"FROM_REF":       "${ref.database.main.url}",
+		"WITH_PREFIX":    "prefix:${ref.database.main.user}",
 		"NO_REFS_AT_ALL": "just a string",
 	}
 
