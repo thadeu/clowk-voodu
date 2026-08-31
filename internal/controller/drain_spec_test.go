@@ -12,7 +12,7 @@ import (
 // is a phone call needs a longer wait than the platform default, and
 // the whole point of the block is that it can say so.
 func TestDrainTimeoutComesFromTheManifest(t *testing.T) {
-	reg, seen := drainPlugin(t, "trafik", `#!/usr/bin/env bash
+	reg, seen := drainPlugin(t, "traffik", `#!/usr/bin/env bash
 cat > {{SEEN}}
 echo '{"status":"ok"}'
 `)
@@ -24,7 +24,7 @@ echo '{"status":"ok"}'
 
 	spec := deploymentSpec{
 		Drain:        &drainSpec{Timeout: "30m"},
-		PluginBlocks: []nestedPluginBlock{{Type: "trafik", Spec: []byte(`{"port":8084}`)}},
+		PluginBlocks: []nestedPluginBlock{{Type: "traffik", Spec: []byte(`{"port":8084}`)}},
 	}
 
 	if err := h.drainReplica(context.Background(), KindDeployment, "prod", "esl", spec, "a1"); err != nil {

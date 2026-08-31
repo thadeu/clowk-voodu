@@ -47,7 +47,7 @@ Omitting `grace` keeps docker's own default. Voodu does not pass `-t 0`, which w
 
 How long a rolling restart waits for a plugin to report that a replica has gone quiet.
 
-This one only does something when a plugin is watching the workload's replicas — [`trafik`](https://github.com/thadeu/voodu-trafik), for instance, which counts live connections and reports when the last one closes. Without such a plugin, `timeout` is inert and `grace` is the whole story.
+This one only does something when a plugin is watching the workload's replicas — [`traffik`](https://github.com/thadeu/voodu-traffik), for instance, which counts live connections and reports when the last one closes. Without such a plugin, `timeout` is inert and `grace` is the whole story.
 
 ```hcl
 deployment "prod" "esl" {
@@ -59,7 +59,7 @@ deployment "prod" "esl" {
     timeout = "30m"   # an ESL call can run for a long time
   }
 
-  trafik {
+  traffik {
     port = 8084
   }
 }

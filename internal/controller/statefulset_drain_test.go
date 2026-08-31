@@ -12,7 +12,7 @@ import (
 )
 
 // TestStatefulsetDrainsBeforeRemoving closes an asymmetry that is worse
-// than a missing feature: the parser accepts a trafik block and a drain
+// than a missing feature: the parser accepts a traffik block and a drain
 // block on a statefulset, and the reconcile publishes its endpoints, so
 // everything says the workload is covered. Without this the roll still
 // removed the pod out from under whatever was running through it.
@@ -30,7 +30,7 @@ echo '{"status":"ok"}'
 `)
 
 	reg := &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {Manifest: plugin.Manifest{Name: "trafik"}, Dir: dir, Commands: map[string]string{"drain": dir + "/drain"}},
+		"traffik": {Manifest: plugin.Manifest{Name: "traffik"}, Dir: dir, Commands: map[string]string{"drain": dir + "/drain"}},
 	}}
 
 	h := &StatefulsetHandler{
@@ -40,7 +40,7 @@ echo '{"status":"ok"}'
 
 	spec := statefulsetSpec{
 		Drain:        &drainSpec{Timeout: "10m"},
-		PluginBlocks: []nestedPluginBlock{{Type: "trafik", Spec: []byte(`{"port":5432}`)}},
+		PluginBlocks: []nestedPluginBlock{{Type: "traffik", Spec: []byte(`{"port":5432}`)}},
 	}
 
 	if err := h.drainReplica(context.Background(), "data", "pg", spec, "0"); err != nil {

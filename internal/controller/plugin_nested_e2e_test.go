@@ -12,7 +12,7 @@ import (
 )
 
 // TestNestedPluginBlockEndToEnd walks the whole contract with a plugin
-// that behaves the way voodu-trafik will: it refuses a block with no
+// that behaves the way voodu-traffik will: it refuses a block with no
 // bind at apply time, fills in the addressing default, and then
 // receives the live replicas once the workload has reconciled.
 //
@@ -22,7 +22,7 @@ import (
 //	  image    = "esl:1"
 //	  replicas = 2
 //
-//	  trafik {
+//	  traffik {
 //	    bind = "0.0.0.0:8084"
 //	    port = 8084
 //	  }
@@ -47,15 +47,15 @@ port="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' <<<"$req" | head -1)"
 echo "{\"status\":\"ok\",\"data\":{\"bind\":\"0.0.0.0:8084\",\"port\":${port},\"addressing\":\"ip\"}}"
 `)
 
-	// apply: what a real trafik would turn into PUT /config.
+	// apply: what a real traffik would turn into PUT /config.
 	writePluginScript(t, dir+"/apply", `#!/usr/bin/env bash
 cat > `+seenApply+`
 echo '{"status":"ok"}'
 `)
 
 	registry := &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {
-			Manifest: plugin.Manifest{Name: "trafik"},
+		"traffik": {
+			Manifest: plugin.Manifest{Name: "traffik"},
 			Dir:      dir,
 			Commands: map[string]string{"expand": dir + "/expand", "apply": dir + "/apply"},
 		},
@@ -67,7 +67,7 @@ echo '{"status":"ok"}'
 		Scope: "prod",
 		Name:  "esl",
 		Spec: json.RawMessage(`{"image":"esl:1","replicas":2,` +
-			`"plugin_blocks":[{"type":"trafik","spec":{"bind":"0.0.0.0:8084","port":8084}}]}`),
+			`"plugin_blocks":[{"type":"traffik","spec":{"bind":"0.0.0.0:8084","port":8084}}]}`),
 	}
 
 	api := &API{PluginBlocks: registry}
@@ -150,12 +150,12 @@ echo '{"status":"ok","data":{}}'
 `)
 
 	api := &API{PluginBlocks: &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {Manifest: plugin.Manifest{Name: "trafik"}, Dir: dir, Commands: map[string]string{"expand": dir + "/expand"}},
+		"traffik": {Manifest: plugin.Manifest{Name: "traffik"}, Dir: dir, Commands: map[string]string{"expand": dir + "/expand"}},
 	}}}
 
 	m := &Manifest{
 		Kind: KindDeployment, Scope: "prod", Name: "esl",
-		Spec: json.RawMessage(`{"image":"esl:1","plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`),
+		Spec: json.RawMessage(`{"image":"esl:1","plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`),
 	}
 
 	_, _, _, err := api.expandPluginBlocks(context.Background(), []*Manifest{m})

@@ -32,14 +32,14 @@ func drainerFor(reg PluginBlockRegistry) *replicaDrainer {
 	return &replicaDrainer{Registry: reg, logf: func(string, ...any) {}}
 }
 
-const specWithTrafik = `{"image":"esl:1","plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`
+const specWithTrafik = `{"image":"esl:1","plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`
 
 // TestDrainAsksTheOwningPluginBeforeRemoval is the point of the gate.
 // Removing a replica while a connection is still running through it is
 // the failure the whole load-balancing story exists to prevent, and the
 // controller is the only thing that knows a removal is about to happen.
 func TestDrainAsksTheOwningPluginBeforeRemoval(t *testing.T) {
-	reg, seen := drainPlugin(t, "trafik", `#!/usr/bin/env bash
+	reg, seen := drainPlugin(t, "traffik", `#!/usr/bin/env bash
 cat > {{SEEN}}
 echo '{"status":"ok"}'
 `)
@@ -70,7 +70,7 @@ echo '{"status":"ok"}'
 // deployment — the overwhelming majority — free of a subprocess per
 // replica on every roll.
 func TestDrainWithoutPluginBlocksIsAnInstantNoop(t *testing.T) {
-	reg, seen := drainPlugin(t, "trafik", `#!/usr/bin/env bash
+	reg, seen := drainPlugin(t, "traffik", `#!/usr/bin/env bash
 cat > {{SEEN}}
 echo '{"status":"ok"}'
 `)
@@ -93,7 +93,7 @@ echo '{"status":"ok"}'
 // worse than the cut this gate exists to avoid — the roll proceeds, and
 // says so.
 func TestDrainTimeoutDoesNotWedgeTheRoll(t *testing.T) {
-	reg, _ := drainPlugin(t, "trafik", `#!/usr/bin/env bash
+	reg, _ := drainPlugin(t, "traffik", `#!/usr/bin/env bash
 cat >/dev/null
 sleep 30
 `)
@@ -151,7 +151,7 @@ echo '{"status":"ok"}'
 `)
 
 	reg := &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {Manifest: plugin.Manifest{Name: "trafik"}, Dir: dir, Commands: map[string]string{"drain": dir + "/drain"}},
+		"traffik": {Manifest: plugin.Manifest{Name: "traffik"}, Dir: dir, Commands: map[string]string{"drain": dir + "/drain"}},
 	}}
 
 	fc := &fakeContainers{slots: map[string]*ContainerSlot{}, removeHook: func(string) {
@@ -167,7 +167,7 @@ echo '{"status":"ok"}'
 	}
 
 	spec := deploymentSpec{
-		PluginBlocks: []nestedPluginBlock{{Type: "trafik", Spec: []byte(`{"port":8084}`)}},
+		PluginBlocks: []nestedPluginBlock{{Type: "traffik", Spec: []byte(`{"port":8084}`)}},
 	}
 
 	if err := h.drainReplica(context.Background(), KindDeployment, "prod", "esl", spec, "a1"); err != nil {

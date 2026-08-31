@@ -79,11 +79,11 @@ func publisherFor(reg PluginBlockRegistry, ips map[string]string) *endpointPubli
 // which replicas are actually up, because that set changes on every
 // roll and nothing in the manifest describes it.
 func TestPublishesLiveEndpointsToOwningPlugin(t *testing.T) {
-	reg, seen := recordingPlugin(t, "trafik")
+	reg, seen := recordingPlugin(t, "traffik")
 
 	slots, ips := replicaSlots("prod", "esl", "a1", "b2")
 
-	spec := json.RawMessage(`{"plugin_blocks":[{"type":"trafik","spec":{"port":8084,"bind":"0.0.0.0:8084"}}]}`)
+	spec := json.RawMessage(`{"plugin_blocks":[{"type":"traffik","spec":{"port":8084,"bind":"0.0.0.0:8084"}}]}`)
 
 	err := publisherFor(reg, ips).publish(context.Background(), KindDeployment, "prod", "esl", spec, slots)
 
@@ -110,11 +110,11 @@ func TestPublishesLiveEndpointsToOwningPlugin(t *testing.T) {
 // nothing docker knows, so an address is the only thing it can dial.
 // That is the common case, so it is the default.
 func TestEndpointsAreIPsByDefault(t *testing.T) {
-	reg, seen := recordingPlugin(t, "trafik")
+	reg, seen := recordingPlugin(t, "traffik")
 
 	slots, ips := replicaSlots("prod", "esl", "a1")
 
-	spec := json.RawMessage(`{"plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`)
+	spec := json.RawMessage(`{"plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`)
 
 	if err := publisherFor(reg, ips).publish(context.Background(), KindDeployment, "prod", "esl", spec, slots); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -150,12 +150,12 @@ func TestEndpointsUseNamesWhenAddressingIsDNS(t *testing.T) {
 // TestOnlyRunningReplicasArePublished keeps an address with nothing
 // listening out of a load balancer's rotation.
 func TestOnlyRunningReplicasArePublished(t *testing.T) {
-	reg, seen := recordingPlugin(t, "trafik")
+	reg, seen := recordingPlugin(t, "traffik")
 
 	slots, ips := replicaSlots("prod", "esl", "a1", "b2")
 	slots[1].Running = false
 
-	spec := json.RawMessage(`{"plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`)
+	spec := json.RawMessage(`{"plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`)
 
 	if err := publisherFor(reg, ips).publish(context.Background(), KindDeployment, "prod", "esl", spec, slots); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -175,7 +175,7 @@ func TestOnlyRunningReplicasArePublished(t *testing.T) {
 // TestNoPluginBlocksMeansNoPluginCall keeps the overwhelmingly common
 // deployment free of a subprocess it has no use for.
 func TestNoPluginBlocksMeansNoPluginCall(t *testing.T) {
-	reg, _ := recordingPlugin(t, "trafik")
+	reg, _ := recordingPlugin(t, "traffik")
 
 	slots, ips := replicaSlots("prod", "esl", "a1")
 
@@ -200,12 +200,12 @@ exit 1
 `)
 
 	reg := &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {Manifest: plugin.Manifest{Name: "trafik"}, Dir: dir, Commands: map[string]string{"apply": path}},
+		"traffik": {Manifest: plugin.Manifest{Name: "traffik"}, Dir: dir, Commands: map[string]string{"apply": path}},
 	}}
 
 	slots, ips := replicaSlots("prod", "esl", "a1")
 
-	spec := json.RawMessage(`{"plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`)
+	spec := json.RawMessage(`{"plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`)
 
 	err := publisherFor(reg, ips).publish(context.Background(), KindDeployment, "prod", "esl", spec, slots)
 

@@ -11,7 +11,7 @@ import (
 // schema knows and the blocks it does not.
 //
 // The unknown ones are not an error. A block the core does not
-// recognise inside a deployment belongs to a plugin — `trafik {}` and
+// recognise inside a deployment belongs to a plugin — `traffik {}` and
 // whatever comes after it — and rejecting it here would mean every
 // plugin that wants a nested block has to land a change in the core
 // parser before it can ship.

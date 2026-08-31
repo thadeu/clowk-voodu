@@ -62,13 +62,13 @@ echo '{"status":"ok","data":{}}'
 `)
 
 	api := &API{PluginBlocks: &fakePluginRegistry{plugins: map[string]*plugins.LoadedPlugin{
-		"trafik": {Manifest: plugin.Manifest{Name: "trafik"}, Dir: dir, Commands: map[string]string{"expand": dir + "/expand"}},
+		"traffik": {Manifest: plugin.Manifest{Name: "traffik"}, Dir: dir, Commands: map[string]string{"expand": dir + "/expand"}},
 	}}}
 
 	m := &Manifest{
 		Kind: KindDeployment, Scope: "prod", Name: "esl",
 		Spec: json.RawMessage(`{"image":"esl:1","ports":["3000:80"],` +
-			`"plugin_blocks":[{"type":"trafik","spec":{"port":8084}}]}`),
+			`"plugin_blocks":[{"type":"traffik","spec":{"port":8084}}]}`),
 	}
 
 	if _, _, _, err := api.expandPluginBlocks(context.Background(), []*Manifest{m}); err != nil {

@@ -65,12 +65,12 @@ func pluginBlocksOf(t *testing.T, m *Manifest) []map[string]any {
 func TestNestedBlockReachesItsPluginWithParentContext(t *testing.T) {
 	// Echoes the request back as the normalized spec, so the test can
 	// assert on exactly what the plugin received.
-	a := nestedPluginFixture(t, "trafik", `#!/usr/bin/env bash
+	a := nestedPluginFixture(t, "traffik", `#!/usr/bin/env bash
 req="$(cat)"
 printf '{"status":"ok","data":%s}\n' "$req"
 `)
 
-	m := deploymentWithBlocks(t, `[{"type":"trafik","spec":{"bind":"0.0.0.0:8084"}}]`)
+	m := deploymentWithBlocks(t, `[{"type":"traffik","spec":{"bind":"0.0.0.0:8084"}}]`)
 
 	out, _, _, err := a.expandPluginBlocks(context.Background(), []*Manifest{m})
 
@@ -93,7 +93,7 @@ printf '{"status":"ok","data":%s}\n' "$req"
 
 	for _, want := range []string{
 		`"position":"nested"`,
-		`"kind":"trafik"`,
+		`"kind":"traffik"`,
 		`"bind":"0.0.0.0:8084"`,
 	} {
 		if !strings.Contains(got, want) {
@@ -110,12 +110,12 @@ printf '{"status":"ok","data":%s}\n' "$req"
 // Validating and then throwing the result away would mean the defaults
 // a plugin fills in never reach the reconciler.
 func TestNestedBlockNormalizationIsPersisted(t *testing.T) {
-	a := nestedPluginFixture(t, "trafik", `#!/usr/bin/env bash
+	a := nestedPluginFixture(t, "traffik", `#!/usr/bin/env bash
 cat >/dev/null
 echo '{"status":"ok","data":{"bind":"0.0.0.0:8084","port":8084,"addressing":"ip"}}'
 `)
 
-	m := deploymentWithBlocks(t, `[{"type":"trafik","spec":{"bind":"0.0.0.0:8084"}}]`)
+	m := deploymentWithBlocks(t, `[{"type":"traffik","spec":{"bind":"0.0.0.0:8084"}}]`)
 
 	out, _, _, err := a.expandPluginBlocks(context.Background(), []*Manifest{m})
 
@@ -158,13 +158,13 @@ func TestNestedBlockRejectedWhenPluginMissing(t *testing.T) {
 // config must fail the apply, not be ignored. Validation that can be
 // skipped is not validation.
 func TestNestedBlockFailureSurfacesPluginError(t *testing.T) {
-	a := nestedPluginFixture(t, "trafik", `#!/usr/bin/env bash
+	a := nestedPluginFixture(t, "traffik", `#!/usr/bin/env bash
 cat >/dev/null
 echo '{"status":"error","error":"bind is required"}'
 exit 1
 `)
 
-	m := deploymentWithBlocks(t, `[{"type":"trafik","spec":{}}]`)
+	m := deploymentWithBlocks(t, `[{"type":"traffik","spec":{}}]`)
 
 	_, _, _, err := a.expandPluginBlocks(context.Background(), []*Manifest{m})
 

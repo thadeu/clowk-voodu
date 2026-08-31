@@ -11,13 +11,13 @@ deployment "prod" "esl" {
   replicas = 3
   ports    = ["8084"]
 
-  trafik {
+  traffik {
     port = 8084
   }
 }
 ```
 
-`trafik` is not a voodu kind. It is a block the [voodu-trafik](https://github.com/thadeu/voodu-trafik) plugin owns, and voodu knows only that it belongs to a plugin by that name.
+`traffik` is not a voodu kind. It is a block the [voodu-traffik](https://github.com/thadeu/voodu-traffik) plugin owns, and voodu knows only that it belongs to a plugin by that name.
 
 ## Why inside the workload
 
@@ -36,14 +36,14 @@ That line is what keeps a plugin block from becoming a contract every plugin of 
 At apply time voodu hands the block to its plugin, which validates and normalises it. The plugin's refusal fails the apply, with the plugin's own message:
 
 ```
-deployment/prod/esl: trafik block: prod/esl pins a host port, so it can only
+deployment/prod/esl: traffik block: prod/esl pins a host port, so it can only
 ever run one replica — a load balancer in front of it has nothing to balance
 ```
 
 A block whose plugin is not installed also fails, naming what is missing:
 
 ```
-deployment/prod/esl: block "trafik" belongs to a plugin named "trafik", which
+deployment/prod/esl: block "traffik" belongs to a plugin named "traffik", which
 is not installed — run `vd plugins:install <source>` or remove the block
 ```
 
@@ -58,7 +58,7 @@ The manifest cannot describe which replicas are up. That set changes on every ro
 ```json
 {
   "kind": "deployment", "scope": "prod", "name": "esl",
-  "block": { "type": "trafik", "spec": { "port": 8084, "bind": "0.0.0.0:8084" } },
+  "block": { "type": "traffik", "spec": { "port": 8084, "bind": "0.0.0.0:8084" } },
   "endpoints": [
     { "replica_id": "a1", "address": "172.18.0.5:8084" },
     { "replica_id": "b2", "address": "172.18.0.6:8084" }
@@ -80,8 +80,8 @@ A block may appear more than once, and labels name each one:
 
 ```hcl
 deployment "prod" "esl" {
-  trafik "sip"  { port = 5060 }
-  trafik "http" { port = 8084 }
+  traffik "sip"  { port = 5060 }
+  traffik "http" { port = 8084 }
 }
 ```
 

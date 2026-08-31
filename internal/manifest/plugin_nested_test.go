@@ -34,7 +34,7 @@ deployment "prod" "esl" {
   image    = "ghcr.io/clowk/esl:1.2"
   replicas = 3
 
-  trafik {
+  traffik {
     bind = "0.0.0.0:8084"
     port = 8084
   }
@@ -59,8 +59,8 @@ deployment "prod" "esl" {
 
 	blk := spec.PluginBlocks[0]
 
-	if blk.Type != "trafik" {
-		t.Errorf("type = %q, want trafik", blk.Type)
+	if blk.Type != "traffik" {
+		t.Errorf("type = %q, want traffik", blk.Type)
 	}
 
 	var attrs struct {
@@ -85,8 +85,8 @@ func TestDeploymentKeepsNestedPluginBlockOrder(t *testing.T) {
 deployment "prod" "esl" {
   image = "x"
 
-  trafik { port = 8084 }
-  trafik { port = 9090 }
+  traffik { port = 8084 }
+  traffik { port = 9090 }
 }
 `
 
@@ -123,7 +123,7 @@ func TestDeploymentKeepsNestedPluginBlockLabels(t *testing.T) {
 deployment "prod" "esl" {
   image = "x"
 
-  trafik "public" {
+  traffik "public" {
     port = 8084
   }
 }
@@ -188,7 +188,7 @@ statefulset "data" "pg" {
   image    = "postgres:16"
   replicas = 2
 
-  trafik {
+  traffik {
     bind = "0.0.0.0:5432"
     port = 5432
   }
@@ -207,7 +207,7 @@ statefulset "data" "pg" {
 		t.Fatalf("decode spec: %v", err)
 	}
 
-	if len(spec.PluginBlocks) != 1 || spec.PluginBlocks[0].Type != "trafik" {
-		t.Fatalf("plugin blocks = %+v, want one trafik block", spec.PluginBlocks)
+	if len(spec.PluginBlocks) != 1 || spec.PluginBlocks[0].Type != "traffik" {
+		t.Fatalf("plugin blocks = %+v, want one traffik block", spec.PluginBlocks)
 	}
 }

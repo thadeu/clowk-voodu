@@ -1459,7 +1459,7 @@ type IngressTLS struct {
 }
 
 // PluginBlock is one block found inside a core kind that the core
-// parser does not recognise — `trafik {}` inside a deployment, and
+// parser does not recognise — `traffik {}` inside a deployment, and
 // whatever a future plugin declares.
 //
 // It is carried, not interpreted. The controller looks up a plugin
