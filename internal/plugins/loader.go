@@ -243,6 +243,17 @@ func LoadByName(root, name string) (*LoadedPlugin, error) {
 			continue
 		}
 
+		// Hidden directories are not plugins. Install writes its scratch tree
+		// as `.install-*` INSIDE Root and renames it into place, so for the
+		// seconds that takes an unfiltered walk reports a plugin called
+		// ".install-1035027576" — no manifest, no version, and a delete button
+		// beside it. Nobody saw that while the only reader was a human typing
+		// `vd plugins:list`; a dashboard polling every five seconds lands in
+		// that window routinely.
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+
 		p, err := LoadFromDir(filepath.Join(root, e.Name()))
 		if err != nil {
 			// Skip broken plugins silently — surfacing them here
@@ -276,6 +287,17 @@ func LoadAll(root string) ([]*LoadedPlugin, []error) {
 
 	for _, e := range entries {
 		if !e.IsDir() {
+			continue
+		}
+
+		// Hidden directories are not plugins. Install writes its scratch tree
+		// as `.install-*` INSIDE Root and renames it into place, so for the
+		// seconds that takes an unfiltered walk reports a plugin called
+		// ".install-1035027576" — no manifest, no version, and a delete button
+		// beside it. Nobody saw that while the only reader was a human typing
+		// `vd plugins:list`; a dashboard polling every five seconds lands in
+		// that window routinely.
+		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 
