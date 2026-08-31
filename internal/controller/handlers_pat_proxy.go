@@ -104,9 +104,26 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/metrics/dump",
 		auth.Middleware(ScopeRead, a.handlePATMetricsDump))
 
+	// Installed plugins, plus any install still running or recently
+	// failed. ScopeRead: it is a list of names, versions and homepages —
+	// the same metadata `vd plugins:list` prints on the box.
+	mux.HandleFunc("GET /api/pat/v1/plugins",
+		auth.Middleware(ScopeRead, a.handlePATPluginList))
+
 	// Action endpoints — scope=actions + per-PAT rate limit.
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
+
+	// Plugin install and removal. ScopeActions, and worth pausing on:
+	// installing clones a repository and runs ITS lifecycle hooks as this
+	// controller's user, so `actions` now grants arbitrary code execution
+	// on this machine — not just "restart a pod". Rate limited like every
+	// other action, which also bounds how fast a stolen token could try.
+	mux.HandleFunc("POST /api/pat/v1/plugins/install",
+		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPluginInstall)))
+
+	mux.HandleFunc("DELETE /api/pat/v1/plugins/{name}",
+		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPluginRemove)))
 
 	// PAT management proxies. ScopeActions (not ScopeRead) because
 	// the redacted list still leaks token NAMES + PREFIXES + scopes,

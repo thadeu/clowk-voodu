@@ -41,6 +41,14 @@ type API struct {
 	// errors — used by unit tests that don't care about plugins.
 	PluginsRoot string
 
+	// In-flight plugin installs. Built lazily so every existing
+	// construction of API — every test in this package — keeps working
+	// without a constructor. Safe as a field because API is only ever
+	// used through a pointer (&API{} at the call sites, pointer receivers
+	// on every method); a value copy would copy the Once with it.
+	pluginJobsOnce sync.Once
+	pluginJobsReg  *pluginJobs
+
 	// NodeName and EtcdClient are passed to plugins via environment so
 	// plugin authors can reach back into the cluster if they need to.
 	NodeName   string
