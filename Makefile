@@ -77,10 +77,39 @@ force-install-cli: ## Force-rebuild from scratch + reinstall (use when stale bin
 	@echo "   Clear it with:   hash -r       (bash/zsh)"
 	@echo "   Or open a new terminal session."
 
-install-controller: build-linux-arm64
-	scp bin/linux-arm64/voodu $(HOST):/tmp/voodu
-	scp bin/linux-arm64/voodu-controller $(HOST):/tmp/voodu-controller
-	ssh $(HOST) 'sudo install -m 0755 /tmp/voodu /usr/local/bin/voodu && sudo install -m 0755 /tmp/voodu-controller /usr/local/bin/voodu-controller && sudo systemctl restart voodu-controller'
+# install-controller asks the box what it is before building for it.
+#
+# This used to hardcode arm64, which is right for a lima VM on Apple Silicon
+# and wrong for every x86 VPS — and the failure is silent at the point of the
+# mistake: scp and install both succeed, then systemd cannot exec the binary
+# and the service just does not come up. One `uname -m` is cheaper than that
+# debugging session.
+#
+# Override with ARCH=amd64 / ARCH=arm64 when the box cannot be reached the
+# usual way (a bastion, a paused VM) and you already know what it is.
+install-controller: ## Ship to HOST (auto-detects arch; override with ARCH=amd64|arm64)
+	@test -n "$(HOST)" || { echo "HOST is required: make install-controller HOST=user@box"; exit 1; }
+	@set -e; \
+	arch="$(ARCH)"; \
+	if [ -z "$$arch" ]; then \
+		remote="$$(ssh $(HOST) uname -m)"; \
+		case "$$remote" in \
+			x86_64|amd64)   arch=amd64 ;; \
+			aarch64|arm64)  arch=arm64 ;; \
+			*) echo "unsupported architecture on $(HOST): $$remote"; exit 1 ;; \
+		esac; \
+		echo "==> $(HOST) is $$remote → building linux/$$arch  (override: ARCH=amd64|arm64)"; \
+	else \
+		echo "==> building linux/$$arch (ARCH override)"; \
+	fi; \
+	$(MAKE) build-linux-$$arch; \
+	scp bin/linux-$$arch/$(BINARY_CLI) $(HOST):/tmp/$(BINARY_CLI); \
+	scp bin/linux-$$arch/$(BINARY_CONTROLLER) $(HOST):/tmp/$(BINARY_CONTROLLER); \
+	ssh $(HOST) 'sudo install -m 0755 /tmp/$(BINARY_CLI) /usr/local/bin/$(BINARY_CLI) \
+		&& sudo install -m 0755 /tmp/$(BINARY_CONTROLLER) /usr/local/bin/$(BINARY_CONTROLLER) \
+		&& sudo systemctl restart $(BINARY_CONTROLLER)'; \
+	echo "==> installed:"; \
+	ssh $(HOST) '$(BINARY_CONTROLLER) --version 2>/dev/null || true; systemctl is-active $(BINARY_CONTROLLER)'
 
 check: fmt vet lint test ## Run all checks
 	@echo "All checks passed"
