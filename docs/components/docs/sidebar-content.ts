@@ -185,6 +185,8 @@ export const contents: SidebarSection[] = [
       { title: 'Cron syntax', href: '/docs/reference/cron', icon: Clock },
       { title: 'Errors', href: '/docs/reference/errors', icon: AlertTriangle },
       { title: 'Contributing', href: '/docs/reference/contributing', icon: HandHelping },
+      { title: 'Single sign-on', href: '/sso', icon: Lock },
+      { title: 'Enterprise licence', href: '/license/enterprise', icon: KeyRound },
     ],
   },
 ];

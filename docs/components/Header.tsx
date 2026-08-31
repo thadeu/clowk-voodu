@@ -8,6 +8,8 @@ const navLinks = [
   { label: 'Manifest', href: '/#hcl' },
   { label: 'Stack', href: '/#stack' },
   { label: 'Docs', href: '/docs' },
+  { label: 'SSO', href: '/sso' },
+  { label: 'Enterprise', href: '/license/enterprise' },
   { label: 'FAQ', href: '/#faq' },
 ];
 
@@ -51,7 +53,7 @@ export default function Header() {
       >
         <div className="max-w-[1180px] mx-auto px-5 sm:px-8 md:px-10 lg:px-14 h-15 flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2.5 font-bold tracking-tight text-[17px]">
-            <img src="icon.svg" alt="Voodu icon" className="w-10 h-10" />
+            <img src="/icon.svg" alt="Voodu icon" className="w-10 h-10" />
             <span className="text-white">voodu</span>
           </Link>
 
