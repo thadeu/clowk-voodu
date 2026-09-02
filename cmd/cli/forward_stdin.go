@@ -52,6 +52,12 @@ type streamResult struct {
 	stdin            io.Reader
 	buildModeDeploys []buildModeDep
 	manifests        []controller.Manifest
+
+	// files are the operator's ORIGINAL `-f` arguments, kept because the
+	// rewrite below destroys them: the manifests go over stdin and the
+	// forwarded argv says `-f -`. Without carrying them, "which file produced
+	// this apply" becomes unanswerable the moment the apply leaves the laptop.
+	files []string
 }
 
 // rewriteForStdinStream inspects argv for a manifest-consuming command;
@@ -128,6 +134,8 @@ func rewriteForStdinStream(info *remote.Info, identity string, args []string) (s
 		args:      rest,
 		stdin:     bytes.NewReader(body),
 		manifests: mans,
+		// Captured BEFORE the rewrite replaced them with `-f -`.
+		files: paths,
 	}
 
 	if cmdName == "apply" {
@@ -284,4 +292,3 @@ func splitFileAndFormatFlags(args []string) (paths []string, format string, rest
 
 	return paths, format, rest
 }
-

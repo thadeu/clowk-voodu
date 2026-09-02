@@ -28,9 +28,9 @@ import (
 // Ref shape (same disambiguation rule the rest of the CLI uses):
 //
 //   - "<scope>"           scope-level config (shared by every
-//                         resource in the scope)
+//     resource in the scope)
 //   - "<scope>/<name>"    app-level config (overrides scope-level
-//                         keys on conflict)
+//     keys on conflict)
 //
 // On set/unset the controller fires reconcile events for affected
 // resources so the new env reaches running pods without a manual
@@ -142,10 +142,10 @@ Examples:
 // configOutputFormat is the closed enum of -o values vd config
 // accepts. Three formats cover the realistic operator workflows:
 //
-//   text  — KEY=VALUE per line, paste into a .env file or copy
-//           a single value from the terminal
-//   json  — pipe through jq / consume from scripts
-//   hcl   — paste straight into a manifest's `env = { ... }` block
+//	text  — KEY=VALUE per line, paste into a .env file or copy
+//	        a single value from the terminal
+//	json  — pipe through jq / consume from scripts
+//	hcl   — paste straight into a manifest's `env = { ... }` block
 //
 // YAML was considered and dropped — the output `KEY: VALUE` per
 // line is functionally redundant with text's `KEY=VALUE`. Operators
@@ -387,15 +387,20 @@ func runConfigGet(cmd *cobra.Command, target configTarget, pattern string, forma
 	return renderConfigVars(os.Stdout, filtered, format)
 }
 
-// runConfigUnset deletes one or more keys, one per /config DELETE.
-// The server fires reconcile events for affected resources unless
-// --no-restart is set.
+// runConfigUnset deletes one or more keys in a SINGLE /config DELETE.
+//
+// One request and not one per key, so the controller records `vd config unset
+// A B C` as the one thing the operator did rather than three. It also means
+// one reconcile instead of three, which is the behaviour change worth naming:
+// unsetting three keys used to restart the affected containers three times.
 func runConfigUnset(cmd *cobra.Command, target configTarget, keys []string, restart bool) error {
-	for _, key := range keys {
-		if err := configDelete(cmd, target.scope, target.name, key, restart); err != nil {
-			return err
-		}
+	if err := configDelete(cmd, target.scope, target.name, keys, restart); err != nil {
+		return err
+	}
 
+	// Still one line per key in the output: the request is one, but the
+	// operator asked about three things and wants to see three confirmations.
+	for _, key := range keys {
 		fmt.Printf("Unset %s\n", key)
 	}
 
@@ -529,8 +534,17 @@ func configFetch(cmd *cobra.Command, scope, name, key string) (map[string]string
 	return nested.Vars, nil
 }
 
-// configDelete DELETEs /config?scope=&name=&key=.
-func configDelete(cmd *cobra.Command, scope, name, key string, restart bool) error {
+// configDelete DELETEs /config?scope=&name=&key= (or &keys= for several).
+//
+// A single key still rides on `key`, which every controller has always
+// understood. Only a multi-key unset uses `keys`, so the one common case keeps
+// working against an older controller and the rarer one fails loudly there
+// ("key is required") instead of silently deleting just the first.
+func configDelete(cmd *cobra.Command, scope, name string, keys []string, restart bool) error {
+	if len(keys) == 0 {
+		return fmt.Errorf("unset: at least one KEY is required")
+	}
+
 	q := url.Values{}
 	q.Set("scope", scope)
 
@@ -538,7 +552,11 @@ func configDelete(cmd *cobra.Command, scope, name, key string, restart bool) err
 		q.Set("name", name)
 	}
 
-	q.Set("key", key)
+	if len(keys) == 1 {
+		q.Set("key", keys[0])
+	} else {
+		q.Set("keys", strings.Join(keys, ","))
+	}
 
 	if !restart {
 		q.Set("restart", "false")

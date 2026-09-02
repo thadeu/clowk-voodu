@@ -82,7 +82,12 @@ func runApplyForwarded(info *remote.Info, identity string, stream streamResult, 
 		return 1, err
 	}
 
-	env := remoteEnv()
+	// withFiles, not a bare remoteEnv: `vd apply` is routed here BEFORE the
+	// generic forwarder, so this is the one place on the apply path that can
+	// carry the operator's original `-f` arguments. The stream captured them
+	// before the rewrite replaced them with `-f -`; by the time the command
+	// reaches the box they no longer exist anywhere.
+	env := withFiles(remoteEnv(), stream.files)
 
 	// Phase 1: diff with -o json, capture stdout.
 	diffArgs := rewriteApplyToDiffJSON(stream.args)

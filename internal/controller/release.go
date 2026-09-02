@@ -1,8 +1,8 @@
 package controller
 
 import (
-	crand "crypto/rand"
 	"context"
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -90,7 +90,6 @@ func (h *DeploymentHandler) acquireReleaseLock(app string) (release func(), acqu
 
 	return mu.Unlock, true
 }
-
 
 // releaseContainerName composes the docker name for a release-phase
 // container. Distinct from the deployment's replica names so the
@@ -1103,4 +1102,3 @@ func pickRollbackTarget(history []ReleaseRecord, targetID string) (*ReleaseRecor
 
 	return nil, fmt.Errorf("no prior succeeded release to roll back to")
 }
-

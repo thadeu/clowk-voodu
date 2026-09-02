@@ -619,6 +619,7 @@ func markFiredOnce(transitionID string) bool {
 // Error paths:
 //   - file read failure (file vanished between apply and fire)
 //   - JSON parse failure on the file content
+//
 // In both cases the caller logs + sends the default payload as
 // a safety net (see fireDeployWebhook).
 func buildCustomBody(target *deployWebhookWireSpec, payload WebhookPayload) ([]byte, error) {

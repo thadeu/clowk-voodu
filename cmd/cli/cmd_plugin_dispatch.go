@@ -206,6 +206,7 @@ func runPluginDispatch(root *cobra.Command, plugin, command string, args []strin
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	client := &http.Client{Timeout: forwardTimeout}
 

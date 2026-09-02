@@ -45,12 +45,13 @@ const patBase = "/api/pat/v1/"
 // routes. A plugin route may not use one of these — guarding here means
 // a misconfigured plugin can never shadow a built-in endpoint.
 var reservedPATPrefixes = map[string]struct{}{
-	"stats":   {},
-	"system":  {},
-	"pods":    {},
-	"logs":    {},
-	"metrics": {},
-	"pats":    {},
+	"stats":    {},
+	"system":   {},
+	"pods":     {},
+	"logs":     {},
+	"metrics":  {},
+	"activity": {},
+	"pats":     {},
 }
 
 // pluginRoute is a resolved route declaration. The actual upstream port

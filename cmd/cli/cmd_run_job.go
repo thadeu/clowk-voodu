@@ -26,9 +26,9 @@ import (
 // records the failure before returning), so the CLI can render exit
 // code + duration even on error.
 type runJobResponse struct {
-	Status string             `json:"status"`
-	Data   controller.JobRun  `json:"data"`
-	Error  string             `json:"error,omitempty"`
+	Status string            `json:"status"`
+	Data   controller.JobRun `json:"data"`
+	Error  string            `json:"error,omitempty"`
 }
 
 func runRunJob(cmd *cobra.Command, ref string) error {
@@ -61,6 +61,7 @@ func runRunJob(cmd *cobra.Command, ref string) error {
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/deploy"
 	"go.voodu.clowk.in/internal/docker"
@@ -39,8 +40,8 @@ func newReceivePackCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:    "receive-pack <scope>/<name>",
-		Short:  "Internal: ingest a tarball build context over SSH and deploy",
+		Use:   "receive-pack <scope>/<name>",
+		Short: "Internal: ingest a tarball build context over SSH and deploy",
 		Long: `Reads a gzipped tar of the build context from stdin, extracts it to
 a content-addressed release directory, and runs the build/swap/container
 pipeline. This is the commitless-deploy counterpart of git's receive-pack
@@ -70,6 +71,11 @@ auto-detection if neither resolves.`,
 		// per-(scope,name) mode takes exactly one.
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// This invocation arrived over SSH, so VOODU_ORIGIN says
+			// `ssh` — but "a git push deployed this" is the more useful
+			// fact, and the trail should carry the specific one.
+			originOverride = string(activity.OriginReceivePack)
+
 			// receive-pack only ever runs ON the server (it is the far
 			// end of the SSH tarball stream), so it is safe — and
 			// necessary — to adopt the controller's docker credentials

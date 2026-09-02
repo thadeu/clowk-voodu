@@ -31,7 +31,10 @@ func TestShellEscape(t *testing.T) {
 
 func TestBuildRemoteCommand(t *testing.T) {
 	got := buildRemoteCommand("voodu", []string{"config", "set", "FOO=bar baz", "-a", "api"}, nil)
-	want := "voodu config set 'FOO=bar baz' -a api"
+	// VOODU_ORIGIN is injected by buildRemoteCommand itself: the controller
+	// cannot tell a forwarded command from a local one, so every remote
+	// invocation declares itself for the activity trail.
+	want := "VOODU_ORIGIN=ssh voodu config set 'FOO=bar baz' -a api"
 
 	if got != want {
 		t.Errorf("buildRemoteCommand:\n  got:  %s\n  want: %s", got, want)
@@ -54,7 +57,7 @@ func TestBuildRemoteCommandWithEnv(t *testing.T) {
 	}
 
 	got := buildRemoteCommand("voodu", []string{"diff"}, env)
-	want := "FORCE_COLOR=1 NO_COLOR= 'WEIRD=a b' voodu diff"
+	want := "FORCE_COLOR=1 NO_COLOR= VOODU_ORIGIN=ssh 'WEIRD=a b' voodu diff"
 
 	if got != want {
 		t.Errorf("buildRemoteCommand with env:\n  got:  %s\n  want: %s", got, want)
@@ -109,7 +112,7 @@ func TestForwardInvokesSSH(t *testing.T) {
 		t.Errorf("host arg: %q", host)
 	}
 
-	if remoteCmd := lines[len(lines)-1]; remoteCmd != "voodu config set K=V -a api" {
+	if remoteCmd := lines[len(lines)-1]; remoteCmd != "VOODU_ORIGIN=ssh voodu config set K=V -a api" {
 		t.Errorf("remote cmd: %q", remoteCmd)
 	}
 }
@@ -362,5 +365,29 @@ func TestForwardSkipsMultiplexForStubSSH(t *testing.T) {
 
 	if strings.Contains(string(raw), "ControlMaster") {
 		t.Errorf("stub ssh should not get ControlMaster args: %s", raw)
+	}
+}
+
+// An explicit origin must survive: receive-pack forwards over SSH too, and
+// "a git push deployed this" is more specific than "somebody used SSH".
+func TestBuildRemoteCommandKeepsExplicitOrigin(t *testing.T) {
+	got := buildRemoteCommand("voodu", []string{"diff"}, map[string]string{OriginEnv: "receive_pack"})
+	want := "VOODU_ORIGIN=receive_pack voodu diff"
+
+	if got != want {
+		t.Errorf("buildRemoteCommand:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// The caller's map must not be mutated — it may be reused across several
+// forwarded commands, and a surprise key appearing in it is the kind of bug
+// that shows up far from here.
+func TestBuildRemoteCommandDoesNotMutateCallerEnv(t *testing.T) {
+	env := map[string]string{"FORCE_COLOR": "1"}
+
+	buildRemoteCommand("voodu", []string{"diff"}, env)
+
+	if _, ok := env[OriginEnv]; ok {
+		t.Fatalf("caller env was mutated: %v", env)
 	}
 }

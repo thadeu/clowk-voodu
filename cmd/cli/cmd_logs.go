@@ -266,7 +266,7 @@ func streamSequentialLogs(ctx context.Context, cmd *cobra.Command, containers []
 	for _, name := range containers {
 		fmt.Fprintln(os.Stderr, headerPalette.ColorFor(name)("==> "+name+" <=="))
 
-		prefix := prefixPalette.ColorFor(name)("[" + name + "]") + " "
+		prefix := prefixPalette.ColorFor(name)("["+name+"]") + " "
 		writer := &lockedPrefixWriter{w: os.Stdout, mu: &sync.Mutex{}, prefix: prefix}
 
 		// follow=false here because this path only runs in the
@@ -288,7 +288,7 @@ func streamSequentialLogs(ctx context.Context, cmd *cobra.Command, containers []
 // names. Four shapes:
 //
 //   - has '/' AND the name part has '.'  → per-replica ref, e.g.
-//                  clowk-lp/redis.0 → container clowk-lp-redis.0 (1 elem)
+//     clowk-lp/redis.0 → container clowk-lp-redis.0 (1 elem)
 //   - has '.'  → already a full container name, return as-is (1 elem)
 //   - has '/'  → splitJobRef → /pods?scope=&name= (every replica)
 //   - bare     → /pods?scope= (everything in scope)
@@ -421,6 +421,7 @@ func streamOneLog(ctx context.Context, cmd *cobra.Command, name string, follow b
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

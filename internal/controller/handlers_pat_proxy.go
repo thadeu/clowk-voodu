@@ -104,6 +104,27 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/metrics/dump",
 		auth.Middleware(ScopeRead, a.handlePATMetricsDump))
 
+	// Operator-action trail (activity). ScopeRead, and that is a decision
+	// rather than a default: the earlier proposal was ScopeActions, by the
+	// precedent /pats sets.
+	//
+	// Read wins because a PAT that already reads logs and metrics sees far
+	// more than the trail shows — `vd logs` hands over production stdout.
+	// Requiring a WRITE scope to READ history would invert the model, and
+	// the WebUI poller, the main consumer, holds a read PAT.
+	//
+	// What bounds the exposure is the content, not the scope: a config
+	// VALUE is never recorded, only its key and a digest. What remains is
+	// the same class of thing read already sees.
+	mux.HandleFunc("GET /api/pat/v1/activity",
+		auth.Middleware(ScopeRead, a.handlePATActivity))
+
+	// Incremental NDJSON dump for the WebUI's activity warehouse. Same
+	// contract as /metrics/dump — the sync job is the same shape of code
+	// against both stores.
+	mux.HandleFunc("GET /api/pat/v1/activity/dump",
+		auth.Middleware(ScopeRead, a.handlePATActivityDump))
+
 	// Installed plugins, plus any install still running or recently
 	// failed. ScopeRead: it is a list of names, versions and homepages —
 	// the same metadata `vd plugins:list` prints on the box.
@@ -204,6 +225,18 @@ func (a *API) handlePATMetrics(w http.ResponseWriter, r *http.Request) {
 // ingest line-by-line as bytes arrive.
 func (a *API) handlePATMetricsDump(w http.ResponseWriter, r *http.Request) {
 	a.handleMetricsDump(w, r)
+}
+
+// handlePATActivity is the proxy for the filtered action-trail query.
+// Verbatim passthrough per the invariant at the top of this file.
+func (a *API) handlePATActivity(w http.ResponseWriter, r *http.Request) {
+	a.handleActivity(w, r)
+}
+
+// handlePATActivityDump is the proxy for the incremental NDJSON dump the
+// WebUI's activity warehouse pulls on each sync tick.
+func (a *API) handlePATActivityDump(w http.ResponseWriter, r *http.Request) {
+	a.handleActivityDump(w, r)
 }
 
 // handlePATLogsMulti is the proxy for the server-side multi-pod

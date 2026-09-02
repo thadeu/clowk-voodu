@@ -62,6 +62,16 @@ func CacheDir() string    { return filepath.Join(Root(), "cache") }
 // and just loses pre-loss history. No manifest survives there.
 func MetricsDir() string { return filepath.Join(CacheDir(), "metrics") }
 
+// ActivityDir is where the operator-action trail is appended
+// (one file per UTC day, `activity-YYYY-MM-DD.ndjson`).
+//
+// Under StateDir, NOT CacheDir where metrics live, and the
+// difference is deliberate: a metrics file that disappears costs
+// you a chart's tail, which the next sample tick starts refilling.
+// An activity file that disappears is history that no longer
+// exists anywhere — nothing regenerates it.
+func ActivityDir() string { return filepath.Join(StateDir(), "activity") }
+
 // AssetDir is the materialised on-disk root for one asset
 // manifest. Asset blocks take 1 label (unscoped, scope="") or
 // 2 labels (scoped). Each file key in the spec lands as a

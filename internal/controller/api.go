@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/containers"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
@@ -141,6 +142,24 @@ type API struct {
 	// → 503 (controller not wired with metrics support). Production
 	// wires `paths.MetricsDir()`; same dir the Sampler writes to.
 	MetricsDir string
+
+	// ActivityDir is where the operator-action trail is appended.
+	// The activity read handlers query from here. Empty string →
+	// 503. Production wires `paths.ActivityDir()`; same dir Activity
+	// writes to — two sides of one store, exactly like MetricsDir.
+	ActivityDir string
+
+	// Activity records what was DONE to this box (apply, restart,
+	// delete, rollback, config), so the timeline can answer "what
+	// happened here, and who did it" — a question no other subsystem
+	// can answer today.
+	//
+	// Nil is a supported state, not a bug: every call site goes
+	// through recordActivity, which no-ops on nil. Test setups and a
+	// box whose disk refused the writer keep operating without a
+	// trail. Recording history must never be the reason an action
+	// fails.
+	Activity *activity.Writer
 
 	// Readiness powers `GET /pods/{name}/ready` — the per-replica
 	// readiness gate caddy (or any ingress) reads to decide
@@ -337,6 +356,11 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /system", a.handleSystem)
 	mux.HandleFunc("GET /metrics", a.handleMetrics)
 	mux.HandleFunc("GET /metrics/dump", a.handleMetricsDump)
+
+	// Operator-action trail. On the internal plane too, not only the PAT
+	// one, so `vd activity` can read it on the box without a token.
+	mux.HandleFunc("GET /activity", a.handleActivity)
+	mux.HandleFunc("GET /activity/dump", a.handleActivityDump)
 	mux.HandleFunc("POST /plugins/exec", a.handleExec)
 	mux.HandleFunc("POST /pods/{name}/exec", a.handlePodExec)
 	mux.HandleFunc("GET /pods/{name}/logs", a.handlePodLogs)
@@ -481,6 +505,27 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	// running the old digest.
 	force := r.URL.Query().Get("force") == "true"
 
+	// Activity: record the apply, EXCEPT on dry_run.
+	//
+	// `vd diff` is a read — it touches nothing and answers "what would
+	// happen". Recording it would fill the trail with rows that changed
+	// nothing, and the whole value of the trail is that every row it holds
+	// is something that actually happened to this box.
+	//
+	// Paired (started + finished): apply is the one action here that can
+	// run long enough for "in flight" to be a state worth seeing.
+	var act *activityTracker
+
+	if !dryRun {
+		w, act = a.beginActivity(w, r, true, activity.Record{
+			Action:    activity.ActionApply,
+			Prune:     prune,
+			Resources: manifestResources(manifests),
+		})
+
+		defer act.Finish()
+	}
+
 	// Plugin-block expansion: any manifest whose Kind is not a
 	// core kind gets expanded by an installed plugin into one or
 	// more core-kind manifests. Operator wrote `postgres "data"
@@ -605,6 +650,29 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	prunedRefs := make([]string, 0, len(pruned))
 	for _, t := range pruned {
 		prunedRefs = append(prunedRefs, t.String())
+	}
+
+	// Re-state the resources from the POST-expansion batch: a `postgres`
+	// block the operator wrote becomes a statefulset, and the trail should
+	// show what was actually stored, not the macro that produced it.
+	if act != nil {
+		act.Record.Resources = manifestResources(applied)
+
+		// Scope is set whenever the whole batch shares one, not only for a
+		// single manifest. An apply of five resources that all live in `runa`
+		// IS an action on `runa`, and leaving the column empty would hide it
+		// from a scope filter that every one of its resources matches — which
+		// is the normal shape of an apply, one file describing one scope.
+		//
+		// Kind and Name stay single-manifest-only: five resources have no one
+		// name, and picking one would be a lie rather than a summary. The
+		// batch is described by Resources.
+		act.Record.Scope = commonScope(applied)
+
+		if len(applied) == 1 {
+			act.Record.Kind = string(applied[0].Kind)
+			act.Record.Name = applied[0].Name
+		}
 	}
 
 	data := map[string]any{
@@ -860,6 +928,18 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Activity: a delete is instantaneous, so one `done` line, not a pair.
+	// Scope is filled in below once resolved — the tracker's Record is
+	// enriched in place and only read when Finish runs.
+	w, act := a.beginActivity(w, r, false, activity.Record{
+		Action: activity.ActionDelete,
+		Kind:   string(kind),
+		Name:   name,
+		Scope:  scope,
+	})
+
+	defer act.Finish()
+
 	if IsScoped(kind) && scope == "" {
 		// For scoped kinds the CLI must provide scope. Scan and return a
 		// clear error if there's a single match, or ask for disambiguation.
@@ -875,6 +955,7 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 		}
 
 		scope = resolved
+		act.Record.Scope = scope
 	}
 
 	deleted, err := a.Store.Delete(r.Context(), kind, scope, name)
@@ -889,6 +970,8 @@ func (a *API) applyDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prune := r.URL.Query().Get("prune") == "true"
+
+	act.Record.Prune = prune
 
 	pruned := pruneSummary{}
 
@@ -1266,7 +1349,6 @@ func resolveScope(ctx context.Context, store Store, kind Kind, name string) (str
 		return "", fmt.Errorf("%s/%s is ambiguous across scopes %v — pass ?scope=...", kind, name, matches)
 	}
 }
-
 
 // handleDescribe returns the full picture for a single declared
 // resource: the source manifest, its persisted status blob, and any
@@ -2376,15 +2458,15 @@ func (a *API) handlePodStop(w http.ResponseWriter, r *http.Request) {
 //
 // That breaks the failover flow:
 //
-//   1. operator: `vd stop redis.0`            (pod-0 frozen, master)
-//   2. operator: `vd redis:failover --replica 1`   (env file: REDIS_MASTER_ORDINAL=1)
-//   3. operator: `vd start redis.0`           (pod-0 starts)
-//   4. wrapper script reads MASTER_ORDINAL... but pod-0's
-//      container has the OLD env from step 1's `docker run`,
-//      so it sees MASTER_ORDINAL=0 → boots as master AGAIN.
-//   5. cluster has TWO masters; subsequent failovers can lose
-//      writes via async-replication's "old master came back as
-//      master" data-loss path.
+//  1. operator: `vd stop redis.0`            (pod-0 frozen, master)
+//  2. operator: `vd redis:failover --replica 1`   (env file: REDIS_MASTER_ORDINAL=1)
+//  3. operator: `vd start redis.0`           (pod-0 starts)
+//  4. wrapper script reads MASTER_ORDINAL... but pod-0's
+//     container has the OLD env from step 1's `docker run`,
+//     so it sees MASTER_ORDINAL=0 → boots as master AGAIN.
+//  5. cluster has TWO masters; subsequent failovers can lose
+//     writes via async-replication's "old master came back as
+//     master" data-loss path.
 //
 // Fix: on `vd start`, remove the stopped container and re-fire
 // the manifest's reconcile event. The handler's apply path sees
@@ -2959,9 +3041,17 @@ func (a *API) configPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.Store.PatchConfig(r.Context(), scope, name, payload); err != nil {
+		a.recordConfigChange(r, activity.ActionConfigSet, scope, name, payload, err)
+
 		writeErr(w, http.StatusInternalServerError, err)
+
 		return
 	}
+
+	// Recorded only from here down, where the store write actually happened.
+	// The 400s above rejected the request before touching config, and a row
+	// saying a key changed when nothing did would be worse than no row.
+	a.recordConfigChange(r, activity.ActionConfigSet, scope, name, payload, nil)
 
 	// Materialize the bucket as a .env file on disk so resources
 	// referencing it via `env_from = ["<scope>/<name>"]` find a
@@ -2980,22 +3070,44 @@ func (a *API) configPost(w http.ResponseWriter, r *http.Request) {
 func (a *API) configDelete(w http.ResponseWriter, r *http.Request) {
 	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	key := strings.TrimSpace(r.URL.Query().Get("key"))
-
 	if scope == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("scope is required"))
 		return
 	}
 
-	if key == "" {
+	// `keys` (comma-separated) or `key` (one).
+	//
+	// Both, and not just the plural, because of version skew: a new CLI
+	// unsetting one key keeps using `key` and works against any controller.
+	// Only a MULTI-key unset sends `keys`, which an older controller rejects
+	// with "key is required" — loud, and the operator updates. The alternative
+	// (repeating `key=`) would have an old controller silently delete the
+	// first and drop the rest, which is the failure mode worth paying to
+	// avoid.
+	keys := configDeleteKeys(r)
+
+	if len(keys) == 0 {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("key is required for DELETE"))
 		return
 	}
 
-	if _, err := a.Store.DeleteConfigKey(r.Context(), scope, name, key); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+	// One line for the whole command, not one per key: `vd config unset A B C`
+	// is a single thing the operator did.
+	touched := make(map[string]string, len(keys))
+
+	for _, key := range keys {
+		touched[key] = ""
+
+		if _, err := a.Store.DeleteConfigKey(r.Context(), scope, name, key); err != nil {
+			a.recordConfigChange(r, activity.ActionConfigDelete, scope, name, touched, err)
+
+			writeErr(w, http.StatusInternalServerError, err)
+
+			return
+		}
 	}
+
+	a.recordConfigChange(r, activity.ActionConfigDelete, scope, name, touched, nil)
 
 	// Re-materialize after the delete so the on-disk .env mirrors
 	// the etcd bucket state (the deleted key is now absent). Without
@@ -3237,6 +3349,22 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 		scope = resolved
 	}
+
+	// Activity: paired, like apply. A rolling restart of a multi-replica
+	// deployment is the other action long enough for "in flight" to be a
+	// state an operator wants to see on the screen.
+	//
+	// Placed after scope resolution so the `started` line already names the
+	// right resource — a started row pointing at an unresolved scope would
+	// be the row nobody can filter for.
+	w, act := a.beginActivity(w, r, true, activity.Record{
+		Action: activity.ActionRestart,
+		Kind:   string(kind),
+		Scope:  scope,
+		Name:   name,
+	})
+
+	defer act.Finish()
 
 	// `vd restart` is the operator's explicit "rebuild everything
 	// in this resource" command. Frozen replicas (parked via
@@ -3543,11 +3671,30 @@ func (a *API) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 	targetID := strings.TrimSpace(r.URL.Query().Get("release_id"))
 
+	// Activity: a rollback reports as instantaneous (one `done`). It does
+	// real work, but the handler is synchronous and the operator is not
+	// watching an "in flight" state — the call returns when it is over.
+	//
+	// ReleaseID is the NEW release the rollback produced, which is the row
+	// that joins this line to the ReleaseRecord history. The release it was
+	// rolled back TO is in the response, not in the trail: the trail records
+	// what happened, and what happened is that a new release was created.
+	w, act := a.beginActivity(w, r, false, activity.Record{
+		Action: activity.ActionRollback,
+		Kind:   string(kind),
+		Scope:  scope,
+		Name:   name,
+	})
+
+	defer act.Finish()
+
 	newID, err := fn(r.Context(), scope, name, targetID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	act.Record.ReleaseID = newID
 
 	writeJSON(w, http.StatusOK, envelope{
 		Status: "ok",

@@ -14,12 +14,12 @@ import (
 // assetRefPattern matches BOTH 3-segment and 4-segment forms in
 // a single regex via an optional scope group:
 //
-//   ${asset.NAME.KEY}              → unscoped lookup (scope="")
-//                                    Matches a 1-label
-//                                    `asset "name" { … }`.
-//   ${asset.SCOPE.NAME.KEY}        → scoped lookup at (SCOPE,
-//                                    NAME). Matches a 2-label
-//                                    `asset "scope" "name" { … }`.
+//	${asset.NAME.KEY}              → unscoped lookup (scope="")
+//	                                 Matches a 1-label
+//	                                 `asset "name" { … }`.
+//	${asset.SCOPE.NAME.KEY}        → scoped lookup at (SCOPE,
+//	                                 NAME). Matches a 2-label
+//	                                 `asset "scope" "name" { … }`.
 //
 // The first capture group is the OPTIONAL scope; group 2 is
 // always name; group 3 is always key. When the scope group is

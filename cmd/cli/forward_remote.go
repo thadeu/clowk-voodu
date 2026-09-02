@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"context"
+	"go.voodu.clowk.in/internal/clientinfo"
 	"go.voodu.clowk.in/internal/progress"
 	"go.voodu.clowk.in/internal/remote"
 	"go.voodu.clowk.in/internal/tarball"
@@ -230,7 +232,7 @@ func maybeForwardRemote(root *cobra.Command, args []string) (int, bool) {
 	code, err := remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    stream.stdin,
-		Env:      remoteEnv(),
+		Env:      withFiles(remoteEnv(), stream.files),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -520,6 +522,30 @@ func pushSourceViaTarball(info *remote.Info, identity string, d buildModeDep, fo
 // negotiatingWriter sniffs the server's first stdout line to decide
 // which renderer to use — if no hello arrives, the legacy
 // progressFilter takes over transparently.
+// FilesEnv carries the operator's original `-f` arguments to the remote `vd`.
+//
+// Needed because the client rewrites them: it reads the files, streams the
+// parsed manifests over stdin, and forwards `-f -`. The remote therefore never
+// learns what the file was called, and "which file produced this apply" is a
+// question the trail should answer.
+const FilesEnv = "VOODU_FILES"
+
+// FilesHeader carries the same list from the remote `vd` to the controller.
+const FilesHeader = "X-Voodu-Files"
+
+// maxForwardedFiles bounds what is carried. A `-f` per service in a large repo
+// is plausible; a hundred is somebody globbing, and the trail wants the shape
+// of the apply, not a directory listing.
+const maxForwardedFiles = 20
+
+// remoteEnv is the environment inlined before the remote binary on EVERY
+// forwarded command.
+//
+// The client attribution goes in here rather than at the call sites, and that
+// placement is the point: `vd apply` is routed through runApplyForwarded, and
+// delete through runDeleteForwarded, each with its own remote.Forward. Adding
+// the lookup per call site means the next command with its own orchestrator
+// silently records nothing, and a gap in an audit trail is invisible.
 func remoteEnv() map[string]string {
 	env := map[string]string{
 		progress.EnvProtocol: progress.ProtocolVersion,
@@ -535,19 +561,19 @@ func remoteEnv() map[string]string {
 
 	if v := os.Getenv("NO_COLOR"); v != "" {
 		env["NO_COLOR"] = v
-		return env
+		return withClientInfo(env)
 	}
 
 	if v := os.Getenv("FORCE_COLOR"); v != "" {
 		env["FORCE_COLOR"] = v
-		return env
+		return withClientInfo(env)
 	}
 
 	if term.IsTerminal(int(os.Stdout.Fd())) {
 		env["FORCE_COLOR"] = "1"
 	}
 
-	return env
+	return withClientInfo(env)
 }
 
 // buildContextMaxSize returns the byte cap for an individual
@@ -565,4 +591,60 @@ func buildContextMaxSize() int64 {
 	}
 
 	return 500 * 1024 * 1024
+}
+
+// withClientInfo adds who is running this to the forwarded environment.
+//
+// Resolved HERE and not on the box, because a remote `vd apply` does not
+// execute on your laptop: the client reads the manifests, streams them over
+// SSH, and the binary on the box makes the controller call. A lookup performed
+// there returns the SERVER's own address, and the trail would say the action
+// came from the machine it was performed on — worse than an empty column,
+// because it looks like an answer.
+//
+// Best-effort: a failed lookup adds nothing and the command goes out
+// unchanged. Recording who did something must never stop the something.
+func withClientInfo(env map[string]string) map[string]string {
+	if env == nil {
+		env = map[string]string{}
+	}
+
+	if encoded := clientinfo.Lookup(context.Background()).Encode(); encoded != "" {
+		env[clientinfo.EnvKey] = encoded
+	}
+
+	return env
+}
+
+// withFiles adds the operator's original `-f` arguments.
+//
+// Separate from withClientInfo because it needs something remoteEnv cannot
+// see: the stream that captured the paths before the rewrite replaced them
+// with `-f -`. Call it wherever a streamResult is in hand; the attribution
+// above rides along regardless.
+func withFiles(env map[string]string, files []string) map[string]string {
+	if env == nil {
+		env = map[string]string{}
+	}
+
+	if joined := encodeFiles(files); joined != "" {
+		env[FilesEnv] = joined
+	}
+
+	return env
+}
+
+// encodeFiles renders the `-f` list for transport, capped. Comma-joined and
+// base64'd for the same reason the client info is: it rides as a shell word in
+// the forwarded command, and a path can hold spaces.
+func encodeFiles(files []string) string {
+	if len(files) == 0 {
+		return ""
+	}
+
+	if len(files) > maxForwardedFiles {
+		files = files[:maxForwardedFiles]
+	}
+
+	return base64.RawURLEncoding.EncodeToString([]byte(strings.Join(files, ",")))
 }

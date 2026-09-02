@@ -107,22 +107,22 @@ type jobSpec struct {
 //
 // Three responsibilities, in order of frequency:
 //
-//   1. apply — validate the spec, persist a baseline JobStatus so the
-//      runner can find image/command/env later. Idempotent on replay.
+//  1. apply — validate the spec, persist a baseline JobStatus so the
+//     runner can find image/command/env later. Idempotent on replay.
 //
-//   2. RunOnce — the one imperative entry point. Pulls the manifest off
-//      the store (so the run reflects current desired state, not a
-//      snapshot taken at apply time), spawns a one-shot container
-//      WITHOUT AutoRemove, blocks on docker wait, and records the exit
-//      code + duration in the status's history. The stopped container
-//      stays around so `voodu logs job <name>` (and the docker
-//      json-file driver underneath it) has something to read; the
-//      runner GCs old run containers down to the spec's
-//      successful_history_limit / failed_history_limit caps.
+//  2. RunOnce — the one imperative entry point. Pulls the manifest off
+//     the store (so the run reflects current desired state, not a
+//     snapshot taken at apply time), spawns a one-shot container
+//     WITHOUT AutoRemove, blocks on docker wait, and records the exit
+//     code + duration in the status's history. The stopped container
+//     stays around so `voodu logs job <name>` (and the docker
+//     json-file driver underneath it) has something to read; the
+//     runner GCs old run containers down to the spec's
+//     successful_history_limit / failed_history_limit caps.
 //
-//   3. remove — torch any historical job containers (in-flight or
-//      retained-for-logs). Status blob clears so the next apply
-//      baselines from scratch.
+//  3. remove — torch any historical job containers (in-flight or
+//     retained-for-logs). Status blob clears so the next apply
+//     baselines from scratch.
 //
 // JobHandler does not own scheduling. M4's cronjob handler will share
 // the RunOnce method (or a near twin) so cron ticks dispatch through
@@ -735,15 +735,15 @@ func (h *JobHandler) logf(format string, args ...any) {
 // for operator/plugin tagging — see voodu-postgres' backup capture
 // emitting `voodu.role=backup`.
 var vooduReservedLabels = map[string]bool{
-	containers.LabelCreatedBy:       true,
-	containers.LabelKind:            true,
-	containers.LabelScope:           true,
-	containers.LabelName:            true,
-	containers.LabelReplicaID:       true,
-	containers.LabelManifestHash:    true,
-	containers.LabelCreatedAt:       true,
-	containers.LabelReleaseID:       true,
-	containers.LabelReplicaOrdinal:  true,
+	containers.LabelCreatedBy:      true,
+	containers.LabelKind:           true,
+	containers.LabelScope:          true,
+	containers.LabelName:           true,
+	containers.LabelReplicaID:      true,
+	containers.LabelManifestHash:   true,
+	containers.LabelCreatedAt:      true,
+	containers.LabelReleaseID:      true,
+	containers.LabelReplicaOrdinal: true,
 }
 
 // isVooduReservedLabel reports whether key collides with a label

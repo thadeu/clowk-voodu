@@ -29,15 +29,15 @@ import (
 // Sources:
 //
 //   - "file"   — bytes embedded in the manifest by the CLI
-//                (base64). Just decode + write.
+//     (base64). Just decode + write.
 //   - "url"    — server fetches at reconcile time, caches by
-//                ETag/Last-Modified under <root>/cache/.
-//                Re-applies that didn't change the URL skip
-//                the network round-trip.
+//     ETag/Last-Modified under <root>/cache/.
+//     Re-applies that didn't change the URL skip
+//     the network round-trip.
 //   - "inline" — plain string in the manifest spec; written
-//                verbatim. Tagged here as "inline" for
-//                consistency; on the wire it's just a JSON
-//                string (no _source field).
+//     verbatim. Tagged here as "inline" for
+//     consistency; on the wire it's just a JSON
+//     string (no _source field).
 //
 // On every Apply the handler re-materialises every key.
 // On Delete it removes the asset directory wholesale. The

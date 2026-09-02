@@ -383,8 +383,9 @@ func TestConfigRef_SplitsScopeAndName(t *testing.T) {
 // could silently delete only the first.
 func TestConfigUnset_DeletesEachKey(t *testing.T) {
 	var (
-		mu      sync.Mutex
-		deleted []string
+		mu       sync.Mutex
+		deleted  []string
+		requests int
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -394,7 +395,15 @@ func TestConfigUnset_DeletesEachKey(t *testing.T) {
 		}
 
 		mu.Lock()
-		deleted = append(deleted, r.URL.Query().Get("key"))
+		// `keys` for several, `key` for one — the CLI keeps the singular form
+		// for a single-key unset so it works against any controller version.
+		if multi := r.URL.Query().Get("keys"); multi != "" {
+			deleted = append(deleted, strings.Split(multi, ",")...)
+		} else {
+			deleted = append(deleted, r.URL.Query().Get("key"))
+		}
+
+		requests++
 		mu.Unlock()
 
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -418,8 +427,15 @@ func TestConfigUnset_DeletesEachKey(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// ONE request carrying three keys, not three requests. The controller
+	// records `vd config unset A B C` as the single thing the operator did,
+	// and reconciles the affected containers once instead of three times.
+	if requests != 1 {
+		t.Errorf("expected 1 DELETE carrying every key, got %d", requests)
+	}
+
 	if len(deleted) != 3 {
-		t.Errorf("expected 3 DELETEs, got %d: %v", len(deleted), deleted)
+		t.Errorf("expected 3 keys deleted, got %d: %v", len(deleted), deleted)
 	}
 
 	for _, want := range []string{"FOO", "BAR", "BAZ"} {

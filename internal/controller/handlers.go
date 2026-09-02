@@ -514,12 +514,12 @@ func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
 // AppID and clears its status blob. Filesystem state (env file, release
 // dirs, shared volumes) is intentionally left in place — two reasons:
 //
-//   1. `voodu config set` writes secrets that outlive any single manifest
-//      revision. A user who re-applies the deployment expects their
-//      secrets to still be there.
-//   2. A release dir carries the build context from the last `voodu
-//      deploy`. Keeping it around lets the user roll back by re-applying
-//      without re-building.
+//  1. `voodu config set` writes secrets that outlive any single manifest
+//     revision. A user who re-applies the deployment expects their
+//     secrets to still be there.
+//  2. A release dir carries the build context from the last `voodu
+//     deploy`. Keeping it around lets the user roll back by re-applying
+//     without re-building.
 //
 // Operators who want a full wipe still have the shell: `rm -rf
 // /opt/voodu/apps/<app>` is the explicit, loud way to do that.
@@ -1804,10 +1804,10 @@ func (h *DeploymentHandler) linkEnv(ctx context.Context, scope, name, app string
 // handler that mounts a `--env-file` (deployment, statefulset, job
 // runner via the same merge contract). Centralising the merge:
 //
-//   1. config (scope-level overlaid by app-level, via Store.ResolveConfig)
-//   2. manifest spec.env (HCL `env = { ... }`)
-//   3. ${ref.kind.name.field} interpolation against /status/...
-//   4. WriteEnv to persist `<KEY>=<VAL>` lines
+//  1. config (scope-level overlaid by app-level, via Store.ResolveConfig)
+//  2. manifest spec.env (HCL `env = { ... }`)
+//  3. ${ref.kind.name.field} interpolation against /status/...
+//  4. WriteEnv to persist `<KEY>=<VAL>` lines
 //
 // Returns whether the on-disk env actually moved — handlers gate
 // their rolling-restart on that flag (re-running the same merge
@@ -1914,7 +1914,6 @@ func makeRefLookup(ctx context.Context, store Store, scope string) RefLookup {
 		return fmt.Sprintf("%v", v), true
 	}
 }
-
 
 // refLookup is a thin wrapper that delegates to the package-level
 // makeRefLookup — kept on the receiver so the existing call site

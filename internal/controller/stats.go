@@ -133,7 +133,7 @@ type LimitStats struct {
 // Why a snapshot type instead of embedding PodStats directly?
 //
 //   - PodStats carries Identity + ContainerName + DesiredReplicas
-//     + Orphan, which are already represented on PodDetail.Pod. The
+//   - Orphan, which are already represented on PodDetail.Pod. The
 //     snapshot strips the duplicate keys so the JSON stays tight.
 //   - Pointer (Stats *PodStatsSnapshot) with omitempty means callers
 //     that DON'T enable stats (or pods whose stats failed) just see

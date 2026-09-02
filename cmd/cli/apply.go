@@ -711,16 +711,16 @@ var errExitWithChanges = fmt.Errorf("voodu-diff-has-changes")
 // response and prints the resource header. Two rendering modes,
 // chosen by the verbose flag:
 //
-//   verbose=true (also used by `voodu diff`):
-//     ~ kind/scope/name              ← header
-//         ~ field.path  "old"  →  "new"
-//         + new.field   "v"
-//     ...
+//	verbose=true (also used by `voodu diff`):
+//	  ~ kind/scope/name              ← header
+//	      ~ field.path  "old"  →  "new"
+//	      + new.field   "v"
+//	  ...
 //
-//   verbose=false (default for `voodu apply` preview):
-//     ~ kind/scope/name   field.path=new, another=v
-//     + kind/scope/name   replicas=3 image=...
-//     - kind/scope/name
+//	verbose=false (default for `voodu apply` preview):
+//	  ~ kind/scope/name   field.path=new, another=v
+//	  + kind/scope/name   replicas=3 image=...
+//	  - kind/scope/name
 //
 // The compact mode is what the landing page mockup shows — one line
 // per resource, eye scans down a column. Operators reach for verbose
@@ -1077,8 +1077,8 @@ func runScopeWipe(cmd *cobra.Command, scope string, f applyFlags) error {
 	// transcript matters most when something went wrong.
 	var env struct {
 		Data struct {
-			Scope            string `json:"scope"`
-			ResourcesWiped   []struct {
+			Scope          string `json:"scope"`
+			ResourcesWiped []struct {
 				Kind   string `json:"kind"`
 				Name   string `json:"name"`
 				Pruned struct {
@@ -1483,8 +1483,8 @@ func loadOne(fetch bucketFetcher, path, stdinFormat string, shellEnv map[string]
 // voodu's project home `.voodu/`.
 //
 // Search order, first hit wins:
-//   1. `.voodu/<path>`  (+ `.hcl/.voodu/.vdu/.vd`)
-//   2. `<path>`         (+ `.hcl/.voodu/.vdu/.vd`)  ← today's behaviour
+//  1. `.voodu/<path>`  (+ `.hcl/.voodu/.vdu/.vd`)
+//  2. `<path>`         (+ `.hcl/.voodu/.vdu/.vd`)  ← today's behaviour
 //
 // So `vd apply -f web` finds `.voodu/web.voodu` if present, else a
 // root-level `web.voodu`. `vd apply -f infra/web` → `.voodu/infra/web.*`
@@ -1564,6 +1564,7 @@ func controllerDoTimeout(root *cobra.Command, method, path, rawQuery string, bod
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	client := &http.Client{Timeout: timeout}
 
@@ -1606,6 +1607,7 @@ func controllerStream(ctx context.Context, root *cobra.Command, method, path, ra
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	// Transport-level guards keep the failure-mode useful without ever
 	// trimming the body-read budget — `Client.Timeout` is left zero.
@@ -1674,4 +1676,3 @@ func fetchRemote(root *cobra.Command, kind controller.Kind, scope, name string) 
 
 	return nil, nil
 }
-

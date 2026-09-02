@@ -28,15 +28,15 @@ import (
 // behaviour to start; the OR semantics can be slotted in later under
 // the same Schedule type without API churn.
 type Schedule struct {
-	expr      string
-	minutes   uint64 // bits 0..59
-	hours     uint32 // bits 0..23
-	doms      uint32 // bits 1..31 (bit 0 unused)
-	months    uint16 // bits 1..12 (bit 0 unused)
-	dows      uint8  // bits 0..6
-	loc       *time.Location
-	domStar   bool
-	dowStar   bool
+	expr    string
+	minutes uint64 // bits 0..59
+	hours   uint32 // bits 0..23
+	doms    uint32 // bits 1..31 (bit 0 unused)
+	months  uint16 // bits 1..12 (bit 0 unused)
+	dows    uint8  // bits 0..6
+	loc     *time.Location
+	domStar bool
+	dowStar bool
 }
 
 // ParseSchedule decodes a cron expression. Whitespace separates

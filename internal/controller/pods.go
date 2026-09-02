@@ -87,11 +87,11 @@ type PodsLister interface {
 // (deployment, statefulset). When the error clears on the next
 // successful reconcile, the entry drops from the next /pods response.
 type DegradedResource struct {
-	Kind       string `json:"kind"`
-	Scope      string `json:"scope,omitempty"`
-	Name       string `json:"name"`
-	Reason     string `json:"reason"`
-	At         string `json:"at,omitempty"`         // RFC3339 timestamp of the reconcile attempt
+	Kind       string   `json:"kind"`
+	Scope      string   `json:"scope,omitempty"`
+	Name       string   `json:"name"`
+	Reason     string   `json:"reason"`
+	At         string   `json:"at,omitempty"`          // RFC3339 timestamp of the reconcile attempt
 	ReplicaIDs []string `json:"replica_ids,omitempty"` // running replicas of this resource (may be empty)
 }
 

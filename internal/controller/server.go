@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/envfile"
 	"go.voodu.clowk.in/internal/metrics"
@@ -77,6 +78,18 @@ type Config struct {
 	// (`metrics.DefaultRetention`). Operator override via
 	// `--metrics-retention` / `VOODU_METRICS_RETENTION`.
 	MetricsRetention time.Duration
+
+	// ActivityDir is where the operator-action trail is appended.
+	// Defaults to `paths.ActivityDir()` when empty. Override useful
+	// for tests; production wires the canonical StateDir path.
+	ActivityDir string
+
+	// ActivityRetention is the trail's cleanup window. Default 30
+	// days (`activity.DefaultRetention`) — four times the metrics
+	// window, because "what changed last month" is a question people
+	// ask and "what was the CPU last month" is not. Operator override
+	// via `--activity-retention` / `VOODU_ACTIVITY_RETENTION`.
+	ActivityRetention time.Duration
 }
 
 // Server composes embedded etcd + HTTP API + reconciler into a single
@@ -96,9 +109,9 @@ type Server struct {
 	cancelRec context.CancelFunc
 	recDone   chan struct{}
 
-	cronSched   *CronScheduler
-	cancelCron  context.CancelFunc
-	cronDone    chan struct{}
+	cronSched  *CronScheduler
+	cancelCron context.CancelFunc
+	cronDone   chan struct{}
 
 	// Autoscaler goroutine — M7 CPU-driven horizontal scaler for
 	// deployments with an `autoscale {}` block. On its own goroutine
@@ -126,6 +139,14 @@ type Server struct {
 	ingressSampler *metrics.IngressSampler
 	cancelIngress  context.CancelFunc
 	ingressDone    chan struct{}
+
+	// Activity trail — the append-only record of what was DONE to
+	// this box. No sampler goroutine: the writer is driven by the
+	// handlers themselves, so the only background work is the
+	// retention pass, on its own ticker.
+	activityWriter *activity.Writer
+	cancelActivity context.CancelFunc
+	activityDone   chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -196,14 +217,14 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.api = &API{
-		Store:       store,
-		Version:     s.cfg.Version,
+		Store:         store,
+		Version:       s.cfg.Version,
 		PluginsRoot:   s.cfg.PluginsRoot,
 		NodeName:      s.cfg.NodeName,
 		EtcdClient:    s.cfg.EtcdClient,
 		ControllerURL: deriveControllerURL(s.cfg.HTTPAddr),
 		Invoker:       invoker,
-		Pods:        DockerPodsLister{},
+		Pods:          DockerPodsLister{},
 		// DockerContainerManager satisfies LogStreamer via its Logs
 		// method — same instance the deployment/job/cronjob handlers
 		// already use, so /pods/{name}/logs and the runners agree on
@@ -252,6 +273,16 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 
 			return paths.MetricsDir()
+		}(),
+
+		// ActivityDir tells the activity read handlers where the
+		// trail lives. Same path the writer below appends to.
+		ActivityDir: func() string {
+			if s.cfg.ActivityDir != "" {
+				return s.cfg.ActivityDir
+			}
+
+			return paths.ActivityDir()
 		}(),
 
 		// Plugin-block expansion: discovers plugins under
@@ -526,6 +557,35 @@ func (s *Server) Start(ctx context.Context) error {
 		s.autoscaler.Run(scalerCtx)
 	}()
 
+	// Activity trail — the record of what was DONE to this box.
+	//
+	// Wired BEFORE the HTTP listeners start, so no action can be served
+	// without a trail to write it to. Failure to open is logged and NOT
+	// fatal, same as metrics: a box that cannot write its own history
+	// still has to be able to operate. api.Activity stays nil in that
+	// case and recordActivity no-ops.
+	activityDir := s.cfg.ActivityDir
+	if activityDir == "" {
+		activityDir = paths.ActivityDir()
+	}
+
+	if w, err := activity.NewWriter(activityDir, s.cfg.Logger); err != nil {
+		s.cfg.Logger.Printf("activity: writer disabled (%v); actions will not be recorded", err)
+	} else {
+		s.activityWriter = w
+		s.api.Activity = w
+
+		activityCtx, cancelActivity := context.WithCancel(context.Background())
+		s.cancelActivity = cancelActivity
+		s.activityDone = make(chan struct{})
+
+		go func() {
+			defer close(s.activityDone)
+
+			s.runActivityCleanup(activityCtx)
+		}()
+	}
+
 	// Metrics sampler — persists 15s-cadence time-series to NDJSON
 	// for chart history. Failure to open the writer is logged but
 	// NOT fatal: the controller still serves /system + /pods + the
@@ -718,6 +778,20 @@ func (s *Server) teardown() {
 		_ = s.metricsWriter.Close()
 	}
 
+	if s.cancelActivity != nil {
+		s.cancelActivity()
+	}
+
+	if s.activityDone != nil {
+		<-s.activityDone
+	}
+
+	// Closed LAST among the writers: the HTTP listeners are already down
+	// by here, so no handler can still be mid-record.
+	if s.activityWriter != nil {
+		_ = s.activityWriter.Close()
+	}
+
 	if s.cancelScaler != nil {
 		s.cancelScaler()
 	}
@@ -860,3 +934,43 @@ func deriveContainerControllerURL(httpAddr string) string {
 	return "http://host.docker.internal" + port
 }
 
+// runActivityCleanup runs the retention + gzip pass on a slow ticker.
+//
+// Hourly, not per-tick like metrics: the metrics sampler already wakes every
+// 15s so cleanup rides along for free, while activity has no other reason to
+// wake at all. Retention is measured in days — an hour of slack costs nothing
+// and a busy loop would cost a ReadDir every 15 seconds forever.
+//
+// Runs once at startup so a controller that was down past the cutoff cleans up
+// immediately instead of an hour later.
+func (s *Server) runActivityCleanup(ctx context.Context) {
+	dir := s.cfg.ActivityDir
+	if dir == "" {
+		dir = paths.ActivityDir()
+	}
+
+	retention := s.cfg.ActivityRetention
+	if retention <= 0 {
+		retention = activity.DefaultRetention
+	}
+
+	run := func() {
+		if err := activity.Cleanup(dir, time.Now(), retention, s.cfg.Logger); err != nil {
+			s.cfg.Logger.Printf("activity: cleanup: %v", err)
+		}
+	}
+
+	run()
+
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}

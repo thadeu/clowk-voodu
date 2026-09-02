@@ -47,6 +47,7 @@ func runRunCronJob(cmd *cobra.Command, ref string) error {
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -86,4 +87,3 @@ func runRunCronJob(cmd *cobra.Command, ref string) error {
 
 	return nil
 }
-

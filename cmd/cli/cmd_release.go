@@ -143,6 +143,7 @@ func releaseRunStreaming(cmd *cobra.Command, ref string) error {
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("voodu-cli/%s", version))
+	setOriginHeader(req)
 
 	displayRef := ref
 	if !strings.Contains(displayRef, "/") {

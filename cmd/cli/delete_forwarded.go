@@ -85,7 +85,7 @@ func runDeleteForwarded(info *remote.Info, identity string, stream streamResult,
 	code, err := remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    stream.stdin,
-		Env:      remoteEnv(),
+		Env:      withFiles(remoteEnv(), stream.files),
 	})
 
 	return code, err
@@ -240,7 +240,7 @@ func runScopeWipeForwarded(info *remote.Info, identity string, stream streamResu
 	code, err := remote.Forward(info, stream.args, remote.ForwardOptions{
 		Identity: identity,
 		Stdin:    stream.stdin,
-		Env:      remoteEnv(),
+		Env:      withFiles(remoteEnv(), stream.files),
 	})
 
 	return code, err
@@ -297,4 +297,3 @@ func pruneVolumeSuffix(flags deleteClientFlags) string {
 
 	return ""
 }
-

@@ -203,7 +203,29 @@ func Forward(info *Info, args []string, opts ForwardOptions) (int, error) {
 // binary. The remote shell interprets them as per-command env, same
 // as `FOO=bar VOODU=1 voodu ...` on a local shell.
 func buildRemoteCommand(bin string, args []string, env map[string]string) string {
-	parts := make([]string, 0, len(args)+len(env)+1)
+	parts := make([]string, 0, len(args)+len(env)+2)
+
+	// Declare the origin for the activity trail. The controller cannot tell
+	// a local CLI from an SSH-forwarded one by looking at the request — both
+	// arrive as the same POST from the same binary — so the caller says so.
+	//
+	// Injected HERE, in the one place every forwarded command is built,
+	// rather than at each call site, because a call site added later
+	// without it would silently record as `cli` and the trail would say the
+	// action happened on the box when it did not.
+	//
+	// Never overrides an explicit value: receive-pack forwards over SSH too
+	// and is more specific about what happened.
+	if env[OriginEnv] == "" {
+		next := make(map[string]string, len(env)+1)
+
+		for k, v := range env {
+			next[k] = v
+		}
+
+		next[OriginEnv] = OriginSSH
+		env = next
+	}
 
 	// Sort env keys so the command is deterministic — helpful for
 	// logs, `ssh -v`, and the table-driven tests.
@@ -271,3 +293,13 @@ func wantTTY(force *bool) bool {
 
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
+
+// OriginEnv carries the activity origin to a remote `vd` invocation, which
+// turns it into the X-Voodu-Origin header on its own controller calls.
+//
+// An env var rather than a flag: every command forwards through the same
+// path, and a flag would have to be threaded through each one.
+const OriginEnv = "VOODU_ORIGIN"
+
+// OriginSSH is what a forwarded command declares.
+const OriginSSH = "ssh"

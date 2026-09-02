@@ -305,7 +305,6 @@ func defaultPluginRepo(blockType string) string {
 	return "thadeu/voodu-" + blockType
 }
 
-
 // blockCoreAttributes is the catalogue of nested-block names
 // the controller reserves at the plugin-block level. The
 // reserved blocks carry installer metadata (which version of
@@ -623,11 +622,11 @@ func spliceJSONField(spec json.RawMessage, key string, value json.RawMessage) (j
 //     opt-in for stateful plugins like voodu-redis.
 //
 //   - [...]   — an array of manifest objects. The classic shape
-//                voodu-postgres-multi and any fan-out plugin uses.
+//     voodu-postgres-multi and any fan-out plugin uses.
 //
 //   - {...}   — a single manifest object. The simplest shape,
-//                used by single-resource plugins like voodu-caddy
-//                ingress (one ingress in, one ingress out).
+//     used by single-resource plugins like voodu-caddy
+//     ingress (one ingress in, one ingress out).
 //
 // The shape is detected by inspecting the first non-whitespace
 // byte of the re-marshalled JSON. `[` → array; `{` with a

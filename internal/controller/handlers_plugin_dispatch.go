@@ -40,29 +40,29 @@ type pluginDispatchRequest struct {
 //   - config_set       — write KV pairs to the (Scope, Name) bucket
 //   - config_unset     — remove Keys from the (Scope, Name) bucket
 //   - apply_manifest   — upsert a manifest via Store.Put. The
-//                        embedded Manifest carries kind+scope+
-//                        name+spec; action's top-level Scope/Name
-//                        are the "owner context" (typically the
-//                        plugin resource emitting the apply).
+//     embedded Manifest carries kind+scope+
+//     name+spec; action's top-level Scope/Name
+//     are the "owner context" (typically the
+//     plugin resource emitting the apply).
 //   - delete_manifest  — Store.Delete(Kind, Scope, Name). The
-//                        action's top-level Scope/Name + Kind
-//                        identify the manifest to remove.
+//     action's top-level Scope/Name + Kind
+//     identify the manifest to remove.
 //   - run_job          — async Jobs.RunOnce(Scope, Name) on an
-//                        already-applied job manifest. Spawns a
-//                        goroutine and returns immediately with
-//                        a "queued" summary. Errors during the
-//                        run surface via /describe?kind=job and
-//                        the per-job status, never to this
-//                        dispatch response (fire-and-forget by
-//                        design — plugin already exited when the
-//                        run starts).
+//     already-applied job manifest. Spawns a
+//     goroutine and returns immediately with
+//     a "queued" summary. Errors during the
+//     run surface via /describe?kind=job and
+//     the per-job status, never to this
+//     dispatch response (fire-and-forget by
+//     design — plugin already exited when the
+//     run starts).
 //   - exec_local       — passthrough: controller does NOT run
-//                        the command server-side; it adds the
-//                        command vector to a separate
-//                        `exec_local` field in the response so
-//                        the CLI can run it locally with TTY
-//                        attached. Use for interactive shells
-//                        and other TTY-dependent flows.
+//     the command server-side; it adds the
+//     command vector to a separate
+//     `exec_local` field in the response so
+//     the CLI can run it locally with TTY
+//     attached. Use for interactive shells
+//     and other TTY-dependent flows.
 //
 // Unknown action types are rejected (loud failure beats silent
 // no-op when a plugin author typos a type).

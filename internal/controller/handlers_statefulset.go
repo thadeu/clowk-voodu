@@ -91,17 +91,17 @@ type StatefulsetHandler struct {
 // avoids a reverse import (manifest already imports controller for the
 // wire Manifest type).
 type statefulsetSpec struct {
-	Image       string             `json:"image,omitempty"`
-	Replicas    int                `json:"replicas,omitempty"`
-	Command     []string           `json:"command,omitempty"`
-	Env         map[string]string  `json:"env,omitempty"`
-	Ports       []string           `json:"ports,omitempty"`
-	Volumes     []string           `json:"volumes,omitempty"`
-	Network     string             `json:"network,omitempty"`
-	Networks    []string           `json:"networks,omitempty"`
-	NetworkMode string             `json:"network_mode,omitempty"`
-	Restart     string             `json:"restart,omitempty"`
-	HealthCheck string             `json:"health_check,omitempty"`
+	Image       string            `json:"image,omitempty"`
+	Replicas    int               `json:"replicas,omitempty"`
+	Command     []string          `json:"command,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	Ports       []string          `json:"ports,omitempty"`
+	Volumes     []string          `json:"volumes,omitempty"`
+	Network     string            `json:"network,omitempty"`
+	Networks    []string          `json:"networks,omitempty"`
+	NetworkMode string            `json:"network_mode,omitempty"`
+	Restart     string            `json:"restart,omitempty"`
+	HealthCheck string            `json:"health_check,omitempty"`
 
 	// EnvFrom mirrors JobSpec.EnvFrom — each entry is a "scope/name"
 	// (or bare "name" for the current scope) ref to another resource
@@ -512,7 +512,7 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 			// against a container in mid-delete.
 			h.Probes.MarkPlannedTeardown(app, s.Name)
 			h.Probes.MarkPlannedTeardown(app, s.Name)
-		h.Probes.Stop(app, s.Name)
+			h.Probes.Stop(app, s.Name)
 
 			if err := h.Containers.Remove(s.Name); err != nil {
 				return fmt.Errorf("remove %s: %w", s.Name, err)
@@ -1660,20 +1660,20 @@ func (h *StatefulsetHandler) Rollback(ctx context.Context, scope, name, targetID
 
 // rolloutRollback brings the running fleet to the snapshot's shape:
 //
-//   1. Scale down: drop ordinals above the snapshot's want.
-//      VOLUMES OF DROPPED PODS STAY — that's the contract
-//      separating statefulset rollback from deployment rollback.
-//      Operator recovers data via re-scale or `vd delete --prune`.
-//   2. Rolling-replace top-down: each surviving ordinal swaps to
-//      the rolled-back spec. Pod-0 is the last to swap (postgres
-//      primary stays serving longest).
-//   3. Scale up: if snapshot wants MORE replicas than currently
-//      live, spawn the missing ordinals. Their volumes — if they
-//      existed from a prior peak — re-attach automatically.
-//   4. Re-stamp release_id: any pod whose label still points at
-//      the rolled-back-FROM release gets recycled so `vd describe`
-//      shows the new release_id on every replica. Mirror of the
-//      deployment rollback's Phase 4.
+//  1. Scale down: drop ordinals above the snapshot's want.
+//     VOLUMES OF DROPPED PODS STAY — that's the contract
+//     separating statefulset rollback from deployment rollback.
+//     Operator recovers data via re-scale or `vd delete --prune`.
+//  2. Rolling-replace top-down: each surviving ordinal swaps to
+//     the rolled-back spec. Pod-0 is the last to swap (postgres
+//     primary stays serving longest).
+//  3. Scale up: if snapshot wants MORE replicas than currently
+//     live, spawn the missing ordinals. Their volumes — if they
+//     existed from a prior peak — re-attach automatically.
+//  4. Re-stamp release_id: any pod whose label still points at
+//     the rolled-back-FROM release gets recycled so `vd describe`
+//     shows the new release_id on every replica. Mirror of the
+//     deployment rollback's Phase 4.
 func (h *StatefulsetHandler) rolloutRollback(ctx context.Context, scope, name, app string, rollback *Manifest, target *ReleaseRecord, newReleaseID string) error {
 	if h.Containers == nil {
 		return nil

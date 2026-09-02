@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/metrics"
@@ -50,6 +51,11 @@ func main() {
 		// service file's ExecStart.
 		metricsInterval  = flag.Duration("metrics-interval", parseDurationOr("VOODU_METRICS_INTERVAL", metrics.DefaultInterval), "metrics sampler tick cadence (env: VOODU_METRICS_INTERVAL, default 15s)")
 		metricsRetention = flag.Duration("metrics-retention", parseDurationOr("VOODU_METRICS_RETENTION", metrics.DefaultRetention), "metrics file retention window (env: VOODU_METRICS_RETENTION, default 168h = 7d)")
+
+		// Activity trail — the append-only record of operator actions
+		// under `<VOODU_ROOT>/state/activity/`. Only retention is
+		// tunable: there is no cadence, the handlers drive the writes.
+		activityRetention = flag.Duration("activity-retention", parseDurationOr("VOODU_ACTIVITY_RETENTION", activity.DefaultRetention), "activity trail retention window (env: VOODU_ACTIVITY_RETENTION, default 720h = 30d)")
 
 		// Ingress sampler — tails voodu-caddy's JSON access log,
 		// aggregates per-deployment HTTP metrics (count, status
@@ -97,21 +103,22 @@ func main() {
 	}
 
 	srv := controller.NewServer(controller.Config{
-		DataDir:          *dataDir,
-		HTTPAddr:         *httpAddr,
-		PATAddr:          *patAddr,
-		PATActionRate:    *patRate,
-		PATActionBurst:   *patBurst,
-		EtcdClient:       *etcdClient,
-		EtcdPeer:         *etcdPeer,
-		NodeName:         *nodeName,
-		PluginsRoot:      *pluginsDir,
-		Version:          fmt.Sprintf("%s (commit: %s)", version, commit),
-		Logger:           logger,
-		QuietEtcd:        *quietEtcd,
-		MetricsInterval:  *metricsInterval,
-		MetricsRetention: *metricsRetention,
-		CaddyAccessLog:   *caddyLog,
+		DataDir:           *dataDir,
+		HTTPAddr:          *httpAddr,
+		PATAddr:           *patAddr,
+		PATActionRate:     *patRate,
+		PATActionBurst:    *patBurst,
+		EtcdClient:        *etcdClient,
+		EtcdPeer:          *etcdPeer,
+		NodeName:          *nodeName,
+		PluginsRoot:       *pluginsDir,
+		Version:           fmt.Sprintf("%s (commit: %s)", version, commit),
+		Logger:            logger,
+		QuietEtcd:         *quietEtcd,
+		MetricsInterval:   *metricsInterval,
+		MetricsRetention:  *metricsRetention,
+		ActivityRetention: *activityRetention,
+		CaddyAccessLog:    *caddyLog,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
