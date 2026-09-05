@@ -90,6 +90,38 @@ type Config struct {
 	// ask and "what was the CPU last month" is not. Operator override
 	// via `--activity-retention` / `VOODU_ACTIVITY_RETENTION`.
 	ActivityRetention time.Duration
+
+	// ParseManifests turns a manifest file into manifests, for the deploy
+	// executor. Supplied by main.go rather than constructed here, because
+	// internal/manifest imports this package and the dependency cannot run
+	// both ways. Nil leaves the deploy run endpoint answering 503.
+	ParseManifests ManifestParser
+
+	// BuildFromSource builds a workload from a repository's source, for
+	// build-mode deploys. Supplied by main.go for the same reason
+	// ParseManifests is. Nil leaves the executor refusing build mode with
+	// that reason rather than applying a workload whose image was never
+	// built.
+	BuildFromSource SourceBuilder
+
+	// BuildRoot is where a deploy unpacks a repository before building it.
+	// Empty puts it under DataDir — see buildRoot for why not /tmp. Operators
+	// override with --build-root / VOODU_BUILD_ROOT when the data volume is
+	// small and a scratch disk is bigger.
+	BuildRoot string
+}
+
+// buildRoot decides where a deploy unpacks a repository.
+//
+// The operator's value wins. Otherwise `/opt/voodu/builds` — under the tree
+// the platform owns, never /tmp, which a hardened unit (`ProtectSystem=strict`,
+// `PrivateTmp=`) or a read-only rootfs makes unwritable. See paths.BuildsDir.
+func buildRoot(cfg Config) string {
+	if cfg.BuildRoot != "" {
+		return cfg.BuildRoot
+	}
+
+	return paths.BuildsDir()
 }
 
 // Server composes embedded etcd + HTTP API + reconciler into a single
@@ -289,6 +321,16 @@ func (s *Server) Start(ctx context.Context) error {
 		// PluginsRoot at apply time and routes non-core kinds
 		// through their `expand` command. M-D2+ kicks in.
 		PluginBlocks: &DirPluginRegistry{PluginsRoot: s.cfg.PluginsRoot},
+
+		// Deploy executor's parser. See Config.ParseManifests for why it
+		// arrives from outside instead of being imported.
+		ParseManifests:  s.cfg.ParseManifests,
+		BuildFromSource: s.cfg.BuildFromSource,
+
+		// Under the data directory by default: it is the one path the
+		// controller is guaranteed to own and to be able to write, which /tmp
+		// is not on a box with a hardened unit or a read-only rootfs.
+		BuildRoot: buildRoot(s.cfg),
 
 		// JIT-install plugins missing at apply time. Convention
 		// repo is `thadeu/voodu-<kind>`; operators override per

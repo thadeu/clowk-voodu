@@ -6,6 +6,7 @@
 // Three verbs, terse on purpose:
 //
 //	vd pat create [--scope=read,actions] [--name=label]
+//	vd pat create --scope=all --name=console
 //	vd pat list
 //	vd pat revoke <id>
 //
@@ -28,6 +29,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"go.voodu.clowk.in/internal/controller"
 )
 
 // patCreateRequest mirrors controller.patCreateRequest. Kept local
@@ -100,17 +103,20 @@ func newPATCreateCmd() *cobra.Command {
 Lost tokens cannot be recovered — revoke + create a new one.
 
 Scopes:
-  read     — GET endpoints (stats, pods, logs)
-  actions  — POST mutations (restart) + rate-limited
+  read         — GET endpoints (stats, pods, logs, metrics, activity)
+  config:read  — read config keys, masked by default
+  config       — set and unset config values
+  actions      — POST mutations (restart, plugin install) + rate-limited
+  deploy       — the deploy/ subtree: triggers, preflight, firing a deploy
 
-Defaults to "read" only. Pass --scope=read,actions for a token that
-can also restart pods.`,
+Defaults to "read" only. Scopes are additive and independent: a token
+scoped to deploy alone can do nothing but deploy.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runPATCreate(cmd, scope, name)
 		},
 	}
 
-	cmd.Flags().StringVar(&scope, "scope", "read", "comma-separated scopes (read | actions)")
+	cmd.Flags().StringVar(&scope, "scope", "read", "comma-separated scopes ("+scopeFlagHint()+")")
 	cmd.Flags().StringVar(&name, "name", "", "operator-supplied label (optional)")
 
 	return cmd
@@ -152,8 +158,10 @@ func runPATCreate(cmd *cobra.Command, scopeFlag, name string) error {
 		}
 	}
 
+	scopes = expandAll(scopes)
+
 	if len(scopes) == 0 {
-		return fmt.Errorf("--scope is required (read | actions | both)")
+		return fmt.Errorf("--scope is required (%s)", scopeFlagHint())
 	}
 
 	body, _ := json.Marshal(patCreateRequest{Scopes: scopes, Name: strings.TrimSpace(name)})
@@ -342,4 +350,61 @@ func formatPATLastUsed(rfc3339 string) string {
 	}
 
 	return formatPATRelativeTime(rfc3339)
+}
+
+// expandAll turns `--scope=all` into the scopes that exist RIGHT NOW.
+//
+// EXPANDED AT CREATION, never stored as the word "all", and that is the whole
+// design rather than an implementation detail. A token recorded as "all" would
+// silently gain every scope added in a later release — its power would grow
+// without anybody deciding that it should, and the operator who minted it
+// would have no way to see that it had.
+//
+// Expanded, the record lists the five scopes that were granted, `vd pat list`
+// prints them, and a sixth scope shipped next month reaches this token only
+// when somebody mints a new one. The convenience is real; the blank cheque is
+// what is being avoided.
+//
+// It composes: `--scope=all` and `--scope=read,all` mean the same thing, and
+// the result is deduplicated by the controller's own normaliser.
+func expandAll(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	seen := make(map[string]bool, len(scopes))
+
+	for _, s := range scopes {
+		if s != "all" {
+			if !seen[s] {
+				seen[s] = true
+
+				out = append(out, s)
+			}
+
+			continue
+		}
+
+		for _, known := range controller.KnownScopes() {
+			if !seen[string(known)] {
+				seen[string(known)] = true
+
+				out = append(out, string(known))
+			}
+		}
+	}
+
+	return out
+}
+
+// scopeFlagHint renders the scope vocabulary for the flag help and the
+// missing-flag error, from the controller's own list. Retyping it here is how
+// the previous text ended up naming two of five scopes.
+func scopeFlagHint() string {
+	names := make([]string, 0)
+
+	for _, s := range controller.KnownScopes() {
+		names = append(names, string(s))
+	}
+
+	// `all` last, and named as what it is: a shorthand for the list, expanded
+	// at creation. See expandAll.
+	return strings.Join(names, " | ") + " | all"
 }

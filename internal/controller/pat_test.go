@@ -198,6 +198,21 @@ func TestParseScopes(t *testing.T) {
 		{"with whitespace", " read , actions ", []Scope{ScopeRead, ScopeActions}, false},
 		{"dedupes", "read,read,actions", []Scope{ScopeRead, ScopeActions}, false},
 
+		{"deploy", "deploy", []Scope{ScopeDeploy}, false},
+		{"config", "config", []Scope{ScopeConfig}, false},
+		// A colon in a scope name: the splitter must not treat it as a
+		// separator, and the vocabulary must accept it verbatim.
+		{"config read", "config:read", []Scope{ScopeConfigRead}, false},
+		{
+			"every scope normalises least-powerful first",
+			"deploy,actions,config,config:read,read",
+			[]Scope{ScopeRead, ScopeConfigRead, ScopeConfig, ScopeActions, ScopeDeploy},
+			false,
+		},
+		// The deploy plane's whole claim rests on a token that carries this
+		// and nothing else.
+		{"deploy alone stays alone", "deploy", []Scope{ScopeDeploy}, false},
+
 		{"empty string", "", nil, true},
 		{"whitespace only", "   ", nil, true},
 		{"single comma", ",", nil, true},
@@ -400,5 +415,74 @@ func TestParsePATToken_AcceptsHyphenAndUnderscore(t *testing.T) {
 
 	if id != body[:patTokenIDLen] {
 		t.Errorf("ID = %q, want %q", id, body[:patTokenIDLen])
+	}
+}
+
+// normalizeScopes used to be a switch with one branch per scope, which
+// silently DROPPED anything it had no branch for. A scope added to the
+// vocabulary and forgotten there would parse, validate, and then vanish on the
+// way to storage — a PAT reporting fewer powers than it was granted.
+//
+// This walks the vocabulary itself, so forgetting is what fails.
+func TestNormalizeScopesKeepsEveryKnownScope(t *testing.T) {
+	all := make([]Scope, 0, len(scopeOrder))
+	for _, s := range scopeOrder {
+		all = append(all, s)
+	}
+
+	got := normalizeScopes(all)
+
+	if len(got) != len(scopeOrder) {
+		t.Fatalf("normalizeScopes dropped a scope: got %v, want %v", got, scopeOrder)
+	}
+
+	for i := range got {
+		if got[i] != scopeOrder[i] {
+			t.Errorf("position %d: got %q, want %q", i, got[i], scopeOrder[i])
+		}
+	}
+}
+
+// Reversing the input must not reverse the output: the stored order is what
+// makes two equivalent PATs compare equal on the wire.
+func TestNormalizeScopesIsOrderIndependent(t *testing.T) {
+	forward := normalizeScopes([]Scope{ScopeRead, ScopeConfig, ScopeDeploy})
+	backward := normalizeScopes([]Scope{ScopeDeploy, ScopeConfig, ScopeRead})
+
+	if len(forward) != len(backward) {
+		t.Fatalf("different lengths: %v vs %v", forward, backward)
+	}
+
+	for i := range forward {
+		if forward[i] != backward[i] {
+			t.Fatalf("order depends on input: %v vs %v", forward, backward)
+		}
+	}
+}
+
+// The error message is built from the vocabulary, not hand-written — the
+// version this replaced still said "valid: read, actions" and would have kept
+// saying it forever.
+func TestUnknownScopeErrorNamesEveryValidOne(t *testing.T) {
+	_, err := ParseScopes("wat")
+	if err == nil {
+		t.Fatal("an unknown scope must be refused")
+	}
+
+	for _, s := range scopeOrder {
+		if !strings.Contains(err.Error(), string(s)) {
+			t.Errorf("error does not mention %q: %s", s, err)
+		}
+	}
+}
+
+// Invariante V. The plugin plane intercepts before the mux, so an unreserved
+// prefix is one a plugin can claim — and whoever installs a plugin is not
+// necessarily whoever configured the deploy trigger.
+func TestDeployAndConfigPrefixesAreReserved(t *testing.T) {
+	for _, prefix := range []string{"deploy", "config"} {
+		if _, ok := reservedPATPrefixes[prefix]; !ok {
+			t.Errorf("%q is not reserved: a plugin declaring it would receive the controller's traffic", prefix)
+		}
 	}
 }

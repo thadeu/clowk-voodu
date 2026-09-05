@@ -11,24 +11,26 @@ import (
 // this package. It lets us exercise API handlers and the reconciler
 // without paying the embedded-etcd startup cost.
 type memStore struct {
-	mu     sync.Mutex
-	kv     map[string]*Manifest
-	status map[string][]byte
-	config map[string]map[string]string // bucket → key:value
-	frozen map[string][]string          // FrozenKey(kind, scope, name) → replica IDs
-	pats   map[string]*PAT              // ID → PAT (in-memory mirror of /pats/<id>)
-	rev    int64
+	mu       sync.Mutex
+	kv       map[string]*Manifest
+	status   map[string][]byte
+	config   map[string]map[string]string // bucket → key:value
+	frozen   map[string][]string          // FrozenKey(kind, scope, name) → replica IDs
+	pats     map[string]*PAT              // ID → PAT (in-memory mirror of /pats/<id>)
+	triggers map[string]*Trigger          // ID → Trigger (mirror of /triggers/<id>)
+	rev      int64
 
 	watchers []chan WatchEvent
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		kv:     map[string]*Manifest{},
-		status: map[string][]byte{},
-		config: map[string]map[string]string{},
-		frozen: map[string][]string{},
-		pats:   map[string]*PAT{},
+		kv:       map[string]*Manifest{},
+		status:   map[string][]byte{},
+		config:   map[string]map[string]string{},
+		frozen:   map[string][]string{},
+		pats:     map[string]*PAT{},
+		triggers: map[string]*Trigger{},
 	}
 }
 
@@ -444,4 +446,62 @@ func cloneManifest(m *Manifest) *Manifest {
 	_ = json.Unmarshal(b, &c)
 
 	return &c
+}
+
+// Trigger methods — mirror the EtcdStore impl in trigger_store.go. Defensive
+// copies on Put/Get for the same reason the PAT ones make them: the etcd
+// implementation round-trips through JSON and is naturally immune, so a test
+// store that shares pointers would let a test pass where production fails.
+
+func (m *memStore) PutTrigger(_ context.Context, t Trigger) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if t.ID == "" {
+		return nil
+	}
+
+	cp := t
+	m.triggers[t.ID] = &cp
+
+	return nil
+}
+
+func (m *memStore) GetTrigger(_ context.Context, id string) (*Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.triggers[id]
+	if !ok {
+		return nil, nil
+	}
+
+	cp := *t
+
+	return &cp, nil
+}
+
+func (m *memStore) ListTriggers(_ context.Context) ([]Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]Trigger, 0, len(m.triggers))
+	for _, t := range m.triggers {
+		out = append(out, *t)
+	}
+
+	return out, nil
+}
+
+func (m *memStore) DeleteTrigger(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.triggers[id]; !ok {
+		return false, nil
+	}
+
+	delete(m.triggers, id)
+
+	return true, nil
 }

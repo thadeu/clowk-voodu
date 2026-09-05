@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -66,7 +67,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return err
 	}
 
-	buildID, tmpPath, err := bufferTarball(src)
+	buildID, tmpPath, err := bufferTarball(opts.ScratchDir, src)
 	if err != nil {
 		r.StepEnd("receive", progress.StatusFail, err)
 
@@ -97,7 +98,7 @@ func RunFromTarball(app string, src io.Reader, opts Options) error {
 		return fmt.Errorf("create release dir: %w", err)
 	}
 
-	if err := extractTarball(tmpPath, releaseDir); err != nil {
+	if err := extractTarball(tmpPath, releaseDir, opts.StripComponents); err != nil {
 		_ = os.RemoveAll(releaseDir)
 		r.StepEnd("create", progress.StatusFail, err)
 
@@ -222,10 +223,23 @@ func gcReleases(app string, keep int) (int, error) {
 // bufferTarball writes src to a temp file while computing the sha256 of
 // its bytes. Returning the hash as the build-id AND the temp path lets
 // the caller decide dedup-skip vs extract without re-reading the stream.
-func bufferTarball(src io.Reader) (buildID, tmpPath string, err error) {
-	f, err := os.CreateTemp("", "voodu-receive-*.tar.gz")
+//
+// `dir` is where. Empty keeps os.CreateTemp's own default (which honours
+// TMPDIR); a caller running on a box passes a directory the platform owns,
+// because /tmp is not writable under a hardened unit. See Options.ScratchDir.
+func bufferTarball(dir string, src io.Reader) (buildID, tmpPath string, err error) {
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", "", fmt.Errorf("scratch dir %s: %w", dir, err)
+		}
+	}
+
+	f, err := os.CreateTemp(dir, "voodu-receive-*.tar.gz")
 	if err != nil {
-		return "", "", err
+		// Names the directory: without it "read-only file system" leaves the
+		// operator guessing which one, and an empty dir means /tmp — exactly
+		// the knowledge they lack at that moment.
+		return "", "", fmt.Errorf("in %s: %w", scratchLabel(dir), err)
 	}
 
 	defer f.Close()
@@ -240,6 +254,15 @@ func bufferTarball(src io.Reader) (buildID, tmpPath string, err error) {
 	return buildIDFromHash(h), f.Name(), nil
 }
 
+// scratchLabel names the directory in an error, resolving the empty default.
+func scratchLabel(dir string) string {
+	if dir != "" {
+		return dir
+	}
+
+	return os.TempDir()
+}
+
 func buildIDFromHash(h hash.Hash) string {
 	sum := h.Sum(nil)
 
@@ -249,7 +272,7 @@ func buildIDFromHash(h hash.Hash) string {
 // extractTarball unpacks the gzipped tar at path into dest. Refuses path
 // traversal (../), symlinks escaping dest, and absolute paths. Preserves
 // file mode bits to keep scripts executable.
-func extractTarball(path, dest string) error {
+func extractTarball(path, dest string, strip int) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -285,7 +308,15 @@ func extractTarball(path, dest string) error {
 			return fmt.Errorf("tar header: %w", err)
 		}
 
-		target, err := safeJoin(destAbs, hdr.Name)
+		name, keep := stripComponents(hdr.Name, strip)
+		if !keep {
+			// The wrapper directory itself, and anything shallower than the
+			// strip depth. Skipped rather than an error: the wrapper is a
+			// legitimate entry, it just has no destination.
+			continue
+		}
+
+		target, err := safeJoin(destAbs, name)
 		if err != nil {
 			return fmt.Errorf("entry %q: %w", hdr.Name, err)
 		}
@@ -413,4 +444,44 @@ func fileMode(m int64, fallback os.FileMode) os.FileMode {
 	}
 
 	return perm
+}
+
+// stripComponents drops the first `n` path components from a tar entry name,
+// reporting whether anything is left to extract.
+//
+// GitHub's `/tarball` wraps the whole tree in one directory named for the
+// owner, repository and SHA. Callers pass 1 so a repository-relative path in a
+// manifest resolves the way whoever wrote it expects.
+//
+// Returns false for the wrapper directory itself and for anything shallower
+// than the strip depth — those have no destination, which is not an error.
+func stripComponents(name string, n int) (string, bool) {
+	if n <= 0 {
+		return name, true
+	}
+
+	// Tar names are slash-separated regardless of platform, and a leading
+	// "./" is a component nobody meant to count.
+	cleaned := strings.TrimPrefix(path.Clean(strings.TrimPrefix(name, "./")), "/")
+
+	// An entry whose cleaned form still climbs is refused outright rather
+	// than stripped. path.Clean collapses `wrapper/../../etc/passwd` into
+	// `../etc/passwd`, and dropping a component from THAT yields
+	// `etc/passwd` — a path that stays inside the destination and has
+	// nothing to do with what the entry said. safeJoin would accept it,
+	// because by then it no longer escapes. Refusing here is what keeps
+	// stripping from quietly rewriting a traversal into a plausible file.
+	//
+	// A tarball from GitHub cannot contain one of these, so an entry that
+	// does is malformed or hostile — and neither deserves extraction.
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", false
+	}
+
+	parts := strings.Split(cleaned, "/")
+	if len(parts) <= n {
+		return "", false
+	}
+
+	return strings.Join(parts[n:], "/"), true
 }

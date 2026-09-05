@@ -63,6 +63,18 @@ const (
 	ActionRollback     Action = "rollback"
 	ActionConfigSet    Action = "config.set"
 	ActionConfigDelete Action = "config.delete"
+
+	// Trigger changes: the deploy plane's trust statement being written from
+	// somewhere other than the box.
+	//
+	// Recorded because the console may create these over the PAT plane — a
+	// deliberate decision (see the deploy-plane PRD), and one that trades
+	// "impossible" for "visible to whoever owns the box". Without these lines
+	// that trade does not exist: the owner would have no way to see what the
+	// control plane authorised in their name.
+	ActionTriggerCreate Action = "trigger.create"
+	ActionTriggerUpdate Action = "trigger.update"
+	ActionTriggerDelete Action = "trigger.delete"
 )
 
 // Origin is who asked. Without it every row reads `api` and the history cannot
@@ -170,6 +182,14 @@ type Record struct {
 
 	Prune bool `json:"prune,omitempty"`
 
+	// Trigger is the deploy trigger a trigger.* action touched: what the trust
+	// statement became. Present only on those actions.
+	//
+	// The AFTER state, not a diff. An operator reading the trail wants "what
+	// does this box now accept", and reconstructing that from a chain of diffs
+	// is work the reader should not have to do.
+	Trigger *TriggerSnapshot `json:"trigger,omitempty"`
+
 	// ConfigKeys are the keys ONE config command touched.
 	//
 	// A list and not a single key, because `vd config set A=1 B=2 C=3` is one
@@ -182,6 +202,19 @@ type Record struct {
 	Status    Status `json:"status,omitempty"`
 	Error     string `json:"error,omitempty"`
 	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
+}
+
+// TriggerSnapshot is a deploy trigger as it stood after the action.
+//
+// The repository, the pinned branch and the allowed scopes — the three things
+// that decide what the box will accept. Nothing else from the record: an id and
+// a timestamp say nothing about trust.
+type TriggerSnapshot struct {
+	ID          string   `json:"id"`
+	Repo        string   `json:"repo"`
+	Branch      string   `json:"branch"`
+	AllowScopes []string `json:"allow_scopes,omitempty"`
+	Enabled     bool     `json:"enabled"`
 }
 
 // ClientInfo is the operator's own attribution of themselves, resolved by the

@@ -30,6 +30,15 @@ const (
 	// plain token; the value is a JSON-encoded `PAT` record with
 	// sha256(plain) as `HashHex` — the plain token is never stored.
 	prefixPATs = "/pats/"
+
+	// prefixTriggers holds deploy triggers under `/triggers/<id>`. One record
+	// per repository this box will deploy from.
+	//
+	// In etcd and not on disk, deliberately: a trigger is the operator's
+	// statement of trust, and it has to survive whatever the filesystem does
+	// as reliably as the manifests it authorises. It is also read on every
+	// deploy, which is the same access pattern as everything else here.
+	prefixTriggers = "/triggers/"
 )
 
 // Kind is the type of a declared resource. New kinds added in later
@@ -207,6 +216,16 @@ func FrozenScopeRoot(scope string) string {
 // are negligible at 40 bits of entropy for realistic PAT counts.
 func PATKey(id string) string {
 	return prefixPATs + id
+}
+
+// TriggerKey returns "/triggers/<id>" — one deploy trigger.
+func TriggerKey(id string) string {
+	return prefixTriggers + id
+}
+
+// TriggersPrefix returns "/triggers/" — the listing prefix.
+func TriggersPrefix() string {
+	return prefixTriggers
 }
 
 // PATsPrefix returns "/pats/" — the listing prefix for enumerating

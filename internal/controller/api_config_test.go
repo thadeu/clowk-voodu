@@ -414,3 +414,371 @@ func TestConfig_PostScopeLevelDoesNotMaterializeEnvFile(t *testing.T) {
 		t.Errorf("scope-level config materialized unexpected env files: %v", matches)
 	}
 }
+
+// ── ?values=false ──────────────────────────────────────────────────────────
+
+// The redaction is a MODE OF THE ENDPOINT. A console that fetched values and
+// declined to draw them would have already carried them across the internet
+// and into a browser's network panel. Answered here, there is nothing to
+// expose — which is the whole reason this is not a UI concern.
+func TestConfig_ValuesFalseNeverSendsAValue(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false",
+		`{"DATABASE_URL":"postgres://user:hunter2@db/prod","NODE_ENV":"production"}`)
+	resp.Body.Close()
+
+	body := getBody(t, ts.URL+"/config?scope=acme&name=api&values=false")
+
+	for _, secret := range []string{"hunter2", "postgres://", "production"} {
+		if strings.Contains(body, secret) {
+			t.Errorf("a value reached the response: %q is in %s", secret, body)
+		}
+	}
+
+	// The KEYS are the point of the read — an operator has to see what exists
+	// before they can decide to reveal one.
+	for _, key := range []string{"DATABASE_URL", "NODE_ENV"} {
+		if !strings.Contains(body, key) {
+			t.Errorf("key %q missing from %s", key, body)
+		}
+	}
+}
+
+// A DIFFERENT SHAPE, not the same shape with the values blanked. A caller that
+// read a redacted response and wrote it back — the obvious edit-then-save round
+// trip — would set every variable to the empty string and wipe the bucket.
+// `vars` being absent is what makes that code impossible to write by accident.
+func TestConfig_ValuesFalseOmitsVarsEntirely(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"FOO":"bar"}`)
+	resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Vars     map[string]string `json:"vars"`
+			Redacted bool              `json:"redacted"`
+			Keys     []struct {
+				Key         string `json:"key"`
+				ValueDigest string `json:"value_digest"`
+			} `json:"keys"`
+		} `json:"data"`
+	}
+
+	decodeJSON(t, ts.URL+"/config?scope=acme&name=api&values=false", &env)
+
+	if env.Data.Vars != nil {
+		t.Errorf("vars must be absent on a redacted read, got %+v", env.Data.Vars)
+	}
+
+	if !env.Data.Redacted {
+		t.Error("the response must say it is redacted")
+	}
+
+	if len(env.Data.Keys) != 1 || env.Data.Keys[0].Key != "FOO" {
+		t.Fatalf("keys = %+v", env.Data.Keys)
+	}
+
+	if env.Data.Keys[0].ValueDigest == "" {
+		t.Error("digest missing")
+	}
+}
+
+// The digest answers the only question a value would that the key does not:
+// did staging and production drift, or is it the same string in both.
+func TestConfig_ValuesFalseDigestTracksTheValue(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	digest := func() string {
+		var env struct {
+			Data struct {
+				Keys []struct {
+					Key         string `json:"key"`
+					ValueDigest string `json:"value_digest"`
+				} `json:"keys"`
+			} `json:"data"`
+		}
+
+		decodeJSON(t, ts.URL+"/config?scope=acme&name=api&values=false", &env)
+
+		if len(env.Data.Keys) != 1 {
+			t.Fatalf("keys = %+v", env.Data.Keys)
+		}
+
+		return env.Data.Keys[0].ValueDigest
+	}
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"FOO":"one"}`)
+	resp.Body.Close()
+
+	first := digest()
+
+	resp = postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"FOO":"one"}`)
+	resp.Body.Close()
+
+	if digest() != first {
+		t.Error("re-setting the same value changed the digest")
+	}
+
+	resp = postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"FOO":"two"}`)
+	resp.Body.Close()
+
+	if digest() == first {
+		t.Error("a changed value kept the same digest")
+	}
+}
+
+// `?key=X&values=false` is a strange request, and answering it with the value
+// would make values=false a suggestion.
+func TestConfig_ValuesFalseAlsoRedactsASingleKeyRead(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"TOKEN":"hunter2"}`)
+	resp.Body.Close()
+
+	body := getBody(t, ts.URL+"/config?scope=acme&name=api&key=TOKEN&values=false")
+
+	if strings.Contains(body, "hunter2") {
+		t.Errorf("single-key read leaked the value: %s", body)
+	}
+
+	if !strings.Contains(body, "TOKEN") {
+		t.Errorf("single-key read lost the key: %s", body)
+	}
+}
+
+// Sorted, because a map iterates at random and a screen whose rows reshuffle
+// on every refresh is a screen nobody can read down.
+func TestConfig_ValuesFalseSortsKeys(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false",
+		`{"ZED":"1","ALPHA":"2","MIKE":"3"}`)
+	resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Keys []struct {
+				Key string `json:"key"`
+			} `json:"keys"`
+		} `json:"data"`
+	}
+
+	decodeJSON(t, ts.URL+"/config?scope=acme&name=api&values=false", &env)
+
+	got := make([]string, 0, len(env.Data.Keys))
+	for _, k := range env.Data.Keys {
+		got = append(got, k.Key)
+	}
+
+	want := []string{"ALPHA", "MIKE", "ZED"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("keys = %v, want %v", got, want)
+	}
+}
+
+// Omitting the parameter must keep the old shape exactly. Redaction that
+// leaked into the default read would break every existing caller.
+func TestConfig_WithoutValuesFalseTheShapeIsUnchanged(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false", `{"FOO":"bar"}`)
+	resp.Body.Close()
+
+	var env struct {
+		Data struct {
+			Vars     map[string]string `json:"vars"`
+			Redacted bool              `json:"redacted"`
+		} `json:"data"`
+	}
+
+	decodeJSON(t, ts.URL+"/config?scope=acme&name=api", &env)
+
+	if env.Data.Vars["FOO"] != "bar" {
+		t.Errorf("default read lost its values: %+v", env.Data.Vars)
+	}
+
+	if env.Data.Redacted {
+		t.Error("a default read must not claim to be redacted")
+	}
+}
+
+// getBody reads a GET into a string, for the tests that assert on what is NOT
+// in the response — a decode would only see the fields it declares.
+func getBody(t *testing.T, url string) string {
+	t.Helper()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+
+	return buf.String()
+}
+
+func decodeJSON(t *testing.T, url string, into any) {
+	t.Helper()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ── the PAT plane ──────────────────────────────────────────────────────────
+
+// THE acceptance criterion of the config routes: reading which variables exist
+// and setting one are DIFFERENT powers, and the scopes say so.
+//
+// The split matters because of who holds each token. A console that only ever
+// shows config should not carry a token that can rewrite production env, and a
+// token that can rewrite it should not be the one handed to a dashboard.
+//
+// SCOPES MATCH EXACTLY. `config` does NOT imply `config:read`, the same way
+// `actions` does not imply `read` — scopeOrder is display ordering, not a
+// hierarchy. A PAT that both reads and writes config carries both scopes.
+//
+// Pinned because the opposite is the intuitive guess, and a reader who assumes
+// a hierarchy would grant `config` alone and get a 403 on the first page load.
+// If that ever becomes a hierarchy it should be one model-wide decision, not a
+// special case for config.
+func TestConfigRoutesRequireTheirScopes(t *testing.T) {
+	store := newMemStore()
+	auth := newPATAuthorizer(store, quietLogger())
+
+	tokens := map[Scope]string{}
+
+	for _, s := range []Scope{ScopeRead, ScopeConfigRead, ScopeConfig, ScopeActions, ScopeDeploy} {
+		plain, _ := seedTestPAT(t, store, []Scope{s})
+		tokens[s] = plain
+	}
+
+	routes := []struct {
+		method   string
+		path     string
+		required Scope
+		// allowed is every scope that must reach this route.
+		allowed []Scope
+	}{
+		{http.MethodGet, "/api/pat/v1/config", ScopeConfigRead, []Scope{ScopeConfigRead}},
+		{http.MethodPost, "/api/pat/v1/config", ScopeConfig, []Scope{ScopeConfig}},
+		{http.MethodDelete, "/api/pat/v1/config", ScopeConfig, []Scope{ScopeConfig}},
+	}
+
+	for _, route := range routes {
+		for scope, plain := range tokens {
+			name := route.method + " " + route.path + " with " + string(scope)
+
+			t.Run(name, func(t *testing.T) {
+				req := httptest.NewRequest(route.method, route.path, nil)
+				signRequest(req, plain)
+
+				rr := httptest.NewRecorder()
+				called := false
+
+				auth.Middleware(route.required, nextOK(t, &called))(rr, req)
+
+				permitted := false
+
+				for _, s := range route.allowed {
+					if s == scope {
+						permitted = true
+
+						break
+					}
+				}
+
+				if permitted {
+					if rr.Code != http.StatusOK {
+						t.Errorf("scope %q refused: %d (%s)", scope, rr.Code, rr.Body.String())
+					}
+
+					return
+				}
+
+				if rr.Code != http.StatusForbidden {
+					t.Errorf("scope %q reached a config route: %d", scope, rr.Code)
+				}
+
+				if called {
+					t.Errorf("scope %q was let through to the handler", scope)
+				}
+			})
+		}
+	}
+}
+
+// Verbatim passthrough, not a second implementation. Config behaviour has to
+// be ONE behaviour — merge semantics, the restart on write, the scope/name
+// resolution — and a parallel path is where the two quietly start to differ.
+//
+// Asserted as the same BYTES for the same input, because "looks equivalent" is
+// how a divergence survives review.
+func TestConfigPATPlaneAnswersByteForByteLikeTheInternalPlane(t *testing.T) {
+	api, _ := newTestAPI(t)
+	ts := httptest.NewServer(api.Handler())
+
+	defer ts.Close()
+
+	resp := postBody(t, ts.URL+"/config?scope=acme&name=api&restart=false",
+		`{"FOO":"bar","BAZ":"qux"}`)
+	resp.Body.Close()
+
+	for _, query := range []string{
+		"scope=acme&name=api",
+		"scope=acme&name=api&values=false",
+		"scope=acme&name=api&key=FOO",
+		"scope=acme",
+	} {
+		internal := recordConfigGet(t, api, "/config?"+query)
+		plane := recordConfigGet(t, api, "/api/pat/v1/config?"+query)
+
+		if internal != plane {
+			t.Errorf("planes disagree on %q:\n internal: %s\n    plane: %s", query, internal, plane)
+		}
+	}
+}
+
+// recordConfigGet calls the handler directly rather than over the PAT plane's
+// signature check: what is under test is the RESPONSE, and threading a signed
+// request through would be testing the authorizer a second time.
+func recordConfigGet(t *testing.T, api *API, path string) string {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rr := httptest.NewRecorder()
+
+	if strings.HasPrefix(path, "/api/pat/v1/") {
+		api.handlePATConfigGet(rr, req)
+	} else {
+		api.configGet(rr, req)
+	}
+
+	return rr.Body.String()
+}

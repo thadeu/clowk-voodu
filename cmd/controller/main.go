@@ -10,11 +10,15 @@ import (
 	"syscall"
 	"time"
 
+	"encoding/json"
 	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/controller"
+	"go.voodu.clowk.in/internal/deploy"
 	"go.voodu.clowk.in/internal/docker"
+	"go.voodu.clowk.in/internal/manifest"
 	"go.voodu.clowk.in/internal/metrics"
 	"go.voodu.clowk.in/internal/paths"
+	"io"
 )
 
 var (
@@ -40,6 +44,7 @@ func main() {
 		etcdPeer    = flag.String("etcd-peer", "http://127.0.0.1:2380", "etcd peer URL")
 		dataDir     = flag.String("data", "", "etcd data directory (default: <VOODU_ROOT>/state)")
 		pluginsDir  = flag.String("plugins", "", "plugin root directory (default: <VOODU_ROOT>/plugins)")
+		buildRoot   = flag.String("build-root", "", "where deploys unpack a repository (default: <data>/builds)")
 		nodeName    = flag.String("name", "voodu-0", "etcd cluster member name")
 		quietEtcd   = flag.Bool("quiet-etcd", true, "suppress etcd info logging")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -112,13 +117,58 @@ func main() {
 		EtcdPeer:          *etcdPeer,
 		NodeName:          *nodeName,
 		PluginsRoot:       *pluginsDir,
+		BuildRoot:         *buildRoot,
 		Version:           fmt.Sprintf("%s (commit: %s)", version, commit),
 		Logger:            logger,
 		QuietEtcd:         *quietEtcd,
 		MetricsInterval:   *metricsInterval,
 		MetricsRetention:  *metricsRetention,
 		ActivityRetention: *activityRetention,
-		CaddyAccessLog:    *caddyLog,
+
+		// The deploy executor parses the manifest file a repository's trigger
+		// names. Wired HERE and not inside the controller because
+		// internal/manifest imports internal/controller for the Manifest
+		// type — main is the only place that can see both.
+		ParseManifests: func(r io.Reader, format string, vars map[string]string) ([]controller.Manifest, error) {
+			return manifest.ParseReader(r, manifest.Format(format), vars)
+		},
+
+		// Build-mode deploys. Wired here for the same reason as the parser:
+		// internal/deploy imports internal/controller, so the dependency
+		// cannot run both ways. The spec arrives as raw JSON because only
+		// this file can name deploy.Spec.
+		BuildFromSource: func(app string, src io.Reader, buildSpec json.RawMessage, force bool) error {
+			var spec *deploy.Spec
+
+			if len(buildSpec) > 0 {
+				spec = &deploy.Spec{}
+
+				if err := json.Unmarshal(buildSpec, spec); err != nil {
+					// A spec that will not decode is not a reason to refuse
+					// the build: the pipeline falls back to auto-detection,
+					// which is what a manifest with a bare `build {}` gets.
+					spec = nil
+				}
+			}
+
+			return deploy.RunFromTarball(app, src, deploy.Options{
+				Spec:  spec,
+				Force: force,
+
+				// Beside the state this box already writes, never /tmp — a
+				// hardened unit or a read-only rootfs makes that unwritable,
+				// and the deploy fails for a reason that has nothing to do
+				// with the deploy. Same rule as --build-root.
+				ScratchDir: scratchDir(*buildRoot),
+
+				// GitHub wraps the tree in `owner-repo-<sha>/`, but the
+				// controller already stripped that when it extracted and
+				// re-tarred each build context — so what arrives here is
+				// rooted at the context, exactly like a CLI push.
+				StripComponents: 0,
+			})
+		},
+		CaddyAccessLog: *caddyLog,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -166,4 +216,18 @@ func parseDurationOr(name string, fallback time.Duration) time.Duration {
 	}
 
 	return d
+}
+
+// scratchDir picks where a deploy buffers and unpacks, on a box.
+//
+// The operator's --build-root wins. Otherwise `/opt/voodu/builds` — the tree
+// the platform owns. /tmp is not, under `ProtectSystem=strict`, `PrivateTmp=`
+// or a read-only rootfs, and the resulting error names a filesystem policy
+// rather than anything about the deploy.
+func scratchDir(buildRoot string) string {
+	if buildRoot != "" {
+		return buildRoot
+	}
+
+	return paths.BuildsDir()
 }

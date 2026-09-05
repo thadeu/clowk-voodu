@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
+	"go.voodu.clowk.in/internal/paths"
 	"os"
 	"strings"
 
@@ -130,10 +131,13 @@ auto-detection if neither resolves.`,
 			defer reporter.Close()
 
 			return deploy.RunFromTarball(controller.AppID(scope, name), os.Stdin, deploy.Options{
-				LogWriter: os.Stdout,
-				Reporter:  reporter,
-				Force:     force,
-				Spec:      spec,
+				// receive-pack runs ON THE BOX, so it inherits the same
+				// read-only /tmp a hardened unit imposes on the controller.
+				ScratchDir: paths.BuildsDir(),
+				LogWriter:  os.Stdout,
+				Reporter:   reporter,
+				Force:      force,
+				Spec:       spec,
 			})
 		},
 	}

@@ -64,7 +64,7 @@ func MaterializeFromBuilt(app string, src io.Reader, sourceApp string, opts Opti
 	// primary build produced — same bytes ⇒ same buildID. Mirrors what
 	// RunFromTarball does per call today, so the I/O cost is unchanged;
 	// only the build is skipped.
-	buildID, tmpPath, err := bufferTarball(src)
+	buildID, tmpPath, err := bufferTarball(opts.ScratchDir, src)
 	if err != nil {
 		return fmt.Errorf("buffer tarball: %w", err)
 	}
@@ -83,7 +83,7 @@ func MaterializeFromBuilt(app string, src io.Reader, sourceApp string, opts Opti
 		return fmt.Errorf("create release dir: %w", err)
 	}
 
-	if err := extractTarball(tmpPath, releaseDir); err != nil {
+	if err := extractTarball(tmpPath, releaseDir, 0); err != nil {
 		_ = os.RemoveAll(releaseDir)
 
 		return fmt.Errorf("extract tarball: %w", err)

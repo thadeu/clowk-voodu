@@ -51,6 +51,33 @@ type Options struct {
 	// KeepReleases). Nil is valid — the pipeline falls back to
 	// auto-detection with zero-value defaults.
 	Spec *Spec
+
+	// ScratchDir is where the incoming tarball is buffered before it is
+	// hashed and extracted.
+	//
+	// Empty means the system temp dir, which is what this always did — and
+	// what fails on a box whose /tmp is read-only: a hardened systemd unit
+	// (`ProtectSystem=strict`, `PrivateTmp=`) or a read-only rootfs. The
+	// failure surfaces as "buffer tarball: read-only file system" on a deploy
+	// that had nothing wrong with it, and the operator has no way to tell
+	// which directory was meant.
+	//
+	// Callers that run ON A BOX pass a directory the platform already owns.
+	ScratchDir string
+
+	// StripComponents drops leading path components from every tar entry
+	// before extraction.
+	//
+	// Zero for everything that came from `vd apply`: the CLI tars the build
+	// context itself (`tar -C <path> .`), so entries already start at the
+	// repository root.
+	//
+	// One for a tarball from GitHub's API, which wraps the whole tree in
+	// `owner-repo-<sha>/`. Without it every path gains that prefix, and an
+	// `apply.file: voodu.hcl` written by somebody looking at their own
+	// repository resolves to a file that is not there — the classic mistake
+	// with this endpoint, and one that fails at the last step of a deploy.
+	StripComponents int
 }
 
 // reporter returns the configured Reporter, or synthesises a

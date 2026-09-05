@@ -92,6 +92,20 @@ type Store interface {
 	DeletePAT(ctx context.Context, id string) (bool, error)
 	TouchPAT(ctx context.Context, id string, at time.Time) error
 
+	// Deploy triggers — one record per repository this box will deploy from.
+	//
+	// The operator's statement of trust (repo, pinned branch, allowed scopes),
+	// created on the box and read on every deploy. NOT the deploy config:
+	// that lives in `.voodu/**/*.yml` inside the repository. See trigger.go.
+	//
+	// PutTrigger overwrites, like PutPAT: a create builds the record and an
+	// update rewrites it, and TouchTrigger reuses the same path to record a
+	// firing without a second transaction.
+	PutTrigger(ctx context.Context, t Trigger) error
+	GetTrigger(ctx context.Context, id string) (*Trigger, error)
+	ListTriggers(ctx context.Context) ([]Trigger, error)
+	DeleteTrigger(ctx context.Context, id string) (bool, error)
+
 	// Frozen replica-ID annotation. Records which replicas of a
 	// resource are intentionally stopped — the handler skips them
 	// in spawn / rolling-restart paths so a `vd stop --freeze`

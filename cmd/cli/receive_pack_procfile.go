@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"go.voodu.clowk.in/internal/paths"
 	"io"
 	"net/http"
 	"net/url"
@@ -42,7 +43,7 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	defer reporter.Close()
 
 	// 1. Buffer stdin so we can open a fresh reader per process build.
-	tmp, err := os.CreateTemp("", "voodu-procfile-*.tar.gz")
+	tmp, err := os.CreateTemp(procfileScratch(), "voodu-procfile-*.tar.gz")
 	if err != nil {
 		return fmt.Errorf("buffer tarball: %w", err)
 	}
@@ -131,7 +132,7 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	// tags + current symlink). Unchanged path — byte-identical to a
 	// single-deployment build today. Spec nil → auto-detect language.
 	if err := withTarball(tmpPath, func(f *os.File) error {
-		return deploy.RunFromTarball(primary, f, deploy.Options{Reporter: reporter, Force: force})
+		return deploy.RunFromTarball(primary, f, deploy.Options{Reporter: reporter, Force: force, ScratchDir: procfileScratch()})
 	}); err != nil {
 		return fmt.Errorf("build %s: %w", primary, err)
 	}
@@ -140,7 +141,7 @@ func runProcfileReceive(cmd *cobra.Command, scope string, src io.Reader, force b
 	// dir + symlink. No rebuild — that's the win.
 	for _, appID := range reuse {
 		if err := withTarball(tmpPath, func(f *os.File) error {
-			return deploy.MaterializeFromBuilt(appID, f, primary, deploy.Options{Reporter: reporter, Force: force})
+			return deploy.MaterializeFromBuilt(appID, f, primary, deploy.Options{Reporter: reporter, Force: force, ScratchDir: procfileScratch()})
 		}); err != nil {
 			return fmt.Errorf("reuse build for %s: %w", appID, err)
 		}
@@ -322,4 +323,21 @@ func readFileFromTar(path, want string) ([]byte, error) {
 	}
 
 	return nil, errFileNotInTar
+}
+
+// procfileScratch is where this path buffers, on the box.
+//
+// Beside the platform's own root rather than /tmp, which a hardened unit makes
+// read-only — the same rule the controller's --build-root follows. Created on
+// demand: the operator configured a root, not a tree.
+func procfileScratch() string {
+	dir := paths.BuildsDir()
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		// Falling back rather than failing: a box where the platform root is
+		// not writable either has a bigger problem, and /tmp may well work.
+		return ""
+	}
+
+	return dir
 }

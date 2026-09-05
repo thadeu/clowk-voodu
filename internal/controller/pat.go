@@ -34,25 +34,66 @@ import (
 // auth middleware asserts the incoming PAT carries the scope a
 // route requires; insufficient-scope requests get 403.
 //
-// Two scopes today (deliberately coarse — finer granularity adds
-// implementation cost without a clear consumer need yet). Future
-// scopes (e.g. `logs:read`, `pods:restart`) can be added; the
-// vocabulary stays additive — existing PATs keep working.
+// Deliberately coarse: a scope is a plane of the API, not a per-route
+// permission. Finer granularity costs implementation everywhere and buys
+// nothing until somebody needs to hand out one route without its neighbours.
+// The vocabulary is additive — a new scope never invalidates an existing PAT.
 type Scope string
 
 const (
 	// ScopeRead grants the GET endpoints on the observability plane:
-	// stats, pods, pod describe, pod logs. Safe for read-only
-	// dashboards and monitoring integrations.
+	// stats, pods, pod describe, pod logs, metrics, activity. Safe for
+	// read-only dashboards and monitoring integrations.
 	ScopeRead Scope = "read"
 
-	// ScopeActions grants POST mutation endpoints — today that's
-	// pod restart; future mutations (exec, scale, etc.) inherit
-	// the same gate. Action endpoints are additionally rate-limited
-	// per PAT (see pat_ratelimit.go) so a compromised token can't
-	// be used as a runaway DOS vector.
+	// ScopeActions grants POST mutation endpoints — pod restart, plugin
+	// install; future mutations inherit the same gate. Action endpoints are
+	// additionally rate-limited per PAT (see pat_ratelimit.go) so a
+	// compromised token can't be used as a runaway DOS vector.
 	ScopeActions Scope = "actions"
+
+	// ScopeDeploy grants the whole `deploy/` subtree: reading triggers,
+	// reading the manifests a repository declares, preflight, and firing a
+	// deploy.
+	//
+	// Its own scope rather than a corner of `actions`, because it is the one
+	// a hosted control plane holds — and the entire security story of the
+	// deploy plane is what a token holding ONLY this can do. Folded into
+	// `actions` it would also carry pod restart and plugin install, and
+	// plugin install runs a repository's lifecycle hooks as this
+	// controller's user. The claim "this token only deploys your own
+	// repository" has to be true of the token, not of our intentions.
+	//
+	// Covers reads too, preflight included: trigger config names repositories,
+	// branches and file paths — the same admin-grade metadata that made
+	// listing PATs require `actions` rather than `read`.
+	ScopeDeploy Scope = "deploy"
+
+	// ScopeConfig grants writing an app's config bucket — the production
+	// secrets, in the console's hands.
+	//
+	// Separate from `actions` because it is the only scope whose holder can
+	// change what a running container believes about the world without
+	// changing a manifest, and separate from ScopeConfigRead because reading
+	// a key list and setting a value are different powers with different
+	// blast radii.
+	ScopeConfig Scope = "config"
+
+	// ScopeConfigRead grants reading config keys — MASKED by default; the
+	// values come back only when the request asks and the bucket allows.
+	//
+	// A read-only integration that wants to show which keys exist should not
+	// have to be able to set them.
+	ScopeConfigRead Scope = "config:read"
 )
+
+// scopeOrder fixes the wire order of a normalised scope list.
+//
+// An explicit order and not sort.Strings: alphabetical would put `actions`
+// before `read` and `config:read` before `deploy`, which reads as arbitrary
+// to anyone looking at a PAT. This runs least-powerful to most, so the shape
+// of a token is legible at a glance.
+var scopeOrder = []Scope{ScopeRead, ScopeConfigRead, ScopeConfig, ScopeActions, ScopeDeploy}
 
 // patTokenPrefix is the public prefix on every emitted token. Two
 // reasons it's explicit rather than implicit:
@@ -303,7 +344,7 @@ func ParseScopes(s string) ([]Scope, error) {
 
 		sc := Scope(p)
 		if !validScope(sc) {
-			return nil, fmt.Errorf("pat: unknown scope %q (valid: read, actions)", p)
+			return nil, fmt.Errorf("pat: unknown scope %q (valid: %s)", p, knownScopes())
 		}
 
 		if seen[sc] {
@@ -315,7 +356,7 @@ func ParseScopes(s string) ([]Scope, error) {
 	}
 
 	if len(out) == 0 {
-		return nil, fmt.Errorf("pat: no scopes parsed from %q (expected comma-separated read/actions)", s)
+		return nil, fmt.Errorf("pat: no scopes parsed from %q (expected a comma-separated list of: %s)", s, knownScopes())
 	}
 
 	return normalizeScopes(out), nil
@@ -325,41 +366,60 @@ func ParseScopes(s string) ([]Scope, error) {
 // the only entry points are the typed constants above + ParseScopes
 // (which normalises strings).
 func validScope(s Scope) bool {
-	switch s {
-	case ScopeRead, ScopeActions:
-		return true
-	default:
-		return false
-	}
-}
-
-// normalizeScopes returns a deduped, deterministically-ordered copy
-// of the input. Order is `read` before `actions` so the JSON wire
-// shape is stable across two semantically-equivalent inputs.
-//
-// Hard-coded ordering rather than sort.Slice because the set is
-// tiny (two scopes today, maybe four in a year). When the set grows,
-// switch to sort.Strings on the underlying strings.
-func normalizeScopes(in []Scope) []Scope {
-	hasRead, hasActions := false, false
-
-	for _, s := range in {
-		switch s {
-		case ScopeRead:
-			hasRead = true
-		case ScopeActions:
-			hasActions = true
+	for _, known := range scopeOrder {
+		if s == known {
+			return true
 		}
 	}
 
-	out := make([]Scope, 0, 2)
+	return false
+}
 
-	if hasRead {
-		out = append(out, ScopeRead)
+// KnownScopes is the vocabulary, in wire order. Exported so the CLI's help can
+// be built from it instead of retyping the list — the text it replaced still
+// said "read | actions" two scopes after that stopped being true.
+func KnownScopes() []Scope {
+	out := make([]Scope, len(scopeOrder))
+	copy(out, scopeOrder)
+
+	return out
+}
+
+// knownScopes renders the vocabulary for an error message, from the same list
+// that validates. A hand-written "valid: read, actions" goes stale the first
+// time somebody adds a scope and does not grep for it — which is exactly what
+// happened to the message this replaced.
+func knownScopes() string {
+	names := make([]string, 0, len(scopeOrder))
+
+	for _, s := range scopeOrder {
+		names = append(names, string(s))
 	}
 
-	if hasActions {
-		out = append(out, ScopeActions)
+	return strings.Join(names, ", ")
+}
+
+// normalizeScopes returns a deduped copy in scopeOrder, so two semantically
+// equal inputs produce byte-identical JSON.
+//
+// Driven by the ORDER LIST rather than by a switch with one branch per scope.
+// The switch version silently dropped anything it had no branch for, so a
+// scope added to the vocabulary and forgotten here would parse, validate, and
+// then vanish on the way to storage — a PAT that reports fewer powers than it
+// was granted, or none. Iterating the list cannot forget.
+func normalizeScopes(in []Scope) []Scope {
+	present := make(map[Scope]bool, len(in))
+
+	for _, s := range in {
+		present[s] = true
+	}
+
+	out := make([]Scope, 0, len(present))
+
+	for _, s := range scopeOrder {
+		if present[s] {
+			out = append(out, s)
+		}
 	}
 
 	return out

@@ -75,7 +75,7 @@ func TestBufferTarballHashesStream(t *testing.T) {
 		{name: "main.go", mode: 0644, body: []byte("package main\n")},
 	})
 
-	id1, path1, err := bufferTarball(src)
+	id1, path1, err := bufferTarball("", src)
 	if err != nil {
 		t.Fatalf("bufferTarball: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestBufferTarballHashesStream(t *testing.T) {
 		{name: "main.go", mode: 0644, body: []byte("package main\n")},
 	})
 
-	id2, path2, err := bufferTarball(src2)
+	id2, path2, err := bufferTarball("", src2)
 	if err != nil {
 		t.Fatalf("bufferTarball 2: %v", err)
 	}
@@ -109,14 +109,14 @@ func TestBufferTarballDistinctForDifferentContent(t *testing.T) {
 	a := makeTar(t, []tarEntry{{name: "a", mode: 0644, body: []byte("one")}})
 	b := makeTar(t, []tarEntry{{name: "a", mode: 0644, body: []byte("two")}})
 
-	idA, pA, err := bufferTarball(a)
+	idA, pA, err := bufferTarball("", a)
 	if err != nil {
 		t.Fatalf("a: %v", err)
 	}
 
 	defer os.Remove(pA)
 
-	idB, pB, err := bufferTarball(b)
+	idB, pB, err := bufferTarball("", b)
 	if err != nil {
 		t.Fatalf("b: %v", err)
 	}
@@ -138,14 +138,14 @@ func TestExtractTarballBasicLayout(t *testing.T) {
 		{name: "script.sh", mode: 0755, body: []byte("#!/bin/sh\n")},
 	})
 
-	_, tmpPath, err := bufferTarball(src)
+	_, tmpPath, err := bufferTarball("", src)
 	if err != nil {
 		t.Fatalf("buffer: %v", err)
 	}
 
 	defer os.Remove(tmpPath)
 
-	if err := extractTarball(tmpPath, dest); err != nil {
+	if err := extractTarball(tmpPath, dest, 0); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 
@@ -206,14 +206,14 @@ func TestExtractTarballRejectsPathTraversal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			src := makeTar(t, tc.entries)
 
-			_, tmpPath, err := bufferTarball(src)
+			_, tmpPath, err := bufferTarball("", src)
 			if err != nil {
 				t.Fatalf("buffer: %v", err)
 			}
 
 			defer os.Remove(tmpPath)
 
-			err = extractTarball(tmpPath, dest)
+			err = extractTarball(tmpPath, dest, 0)
 			if err == nil {
 				t.Fatalf("expected extract to reject %s, got nil", tc.name)
 			}
@@ -232,14 +232,14 @@ func TestExtractTarballRejectsEscapingSymlink(t *testing.T) {
 		{name: "bad-link", typeflag: tar.TypeSymlink, linkname: "../../../etc/passwd"},
 	})
 
-	_, tmpPath, err := bufferTarball(src)
+	_, tmpPath, err := bufferTarball("", src)
 	if err != nil {
 		t.Fatalf("buffer: %v", err)
 	}
 
 	defer os.Remove(tmpPath)
 
-	err = extractTarball(tmpPath, dest)
+	err = extractTarball(tmpPath, dest, 0)
 	if err == nil {
 		t.Fatal("expected extract to reject escaping symlink, got nil")
 	}
@@ -398,14 +398,14 @@ func TestExtractTarballAllowsInternalSymlink(t *testing.T) {
 		{name: "link", typeflag: tar.TypeSymlink, linkname: "target"},
 	})
 
-	_, tmpPath, err := bufferTarball(src)
+	_, tmpPath, err := bufferTarball("", src)
 	if err != nil {
 		t.Fatalf("buffer: %v", err)
 	}
 
 	defer os.Remove(tmpPath)
 
-	if err := extractTarball(tmpPath, dest); err != nil {
+	if err := extractTarball(tmpPath, dest, 0); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 
@@ -420,3 +420,111 @@ func TestExtractTarballAllowsInternalSymlink(t *testing.T) {
 	}
 }
 
+// GitHub's /tarball wraps the whole tree in `owner-repo-<sha>/`. Without
+// stripping it, an `apply.file: voodu.hcl` written by somebody looking at
+// their own repository resolves to a file that is not there — and it fails at
+// the last step of a deploy, after the download and the build.
+func TestStripComponents(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		strip int
+		want  string
+		keep  bool
+	}{
+		{"no stripping leaves the name alone", "./Dockerfile", 0, "./Dockerfile", true},
+		{"strips the github wrapper", "acme-web-abc123/voodu.hcl", 1, "voodu.hcl", true},
+		{"strips from a nested path", "acme-web-abc123/apps/pwa/main.go", 1, "apps/pwa/main.go", true},
+		{"leading ./ is not a component", "./acme-web-abc123/voodu.hcl", 1, "voodu.hcl", true},
+
+		// The wrapper directory itself has no destination — skipped, not an
+		// error, because it is a legitimate entry.
+		{"the wrapper directory is dropped", "acme-web-abc123/", 1, "", false},
+		{"shallower than the strip depth is dropped", "README.md", 1, "", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, keep := stripComponents(c.in, c.strip)
+
+			if keep != c.keep {
+				t.Fatalf("keep = %v, want %v", keep, c.keep)
+			}
+
+			if keep && got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// Stripping must not quietly rewrite a traversal into a plausible file.
+//
+// path.Clean collapses `wrapper/../../etc/passwd` into `../etc/passwd`, and
+// dropping a component from THAT yields `etc/passwd` — which no longer
+// escapes, so safeJoin would accept it, and the entry would land somewhere
+// inside the release that nothing in the tarball actually named.
+func TestStripComponentsRefusesTraversal(t *testing.T) {
+	for _, name := range []string{
+		"acme-web-abc/../../etc/passwd",
+		"../escape",
+		"..",
+	} {
+		if got, keep := stripComponents(name, 1); keep {
+			t.Errorf("%q was rewritten to %q instead of being refused", name, got)
+		}
+	}
+}
+
+// A box whose /tmp is read-only — a hardened systemd unit
+// (`ProtectSystem=strict`, `PrivateTmp=`) or a read-only rootfs — failed here
+// with "buffer tarball: read-only file system" on a deploy that had nothing
+// wrong with it. Twice: once extracting, once buffering. This is the second.
+func TestBufferTarballUsesTheScratchDirItIsGiven(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "builds")
+
+	_, path, err := bufferTarball(dir, strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer os.Remove(path)
+
+	if !strings.HasPrefix(path, dir) {
+		t.Errorf("buffered to %q, want it under %q", path, dir)
+	}
+}
+
+// Empty keeps the old behaviour, so a caller nobody reconfigured still works.
+func TestBufferTarballFallsBackToTheSystemTempDir(t *testing.T) {
+	_, path, err := bufferTarball("", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer os.Remove(path)
+
+	if !strings.HasPrefix(path, os.TempDir()) {
+		t.Errorf("buffered to %q, want it under %q", path, os.TempDir())
+	}
+}
+
+// The error has to name the directory. Without it, "read-only file system"
+// leaves the operator guessing which one — and an empty dir means /tmp, which
+// is exactly the knowledge they lack at that moment.
+func TestBufferTarballNamesTheDirectoryItCouldNotUse(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := bufferTarball(filepath.Join(blocked, "builds"), strings.NewReader("x"))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	if !strings.Contains(err.Error(), blocked) {
+		t.Errorf("error %q does not name the path", err)
+	}
+}

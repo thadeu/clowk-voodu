@@ -53,7 +53,21 @@ func ScriptsDir() string  { return filepath.Join(Root(), "scripts") }
 func StateDir() string    { return filepath.Join(Root(), "state") }
 func VolumesDir() string  { return filepath.Join(Root(), "volumes") }
 func AssetsDir() string   { return filepath.Join(Root(), "assets") }
-func CacheDir() string    { return filepath.Join(Root(), "cache") }
+
+// BuildsDir is where a deploy unpacks and buffers, and it is UNDER THE
+// PLATFORM ROOT for the same reason everything else here is.
+//
+// Not the system temp dir. A box running the controller under a hardened unit
+// — `ProtectSystem=strict`, `PrivateTmp=`, a read-only rootfs — has no
+// writable /tmp, and the failure surfaces as "read-only file system" on a
+// deploy that had nothing wrong with it. `/opt/voodu` is the one tree the
+// platform is guaranteed to own and to be able to write; scratch that lives
+// anywhere else is scratch that depends on somebody else's policy.
+//
+// Temporary is not a reason to leave the tree. It is a reason to clean up,
+// which the callers do.
+func BuildsDir() string { return filepath.Join(Root(), "builds") }
+func CacheDir() string  { return filepath.Join(Root(), "cache") }
 
 // MetricsDir is where the time-series sampler appends NDJSON files
 // (one file per UTC day, `metrics-YYYY-MM-DD.ndjson`). Lives under

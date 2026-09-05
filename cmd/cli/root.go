@@ -60,6 +60,7 @@ Use ":" syntax as shorthand for subcommands:
 		newStatsCmd(),
 		newSelfUpdateCmd(),
 		newPATCmd(),
+		newDeployCmd(),
 	)
 
 	return root

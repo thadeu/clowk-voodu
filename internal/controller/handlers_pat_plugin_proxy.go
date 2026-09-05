@@ -51,7 +51,16 @@ var reservedPATPrefixes = map[string]struct{}{
 	"logs":     {},
 	"metrics":  {},
 	"activity": {},
-	"pats":     {},
+
+	// Invariante V do deploy plane. The plugin plane intercepts BEFORE the
+	// mux, so an uninstalled prefix is a prefix a plugin can claim — and
+	// whoever installs a plugin is not necessarily whoever configured the
+	// deploy trigger. Reserved here even though the routes land in a later
+	// ticket: a prefix reserved after a plugin already answers on it is a
+	// migration, not a guard.
+	"deploy": {},
+	"config": {},
+	"pats":   {},
 }
 
 // pluginRoute is a resolved route declaration. The actual upstream port

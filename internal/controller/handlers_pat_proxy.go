@@ -125,6 +125,68 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	mux.HandleFunc("GET /api/pat/v1/activity/dump",
 		auth.Middleware(ScopeRead, a.handlePATActivityDump))
 
+	// The deploy subtree. EVERY route requires ScopeDeploy, reads included:
+	// trigger config names repositories, branches and allowed scopes, which is
+	// the same admin-grade metadata that made listing PATs require `actions`
+	// rather than `read`.
+	//
+	// One wrapper per route rather than a sub-mux with a single wrapper: Go's
+	// ServeMux has no middleware chain, and a hand-rolled StripPrefix layer
+	// would be a second place routes are matched — where a path that reaches
+	// the inner mux without passing the wrapper is one refactor away.
+	mux.HandleFunc("GET /api/pat/v1/deploy/triggers",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployTriggers))
+
+	mux.HandleFunc("POST /api/pat/v1/deploy/triggers",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployTriggers))
+
+	mux.HandleFunc("GET /api/pat/v1/deploy/triggers/{id}",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployTrigger))
+
+	mux.HandleFunc("PUT /api/pat/v1/deploy/triggers/{id}",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployTrigger))
+
+	mux.HandleFunc("DELETE /api/pat/v1/deploy/triggers/{id}",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployTrigger))
+
+	// The two reads that let the console show what this box would do. Both
+	// require ScopeDeploy like everything under `deploy/`: a repository's
+	// trigger files name its branches, paths and manifests.
+	mux.HandleFunc("GET /api/pat/v1/deploy/manifests",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployManifests))
+
+	mux.HandleFunc("GET /api/pat/v1/deploy/preflight",
+		auth.Middleware(ScopeDeploy, a.handlePATDeployPreflight))
+
+	// The fire. Rate-limited like every action endpoint: a compromised token
+	// must not become a way to make a box build in a loop.
+	mux.HandleFunc("POST /api/pat/v1/deploy/triggers/{id}/run",
+		auth.Middleware(ScopeDeploy, limiter.Middleware(a.handlePATDeployRun)))
+
+	// Config. THREE ROUTES, TWO SCOPES, and the split is the point: reading
+	// which variables exist is a different power from setting one, and a
+	// console that only ever reads should not hold a token that can write
+	// production env.
+	//
+	// Verbatim passthrough to the same handlers the internal plane uses, never
+	// a second implementation. Config behaviour has to be ONE behaviour —
+	// merge semantics, the auto-restart on write, the scope/name resolution —
+	// and a parallel path is where the two quietly start to differ.
+	//
+	// `?values=false` is a mode of `configGet`, not of this proxy: see the
+	// comment there for why masking on the screen would protect nothing.
+	mux.HandleFunc("GET /api/pat/v1/config",
+		auth.Middleware(ScopeConfigRead, a.handlePATConfigGet))
+
+	// Writes are rate-limited like every other action endpoint. Setting an env
+	// var restarts the resources it affects, so a token in a loop here is a
+	// token restarting production in a loop.
+	mux.HandleFunc("POST /api/pat/v1/config",
+		auth.Middleware(ScopeConfig, limiter.Middleware(a.handlePATConfigPost)))
+
+	mux.HandleFunc("DELETE /api/pat/v1/config",
+		auth.Middleware(ScopeConfig, limiter.Middleware(a.handlePATConfigDelete)))
+
 	// Installed plugins, plus any install still running or recently
 	// failed. ScopeRead: it is a list of names, versions and homepages —
 	// the same metadata `vd plugins:list` prints on the box.
@@ -237,6 +299,45 @@ func (a *API) handlePATActivity(w http.ResponseWriter, r *http.Request) {
 // WebUI's activity warehouse pulls on each sync tick.
 func (a *API) handlePATActivityDump(w http.ResponseWriter, r *http.Request) {
 	a.handleActivityDump(w, r)
+}
+
+// handlePATDeployTriggers / handlePATDeployTrigger are the proxies for the
+// deploy trigger CRUD. Verbatim passthrough per the invariant at the top of
+// this file — a control plane sees byte-identical JSON to what `vd deploy
+// trigger list` shows on the box.
+func (a *API) handlePATDeployTriggers(w http.ResponseWriter, r *http.Request) {
+	a.handleDeployTriggers(w, r)
+}
+
+func (a *API) handlePATDeployTrigger(w http.ResponseWriter, r *http.Request) {
+	a.handleDeployTrigger(w, r)
+}
+
+// The config trio. Each delegates to the internal-plane handler unchanged —
+// see the route registrations for why a second implementation is the thing
+// being avoided.
+func (a *API) handlePATConfigGet(w http.ResponseWriter, r *http.Request) {
+	a.configGet(w, r)
+}
+
+func (a *API) handlePATConfigPost(w http.ResponseWriter, r *http.Request) {
+	a.configPost(w, r)
+}
+
+func (a *API) handlePATConfigDelete(w http.ResponseWriter, r *http.Request) {
+	a.configDelete(w, r)
+}
+
+func (a *API) handlePATDeployManifests(w http.ResponseWriter, r *http.Request) {
+	a.handleDeployManifests(w, r)
+}
+
+func (a *API) handlePATDeployPreflight(w http.ResponseWriter, r *http.Request) {
+	a.handleDeployPreflight(w, r)
+}
+
+func (a *API) handlePATDeployRun(w http.ResponseWriter, r *http.Request) {
+	a.handleDeployRun(w, r)
 }
 
 // handlePATLogsMulti is the proxy for the server-side multi-pod

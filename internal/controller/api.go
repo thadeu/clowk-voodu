@@ -17,6 +17,7 @@ import (
 
 	"go.voodu.clowk.in/internal/activity"
 	"go.voodu.clowk.in/internal/containers"
+	"go.voodu.clowk.in/internal/github"
 	"go.voodu.clowk.in/internal/paths"
 	"go.voodu.clowk.in/internal/plugins"
 	"go.voodu.clowk.in/internal/secrets"
@@ -94,6 +95,32 @@ type API struct {
 	// its Exec method); tests substitute a fake to avoid spinning up
 	// a real docker daemon.
 	Execer Execer
+
+	// ParseManifests turns a manifest file into manifests, for the deploy
+	// executor. Supplied by main.go rather than constructed here, because
+	// internal/manifest imports this package and the dependency cannot run
+	// both ways. Nil leaves the deploy run endpoint answering 503.
+	ParseManifests ManifestParser
+
+	// BuildFromSource builds a workload from a repository's source, for
+	// build-mode deploys. Supplied by main.go for the same reason
+	// ParseManifests is. Nil leaves the executor refusing build mode with
+	// that reason rather than applying a workload whose image was never
+	// built.
+	BuildFromSource SourceBuilder
+
+	// BuildRoot is where a deploy extracts a repository before building it.
+	//
+	// Empty falls back to the system temp dir, which is what this used to do
+	// unconditionally — and what breaks on a controller running under a
+	// hardened unit, where /tmp is read-only. Production points it at a
+	// directory the controller already owns.
+	BuildRoot string
+
+	// GitHub is the read-only client the deploy plane reads repositories
+	// through. A field so tests can point it at a local server — never so a
+	// token can be stashed on it; every call carries its own.
+	GitHub *github.Client
 
 	// Deployments powers `POST /restart?kind=deployment&...` — the
 	// imperative rolling-restart entry point. Nil → 503. Production
@@ -379,6 +406,16 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /rollback", a.handleRollback)
 	mux.HandleFunc("DELETE /scope", a.handleScopeWipe)
 	mux.HandleFunc("DELETE /resource", a.handleResourceDelete)
+
+	// The deploy subtree. Reached over the PAT plane in production (see
+	// handlers_pat_proxy.go, which gates every one of these on ScopeDeploy);
+	// registered here so the orchestration plane and the CLI hit the same
+	// handlers rather than a second implementation.
+	mux.HandleFunc("/deploy/triggers", a.handleDeployTriggers)
+	mux.HandleFunc("/deploy/triggers/{id}", a.handleDeployTrigger)
+	mux.HandleFunc("GET /deploy/manifests", a.handleDeployManifests)
+	mux.HandleFunc("GET /deploy/preflight", a.handleDeployPreflight)
+	mux.HandleFunc("POST /deploy/triggers/{id}/run", a.handleDeployRun)
 
 	// PAT lifecycle — orchestration plane only (localhost). The
 	// WebUI plane (`/api/pat/v1/*`) consumes PATs but never
@@ -2993,6 +3030,23 @@ func (a *API) configGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ?values=false — the values never leave this box.
+	//
+	// A MODE OF THE ENDPOINT, not a mode of a screen. A console that fetched
+	// the values and merely declined to draw them would have already carried
+	// them across the internet and into a browser's network panel; the value
+	// would be exposed and the masking would be decoration. Answered here,
+	// there is nothing to expose.
+	//
+	// Applies to a single-key read too. `?key=X&values=false` is a strange
+	// request, and answering it with the value would make "values=false" a
+	// suggestion.
+	if r.URL.Query().Get("values") == "false" {
+		writeRedactedConfig(w, vars, key)
+
+		return
+	}
+
 	if key != "" {
 		v, ok := vars[key]
 		if !ok {
@@ -3012,6 +3066,64 @@ func (a *API) configGet(w http.ResponseWriter, r *http.Request) {
 		Status: "ok",
 		Data:   map[string]any{"vars": vars},
 	})
+}
+
+// writeRedactedConfig answers a `?values=false` read.
+//
+// A DIFFERENT SHAPE, not the same shape with the values blanked, and that is
+// the safety property rather than a style choice. A caller that reads a
+// redacted response and writes it back — the obvious edit-then-save round trip
+// — would set every variable to the empty string and wipe the bucket. `vars`
+// is absent, so that code cannot be written by accident.
+//
+// The digest is the same one the activity trail records. It answers the only
+// question a value would that the key does not: did staging and production
+// drift, or is it the same string in both. Six bytes is enough to notice a
+// difference and not enough to attack a value with.
+func writeRedactedConfig(w http.ResponseWriter, vars map[string]string, key string) {
+	if key != "" {
+		v, ok := vars[key]
+		if !ok {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("key %q not set", key))
+
+			return
+		}
+
+		writeJSON(w, http.StatusOK, envelope{
+			Status: "ok",
+			Data: map[string]any{
+				"redacted": true,
+				"keys":     []redactedKey{{Key: key, ValueDigest: activity.DigestValue(v)}},
+			},
+		})
+
+		return
+	}
+
+	names := make([]string, 0, len(vars))
+	for k := range vars {
+		names = append(names, k)
+	}
+
+	// Sorted, because a map iterates at random and a screen whose rows
+	// reshuffle on every refresh is a screen nobody can read down.
+	sort.Strings(names)
+
+	keys := make([]redactedKey, 0, len(names))
+	for _, k := range names {
+		keys = append(keys, redactedKey{Key: k, ValueDigest: activity.DigestValue(vars[k])})
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"redacted": true, "keys": keys},
+	})
+}
+
+// redactedKey is one variable, named and fingerprinted, never valued.
+type redactedKey struct {
+	Key         string `json:"key"`
+	ValueDigest string `json:"value_digest"`
 }
 
 func (a *API) configPost(w http.ResponseWriter, r *http.Request) {
