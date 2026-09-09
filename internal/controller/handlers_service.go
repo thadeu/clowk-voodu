@@ -197,6 +197,81 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 	return nil
 }
 
+// RepublishFor re-applies every ingress in scope whose target is this
+// deployment, recomputing its upstreams against the replicas that are
+// live right now.
+//
+// Upstreams are one container name per live replica (see
+// deploymentUpstreams), so they describe the runtime rather than the
+// manifest. The reconciler only fires on /desired/* changes, and
+// replacing a pod changes no manifest — so without an explicit call from
+// the deployment reconcile nothing ever recomputes them. The route goes
+// on naming containers that are gone, docker's embedded DNS answers
+// `no such host` for every one, the router takes the whole upstream set
+// out of rotation, and the edge serves 503 with a healthy deployment
+// sitting beside it.
+//
+// Scope-local, matching resolveUpstream: an ingress only ever resolves a
+// deployment declared under its own scope.
+func (h *IngressHandler) RepublishFor(ctx context.Context, scope, deployment string) error {
+	if h.Store == nil {
+		return nil
+	}
+
+	manifests, err := h.Store.ListByScope(ctx, KindIngress, scope)
+
+	if err != nil {
+		return Transient(fmt.Errorf("list ingresses in scope %s: %w", scope, err))
+	}
+
+	for _, m := range manifests {
+		if m == nil {
+			continue
+		}
+
+		var spec ingressSpec
+
+		if err := json.Unmarshal(m.Spec, &spec); err != nil {
+			// A manifest we cannot decode is one we cannot match against
+			// this deployment. Its own apply already reported the same
+			// error; skipping keeps one unreadable route from stalling
+			// every other route on the same deployment.
+			h.logf("ingress/%s: skipping republish (decode spec: %v)", m.Name, err)
+
+			continue
+		}
+
+		// Same default as apply: a blank service means the ingress is
+		// named after the deployment it fronts.
+		service := spec.Service
+
+		if service == "" {
+			service = m.Name
+		}
+
+		if service != deployment {
+			continue
+		}
+
+		ev := WatchEvent{
+			Type:     WatchPut,
+			Kind:     KindIngress,
+			Scope:    scope,
+			Name:     m.Name,
+			Manifest: m,
+		}
+
+		// %w, not %v: apply reports a not-yet-ready target as Transient
+		// and the reconciler reads that through errors.As. Flattening it
+		// here would turn a retryable race into a dropped route.
+		if err := h.apply(ctx, ev); err != nil {
+			return fmt.Errorf("republish ingress/%s: %w", m.Name, err)
+		}
+	}
+
+	return nil
+}
+
 // envelopeDataAsMap normalises a plugin envelope's Data field to a
 // string-keyed map. Plugins emitting `{"url": "..."}` produce
 // map[string]any when json.Decode targets `any`; plain-string Data

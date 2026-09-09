@@ -61,7 +61,23 @@ type deployRunRequest struct {
 	// Manifest names WHICH trigger file to act on, for a repository that
 	// declares several. Optional: absent runs every file whose `on` matches.
 	Manifest string `json:"manifest,omitempty"`
+
+	// Mode says WHO is asking. "push" (the default) is a webhook relaying a
+	// commit that just landed: trigger files marked `deploy: manual` are
+	// reported in `held` and NOT applied. "dispatch" is a person on the
+	// console choosing this commit, and applies every matching file whatever
+	// its mode says.
+	//
+	// The gate lives here and not in the control plane because the file that
+	// says `manual` is read here. A control plane deciding on its own copy of
+	// the YAML would be a second parser that can disagree with this one.
+	Mode string `json:"mode,omitempty"`
 }
+
+const (
+	runModePush     = "push"
+	runModeDispatch = "dispatch"
+)
 
 type deployRunResponse struct {
 	JobID   string   `json:"job_id"`
@@ -70,6 +86,11 @@ type deployRunResponse struct {
 	Commit  string   `json:"commit"`
 	Applied []string `json:"applied"`
 	Skipped []string `json:"skipped,omitempty"`
+
+	// Held names the trigger files that matched this push and said
+	// `deploy: manual`. Not applied, not an error: they are waiting for a
+	// dispatch, and the console shows a play button beside each one.
+	Held []string `json:"held,omitempty"`
 
 	// Resources is WHAT THIS COMMIT PUT ON THE BOX, as (kind, scope, name).
 	//
@@ -164,7 +185,7 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	specs, ok := a.selectTriggerSpecs(w, r, trigger, req, token, snap)
+	specs, held, ok := a.selectTriggerSpecs(w, r, trigger, req, token, snap)
 	if !ok {
 		return
 	}
@@ -174,6 +195,7 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		Trigger: trigger.ID,
 		Repo:    trigger.Repo,
 		Commit:  req.SHA,
+		Held:    held,
 	}
 
 	for _, spec := range specs {
@@ -196,7 +218,7 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 func (a *API) selectTriggerSpecs(
 	w http.ResponseWriter, r *http.Request, trigger *Trigger, req deployRunRequest,
 	token string, snap repoSnapshot,
-) ([]triggerspec.Spec, bool) {
+) (selected []triggerspec.Spec, held []string, ok bool) {
 	found := a.manifestsFromSnapshot(r, trigger.Repo, req.SHA, token, snap)
 
 	ref := req.Ref
@@ -204,7 +226,10 @@ func (a *API) selectTriggerSpecs(
 		ref = "refs/heads/" + trigger.Branch
 	}
 
-	var selected []triggerspec.Spec
+	mode := req.Mode
+	if mode == "" {
+		mode = runModePush
+	}
 
 	for _, file := range found.Files {
 		if file.Spec == nil {
@@ -222,17 +247,29 @@ func (a *API) selectTriggerSpecs(
 			continue
 		}
 
+		// A push does not get to apply a manual file. It matched — that is
+		// worth reporting, because the console turns it into "waiting for
+		// you" — but only a dispatch carries it any further.
+		if mode == runModePush && file.Spec.Manual() {
+			held = append(held, file.Spec.Name)
+
+			continue
+		}
+
 		selected = append(selected, *file.Spec)
 	}
 
-	if len(selected) == 0 {
+	// Nothing to apply and nothing held is a push no file wanted. Nothing to
+	// apply but something held is a perfectly good answer: the caller gets a
+	// 200 with an empty `applied` and a populated `held`.
+	if len(selected) == 0 && len(held) == 0 {
 		writeErr(w, http.StatusUnprocessableEntity,
 			fmt.Errorf("no trigger file in %s matches %s at %s", triggerspec.Dir, ref, short(req.SHA)))
 
-		return nil, false
+		return nil, nil, false
 	}
 
-	return selected, true
+	return selected, held, true
 }
 
 // applyFromRepo fetches one manifest, checks its scopes and applies it.
@@ -600,6 +637,18 @@ func decodeRunRequest(w http.ResponseWriter, r *http.Request) (deployRunRequest,
 
 	if !looksLikeSHA(req.SHA) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("sha must be a full 40-character commit id"))
+
+		return deployRunRequest{}, false
+	}
+
+	// Refused rather than defaulted, for the same reason the YAML side refuses
+	// a misspelled mode: a typo here would silently turn a dispatch back into
+	// a push, and the manual file would be held instead of deployed.
+	switch req.Mode {
+	case "", runModePush, runModeDispatch:
+	default:
+		writeErr(w, http.StatusBadRequest,
+			fmt.Errorf("mode must be %q or %q", runModePush, runModeDispatch))
 
 		return deployRunRequest{}, false
 	}

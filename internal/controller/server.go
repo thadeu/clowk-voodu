@@ -464,6 +464,11 @@ func (s *Server) Start(ctx context.Context) error {
 		// future Config field.
 	}
 
+	// Wired here rather than in the literal above because depHandler is
+	// built first: the deployment reconcile is what knows the replica set
+	// turned over, and this is how it reaches the router.
+	depHandler.Ingresses = ingHandler
+
 	jobHandler := &JobHandler{
 		Store:      store,
 		Log:        s.cfg.Logger,

@@ -568,3 +568,67 @@ func TestDeployRunDeduplicatesTheResourcesItReports(t *testing.T) {
 		t.Errorf("resources = %+v, want one", env.Data.Resources)
 	}
 }
+
+const manualSpec = runSpec + "deploy: manual\n"
+
+// `deploy: manual` is the developer saying "I press the button". A push that
+// matches such a file is acknowledged — the console needs to know it arrived —
+// but nothing is applied until somebody dispatches it.
+func TestDeployRunHoldsManualFilesOnPush(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": manualSpec, "voodu.hcl": "MANIFEST-BODY"}
+
+	api, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","ref":"refs/heads/main"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	if !strings.Contains(body, `"held":["PWA"]`) {
+		t.Errorf("the held file should be named: %s", body)
+	}
+
+	if strings.Contains(body, `"applied":["PWA"]`) {
+		t.Errorf("a push must not apply a manual file: %s", body)
+	}
+
+	if stored, _ := api.Store.Get(t.Context(), KindDeployment, "runa", "web"); stored != nil {
+		t.Error("the manifest reached the store on a push it was meant to wait out")
+	}
+}
+
+// The dispatch is the button. Same commit, same file, and now it applies.
+func TestDeployRunDispatchAppliesManualFiles(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": manualSpec, "voodu.hcl": "MANIFEST-BODY"}
+
+	api, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","mode":"dispatch"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	if !strings.Contains(body, `"applied":["PWA"]`) || strings.Contains(body, `"held"`) {
+		t.Errorf("a dispatch applies the manual file and holds nothing: %s", body)
+	}
+
+	if stored, _ := api.Store.Get(t.Context(), KindDeployment, "runa", "web"); stored == nil {
+		t.Error("the dispatch did not apply the manifest")
+	}
+}
+
+func TestDeployRunRefusesAnUnknownMode(t *testing.T) {
+	_, ts := newRunAPI(t, repoFiles(), true, nil)
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","mode":"yolo"}`)
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", resp.StatusCode, body)
+	}
+}

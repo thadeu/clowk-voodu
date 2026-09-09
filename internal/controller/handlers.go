@@ -417,6 +417,17 @@ func stringMapsEqual(a, b map[string]string) bool {
 	return true
 }
 
+// IngressRepublisher recomputes the routes that point at a deployment.
+//
+// Ingress upstreams name one live replica each, which is runtime state:
+// it turns over on every roll, scale and crash. Nothing in /desired
+// changes when it does, so the reconciler never fires for it. The
+// deployment reconcile is the one place that knows the set moved, which
+// makes it the one place that can say so.
+type IngressRepublisher interface {
+	RepublishFor(ctx context.Context, scope, deployment string) error
+}
+
 // DeploymentHandler reconciles deployment manifests. Three jobs:
 //
 //  1. Link refs into env — resolve ${ref.<kind>.<name>.<field>} against
@@ -496,6 +507,11 @@ type DeploymentHandler struct {
 	// a ProbeRegistry bound to docker.RestartContainer / .ContainerIP
 	// / DockerContainerManager.Exec. Tests substitute fakes.
 	Probes *ProbeRegistry
+
+	// Ingresses recomputes the routes pointing at this deployment once its
+	// replica set has settled. Optional — nil skips it, which is correct
+	// for a workload nothing routes to.
+	Ingresses IngressRepublisher
 }
 
 func (h *DeploymentHandler) Handle(ctx context.Context, ev WatchEvent) error {
@@ -963,6 +979,13 @@ func (h *DeploymentHandler) apply(ctx context.Context, ev WatchEvent) (retErr er
 		return err
 	}
 
+	// And the same for the router, one layer out. The ingress plugin was
+	// handed one upstream per replica, and the names it holds died with
+	// the containers this reconcile just replaced.
+	if err := h.republishIngresses(ctx, ev.Scope, ev.Name); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -1062,6 +1085,46 @@ func (h *DeploymentHandler) publishEndpoints(ctx context.Context, kind Kind, sco
 	}
 
 	return pub.publish(ctx, kind, scope, name, spec, live)
+}
+
+// republishIngresses recomputes the routes that point at this
+// deployment, now that its replica set has settled.
+//
+// Same reasoning as publishEndpoints, and the same failure if skipped: a
+// router that never heard about the new replicas is a silent outage. It
+// is a separate call because the two travel different paths —
+// publishEndpoints reaches a plugin that claimed a block *inside* this
+// workload, which a plain deployment + ingress pair never has.
+func (h *DeploymentHandler) republishIngresses(ctx context.Context, scope, name string) error {
+	if h.Ingresses == nil || h.Containers == nil {
+		return nil
+	}
+
+	// Nothing running is not a route to fix. A deployment stopped or
+	// scaled to zero has no upstream to publish, and resolving one would
+	// fail this reconcile over a state the operator asked for. The
+	// reconcile that starts a replica publishes the route again.
+	live, err := h.Containers.ListByIdentity(string(KindDeployment), scope, name)
+
+	if err != nil {
+		return Transient(fmt.Errorf("list replicas for ingress republish: %w", err))
+	}
+
+	running := false
+
+	for _, s := range live {
+		if s.Running {
+			running = true
+
+			break
+		}
+	}
+
+	if !running {
+		return nil
+	}
+
+	return h.Ingresses.RepublishFor(ctx, scope, name)
 }
 
 // drainSpec mirrors manifest.DrainSpec on the wire.
@@ -1719,7 +1782,15 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		}
 	}
 
-	return nil
+	// Every replica name this function handed out is new, and the router
+	// is still holding the ones it replaced. This is the choke point for
+	// that: Release (which is the whole rollout in build-mode, where the
+	// handler never creates a container itself), Rollback, `vd restart`
+	// and the apply-time recreate all land here. Publishing from apply
+	// alone left build-mode deployments stale on every deploy — the
+	// controller restart fixed them by replaying, and the next apply
+	// broke them again.
+	return h.republishIngresses(ctx, scope, name)
 }
 
 // Restart performs an imperative rolling restart of every live

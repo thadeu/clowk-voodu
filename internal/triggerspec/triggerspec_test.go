@@ -217,3 +217,36 @@ func TestSpecMarshalsWithTheFieldNamesTheFileUses(t *testing.T) {
 		t.Errorf("empty tags should be omitted: %s", got)
 	}
 }
+
+// A file written before `deploy:` existed must keep applying on push — the
+// zero value is auto, and Manual() is the only thing callers consult.
+func TestDeployDefaultsToAuto(t *testing.T) {
+	spec, err := Parse(".voodu/deploy/pwa.yml", []byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Manual() {
+		t.Error("a file with no deploy: key must be automatic")
+	}
+}
+
+func TestDeployManualHoldsThePush(t *testing.T) {
+	spec, err := Parse(".voodu/deploy/api.yml", []byte(minimal+"deploy: manual\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !spec.Manual() {
+		t.Error("deploy: manual must report Manual()")
+	}
+}
+
+// A misspelled mode is refused, not defaulted: the line was written to hold a
+// commit back, and reading it as auto ships exactly that commit.
+func TestDeployRefusesUnknownMode(t *testing.T) {
+	_, err := Parse(".voodu/deploy/api.yml", []byte(minimal+"deploy: manuel\n"))
+	if err == nil || !strings.Contains(err.Error(), "deploy must be") {
+		t.Fatalf("err = %v", err)
+	}
+}

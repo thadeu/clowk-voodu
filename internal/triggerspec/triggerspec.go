@@ -47,7 +47,37 @@ type Spec struct {
 
 	On    On    `yaml:"on" json:"on"`
 	Apply Apply `yaml:"apply" json:"apply"`
+
+	// Deploy is WHO PRESSES THE BUTTON: `auto` (the default) applies on the
+	// push that matched; `manual` records that the push arrived and waits for
+	// somebody to dispatch it from the console.
+	//
+	// Per FILE, not per repository. A monorepo commonly wants its web tier to
+	// ride every push and its API to be released by hand, and a single switch
+	// for both would force the cautious one onto the other.
+	//
+	// The property this buys is the GitHub Actions `workflow_dispatch` shape
+	// without a runner: a developer keeps pushing, and chooses on the console
+	// WHICH commit goes out — push-1, test, push-2, test — instead of the
+	// newest one going out because it was newest.
+	Deploy Mode `yaml:"deploy,omitempty" json:"deploy,omitempty"`
 }
+
+// Mode is how a matching push becomes a deploy.
+type Mode string
+
+const (
+	// ModeAuto is the zero value's meaning: a file that says nothing behaves
+	// exactly as every file written before the field existed.
+	ModeAuto Mode = "auto"
+
+	// ModeManual holds the push until a dispatch.
+	ModeManual Mode = "manual"
+)
+
+// Manual reports whether this file waits for a dispatch. The empty mode is
+// auto, so callers never have to spell the default themselves.
+func (s Spec) Manual() bool { return s.Deploy == ModeManual }
 
 // On is when a deploy fires. `push` is the only event today; the nesting
 // exists so a second one does not have to break every file already committed.
@@ -125,6 +155,15 @@ func (s Spec) validate(filePath string) error {
 		return ErrInvalid{filePath,
 			"on.push needs branches or tags — a trigger that matches nothing never fires, " +
 				"and a file that never fires is more confusing than a missing one"}
+	}
+
+	// Refused rather than defaulted: `deploy: manuel` silently meaning auto
+	// would ship the one commit the author wrote the line to hold back.
+	switch s.Deploy {
+	case "", ModeAuto, ModeManual:
+	default:
+		return ErrInvalid{filePath,
+			fmt.Sprintf("deploy must be %q or %q, got %q", ModeAuto, ModeManual, string(s.Deploy))}
 	}
 
 	return nil
