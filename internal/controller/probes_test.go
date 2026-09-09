@@ -560,6 +560,57 @@ func TestProbeRegistry_Stop_CallsClear(t *testing.T) {
 	}
 }
 
+// TestProbeRegistry_Stop_ClearsWithoutRunner covers the ghost that
+// survived a controller restart. StopAll cancels every runner but
+// deliberately leaves persistence alone ("cleanup happens at the
+// per-deployment remove() path instead"), and a fresh process starts
+// with an empty runners map either way. The later Stop for that
+// container then found nothing to delete and returned before ever
+// reaching the Recorder, so the persisted ReplicaReadiness entry
+// outlived the container and describe kept listing it — frozen at
+// whatever phase it last reported, forever.
+//
+// Clearing is idempotent on the recorder side, so Stop must always
+// reach it, runner entry or not.
+func TestProbeRegistry_Stop_ClearsWithoutRunner(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+
+	r := &ProbeRegistry{
+		Recorder: rec,
+		IPs:      fakeIPResolver{ips: map[string]string{"x": "127.0.0.1"}},
+	}
+
+	// No Start: this is the post-restart registry, or a container
+	// removed twice, or one whose runners StopAll already cancelled.
+	r.Stop("app", "x")
+
+	rec.mu.Lock()
+	cleared := append([]string(nil), rec.cleared...)
+	rec.mu.Unlock()
+
+	if len(cleared) != 1 || cleared[0] != "x" {
+		t.Errorf("Stop without a runner entry must still clear the persisted readiness, got cleared=%v", cleared)
+	}
+}
+
+// TestProbeRegistry_Stop_NoAppSkipsClear pins the other half of the
+// contract: the clear is keyed by app, so an empty app has nowhere
+// to write and must stay a no-op rather than guessing.
+func TestProbeRegistry_Stop_NoAppSkipsClear(t *testing.T) {
+	rec := &fakeReadinessRecorder{}
+	r := &ProbeRegistry{Recorder: rec}
+
+	r.Stop("", "x")
+
+	rec.mu.Lock()
+	cleared := len(rec.cleared)
+	rec.mu.Unlock()
+
+	if cleared != 0 {
+		t.Errorf("Stop with an empty app must not clear, got %d clears", cleared)
+	}
+}
+
 // TestReplicaIDFromContainerName pins the trailing-after-dot
 // parser shape — matches containers.ContainerName's output for
 // scoped and unscoped names.

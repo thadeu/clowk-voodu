@@ -799,6 +799,25 @@ func (r *ProbeRegistry) Stop(app, containerName string) {
 		return
 	}
 
+	// The persisted entry outlives the runner map, so the clear can
+	// not hang off the lookup succeeding. StopAll cancels every
+	// runner and deliberately leaves persistence to this path; a
+	// controller restart starts with an empty map for containers
+	// that are still running; and remove() calls Stop for every
+	// container it deletes, including ones whose runners never
+	// spawned. In all three the lookup below misses, and the entry
+	// used to survive in the status blob forever — describe listing
+	// replicas that no longer exist, frozen at their last phase.
+	//
+	// Deferred so it still lands after the runners have drained, and
+	// so every early return is covered. ClearReplicaReadiness is a
+	// no-op when the status blob holds nothing for this container.
+	defer func() {
+		if r.Recorder != nil && app != "" && containerName != "" {
+			r.Recorder.ClearReplicaReadiness(context.Background(), app, containerName)
+		}
+	}()
+
 	v, ok := r.runners.LoadAndDelete(containerName)
 	if !ok {
 		return
@@ -826,10 +845,6 @@ func (r *ProbeRegistry) Stop(app, containerName string) {
 				r.Log.Printf("probe/%s a runner did not stop within 5s — leaking goroutine", containerName)
 			}
 		}
-	}
-
-	if r.Recorder != nil && app != "" {
-		r.Recorder.ClearReplicaReadiness(context.Background(), app, containerName)
 	}
 }
 
