@@ -69,6 +69,7 @@ export const contents: SidebarSection[] = [
       { title: 'Install', href: '/docs/getting-started/install', icon: PlayCircle },
       { title: 'First deploy', href: '/docs/getting-started/first-deploy', icon: Server },
       { title: 'Remotes', href: '/docs/getting-started/remotes', icon: Globe },
+      { title: 'Cross-VM networking', href: '/docs/getting-started/cross-vm', icon: Network },
     ],
   },
   {
@@ -161,6 +162,7 @@ export const contents: SidebarSection[] = [
       { title: 'logs', href: '/docs/cli/logs', icon: ScrollText },
       { title: 'config', href: '/docs/cli/config', icon: Settings2 },
       { title: 'remote', href: '/docs/cli/remote', icon: Globe },
+      { title: 'wire', href: '/docs/cli/wire', icon: Network },
       { title: 'plugins', href: '/docs/cli/plugins', icon: Plug },
     ],
   },

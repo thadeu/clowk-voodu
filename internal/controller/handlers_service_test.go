@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -420,7 +421,7 @@ func TestIngressHandler_PortResolvedFromDeployment(t *testing.T) {
 	}
 }
 
-func TestIngressHandler_MissingTargetIsTransient(t *testing.T) {
+func TestIngressHandler_MissingTargetisTransient(t *testing.T) {
 	store := newMemStore()
 
 	h := &IngressHandler{Store: store, Invoker: &fakeInvoker{}, Log: quietLogger()}
@@ -610,5 +611,106 @@ func TestDeploymentUpstreamsSkipsStoppedReplicas(t *testing.T) {
 
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("got %v, want exactly [%s]", got, want)
+	}
+}
+
+// A service declared on another host: the mesh answers for its name, and
+// caddy is handed that name — never the addresses, which the other host
+// changes on every deploy.
+func TestIngressHandler_ServiceOnAnotherHostDialsTheMeshName(t *testing.T) {
+	store := newMemStore()
+
+	inv := &fakeInvoker{results: map[string]*plugins.Result{"caddy.apply": envelopeResult(map[string]any{})}}
+
+	var asked []string
+
+	h := &IngressHandler{
+		Store:   store,
+		Invoker: inv,
+		Log:     quietLogger(),
+		Remote: func(_ context.Context, name string) []netip.Addr {
+			asked = append(asked, name)
+
+			return []netip.Addr{netip.MustParseAddr("10.167.105.130")}
+		},
+	}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{Host: "api.example.com", Service: "api", Port: 8080})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(asked) != 1 || asked[0] != "api.test.voodu" {
+		t.Fatalf("mesh asked for %v, want api.test.voodu", asked)
+	}
+
+	if len(inv.calls) != 1 {
+		t.Fatalf("plugin calls = %d", len(inv.calls))
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressUpstreams]; got != `["api.test.voodu:8080"]` {
+		t.Fatalf("upstreams = %s, want the mesh name", got)
+	}
+}
+
+func TestIngressHandler_ServiceNowhereRetries(t *testing.T) {
+	store := newMemStore()
+	inv := &fakeInvoker{results: map[string]*plugins.Result{}}
+
+	h := &IngressHandler{
+		Store:   store,
+		Invoker: inv,
+		Log:     quietLogger(),
+		Remote:  func(context.Context, string) []netip.Addr { return nil },
+	}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{Host: "api.example.com", Service: "api", Port: 8080})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil || !isTransient(err) || !strings.Contains(err.Error(), "any wired host") {
+		t.Fatalf("err = %v, want a transient 'nowhere' error", err)
+	}
+
+	if len(inv.calls) != 0 {
+		t.Fatal("caddy must not be handed a service nobody runs")
+	}
+}
+
+// Without the service's manifest here there is nothing to read the port
+// from: the operator sets it, or the ingress says so and stops.
+func TestIngressHandler_ServiceOnAnotherHostNeedsAPort(t *testing.T) {
+	store := newMemStore()
+	inv := &fakeInvoker{results: map[string]*plugins.Result{}}
+
+	h := &IngressHandler{
+		Store:   store,
+		Invoker: inv,
+		Log:     quietLogger(),
+		Remote: func(context.Context, string) []netip.Addr {
+			return []netip.Addr{netip.MustParseAddr("10.167.105.130")}
+		},
+	}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{Host: "api.example.com", Service: "api"})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil || isTransient(err) || !strings.Contains(err.Error(), "set port explicitly") {
+		t.Fatalf("err = %v, want a permanent 'set port' error", err)
+	}
+}
+
+// A host local to itself has no mesh: an unknown service keeps retrying
+// exactly as before.
+func TestIngressHandler_NoMeshKeepsRetrying(t *testing.T) {
+	store := newMemStore()
+	inv := &fakeInvoker{results: map[string]*plugins.Result{}}
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "public", ingressSpec{Host: "api.example.com", Service: "api", Port: 8080})
+
+	err := h.Handle(context.Background(), ev)
+	if err == nil || !isTransient(err) {
+		t.Fatalf("err = %v, want transient", err)
 	}
 }

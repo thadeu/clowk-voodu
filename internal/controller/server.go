@@ -237,6 +237,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 	store := NewEtcdStore(etcd.Client)
 
+	// Cross-VM mesh: on a routed voodu0 every container is created pointing
+	// at the mesh DNS. nil — and inert — on a host local to itself.
+	mesh := detectMeshNetwork(s.cfg.Logger.Printf)
+	dockerContainers := DockerContainerManager{DNS: mesh.containerDNS}
+
 	recCtx, cancel := context.WithCancel(context.Background())
 	s.cancelRec = cancel
 
@@ -248,8 +253,15 @@ func (s *Server) Start(ctx context.Context) error {
 		EtcdClient:  s.cfg.EtcdClient,
 	}
 
+	wire := &Wire{
+		Store:    store,
+		ConfPath: paths.WirePeersConf(),
+		Logf:     s.cfg.Logger.Printf,
+	}
+
 	s.api = &API{
 		Store:         store,
+		Wire:          wire,
 		Version:       s.cfg.Version,
 		PluginsRoot:   s.cfg.PluginsRoot,
 		NodeName:      s.cfg.NodeName,
@@ -261,22 +273,22 @@ func (s *Server) Start(ctx context.Context) error {
 		// method — same instance the deployment/job/cronjob handlers
 		// already use, so /pods/{name}/logs and the runners agree on
 		// docker access.
-		Logs: DockerContainerManager{},
+		Logs: dockerContainers,
 
 		// Same instance — its Exec method satisfies the Execer seam.
-		Execer: DockerContainerManager{},
+		Execer: dockerContainers,
 
 		// Same instance — its Pull / ImageID methods satisfy the
 		// ImagePuller seam `vd apply --force` uses to re-pull
 		// registry-mode images. Sharing the instance keeps the pull
 		// on the same docker config.json (and therefore the same
 		// registry credentials) the container-create path uses.
-		Images: DockerContainerManager{},
+		Images: dockerContainers,
 
 		// Same instance — its Stop / Start / InspectLabels methods
 		// satisfy the PodLifecycler seam used by `vd stop` /
 		// `vd start`.
-		PodLifecycle: DockerContainerManager{},
+		PodLifecycle: dockerContainers,
 
 		// Stats collector — wires the existing pods lister + a
 		// fresh DockerStatsClient + the same Store everything else
@@ -373,7 +385,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return !stringMapsEqual(before, after), nil
 		},
 		EnvFilePath: paths.AppEnvFile,
-		Containers:  DockerContainerManager{},
+		Containers:  dockerContainers,
 		// Probe registry — wires the kubelet-style liveness runners
 		// to docker restart + IP resolution + exec. Same docker
 		// surface the rest of the handler uses; tests substitute
@@ -381,7 +393,7 @@ func (s *Server) Start(ctx context.Context) error {
 		Probes: &ProbeRegistry{
 			Restart: dockerRestarter{},
 			IPs:     dockerIPResolver{},
-			Exec:    DockerContainerManager{},
+			Exec:    dockerContainers,
 			Log:     s.cfg.Logger,
 		},
 	}
@@ -424,11 +436,12 @@ func (s *Server) Start(ctx context.Context) error {
 			return !stringMapsEqual(before, after), nil
 		},
 		EnvFilePath: paths.AppEnvFile,
-		Containers:  DockerContainerManager{},
+		Containers:  dockerContainers,
+		PodIPs:      newVoodu0PodIPAllocator(store),
 		Probes: &ProbeRegistry{
 			Restart: dockerRestarter{},
 			IPs:     dockerIPResolver{},
-			Exec:    DockerContainerManager{},
+			Exec:    dockerContainers,
 			Log:     s.cfg.Logger,
 		},
 		// Container-side URL (host.docker.internal-based) — this
@@ -454,11 +467,17 @@ func (s *Server) Start(ctx context.Context) error {
 	// container.
 	s.api.Readiness = compositeReadinessLookup{depHandler.Probes, stsHandler.Probes}
 
+	// The mesh DNS is built before the ingress handler: an ingress whose
+	// service runs on another host resolves it through the same server
+	// the containers ask.
+	meshDNS := mesh.server(&meshIndex{Pods: DockerPodsLister{}}, s.cfg.Logger.Printf)
+
 	ingHandler := &IngressHandler{
 		Store:      store,
 		Invoker:    invoker,
 		Log:        s.cfg.Logger,
-		Containers: DockerContainerManager{},
+		Containers: dockerContainers,
+		Remote:     meshResolver(meshDNS),
 		// PluginName left empty → defaults to "caddy". Operators with a
 		// non-Caddy router install their own plugin and set this via a
 		// future Config field.
@@ -472,7 +491,7 @@ func (s *Server) Start(ctx context.Context) error {
 	jobHandler := &JobHandler{
 		Store:      store,
 		Log:        s.cfg.Logger,
-		Containers: DockerContainerManager{},
+		Containers: dockerContainers,
 		// Jobs read the same env file as their AppID-twinned deployment
 		// would (apps/<scope>-<name>/.env), so `voodu config set` lands
 		// where job runs read from.
@@ -507,7 +526,7 @@ func (s *Server) Start(ctx context.Context) error {
 	cronJobHandler := &CronJobHandler{
 		Store:       store,
 		Log:         s.cfg.Logger,
-		Containers:  DockerContainerManager{},
+		Containers:  dockerContainers,
 		EnvFilePath: paths.AppEnvFile,
 		WriteEnv: func(app string, pairs []string) (bool, error) {
 			envFile := paths.AppEnvFile(app)
@@ -560,6 +579,19 @@ func (s *Server) Start(ctx context.Context) error {
 		Store:   store,
 		Handler: cronJobHandler,
 		Logger:  s.cfg.Logger,
+	}
+
+	// Up before the reconciler, so the containers its replay creates find
+	// their resolver answering.
+	mesh.serve(recCtx, meshDNS, s.cfg.Logger.Printf)
+
+	// Bring wg0's peers to what etcd says, for a host that rebooted or
+	// recreated wg0. Nothing to apply on a host without peers, and a host
+	// without wg0 only logs.
+	if peers, err := store.ListWirePeers(recCtx); err == nil && len(peers) > 0 {
+		if err := wire.Apply(recCtx); err != nil {
+			s.cfg.Logger.Printf("wire: %v", err)
+		}
 	}
 
 	s.recDone = make(chan struct{})

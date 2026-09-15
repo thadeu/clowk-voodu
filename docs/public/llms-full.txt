@@ -4,7 +4,7 @@
 > for LLM ingestion. Source: https://voodu.clowk.in/docs
 > Curated index: https://voodu.clowk.in/llms.txt
 
-Last built: 2026-09-02T02:29:05.685Z
+Last built: 2026-09-15T03:39:06.409Z
 
 ---
 # Introduction
@@ -109,6 +109,307 @@ Six verbs cover ~95% of day-to-day:
 | [`voodu config`](/docs/cli/config) | Set/get env vars per app |
 | [`voodu remote`](/docs/cli/remote) | SSH targets for multi-host |
 | [`voodu plugins`](/docs/cli/plugins) | Install/list/update plugins |
+
+---
+
+# Cross-VM networking
+
+URL: https://voodu.clowk.in/docs/getting-started/cross-vm/
+> Reach a container on another voodu server at its own address, over WireGuard.
+
+## What it is
+
+Every voodu server joins a WireGuard tunnel, and its `voodu0` network is
+**routed**: every container on it has one address, and that address is
+reachable from the other voodu servers on the tunnel — on any port, with
+nothing to declare. It is the same thing that already happens between two
+containers on one host, stretched across hosts.
+
+```
+vm-1 (apps)                          vm-2 (databases)
+api  ──── wg0 ──────────────────────▶ pg-0.contagorda.voodu   10.167.105.2:5432
+                                      cache.contagorda.voodu  10.167.105.3:6379
+```
+
+- **Names work across hosts.** A container on vm-1 reaches
+  `pg-0.contagorda.voodu` on vm-2 by the same name it has on its own host.
+
+- **No `ports` needed.** Every port a container listens on is reachable.
+- **Every container gets an address.** Deployments, statefulsets, and whatever a
+  plugin (`postgres`, `redis`, …) expands to.
+- **Docker does the work.** voodu writes no firewall rules and runs no proxy;
+  the kernel routes and docker configures the network.
+
+## How each host's addresses are chosen
+
+Each host takes the **last two numbers of the IP it goes out on**. They give
+both its address on the tunnel and its containers' subnet:
+
+| Host | Outbound IP | Tunnel (`wg0`) | Containers (`voodu0`) |
+|---|---|---|---|
+| vm-1 | `152.53.91.221` | `10.254.91.221` | `10.91.221.0/24` |
+| vm-2 | `152.53.167.105` | `10.254.167.105` | `10.167.105.0/24` |
+
+The outbound IP is read from the routing table, not from a named interface, so
+`eth0`, `eth1` or `ens3` make no difference. Every host's IP is unique, and its
+last two numbers leave 65,536 combinations, so two hosts landing on the same
+pair is negligible. When it happens — or when the third number is `254`, which
+would put the subnet inside the tunnel itself — pick another address at install
+time:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thadeu/clowk-voodu/main/install | bash -s -- --wg-address 10.254.7.7
+```
+
+## New hosts
+
+WireGuard is installed with voodu, like Docker. On a host with no `wg0`, the
+installer:
+
+1. generates a key pair in `/etc/wireguard/`;
+2. writes `/etc/wireguard/wg0.conf` with the host's tunnel address — no peers yet;
+3. starts `wg-quick@wg0` and enables it at boot;
+4. prints the address and the public key the other hosts need.
+
+Then it creates `voodu0` routed, provided Docker is 28 or newer (routed access
+to any port is the `nat-unprotected` gateway mode, added in 28) and the subnet
+overlaps no route on the host. When a check fails, `voodu0` is a plain bridge,
+local to the host, and the installer says why.
+
+An existing `wg0` or `voodu0` is never touched. `SKIP_WIREGUARD=1` skips
+WireGuard entirely; `voodu0` then stays local.
+
+Open UDP `51820` on every host's firewall — that is the tunnel itself.
+
+## Connect two hosts
+
+Each host needs the other as a WireGuard peer. `vd wire` does that without
+anyone editing `wg0.conf` — run `show` on one host and paste its line on the
+other, then the same the other way round. With `-r`, all of it from your own
+machine:
+
+```bash
+vd wire show -r vm-1
+# → vd wire add --key <vm-1 key> --address 10.254.91.221 --endpoint 152.53.91.221:51820
+vd wire add -r vm-2 --key <vm-1 key> --address 10.254.91.221 --endpoint 152.53.91.221:51820
+
+vd wire show -r vm-2
+# → vd wire add --key <vm-2 key> --address 10.254.167.105 --endpoint 152.53.167.105:51820
+vd wire add -r vm-1 --key <vm-2 key> --address 10.254.167.105 --endpoint 152.53.167.105:51820
+```
+
+`add` applies the peer to `wg0` at once, without dropping the tunnel, and
+covers both of the peer's addresses (`10.254.X.Y/32` and `10.X.Y.0/24`,
+derived from the tunnel address). Peers live in the controller's store and
+come back after a reboot. A host behind NAT is added without `--endpoint`;
+it dials out, the other side learns the endpoint from the handshake.
+
+`vd wire list` shows every peer with its link — last handshake, bytes — and
+`vd wire remove <address>` drops one. A peer that stops answering stays
+listed until you remove it.
+
+The install writes `wg0.conf` once; voodu keeps its peers in
+`/opt/voodu/wire/peers.conf` and never touches `wg0.conf` again.
+
+If the host firewall filters forwarded traffic (ufw's default routed policy
+does), allow `wg0` into the `voodu0` bridge. Its interface name is `br-`
+followed by the first 12 characters of the network id:
+
+```bash
+echo br-$(docker network inspect voodu0 -f '{{.Id}}' | cut -c1-12)
+```
+
+The mesh DNS (see [Names](#names)) listens on port `53` of the `voodu0` gateway,
+for the host's own containers, and of the tunnel address, for the other hosts —
+UDP and TCP. With ufw active, allow both in:
+
+```bash
+sudo ufw allow in on br-<id> to any port 53
+sudo ufw allow in on wg0 to any port 53
+```
+
+## Addresses
+
+`voodu describe` lists each pod with its address:
+
+```bash
+voodu describe statefulset contagorda/pg -r vm-2
+```
+
+```
+pods (2):
+  NAME              REPLICA  IP             RELEASE  IMAGE        STATUS   CREATED
+  contagorda-pg.0   0        10.167.105.2   -        postgres:16  running  …
+  contagorda-pg.1   1        10.167.105.3   -        postgres:16  running  …
+```
+
+- **Statefulset pods have a fixed address** per ordinal. `pg-0` answers on the
+  same address after a restart, a recreate, a new image, or a reboot. The
+  address is kept when the statefulset scales down — the ordinal may come back —
+  and freed when the statefulset is deleted. These come from the lower half of
+  the subnet (`.2`–`.127`).
+- **Deployment replicas get a new address** from docker every time they are
+  recreated (the upper half, `.128`–`.254`). Do not write one into a connection
+  string — use the deployment's [name](#names). An HTTP service can also sit
+  behind an `ingress` on another host: Caddy there dials the name through the
+  mesh, so one host can be the public entry for apps spread across several
+  (see [the caddy plugin](/docs/plugins/caddy#a-service-on-another-voodu-host)).
+
+A connection string to a pod on another host:
+
+```bash
+DATABASE_URL=postgres://user:pass@10.167.105.2:5432/app
+```
+
+## Names
+
+Every container answers, from any host, to the same `.voodu` names it already
+has on its own:
+
+| Name | Answers with |
+|---|---|
+| `pg.contagorda.voodu` | every pod of the statefulset |
+| `pg-0.contagorda.voodu` | pod 0 only |
+| `api.clowk.voodu` | every running replica of the deployment |
+
+A connection string written on one host works from any other — including the
+ones the `postgres` and `redis` plugins generate:
+
+```bash
+DATABASE_URL=postgres://user:pass@db-0.contagorda.voodu:5432/app
+```
+
+**How it resolves.** Every container on a routed `voodu0` is created with two
+resolvers: its own host's controller first, then the host's own resolvers.
+Docker answers the names of the host's containers itself. Anything else reaches
+the controller, which asks the other hosts about a `.voodu` name — the host that
+owns the container answers — and passes every other name to the host's
+resolvers. Nothing is copied between hosts, so an answer is never stale.
+
+- **While the controller restarts** (an upgrade), internet names keep resolving
+  through the host's resolvers, and connections already open are untouched.
+  Only names on other hosts wait for it to come back.
+- **A name without the suffix** (`pg.contagorda`) works on its own host only.
+- **The same name on two hosts** answers with both: the same service running on
+  two hosts. Two environments that share a scope look exactly the same, and
+  their traffic would mix — give each environment its own scope. The controller
+  logs it whenever more than one host answers a name.
+- **A container created before its host was routed** has no mesh resolver; it
+  gets one when it is recreated. The migration below recreates every container.
+
+**From the host itself.** The host sees `voodu0` directly, so `psql -h 10.91.221.2`
+works with no published port. For the names, point systemd-resolved at the mesh
+DNS for the bridge only — `.voodu` goes to the mesh, everything else stays as it
+is:
+
+```bash
+BR=br-$(docker network inspect voodu0 -f '{{.Id}}' | cut -c1-12)
+sudo resolvectl dns "$BR" 10.91.221.1
+sudo resolvectl domain "$BR" '~voodu'
+psql -h pg-0.contagorda.voodu
+```
+
+## Ports
+
+Across hosts, `ports` plays no part. It publishes a container port on the
+**host** (docker's `-p`); a name reaches the **container**, on the port the
+process listens on. The two are independent:
+
+| Path | Who uses it | Port |
+|---|---|---|
+| `127.0.0.1:<host port>` | this host only (`psql` from the host) | one per host, cannot repeat |
+| `pg-0.clowk.voodu:5432` | apps, on any host | the process's own — repeats freely |
+
+So three databases need no `ports` at all, and all listen on 5432:
+
+```hcl
+postgres "contagorda" "pg" { version = "16" }
+postgres "clowk"      "pg" { version = "16" }
+postgres "hep3"       "pg" { version = "16" }
+```
+
+```
+postgres://…@pg-0.contagorda.voodu:5432/app
+postgres://…@pg-0.clowk.voodu:5432/app
+postgres://…@pg-0.hep3.voodu:5432/app
+```
+
+`ports = ["5432"]` on each is harmless — docker picks a different loopback port
+per container — but it is only for reaching the database from the host, and the
+name above does that too, without a port that changes on every recreate.
+
+What to avoid is the shape that made cross-host addressing painful before: a
+fixed host port (`5433:5432`) or an empty host port on a tunnel address
+(`10.8.0.1::5432`). Neither is needed now, and `vd apply` warns about the
+second.
+
+## Migrating an existing host
+
+A host set up before this feature has a `wg0` outside `10.254.0.0/16` and a
+`voodu0` with no subnet of its own. Both get new addresses, and a network's
+subnet can only be set when the network is created — so moving a host over
+means recreating `voodu0` and every container on it. Expect a few minutes of
+downtime per host. Volumes are kept.
+
+1. **Work out the host's addresses** from its outbound IP (the table above):
+   `ip -4 route get 1.1.1.1` shows it after `src`. Check `docker version` (28+).
+2. **Move `wg0` to the voodu tunnel.** In `/etc/wireguard/wg0.conf`, set
+   `Address = 10.254.X.Y/16`, drop any hand-written `[Peer]` blocks, and add
+   the PostUp that reapplies voodu's peers on boot:
+
+   ```ini
+   PostUp = test -f /opt/voodu/wire/peers.conf && wg syncconf %i /opt/voodu/wire/peers.conf || true
+   ```
+
+   Restart `wg-quick@wg0` — the tunnel drops for a moment. Once both hosts
+   are moved, wire them with `vd wire` (see [Connect two hosts](#connect-two-hosts)).
+
+   The controller's unit is ordered after `wg-quick@wg0` by the current
+   install. A host installed earlier has the old unit: re-run the install, or
+   add `wg-quick@wg0.service` to its `After=` line, so the controller does
+   not start before the tunnel on boot.
+3. **Recreate the network**, on the host:
+
+   ```bash
+   sudo systemctl stop voodu-controller
+
+   # every container on voodu0; without -v, volumes are kept
+   docker ps -aq --filter network=voodu0 | xargs -r docker rm -f
+
+   docker network rm voodu0
+   docker network create --driver bridge \
+     --subnet 10.91.221.0/24 --ip-range 10.91.221.128/25 \
+     -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
+     voodu0
+
+   # recreates every deployment and statefulset; pods get fixed addresses
+   sudo systemctl start voodu-controller
+   ```
+
+4. **Bring Caddy back.** Its container belongs to the plugin, not to the
+   controller. Reinstalling recreates it on the new network; routes and
+   certificates live on the host and are kept:
+
+   ```bash
+   voodu plugins:install thadeu/voodu-caddy
+   ```
+
+5. **Point the apps at the names** (`pg-0.contagorda.voodu:5432`) — URLs the
+   plugins generate already use them — and drop any `ports` entry that existed
+   only to publish on the old tunnel address.
+
+## Limitations
+
+- **Docker 28 or newer** is required for routed access to any port.
+- **A container whose primary network is not `voodu0`** (a `networks` list that
+  starts with another network) sends its replies through that network, so it is
+  not reachable across hosts, and a statefulset pod in that shape gets no fixed
+  address.
+- **Every port of every container is reachable from the other hosts on the
+  tunnel.** From the provider's network, only if someone can deliver a packet
+  addressed to the subnet straight to the host's interface — the same exposure a
+  port published on a tunnel address has, now for every port. A host firewall
+  rule that accepts the subnet only from `wg0` closes it.
 
 ---
 
@@ -5813,6 +6114,20 @@ voodu-caddy runs on `voodu0`. Apps and deployments join `voodu0` automatically. 
 
 This is why the install pins Caddy to `voodu0` — dropping it onto the bridge default would break DNS resolution for service names.
 
+### A service on another voodu host
+
+On a host wired to others (see [Cross-VM networking](/docs/getting-started/cross-vm)), an `ingress` may name a service that runs on another host. The controller finds no local deployment, asks the mesh for `<service>.<scope>.voodu`, and when another host answers hands Caddy that name. Caddy resolves it on every dial, so a deploy on the other host needs nothing here.
+
+```hcl
+ingress "clowk" "api" {
+  host    = "api.example.com"
+  service = "api"
+  port    = 8080   # required: the service's manifest is not on this host
+}
+```
+
+Caddy is started with the mesh resolvers by the plugin install, so re-run `voodu plugins:install thadeu/voodu-caddy` once on a host migrated to a routed `voodu0`.
+
 ## Multi-replica upstreams
 
 When a deployment has multiple replicas, the controller passes them as `VOODU_INGRESS_UPSTREAMS` — one `host:port` per replica. Caddy load-balances across them per `lb { policy }`:
@@ -6882,6 +7197,99 @@ watch -n 2 vd stats myorg
 - Stopped pods are omitted by design — no cgroup to sample. Use `vd get pods` to see them.
 - Per-pod rows are deliberate: averaging hides the asymmetry that diagnoses memory leaks, unbalanced load, or a wedged replica. If you need aggregated numbers, fold them yourself from JSON.
 - The JSON wire shape carries the full record: `usage.cpu_percent`, `usage.memory_usage_bytes`, `usage.memory_percent`, `limits.memory_bytes`, `desired_replicas`, etc.
+
+---
+
+# voodu wire
+
+URL: https://voodu.clowk.in/docs/cli/wire/
+> Wire voodu hosts together over WireGuard, without editing wg0.conf.
+
+`voodu wire` manages the WireGuard peers of a host — the other voodu hosts whose
+containers it can reach by name. Peers are stored by the controller, applied to
+`wg0` at once with `wg syncconf` (the tunnel never drops), and come back after a
+reboot. `wg0.conf` is written once by the installer and never edited.
+
+The full picture — addresses, names, migration — is in
+[Cross-VM networking](/docs/getting-started/cross-vm).
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| `show` | Print this host as a ready-to-paste `add` line for another host. |
+| `add` | Add a peer: `--key`, `--address`, optional `--endpoint`. |
+| `remove <address>` | Drop a peer by its tunnel address. |
+| `list` | Peers and their link health (last handshake, bytes). |
+
+Every verb runs against the controller of the host it targets, so `-r` does all
+of it from your own machine.
+
+## Wiring two hosts
+
+`show` on one host, `add` on the other, then the same the other way round:
+
+```bash
+vd wire show -r vm-1
+# → vd wire add --key <vm-1 key> --address 10.254.91.221 --endpoint 152.53.91.221:51820
+vd wire add -r vm-2 --key <vm-1 key> --address 10.254.91.221 --endpoint 152.53.91.221:51820
+
+vd wire show -r vm-2
+# → vd wire add --key <vm-2 key> --address 10.254.167.105 --endpoint 152.53.167.105:51820
+vd wire add -r vm-1 --key <vm-2 key> --address 10.254.167.105 --endpoint 152.53.167.105:51820
+```
+
+The three flags all describe the **other** host:
+
+| Flag | What it is | Example |
+|---|---|---|
+| `--key` | its WireGuard public key | `AbC…=` |
+| `--address` | its address on the tunnel (`wg0`) | `10.254.167.105` |
+| `--endpoint` | its public IP and WireGuard port | `152.53.167.105:51820` |
+
+`--address` is enough for the routing: the peer's container subnet
+(`10.167.105.0/24`) is derived from it, so `AllowedIPs` covers both without a
+flag. A host behind NAT is added without `--endpoint`; it dials out, and the
+other side learns the endpoint from the handshake.
+
+Open UDP `51820` on every host — that is the tunnel itself.
+
+With three hosts, each pair needs its `add` on both sides: six commands, once.
+
+## `voodu wire list`
+
+```
+this host: 10.254.91.221  key LOCALKEY…
+
+ADDRESS         ENDPOINT              HANDSHAKE    RX/TX        KEY
+10.254.167.105  152.53.167.105:51820  12s ago      2.0KB/100B   PEERKEY2…
+10.254.200.7    1.2.3.4:51820         never        0B/0B        PEERKEY3…
+```
+
+| Column | Meaning |
+|---|---|
+| `HANDSHAKE` | how long since the peer last answered; `never` for one that has not yet — usually UDP 51820 closed on one side |
+| `not applied` | the peer is stored but `wg0` does not carry it; the next add, remove, or controller start applies it |
+
+A peer that stops answering stays listed until you `remove` it. `-o json` on
+every verb.
+
+## What it changes
+
+- `add` writes the peer to the controller's store and to
+  `/opt/voodu/wire/peers.conf`, then runs `wg syncconf wg0` on that file.
+- The mesh DNS reads its peer list from `wg0`, so a new peer's names resolve
+  within 30 seconds. Nothing to restart.
+- `add` and `remove` land in the activity trail.
+
+## Errors
+
+| Message | Cause |
+|---|---|
+| `not in the voodu tunnel` | `--address` outside `10.254.0.0/16` |
+| `that is this host` | `--address` is this host's own |
+| `public key already used by peer X` | the same key was added under another address |
+| `wg0 is not up` | WireGuard is not running here — see the installer |
 
 ---
 

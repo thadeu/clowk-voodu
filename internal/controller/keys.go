@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -39,6 +40,22 @@ const (
 	// as reliably as the manifests it authorises. It is also read on every
 	// deploy, which is the same access pattern as everything else here.
 	prefixTriggers = "/triggers/"
+
+	// prefixPodIPs holds the fixed voodu0 addresses of statefulset pods,
+	// as two keys per reservation:
+	//
+	//	/podips/addr/<ip>                     → "<scope>/<name>/<ordinal>"
+	//	/podips/pod/<scope>/<name>/<ordinal>  → "<ip>"
+	//
+	// Both directions are one read, and a reservation claims both in the
+	// same transaction, so an address is never handed to two pods.
+	prefixPodIPs = "/podips/"
+
+	// prefixWirePeers holds the WireGuard peers voodu applies to wg0, one
+	// record per peer under `/wire/peers/<address>`. Keyed by the peer's
+	// tunnel address: the value an operator sees in `vd wire list` and
+	// passes to `vd wire remove`.
+	prefixWirePeers = "/wire/peers/"
 )
 
 // Kind is the type of a declared resource. New kinds added in later
@@ -232,3 +249,28 @@ func TriggersPrefix() string {
 // every PAT on the host. Used by `vd pat list` and any future
 // audit / bulk-revoke tooling.
 func PATsPrefix() string { return prefixPATs }
+
+// PodIPAddrKey returns "/podips/addr/<ip>" — who holds an address.
+func PodIPAddrKey(ip string) string {
+	return prefixPodIPs + "addr/" + ip
+}
+
+// PodIPPodPrefix returns "/podips/pod/<scope>/<name>/" — every address
+// reserved for one statefulset.
+func PodIPPodPrefix(scope, name string) string {
+	return prefixPodIPs + "pod/" + scope + "/" + name + "/"
+}
+
+// PodIPPodKey returns "/podips/pod/<scope>/<name>/<ordinal>" — one pod's
+// address.
+func PodIPPodKey(scope, name string, ordinal int) string {
+	return PodIPPodPrefix(scope, name) + strconv.Itoa(ordinal)
+}
+
+// WirePeerKey returns "/wire/peers/<address>" — one WireGuard peer.
+func WirePeerKey(address string) string {
+	return prefixWirePeers + address
+}
+
+// WirePeersPrefix returns "/wire/peers/" — the listing prefix.
+func WirePeersPrefix() string { return prefixWirePeers }

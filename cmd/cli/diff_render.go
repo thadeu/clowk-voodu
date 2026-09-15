@@ -454,5 +454,25 @@ type diffResponse struct {
 		Current []*controller.Manifest `json:"current"`
 		Pruned  []string               `json:"pruned"`
 		DryRun  bool                   `json:"dry_run"`
+
+		// Warnings are what the apply would let through but flag, such
+		// as a host port docker is free to move. Carried in the plan so
+		// `vd diff -o json` includes them for scripts and CI.
+		Warnings []string `json:"warnings,omitempty"`
 	} `json:"data"`
+}
+
+// renderPlanWarnings prints what the apply would let through but flag, one
+// line per warning, after the plan itself. Nothing is printed when there are
+// none, so a clean plan reads exactly as before.
+func renderPlanWarnings(out io.Writer, warnings []string) {
+	if len(warnings) == 0 {
+		return
+	}
+
+	fmt.Fprintln(out)
+
+	for _, w := range warnings {
+		fmt.Fprintf(out, "%s %s\n", warn(), w)
+	}
 }

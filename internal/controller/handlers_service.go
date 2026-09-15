@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -72,6 +73,14 @@ type IngressHandler struct {
 	// (`<app>.<replica_id>`), so the resolver can no longer
 	// synthesize them from a count; it has to ask the runtime.
 	Containers ContainerManager
+
+	// Remote resolves a .voodu name across the mesh — this host's index,
+	// then the other hosts. Used when the ingress names a service that no
+	// local deployment declares: if another host answers, caddy dials the
+	// name and the mesh DNS keeps it pointed at the live replicas there.
+	// nil on a host without a routed voodu0, where a service is local or
+	// nothing.
+	Remote func(ctx context.Context, name string) []netip.Addr
 }
 
 // IngressStatus persists whatever the ingress plugin returned. As with
@@ -531,7 +540,7 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 	}
 
 	if dep == nil {
-		return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no deployment named %q yet — will retry", name, spec.Service))
+		return h.remoteUpstream(ctx, scope, name, spec)
 	}
 
 	if spec.Port == 0 {
@@ -551,6 +560,51 @@ func (h *IngressHandler) resolveUpstream(ctx context.Context, scope, name string
 		Upstreams:       upstreams,
 		HealthCheckPath: healthCheckPathFor(*dep),
 		LBInterval:      lbIntervalFor(*dep, spec.LB),
+	}, nil
+}
+
+// remoteUpstream is the ingress whose service is not declared on this
+// host. The mesh is asked for <service>.<scope>.voodu; when another host
+// answers, the upstream is that name — never the addresses, which change
+// on every deploy over there. Caddy resolves the name on each dial through
+// docker's DNS and this host's mesh DNS, so a deploy on the other host
+// needs no republish here.
+//
+// The port has to be explicit: there is no deployment spec to read it
+// from. Health checks and load balancing stay with the other host's
+// replicas, which caddy sees as one name.
+func (h *IngressHandler) remoteUpstream(ctx context.Context, scope, name string, spec *ingressSpec) (upstreamResolution, error) {
+	if h.Remote == nil {
+		return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no deployment named %q yet — will retry", name, spec.Service))
+	}
+
+	// The fully-qualified alias: the one name that means the same thing
+	// on every host.
+	meshName := ""
+
+	for _, alias := range BuildNetworkAliases(scope, spec.Service) {
+		if strings.HasSuffix(alias, "."+networkAliasTLD) {
+			meshName = alias
+		}
+	}
+
+	if meshName == "" {
+		return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no deployment named %q yet — will retry", name, spec.Service))
+	}
+
+	addrs := h.Remote(ctx, meshName)
+	if len(addrs) == 0 {
+		return upstreamResolution{}, Transient(fmt.Errorf("ingress/%s: no deployment named %q here or on any wired host — will retry", name, spec.Service))
+	}
+
+	if spec.Port == 0 {
+		return upstreamResolution{}, fmt.Errorf("ingress/%s: service %q runs on another host — set port explicitly, its manifest is not here to read it from", name, spec.Service)
+	}
+
+	h.logf("ingress/%s: %s runs on another host (%v) — caddy dials %s", name, spec.Service, addrs, meshName)
+
+	return upstreamResolution{
+		Upstreams: []string{fmt.Sprintf("%s:%d", meshName, spec.Port)},
 	}, nil
 }
 

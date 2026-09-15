@@ -124,6 +124,30 @@ type Store interface {
 	GetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) ([]string, error)
 	SetFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string, ids []string) error
 	DeleteFrozenReplicaIDs(ctx context.Context, kind Kind, scope, name string) error
+
+	// Fixed voodu0 addresses of statefulset pods. A pod keeps its address
+	// for as long as the statefulset exists, so the address can be written
+	// into a connection string on another VM.
+	//
+	// ReservePodIP claims ip for the pod in one transaction, and only when
+	// neither the address nor the pod holds a reservation yet. false with
+	// no error means one of them did: read the pod's address, or try the
+	// next one.
+	ReservePodIP(ctx context.Context, scope, name string, ordinal int, ip string) (bool, error)
+	GetPodIP(ctx context.Context, scope, name string, ordinal int) (string, error)
+
+	// ReleasePodIP drops one pod's reservation, ReleasePodIPs every
+	// reservation of the statefulset. Both are idempotent.
+	ReleasePodIP(ctx context.Context, scope, name string, ordinal int) error
+	ReleasePodIPs(ctx context.Context, scope, name string) error
+
+	// WireGuard peers voodu keeps on wg0. The etcd record is the source
+	// of truth; wg0 is brought to match it by syncconf (see wire.go).
+	// PutWirePeer overwrites — the same address re-added replaces the
+	// record. DeleteWirePeer is idempotent: (false, nil) when absent.
+	PutWirePeer(ctx context.Context, p WirePeer) error
+	ListWirePeers(ctx context.Context) ([]WirePeer, error)
+	DeleteWirePeer(ctx context.Context, address string) (bool, error)
 }
 
 // WatchEvent is a single change observed on /desired/*.

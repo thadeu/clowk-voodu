@@ -78,6 +78,12 @@ type StatefulsetHandler struct {
 	// so a single configuration knob controls both kinds.
 	Webhooks WebhookPoster
 
+	// PodIPs pins each pod's address on a routed voodu0, so another VM
+	// reaches the same pod at the same address across recreates. nil
+	// disables it; so does a voodu0 without a subnet and ip-range of its
+	// own.
+	PodIPs *podIPAllocator
+
 	// rolloutLocks serialises rolling restart per (scope, name).
 	// Two concurrent reconciles for the same statefulset would
 	// otherwise race on container creation order — mutex granularity
@@ -520,6 +526,12 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 		}
 	}
 
+	// The fixed addresses go with the statefulset. Scaling down keeps them
+	// because the ordinal may come back; a deleted statefulset will not.
+	if err := h.PodIPs.release(ctx, ev.Scope, ev.Name); err != nil {
+		return fmt.Errorf("release pod addresses: %w", err)
+	}
+
 	if err := h.Store.DeleteStatus(ctx, KindStatefulset, app); err != nil {
 		return fmt.Errorf("clear statefulset status: %w", err)
 	}
@@ -527,6 +539,19 @@ func (h *StatefulsetHandler) remove(ctx context.Context, ev WatchEvent) error {
 	h.logf("statefulset/%s deleted (pods removed, volumes preserved)", ev.Name)
 
 	return nil
+}
+
+// podIP is the fixed address for one ordinal, or "" when the pod takes
+// whatever docker gives it. Only a pod whose primary network is voodu0 gets
+// one: --ip applies to the primary network, and a pod whose default route
+// runs through another network would answer a remote caller from the wrong
+// address.
+func (h *StatefulsetHandler) podIP(ctx context.Context, scope, name string, spec statefulsetSpec, ordinal int) (string, error) {
+	if spec.NetworkMode != "" || len(spec.Networks) == 0 || spec.Networks[0] != "voodu0" {
+		return "", nil
+	}
+
+	return h.PodIPs.addressFor(ctx, scope, name, ordinal)
 }
 
 // ensureOrdinalsUp spawns missing ordinals (0..want-1) bottom-up.
@@ -682,6 +707,11 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 			}
 		}
 
+		ip, err := h.podIP(ctx, scope, name, spec, n)
+		if err != nil {
+			return fmt.Errorf("ordinal %d (%s): %w", n, cname, err)
+		}
+
 		_, err = h.Containers.Ensure(ContainerSpec{
 			Name:             cname,
 			Image:            spec.Image,
@@ -690,6 +720,7 @@ func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, 
 			Volumes:          mountedVolumes,
 			Networks:         spec.Networks,
 			NetworkMode:      spec.NetworkMode,
+			IP:               ip,
 			NetworkAliases:   aliases,
 			Restart:          spec.Restart,
 			EnvFile:          envFile,
@@ -1020,6 +1051,11 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 			}
 		}
 
+		ip, err := h.podIP(ctx, scope, name, spec, ord)
+		if err != nil {
+			return fmt.Errorf("respawn ordinal %d: %w", ord, err)
+		}
+
 		if _, err := h.Containers.Ensure(ContainerSpec{
 			Name:             newName,
 			Image:            spec.Image,
@@ -1028,6 +1064,7 @@ func (h *StatefulsetHandler) rollingReplaceTopDown(ctx context.Context, scope, n
 			Volumes:          mountedVolumes,
 			Networks:         spec.Networks,
 			NetworkMode:      spec.NetworkMode,
+			IP:               ip,
 			NetworkAliases:   aliases,
 			Restart:          spec.Restart,
 			EnvFile:          envFile,

@@ -40,6 +40,8 @@ VOODU_ROOT="${VOODU_ROOT:-/opt/voodu}"
 VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-127.0.0.1:8686}"
 VOODU_PAT_ADDR="${VOODU_PAT_ADDR:-0.0.0.0:8687}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
+SKIP_WIREGUARD="${SKIP_WIREGUARD:-0}"
+VOODU_WG_ADDRESS="${VOODU_WG_ADDRESS:-}"
 BIN_DIR="/usr/local/bin"
 UNIT_PATH="/etc/systemd/system/voodu-controller.service"
 MODE=""
@@ -72,11 +74,13 @@ parse_args() {
     case "$1" in
       --server) MODE=server; shift ;;
       --client) MODE=client; shift ;;
+      --wg-address) VOODU_WG_ADDRESS="${2:-}"; shift 2 ;;
+      --wg-address=*) VOODU_WG_ADDRESS="${1#*=}"; shift ;;
       --help|-h)
         cat <<EOF
 voodu installer
 
-Usage: install [--server | --client]
+Usage: install [--server | --client] [--wg-address 10.254.X.Y]
 
 Default mode:
   Linux  → server  (auto-installs Docker + voodu + controller + systemd unit)
@@ -89,6 +93,9 @@ Environment:
   VOODU_HTTP_ADDR       orchestration plane bind (default 127.0.0.1:8686)
   VOODU_PAT_ADDR        observability plane bind (default 0.0.0.0:8687)
   SKIP_DOCKER=1         skip Docker install (server mode only)
+  SKIP_WIREGUARD=1      skip WireGuard (server mode only; voodu0 stays local)
+  VOODU_WG_ADDRESS      this host's tunnel address when wg0 is created
+                        (default 10.254.<last two numbers of the outbound IP>)
 EOF
         exit 0
         ;;
@@ -203,19 +210,242 @@ ensure_docker() {
   ensure_voodu_network
 }
 
+# ensure_wireguard installs WireGuard and gives this host its place on the
+# voodu tunnel. Required in server mode, like Docker: voodu0 is routed over
+# wg0, so wg0 has to exist before the network is created.
+ensure_wireguard() {
+  if [ "$SKIP_WIREGUARD" = "1" ]; then
+    warn "SKIP_WIREGUARD=1 — skipping WireGuard; voodu0 will stay local to this host"
+    return
+  fi
+
+  if command -v wg >/dev/null && command -v wg-quick >/dev/null; then
+    log "wireguard already installed: $(wg --version 2>/dev/null | head -n1)"
+  else
+    install_wireguard_tools
+  fi
+
+  ensure_wg0
+}
+
+install_wireguard_tools() {
+  log "installing WireGuard..."
+
+  case "$DISTRO" in
+    ubuntu|debian)
+      sudo_ apt-get update -qq
+      sudo_ apt-get install -y --no-install-recommends wireguard
+      ;;
+    centos|rhel|fedora|rocky|almalinux|amzn)
+      sudo_ yum install -y wireguard-tools
+      ;;
+    alpine)
+      sudo_ apk add --no-cache wireguard-tools
+      ;;
+    *)
+      fail "automatic WireGuard install not supported for $DISTRO.
+  Install wireguard-tools manually and re-run, or pass SKIP_WIREGUARD=1 to skip."
+      ;;
+  esac
+}
+
+# ensure_wg0 gives this host a wg0 when it has none — no peers yet, just
+# its address and keys, so another host can be pointed at it. An existing
+# wg0 (the interface, or /etc/wireguard/wg0.conf) is never touched: it is
+# the operator's, and rewriting it would cut the tunnel.
+ensure_wg0() {
+  if ip link show wg0 >/dev/null 2>&1 || sudo_ test -e /etc/wireguard/wg0.conf; then
+    log "wg0 already configured — leaving it as is"
+    return
+  fi
+
+  local address
+
+  if ! address="$(voodu_wg_address)"; then
+    warn "wg0 not created — voodu0 will stay local to this host" >&2
+    return
+  fi
+
+  log "creating wg0 at $address/16"
+
+  sudo_ install -m 0700 -d /etc/wireguard
+  sudo_ sh -c 'umask 077 && wg genkey > /etc/wireguard/privatekey'
+  sudo_ sh -c 'wg pubkey < /etc/wireguard/privatekey > /etc/wireguard/publickey'
+
+  # The second PostUp brings back the peers `vd wire add` keeps under
+  # VOODU_ROOT, so a rebooted host is wired before the controller starts.
+  printf '[Interface]\nAddress = %s/16\nListenPort = 51820\nPostUp = wg set %%i private-key /etc/wireguard/privatekey\nPostUp = test -f %s/wire/peers.conf && wg syncconf %%i %s/wire/peers.conf || true\n' "$address" "$VOODU_ROOT" "$VOODU_ROOT" \
+    | sudo_ sh -c 'umask 077 && cat > /etc/wireguard/wg0.conf'
+
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo_ systemctl enable --now wg-quick@wg0 >/dev/null
+  else
+    sudo_ wg-quick up wg0 >/dev/null
+    warn "no systemd — wg0 is up now, but will not come back after a reboot on its own"
+  fi
+
+  success "wg0 is $address — public key $(sudo_ cat /etc/wireguard/publickey)"
+  log "open UDP 51820, then wire it to the other hosts with 'vd wire'"
+}
+
+# voodu_wg_address prints this host's address on the voodu tunnel: the
+# --wg-address override, or 10.254.<last two numbers of the IP this host
+# goes out on> (152.53.91.221 → 10.254.91.221). The whole IP is unique per
+# host; its last two numbers leave 65k combinations, so two hosts landing
+# on the same one is negligible — and --wg-address settles it when they do.
+#
+# The outbound IP comes from the routing table rather than a named
+# interface, so eth0, eth1, ens3 all work. Returns non-zero — saying why on
+# stderr — when no usable address comes out.
+voodu_wg_address() {
+  local addr src a b c d
+
+  addr="$VOODU_WG_ADDRESS"
+
+  if [ -z "$addr" ]; then
+    src="$(ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+
+    if [ -z "$src" ]; then
+      warn "cannot tell which IP this host goes out on — pass --wg-address 10.254.X.Y" >&2
+      return 1
+    fi
+
+    IFS=. read -r a b c d <<<"$src"
+    addr="10.254.$c.$d"
+  fi
+
+  IFS=. read -r a b c d <<<"$addr"
+
+  if [ "$a.$b" != "10.254" ] || ! is_octet "$c" || ! is_octet "$d" \
+    || [ "$c.$d" = "0.0" ] || [ "$c.$d" = "255.255" ]; then
+    warn "$addr is not a host address on the voodu tunnel (10.254.0.0/16)" >&2
+    return 1
+  fi
+
+  # 10.254.254.Y would put this host's containers in 10.254.Y.0/24 — inside
+  # the tunnel itself. The outbound IP's third number happening to be 254
+  # is the one case the derivation cannot handle; the operator picks any
+  # other third number.
+  if [ "$c" = "254" ]; then
+    warn "$addr would place this host's containers inside the tunnel (10.254.$d.0/24) — pass --wg-address 10.254.X.$d with another X" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$addr"
+}
+
+is_octet() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+
+  [ "$1" -le 255 ]
+}
+
 # ensure_voodu_network creates the shared docker bridge that voodu-caddy
 # and every managed app join. Caddy needs the same network as upstreams
 # so it can resolve container names via docker's embedded DNS — without
 # this, ingress would fail with "dial tcp: lookup <app>: no such host".
-# Idempotent: docker network create errors "already exists", we swallow.
+#
+# On a host with WireGuard, voodu0 is created routed: its subnet comes from
+# the wg0 address, and every container on it is reachable from the other
+# voodu hosts on the tunnel at its own address, on any port. Without wg0
+# (or when a check fails) it is a plain bridge, local to this host.
+#
+# An existing voodu0 is never touched — changing its subnet means
+# recreating it and every container on it, which is a migration the
+# operator runs on purpose, not something an install does in passing.
 ensure_voodu_network() {
   if sudo_ docker network inspect voodu0 >/dev/null 2>&1; then
     log "docker network voodu0 already exists"
+
+    # Created before this host had a wg0 (an earlier install, or one with
+    # SKIP_WIREGUARD=1): it is local, and only a migration makes it routed.
+    if [ -z "$(sudo_ docker network inspect voodu0 -f '{{range .IPAM.Config}}{{.IPRange}}{{end}}' 2>/dev/null)" ] \
+      && ip -4 -o addr show dev wg0 2>/dev/null | grep -q ' inet 10\.254\.'; then
+      warn "voodu0 has no routed subnet, but wg0 is on the voodu tunnel — see Cross-VM networking to migrate"
+    fi
+
+    return
+  fi
+
+  local subnet
+
+  if subnet="$(routed_voodu0_subnet)"; then
+    log "creating docker network voodu0, routed over wg0 ($subnet)"
+    sudo_ docker network create --driver bridge \
+      --subnet "$subnet" \
+      --ip-range "${subnet%.0/24}.128/25" \
+      -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
+      voodu0 >/dev/null
+    success "voodu0 is $subnet — wire this host to the others with 'vd wire'"
     return
   fi
 
   log "creating docker network voodu0"
   sudo_ docker network create --driver bridge voodu0 >/dev/null
+}
+
+# routed_voodu0_subnet derives voodu0's subnet from this host's address on
+# the voodu tunnel: 10.254.X.Y → 10.X.Y.0/24. Tunnel addresses are unique
+# across hosts, so the subnets are too, with nothing to coordinate.
+#
+# The lower half of the subnet is left to the controller, which pins
+# statefulset pods there; docker hands out the upper half (--ip-range).
+#
+# Prints the subnet, or returns non-zero — saying why on stderr — when
+# voodu0 should stay a plain bridge. stdout carries only the subnet: the
+# caller captures it.
+routed_voodu0_subnet() {
+  local addr a b c d subnet version major inside covering
+
+  addr="$(ip -4 -o addr show dev wg0 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+
+  if [ -z "$addr" ]; then
+    log "no IPv4 address on wg0 — voodu0 stays local to this host" >&2
+    return 1
+  fi
+
+  IFS=. read -r a b c d <<<"${addr%/*}"
+
+  # A wg0 outside the voodu tunnel — set up by hand before voodu managed
+  # it — has no place in the plan: its address cannot name a subnet.
+  if [ "$a.$b" != "10.254" ]; then
+    warn "wg0 is ${addr%/*}, outside the voodu tunnel 10.254.0.0/16 — voodu0 stays local to this host (see Cross-VM networking to migrate)" >&2
+    return 1
+  fi
+
+  subnet="10.$c.$d.0/24"
+
+  # Routed access to unpublished ports is gateway mode nat-unprotected,
+  # which docker added in 28.
+  version="$(sudo_ docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  major="${version%%.*}"
+
+  case "$major" in
+    ''|*[!0-9]*) major=0 ;;
+  esac
+
+  if [ "$major" -lt 28 ]; then
+    warn "docker ${version:-unknown} is older than 28 — voodu0 stays local to this host" >&2
+    return 1
+  fi
+
+  # A route inside the subnet, or one covering it (the tunnel's own
+  # network, a peer's subnet from AllowedIPs), means the address is taken.
+  # Output is captured whole rather than piped into `grep -q`: an early
+  # exit there can SIGPIPE `ip`, and under pipefail that reads as "no
+  # overlap" — exactly the wrong answer.
+  inside="$(ip -4 route show root "$subnet" 2>/dev/null || true)"
+  covering="$(ip -4 route show match "10.$c.$d.0" 2>/dev/null | grep -v '^default' || true)"
+
+  if [ -n "$inside" ] || [ -n "$covering" ]; then
+    warn "$subnet overlaps a route on this host — voodu0 stays local to this host" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$subnet"
 }
 
 install_docker_debian() {
@@ -461,7 +691,9 @@ write_systemd_unit() {
 [Unit]
 Description=Voodu Controller — embedded etcd + reconciler + observability API
 Documentation=https://github.com/${REPO}
-After=network-online.target docker.service
+# wg-quick@wg0 is ordered, not required: a host installed with
+# SKIP_WIREGUARD has no such unit, and After= on a missing unit is harmless.
+After=network-online.target docker.service wg-quick@wg0.service
 Wants=network-online.target
 Requires=docker.service
 
@@ -626,6 +858,9 @@ main() {
   ensure_base_packages
 
   if [ "$MODE" = "server" ]; then
+    # WireGuard first: voodu0 is routed over wg0, and ensure_docker creates
+    # voodu0 at its end.
+    ensure_wireguard
     ensure_docker
   fi
 

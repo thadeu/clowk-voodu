@@ -75,6 +75,10 @@ const (
 	ActionTriggerCreate Action = "trigger.create"
 	ActionTriggerUpdate Action = "trigger.update"
 	ActionTriggerDelete Action = "trigger.delete"
+
+	// WireGuard peers: the other voodu hosts this one is wired to.
+	ActionWireAdd    Action = "wire.add"
+	ActionWireRemove Action = "wire.remove"
 )
 
 // Origin is who asked. Without it every row reads `api` and the history cannot
@@ -197,6 +201,12 @@ type Record struct {
 	// reader had to recognise as one command by squinting at a shared id, and
 	// the screen showed three changes where one happened.
 	ConfigKeys []ConfigChange `json:"config_keys,omitempty"`
+
+	// Warnings are problems an apply let through: the change was stored, but
+	// something in it will bite later — a host port docker is free to move,
+	// for one. On the trail because a deploy triggered from GitHub has no
+	// terminal to print them to, and this is the only trace it leaves.
+	Warnings []string `json:"warnings,omitempty"`
 
 	// finished / done only
 	Status    Status `json:"status,omitempty"`

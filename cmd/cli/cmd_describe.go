@@ -356,6 +356,9 @@ func filterInternalSpecFields(spec []byte) []byte {
 // minus the kind/scope/name (already in the describe header) — the
 // extra context would just push the useful columns off the screen.
 //
+// Plus IP, the pod's voodu0 address: on a routed voodu0 it is what another
+// VM dials, so "which address does pg-0 answer on" is answered here.
+//
 // RELEASE column correlates each pod to the deployment-release record
 // it was spawned from (label voodu.release_id). Empty for pods
 // created outside a release orchestrator (initial replica before the
@@ -364,7 +367,7 @@ func filterInternalSpecFields(spec []byte) []byte {
 func renderDescribePodsTable(w io.Writer, pods []controller.Pod) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(tw, "  NAME\tREPLICA\tRELEASE\tIMAGE\tSTATUS\tCREATED")
+	fmt.Fprintln(tw, "  NAME\tREPLICA\tIP\tRELEASE\tIMAGE\tSTATUS\tCREATED")
 
 	for _, p := range pods {
 		status := p.Status
@@ -376,8 +379,8 @@ func renderDescribePodsTable(w io.Writer, pods []controller.Pod) error {
 			}
 		}
 
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n",
-			p.Name, dashIfEmpty(p.ReplicaID), dashIfEmpty(p.ReleaseID), p.Image, status, p.CreatedAt)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			p.Name, dashIfEmpty(p.ReplicaID), dashIfEmpty(p.IP), dashIfEmpty(p.ReleaseID), p.Image, status, p.CreatedAt)
 	}
 
 	return tw.Flush()

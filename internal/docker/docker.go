@@ -94,6 +94,20 @@ type ContainerConfig struct {
 	// doesn't accept --network multiple times).
 	Networks []string
 
+	// IP pins the container's address on its primary network (--ip).
+	// Empty lets docker choose, which is what almost every container
+	// wants; a statefulset pod gets one so the address can live in a
+	// connection string on another VM. Docker only honours it on a
+	// network whose subnet was declared at creation.
+	IP string
+
+	// DNS is the resolvers the container asks, in order (--dns). Empty
+	// keeps docker's default, the host's resolvers. On a routed voodu0 the
+	// controller's mesh DNS comes first — see meshdns — and the host's own
+	// resolvers after it, so names keep resolving when the controller is
+	// down.
+	DNS []string
+
 	RestartPolicy string
 	Volumes       []string
 	WorkingDir    string
@@ -316,6 +330,16 @@ func buildRunArgs(cfg ContainerConfig) []string {
 
 			args = append(args, "--add-host", h)
 		}
+
+		// Resolvers are the same story: host/none containers use the
+		// host's resolv.conf directly, and --dns would be a lie there.
+		for _, d := range cfg.DNS {
+			if d == "" {
+				continue
+			}
+
+			args = append(args, "--dns", d)
+		}
 	}
 
 	// Capabilities are NOT gated on network mode — they're a kernel
@@ -343,6 +367,10 @@ func buildRunArgs(cfg ContainerConfig) []string {
 
 	if primaryNet != "" {
 		args = append(args, "--network", primaryNet)
+
+		if cfg.IP != "" && cfg.NetworkMode != "host" && cfg.NetworkMode != "none" {
+			args = append(args, "--ip", cfg.IP)
+		}
 	}
 
 	// Network aliases register DNS names other containers can resolve
@@ -660,6 +688,47 @@ func formatPortSummary(ports []containerapi.PortSummary) string {
 	}
 
 	return strings.Join(parts, ", ")
+}
+
+// NetworkAddressPlan is the part of a network's IPAM that decides where a
+// container's address comes from: the subnet, the range docker assigns
+// automatically from, and the gateway.
+type NetworkAddressPlan struct {
+	Subnet  netip.Prefix
+	IPRange netip.Prefix
+	Gateway netip.Addr
+}
+
+// InspectNetworkAddressPlan reads a network's IPv4 address plan. ok is false
+// when the network does not exist or declares no IPv4 subnet of its own —
+// docker picked one, and nothing outside docker can plan against it.
+func InspectNetworkAddressPlan(name string) (plan NetworkAddressPlan, ok bool, err error) {
+	cli, err := getDockerClient()
+	if err != nil {
+		return NetworkAddressPlan{}, false, fmt.Errorf("docker client init: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := cli.NetworkInspect(ctx, name, dockerclient.NetworkInspectOptions{})
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return NetworkAddressPlan{}, false, nil
+		}
+
+		return NetworkAddressPlan{}, false, err
+	}
+
+	for _, c := range resp.Network.IPAM.Config {
+		if !c.Subnet.IsValid() || !c.Subnet.Addr().Is4() {
+			continue
+		}
+
+		return NetworkAddressPlan{Subnet: c.Subnet, IPRange: c.IPRange, Gateway: c.Gateway}, true, nil
+	}
+
+	return NetworkAddressPlan{}, false, nil
 }
 
 // sdkContainerInspect is the single point through which every

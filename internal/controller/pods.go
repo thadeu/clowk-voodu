@@ -50,6 +50,12 @@ type Pod struct {
 	Running   bool   `json:"running"`
 	CreatedAt string `json:"created_at,omitempty"`
 
+	// IP is the pod's address on voodu0. On a routed voodu0 it is also the
+	// address another VM reaches the pod on: fixed for a statefulset pod,
+	// new on every recreate for anything else. Empty when the pod is not on
+	// voodu0 or not running.
+	IP string `json:"ip,omitempty"`
+
 	// Spec is the declared manifest from etcd for this pod's
 	// (kind, scope, resource_name). Populated only when the caller
 	// passes `?spec=true`; nil otherwise. PodDetail inherits this
@@ -122,18 +128,17 @@ func (DockerPodsLister) ListPods() ([]Pod, error) {
 			continue
 		}
 
-		labels, err := docker.InspectLabels(name)
-		if err != nil {
-			// Inspection failure on one container shouldn't poison
-			// the whole listing — log-and-skip is the safer choice
-			// during a partial docker outage. Skip silently so the
-			// next refresh picks it up.
+		// One inspect for labels, state and address. Inspection failure on
+		// one container shouldn't poison the whole listing — log-and-skip
+		// is the safer choice during a partial docker outage, and the next
+		// refresh picks it up. A nil detail is a container that vanished
+		// between the listing and the inspect.
+		det, err := docker.InspectContainer(name)
+		if err != nil || det == nil {
 			continue
 		}
 
-		id, _ := containers.ParseLabels(labels)
-
-		running, _ := docker.IsRunning(name)
+		id, _ := containers.ParseLabels(det.Labels)
 
 		out = append(out, Pod{
 			Name:         name,
@@ -145,8 +150,9 @@ func (DockerPodsLister) ListPods() ([]Pod, error) {
 			Role:         id.Role,
 			Image:        c.Image,
 			Status:       c.Status,
-			Running:      running,
+			Running:      det.State.Running,
 			CreatedAt:    id.CreatedAt,
+			IP:           det.Networks["voodu0"].IPAddress,
 		})
 	}
 

@@ -626,7 +626,7 @@ func TestRenderDescribePodsTable(t *testing.T) {
 	}
 
 	pods := []controller.Pod{
-		{Name: "api-web.aaaa", ReplicaID: "aaaa", Image: "img:1", Running: true, CreatedAt: "2026-04-24T12:00:00Z"},
+		{Name: "api-web.aaaa", ReplicaID: "aaaa", Image: "img:1", Running: true, CreatedAt: "2026-04-24T12:00:00Z", IP: "10.8.2.140"},
 		{Name: "api-web.bbbb", ReplicaID: "bbbb", Image: "img:1", Running: false, CreatedAt: "2026-04-24T11:00:00Z"},
 	}
 
@@ -655,6 +655,11 @@ func TestRenderDescribePodsTable(t *testing.T) {
 
 	if !strings.Contains(out, "stopped") {
 		t.Errorf("stopped fallback status missing: %q", out)
+	}
+
+	// The address another VM dials, when the pod has one.
+	if !strings.Contains(out, "IP") || !strings.Contains(out, "10.8.2.140") {
+		t.Errorf("missing the pod address: %q", out)
 	}
 }
 

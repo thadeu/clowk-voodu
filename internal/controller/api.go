@@ -35,6 +35,10 @@ var errScopeNotFound = errors.New("not found in any scope")
 // packages the handlers delegate to.
 type API struct {
 	Store Store
+
+	// Wire manages wg0's peers for `vd wire`. nil on a host without wg0,
+	// where the routes answer 503.
+	Wire *Wire
 	// Version is reported by /health.
 	Version string
 
@@ -425,6 +429,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /pats", a.handlePATList)
 	mux.HandleFunc("DELETE /pats/{id}", a.handlePATRevoke)
 
+	mux.HandleFunc("GET /wire", a.handleWireStatus)
+	mux.HandleFunc("POST /wire/peers", a.handleWirePeerAdd)
+	mux.HandleFunc("DELETE /wire/peers/{address}", a.handleWirePeerRemove)
+
 	return logRequests(mux)
 }
 
@@ -587,6 +595,17 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 
 	manifests = expandedManifests
 
+	// A host port docker is free to move gets a warning, not a rejection:
+	// the batch still applies. Collected after expansion, because a plugin
+	// block's `ports` only exists once it is a statefulset. Carried in the
+	// response AND on the trail — a deploy triggered from GitHub discards
+	// the response, and the trail is the only trace it leaves.
+	warnings := emptyHostPortWarnings(manifests)
+
+	if act != nil {
+		act.Record.Warnings = warnings
+	}
+
 	// Asset-digest stamping. Walks the post-expand batch, hashes
 	// every asset's bytes, and embeds the resulting digests under
 	// `_asset_digests` on each consumer's spec (deployment,
@@ -737,6 +756,10 @@ func (a *API) applyPost(w http.ResponseWriter, r *http.Request) {
 	// apply was a genuine no-op".
 	if len(imagePulls) > 0 {
 		data["image_pulls"] = imagePulls
+	}
+
+	if len(warnings) > 0 {
+		data["warnings"] = warnings
 	}
 
 	// `current` is only meaningful for dry-run — it's the "before"

@@ -69,29 +69,68 @@ func canSurge(spec deploymentSpec) bool {
 }
 
 // pinsHostPort reports whether a port mapping names the host side.
-//
-// Reads the normalised form so every shape reduces to the same layout
-// and this does not have to re-derive normalizePort's defaults.
 func pinsHostPort(port string) bool {
-	normalized := normalizePort(port)
-
-	// IPv6 literals keep their brackets and are passed to docker
-	// untouched. Rather than parse them, treat them as pinned: a
-	// wrong "cannot surge" costs a slower rollout, a wrong "can
-	// surge" costs a failed one.
-	if strings.HasPrefix(normalized, "[") {
+	// IPv6 literals stay classified as pinned. parseHostBinding can
+	// read them, but surge has always treated them conservatively,
+	// and the asymmetry still holds: a wrong "cannot surge" costs a
+	// slower rollout, a wrong "can surge" costs a failed one.
+	if strings.HasPrefix(normalizePort(port), "[") {
 		return true
 	}
 
-	parts := strings.Split(normalized, ":")
-
-	// ip:host:container — the host field is the middle one, and an
-	// empty middle is docker's "pick one for me".
-	if len(parts) == 3 {
-		return parts[1] != ""
+	b, ok := parseHostBinding(port)
+	if !ok {
+		// A shape normalizePort did not produce. Same conservative
+		// call as the bracket case.
+		return true
 	}
 
-	// Anything else is a shape normalizePort did not produce. Same
-	// conservative call as the bracket case.
-	return true
+	return b.HostPort != ""
+}
+
+// hostBinding is a port mapping in the shape docker receives it: the
+// address the host side binds, the host port, and the container side
+// (with its protocol suffix, when there is one).
+type hostBinding struct {
+	IP        string
+	HostPort  string
+	Container string
+}
+
+// parseHostBinding reads a port mapping through normalizePort, so every
+// shape reduces to ip:host:container and nothing here re-derives its
+// defaults. It is the one reading of a port spec: surge and the
+// empty-host-port warning both go through it, so they cannot disagree
+// about what a mapping means.
+//
+// An IPv6 address keeps its brackets in IP. An empty HostPort is
+// docker's "pick one for me". ok is false for a shape normalizePort
+// did not produce; what that means is the caller's decision.
+func parseHostBinding(port string) (hostBinding, bool) {
+	normalized := normalizePort(port)
+
+	var ip, rest string
+
+	if strings.HasPrefix(normalized, "[") {
+		end := strings.Index(normalized, "]:")
+		if end < 0 {
+			return hostBinding{}, false
+		}
+
+		ip, rest = normalized[:end+1], normalized[end+2:]
+	} else {
+		var found bool
+
+		ip, rest, found = strings.Cut(normalized, ":")
+		if !found {
+			return hostBinding{}, false
+		}
+	}
+
+	host, container, found := strings.Cut(rest, ":")
+	if !found || strings.Contains(container, ":") {
+		return hostBinding{}, false
+	}
+
+	return hostBinding{IP: ip, HostPort: host, Container: container}, true
 }

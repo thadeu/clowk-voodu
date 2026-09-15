@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,6 +20,8 @@ type memStore struct {
 	frozen   map[string][]string          // FrozenKey(kind, scope, name) → replica IDs
 	pats     map[string]*PAT              // ID → PAT (in-memory mirror of /pats/<id>)
 	triggers map[string]*Trigger          // ID → Trigger (mirror of /triggers/<id>)
+	podIPs   map[string]string            // PodIPAddrKey / PodIPPodKey → value, as in etcd
+	wire     map[string]WirePeer          // address → peer
 	rev      int64
 
 	watchers []chan WatchEvent
@@ -31,6 +35,8 @@ func newMemStore() *memStore {
 		frozen:   map[string][]string{},
 		pats:     map[string]*PAT{},
 		triggers: map[string]*Trigger{},
+		podIPs:   map[string]string{},
+		wire:     map[string]WirePeer{},
 	}
 }
 
@@ -182,6 +188,78 @@ func (m *memStore) DeleteFrozenReplicaIDs(_ context.Context, kind Kind, scope, n
 	delete(m.frozen, FrozenKey(kind, scope, name))
 
 	return nil
+}
+
+func (m *memStore) ReservePodIP(_ context.Context, scope, name string, ordinal int, ip string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	addrKey, podKey := PodIPAddrKey(ip), PodIPPodKey(scope, name, ordinal)
+
+	if _, taken := m.podIPs[addrKey]; taken {
+		return false, nil
+	}
+
+	if _, held := m.podIPs[podKey]; held {
+		return false, nil
+	}
+
+	m.podIPs[addrKey] = podRef(scope, name, ordinal)
+	m.podIPs[podKey] = ip
+
+	return true, nil
+}
+
+func (m *memStore) GetPodIP(_ context.Context, scope, name string, ordinal int) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.podIPs[PodIPPodKey(scope, name, ordinal)], nil
+}
+
+func (m *memStore) ReleasePodIP(_ context.Context, scope, name string, ordinal int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.releasePodIPLocked(scope, name, ordinal)
+
+	return nil
+}
+
+func (m *memStore) ReleasePodIPs(_ context.Context, scope, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prefix := PodIPPodPrefix(scope, name)
+
+	for key := range m.podIPs {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
+		if ordinal, err := strconv.Atoi(key[len(prefix):]); err == nil {
+			m.releasePodIPLocked(scope, name, ordinal)
+		}
+	}
+
+	return nil
+}
+
+// releasePodIPLocked mirrors EtcdStore.ReleasePodIP: the address key goes
+// only while it still points at this pod.
+func (m *memStore) releasePodIPLocked(scope, name string, ordinal int) {
+	podKey := PodIPPodKey(scope, name, ordinal)
+
+	ip, held := m.podIPs[podKey]
+	if !held {
+		return
+	}
+
+	delete(m.podIPs, podKey)
+
+	if addrKey := PodIPAddrKey(ip); m.podIPs[addrKey] == podRef(scope, name, ordinal) {
+		delete(m.podIPs, addrKey)
+	}
 }
 
 // PAT methods — mirror the EtcdStore impl in pat_store.go.
@@ -479,6 +557,40 @@ func (m *memStore) GetTrigger(_ context.Context, id string) (*Trigger, error) {
 	cp := *t
 
 	return &cp, nil
+}
+
+func (m *memStore) PutWirePeer(_ context.Context, p WirePeer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.wire[p.Address] = p
+
+	return nil
+}
+
+func (m *memStore) ListWirePeers(_ context.Context) ([]WirePeer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]WirePeer, 0, len(m.wire))
+	for _, p := range m.wire {
+		out = append(out, p)
+	}
+
+	return out, nil
+}
+
+func (m *memStore) DeleteWirePeer(_ context.Context, address string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.wire[address]; !ok {
+		return false, nil
+	}
+
+	delete(m.wire, address)
+
+	return true, nil
 }
 
 func (m *memStore) ListTriggers(_ context.Context) ([]Trigger, error) {

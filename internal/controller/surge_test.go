@@ -27,6 +27,8 @@ func TestCanSurgeReadsTheHostPort(t *testing.T) {
 		{"pinned with interface", []string{"0.0.0.0:8084:8084"}, false},
 		{"one pinned among many", []string{"8080", "3000:80"}, false},
 		{"udp container port", []string{"5060/udp"}, true},
+		{"IPv6 literal stays pinned", []string{"[::1]::8080"}, false},
+		{"unrecognised shape stays pinned", []string{"a:b:c:d"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := canSurge(deploymentSpec{Ports: tc.ports}); got != tc.want {

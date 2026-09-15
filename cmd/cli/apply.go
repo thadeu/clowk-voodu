@@ -420,6 +420,7 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 			PluginInstalls   []controllerInstallRef   `json:"plugin_installs,omitempty"`
 			PluginExpansions []controllerExpansionRef `json:"plugin_expansions,omitempty"`
 			ImagePulls       []controllerImagePullRef `json:"image_pulls,omitempty"`
+			Warnings         []string                 `json:"warnings,omitempty"`
 		} `json:"data"`
 	}
 
@@ -489,6 +490,14 @@ func runApply(cmd *cobra.Command, f applyFlags) error {
 			// match what the legacy client rendered.
 			kind, scope, name := splitManifestRef(p)
 			reporter.Result(kind, scope, name, "pruned (removed from manifests)")
+		}
+
+		// Warnings last: each one names the resource it is about, so it
+		// reads as a footnote to the line above that already said
+		// "applied". Log and not Result — a warning is not a resource,
+		// and must not inflate the `apply complete (N resources)` tally.
+		for _, w := range env.Data.Warnings {
+			reporter.Log("warn", w)
 		}
 	}
 
@@ -654,6 +663,7 @@ func runDiff(cmd *cobra.Command, f applyFlags) error {
 	// verbose=true regardless of the apply spinner's --verbose flag.
 	added, modified := renderApplyPlan(out, plan, palette, true)
 	renderPrunePlan(out, plan.Data.Pruned, palette)
+	renderPlanWarnings(out, plan.Data.Warnings)
 
 	fmt.Fprintf(out, "\n%s\n", diffSummary(added, modified, len(plan.Data.Pruned)))
 

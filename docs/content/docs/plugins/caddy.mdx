@@ -113,6 +113,20 @@ voodu-caddy runs on `voodu0`. Apps and deployments join `voodu0` automatically. 
 
 This is why the install pins Caddy to `voodu0` — dropping it onto the bridge default would break DNS resolution for service names.
 
+### A service on another voodu host
+
+On a host wired to others (see [Cross-VM networking](/docs/getting-started/cross-vm)), an `ingress` may name a service that runs on another host. The controller finds no local deployment, asks the mesh for `<service>.<scope>.voodu`, and when another host answers hands Caddy that name. Caddy resolves it on every dial, so a deploy on the other host needs nothing here.
+
+```hcl
+ingress "clowk" "api" {
+  host    = "api.example.com"
+  service = "api"
+  port    = 8080   # required: the service's manifest is not on this host
+}
+```
+
+Caddy is started with the mesh resolvers by the plugin install, so re-run `voodu plugins:install thadeu/voodu-caddy` once on a host migrated to a routed `voodu0`.
+
 ## Multi-replica upstreams
 
 When a deployment has multiple replicas, the controller passes them as `VOODU_INGRESS_UPSTREAMS` — one `host:port` per replica. Caddy load-balances across them per `lb { policy }`:

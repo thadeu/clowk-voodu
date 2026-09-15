@@ -540,3 +540,45 @@ deployment "clowk" "lp" {
 		}
 	}
 }
+
+// TestApplyRendersWarnings — the apply succeeds, but the operator has to
+// hear what the controller flagged, or the warning exists for nobody.
+func TestApplyRendersWarnings(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "statefulset.hcl"), `
+statefulset "contagorda" "cache" {
+  image = "redis:7"
+}
+`)
+
+	warning := `statefulset/contagorda/cache: ports[0] "10.8.0.1::6379" leaves the host port empty on a non-loopback address`
+
+	body, _ := json.Marshal(map[string]any{
+		"status": "ok",
+		"data":   map[string]any{"warnings": []string{warning}},
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer ts.Close()
+
+	root := newRootCmd()
+	_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+	cmd, _, err := root.Find([]string{"apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runApply(cmd, applyFlags{files: []string{dir}}); err != nil {
+			t.Errorf("a warning must not fail the apply: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, warning) {
+		t.Errorf("output missing the warning:\n%s", out)
+	}
+}

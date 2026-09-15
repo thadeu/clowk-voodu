@@ -1,0 +1,90 @@
+---
+title: voodu wire
+description: Wire voodu hosts together over WireGuard, without editing wg0.conf.
+---
+
+`voodu wire` manages the WireGuard peers of a host — the other voodu hosts whose
+containers it can reach by name. Peers are stored by the controller, applied to
+`wg0` at once with `wg syncconf` (the tunnel never drops), and come back after a
+reboot. `wg0.conf` is written once by the installer and never edited.
+
+The full picture — addresses, names, migration — is in
+[Cross-VM networking](/docs/getting-started/cross-vm).
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| `show` | Print this host as a ready-to-paste `add` line for another host. |
+| `add` | Add a peer: `--key`, `--address`, optional `--endpoint`. |
+| `remove <address>` | Drop a peer by its tunnel address. |
+| `list` | Peers and their link health (last handshake, bytes). |
+
+Every verb runs against the controller of the host it targets, so `-r` does all
+of it from your own machine.
+
+## Wiring two hosts
+
+`show` on one host, `add` on the other, then the same the other way round:
+
+```bash
+vd wire show -r vm-1
+# → vd wire add --key <vm-1 key> --address 10.254.91.221 --endpoint VM_IP:51820
+vd wire add -r vm-2 --key <vm-1 key> --address 10.254.91.221 --endpoint VM_IP:51820
+
+vd wire show -r vm-2
+# → vd wire add --key <vm-2 key> --address 10.254.167.105 --endpoint VM_IP:51820
+vd wire add -r vm-1 --key <vm-2 key> --address 10.254.167.105 --endpoint VM_IP:51820
+```
+
+The three flags all describe the **other** host:
+
+| Flag | What it is | Example |
+|---|---|---|
+| `--key` | its WireGuard public key | `AbC…=` |
+| `--address` | its address on the tunnel (`wg0`) | `10.254.167.105` |
+| `--endpoint` | its public IP and WireGuard port | `VM_IP:51820` |
+
+`--address` is enough for the routing: the peer's container subnet
+(`10.167.105.0/24`) is derived from it, so `AllowedIPs` covers both without a
+flag. A host behind NAT is added without `--endpoint`; it dials out, and the
+other side learns the endpoint from the handshake.
+
+Open UDP `51820` on every host — that is the tunnel itself.
+
+With three hosts, each pair needs its `add` on both sides: six commands, once.
+
+## `voodu wire list`
+
+```
+this host: 10.254.91.221  key LOCALKEY…
+
+ADDRESS         ENDPOINT              HANDSHAKE    RX/TX        KEY
+10.254.167.105  VM_IP:51820  12s ago      2.0KB/100B   PEERKEY2…
+10.254.200.7    1.2.3.4:51820         never        0B/0B        PEERKEY3…
+```
+
+| Column | Meaning |
+|---|---|
+| `HANDSHAKE` | how long since the peer last answered; `never` for one that has not yet — usually UDP 51820 closed on one side |
+| `not applied` | the peer is stored but `wg0` does not carry it; the next add, remove, or controller start applies it |
+
+A peer that stops answering stays listed until you `remove` it. `-o json` on
+every verb.
+
+## What it changes
+
+- `add` writes the peer to the controller's store and to
+  `/opt/voodu/wire/peers.conf`, then runs `wg syncconf wg0` on that file.
+- The mesh DNS reads its peer list from `wg0`, so a new peer's names resolve
+  within 30 seconds. Nothing to restart.
+- `add` and `remove` land in the activity trail.
+
+## Errors
+
+| Message | Cause |
+|---|---|
+| `not in the voodu tunnel` | `--address` outside `10.254.0.0/16` |
+| `that is this host` | `--address` is this host's own |
+| `public key already used by peer X` | the same key was added under another address |
+| `wg0 is not up` | WireGuard is not running here — see the installer |

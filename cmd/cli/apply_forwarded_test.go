@@ -514,3 +514,59 @@ func TestApplyHasWork(t *testing.T) {
 		})
 	}
 }
+
+// TestDiffShowsWarnings — `vd diff` is where an operator asks "what would
+// happen", so what the apply would flag has to show there too, in text for a
+// person and in the JSON plan for a script.
+func TestDiffShowsWarnings(t *testing.T) {
+	dir := t.TempDir()
+
+	mustWrite(t, filepath.Join(dir, "deployment.hcl"), `
+deployment "clowk" "lp" {
+  image = "nginx:1.27"
+}
+`)
+
+	warning := `deployment/clowk/lp: ports[0] "0.0.0.0::80" leaves the host port empty on a non-loopback address`
+
+	reply, _ := json.Marshal(map[string]any{
+		"status": "ok",
+		"data": map[string]any{
+			"applied":  []map[string]any{{"kind": "deployment", "scope": "clowk", "name": "lp", "spec": map[string]any{"image": "nginx:1.27"}}},
+			"current":  []any{nil},
+			"pruned":   []string{},
+			"dry_run":  true,
+			"warnings": []string{warning},
+		},
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(reply)
+	}))
+	defer ts.Close()
+
+	for _, format := range []string{"", "json"} {
+		root := newRootCmd()
+		_ = root.PersistentFlags().Set("controller-url", ts.URL)
+
+		if format != "" {
+			_ = root.PersistentFlags().Set("output", format)
+		}
+
+		cmd, _, err := root.Find([]string{"diff"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout bytes.Buffer
+		cmd.SetOut(&stdout)
+
+		if err := runDiff(cmd, applyFlags{files: []string{dir}}); err != nil {
+			t.Fatalf("runDiff (output=%q): %v", format, err)
+		}
+
+		if !strings.Contains(stdout.String(), `0.0.0.0::80`) {
+			t.Errorf("output=%q is missing the warning:\n%s", format, stdout.String())
+		}
+	}
+}

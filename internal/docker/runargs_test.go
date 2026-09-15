@@ -183,3 +183,67 @@ func TestCreateContainer_OmitsLogOptsWhenZero(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateContainer_PinsTheAddressOnThePrimaryNetwork — a statefulset
+// pod reached from another VM needs the same address across recreates, and
+// docker only takes --ip for the network the container is created on.
+func TestCreateContainer_PinsTheAddressOnThePrimaryNetwork(t *testing.T) {
+	pinned := strings.Join(buildRunArgs(ContainerConfig{
+		Name:     "test-pg.0",
+		Image:    "postgres:16",
+		Networks: []string{"voodu0", "backend"},
+		IP:       "10.8.2.7",
+	}), " ")
+
+	if !strings.Contains(pinned, "--network voodu0 --ip 10.8.2.7") {
+		t.Errorf("want --ip right after the primary --network, got: %s", pinned)
+	}
+
+	unpinned := strings.Join(buildRunArgs(ContainerConfig{
+		Name:     "test-api.a1b2",
+		Image:    "api:1",
+		Networks: []string{"voodu0"},
+	}), " ")
+
+	if strings.Contains(unpinned, "--ip") {
+		t.Errorf("no IP must leave the address to docker, got: %s", unpinned)
+	}
+
+	host := strings.Join(buildRunArgs(ContainerConfig{
+		Name:        "test-host",
+		Image:       "x:1",
+		NetworkMode: "host",
+		IP:          "10.8.2.7",
+	}), " ")
+
+	if strings.Contains(host, "--ip") {
+		t.Errorf("host networking has no address of its own to pin, got: %s", host)
+	}
+}
+
+// TestCreateContainer_AsksTheResolversInOrder — the mesh DNS has to come
+// first: docker's embedded DNS stops at the first NXDOMAIN, so a host
+// resolver in front would deny every .voodu name before the mesh saw it.
+func TestCreateContainer_AsksTheResolversInOrder(t *testing.T) {
+	args := strings.Join(buildRunArgs(ContainerConfig{
+		Name:     "test-api.a1b2",
+		Image:    "api:1",
+		Networks: []string{"voodu0"},
+		DNS:      []string{"10.91.221.1", "185.12.64.1"},
+	}), " ")
+
+	if !strings.Contains(args, "--dns 10.91.221.1 --dns 185.12.64.1") {
+		t.Errorf("want the mesh DNS then the host's, in that order, got: %s", args)
+	}
+
+	host := strings.Join(buildRunArgs(ContainerConfig{
+		Name:        "test-host",
+		Image:       "x:1",
+		NetworkMode: "host",
+		DNS:         []string{"10.91.221.1"},
+	}), " ")
+
+	if strings.Contains(host, "--dns") {
+		t.Errorf("host networking uses the host's resolv.conf, got: %s", host)
+	}
+}

@@ -350,6 +350,11 @@ type ContainerSpec struct {
 	// already in bytes.
 	MemoryLimitBytes int64
 
+	// IP pins the container's address on its primary network. Only a
+	// statefulset pod gets one, and only on a routed voodu0 — see
+	// podIPAllocator. Empty lets docker choose.
+	IP string
+
 	// ExtraHosts is the operator-declared list of `name:ip` entries
 	// that the docker daemon writes into the container's /etc/hosts,
 	// on top of the platform's always-injected
@@ -392,7 +397,12 @@ type ContainerSpec struct {
 // flow (hardcoded image name, /app working dir, release volumes). The
 // manifest-driven path runs pre-built images from a registry and needs
 // a plainer CreateContainer call.
-type DockerContainerManager struct{}
+type DockerContainerManager struct {
+	// DNS returns the resolvers every container is created with — the mesh
+	// DNS first, then the host's — or nil to leave docker's default. nil
+	// func is the same as nil list.
+	DNS func() []string
+}
 
 func (DockerContainerManager) Exists(name string) (bool, error) {
 	return docker.ContainerExists(name), nil
@@ -413,7 +423,7 @@ func (DockerContainerManager) Exists(name string) (bool, error) {
 // --restart` is cheap and idempotent, so we run it whenever the spec
 // declares a policy — no drift detection, the reconciler is the
 // source of truth.
-func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
+func (m DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 	if docker.ContainerExists(spec.Name) {
 		if spec.Restart != "" {
 			// Non-fatal: an operator running an ancient docker might not
@@ -437,33 +447,7 @@ func (DockerContainerManager) Ensure(spec ContainerSpec) (bool, error) {
 		return false, nil
 	}
 
-	cfg := docker.ContainerConfig{
-		Name:             spec.Name,
-		Image:            spec.Image,
-		Command:          spec.Command,
-		Ports:            spec.Ports,
-		Volumes:          spec.Volumes,
-		NetworkMode:      spec.NetworkMode,
-		Networks:         spec.Networks,
-		NetworkAliases:   spec.NetworkAliases,
-		RestartPolicy:    spec.Restart,
-		EnvFile:          spec.EnvFile,
-		ExtraEnvFiles:    spec.ExtraEnvFiles,
-		Env:              spec.Env,
-		Labels:           spec.Labels,
-		AutoRemove:       spec.AutoRemove,
-		TTY:              spec.TTY,
-		CPULimit:         spec.CPULimit,
-		MemoryLimitBytes: spec.MemoryLimitBytes,
-		ExtraHosts:       spec.ExtraHosts,
-		CapAdd:           spec.CapAdd,
-		Ulimits:          spec.Ulimits,
-		DockerOptions:    spec.DockerOptions,
-		LogMaxSize:       spec.LogMaxSize,
-		LogMaxFiles:      spec.LogMaxFiles,
-	}
-
-	if err := docker.CreateContainer(cfg); err != nil {
+	if err := docker.CreateContainer(m.containerConfig(spec)); err != nil {
 		return false, err
 	}
 
@@ -795,7 +779,7 @@ func (DockerContainerManager) Exec(name string, command []string, opts ExecOptio
 	})
 }
 
-func (DockerContainerManager) Recreate(spec ContainerSpec) error {
+func (m DockerContainerManager) Recreate(spec ContainerSpec) error {
 	if docker.ContainerExists(spec.Name) {
 		if err := docker.StopContainer(spec.Name); err != nil {
 			return err
@@ -806,6 +790,15 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		}
 	}
 
+	return docker.CreateContainer(m.containerConfig(spec))
+}
+
+// containerConfig is the one translation from a ContainerSpec to what
+// docker receives, shared by Ensure and Recreate so the two cannot drift.
+// It is also where the platform's own additions land — the mesh DNS — so
+// no handler has to remember them, and every kind gets them: deployment,
+// statefulset, job, cronjob, release and init all come through here.
+func (m DockerContainerManager) containerConfig(spec ContainerSpec) docker.ContainerConfig {
 	cfg := docker.ContainerConfig{
 		Name:             spec.Name,
 		Image:            spec.Image,
@@ -825,6 +818,7 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		CPULimit:         spec.CPULimit,
 		MemoryLimitBytes: spec.MemoryLimitBytes,
 		ExtraHosts:       spec.ExtraHosts,
+		IP:               spec.IP,
 		CapAdd:           spec.CapAdd,
 		Ulimits:          spec.Ulimits,
 		DockerOptions:    spec.DockerOptions,
@@ -832,5 +826,9 @@ func (DockerContainerManager) Recreate(spec ContainerSpec) error {
 		LogMaxFiles:      spec.LogMaxFiles,
 	}
 
-	return docker.CreateContainer(cfg)
+	if m.DNS != nil {
+		cfg.DNS = m.DNS()
+	}
+
+	return cfg
 }

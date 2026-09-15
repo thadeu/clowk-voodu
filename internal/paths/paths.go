@@ -86,6 +86,10 @@ func MetricsDir() string { return filepath.Join(CacheDir(), "metrics") }
 // exists anywhere — nothing regenerates it.
 func ActivityDir() string { return filepath.Join(StateDir(), "activity") }
 
+// WirePeersConf is the wg-native peers file voodu keeps for wg0, reapplied
+// by `wg syncconf` on boot (PostUp in wg0.conf) and on controller start.
+func WirePeersConf() string { return filepath.Join(Root(), "wire", "peers.conf") }
+
 // AssetDir is the materialised on-disk root for one asset
 // manifest. Asset blocks take 1 label (unscoped, scope="") or
 // 2 labels (scoped). Each file key in the spec lands as a
