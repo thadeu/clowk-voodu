@@ -87,7 +87,7 @@ func MetricsDir() string { return filepath.Join(CacheDir(), "metrics") }
 func ActivityDir() string { return filepath.Join(StateDir(), "activity") }
 
 // WirePeersConf is the wg-native peers file voodu keeps for wg0, reapplied
-// by `wg syncconf` on boot (PostUp in wg0.conf) and on controller start.
+// by `wg addconf` on boot (PostUp in wg0.conf) and on controller start.
 func WirePeersConf() string { return filepath.Join(Root(), "wire", "peers.conf") }
 
 // AssetDir is the materialised on-disk root for one asset

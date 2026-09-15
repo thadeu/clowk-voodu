@@ -256,6 +256,7 @@ install_wireguard_tools() {
 ensure_wg0() {
   if ip link show wg0 >/dev/null 2>&1 || sudo_ test -e /etc/wireguard/wg0.conf; then
     log "wg0 already configured — leaving it as is"
+    fix_wg0_postup
     return
   fi
 
@@ -274,7 +275,9 @@ ensure_wg0() {
 
   # The second PostUp brings back the peers `vd wire add` keeps under
   # VOODU_ROOT, so a rebooted host is wired before the controller starts.
-  printf '[Interface]\nAddress = %s/16\nListenPort = 51820\nPostUp = wg set %%i private-key /etc/wireguard/privatekey\nPostUp = test -f %s/wire/peers.conf && wg syncconf %%i %s/wire/peers.conf || true\n' "$address" "$VOODU_ROOT" "$VOODU_ROOT" \
+  # addconf, not syncconf: syncconf rewrites the interface too, and with
+  # no [Interface] in that file it would reset the listen port.
+  printf '[Interface]\nAddress = %s/16\nListenPort = 51820\nPostUp = wg set %%i private-key /etc/wireguard/privatekey\nPostUp = test -f %s/wire/peers.conf && wg addconf %%i %s/wire/peers.conf || true\n' "$address" "$VOODU_ROOT" "$VOODU_ROOT" \
     | sudo_ sh -c 'umask 077 && cat > /etc/wireguard/wg0.conf'
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -286,6 +289,31 @@ ensure_wg0() {
 
   success "wg0 is $address — public key $(sudo_ cat /etc/wireguard/publickey)"
   log "open UDP 51820, then wire it to the other hosts with 'vd wire'"
+}
+
+# fix_wg0_postup rewrites the one line in wg0.conf that an earlier voodu
+# install wrote wrong: `wg syncconf` on the peers file resets the listen
+# port to a random one, so the peers never handshake. Only that exact line
+# is touched — the rest of the file is the operator's. The running
+# interface gets its port back too, without dropping the tunnel.
+fix_wg0_postup() {
+  local conf=/etc/wireguard/wg0.conf
+  local bad="wg syncconf %i $VOODU_ROOT/wire/peers.conf"
+
+  if ! sudo_ grep -qF "$bad" "$conf" 2>/dev/null; then
+    return
+  fi
+
+  warn "wg0.conf reapplies peers with 'wg syncconf', which resets the listen port — switching to 'wg addconf'"
+  sudo_ sed -i "s|$bad|wg addconf %i $VOODU_ROOT/wire/peers.conf|" "$conf"
+
+  local port
+  port="$(sudo_ awk -F' *= *' '$1 == "ListenPort" { print $2 }' "$conf" | head -n1)"
+
+  if [ -n "$port" ] && ip link show wg0 >/dev/null 2>&1; then
+    sudo_ wg set wg0 listen-port "$port" private-key /etc/wireguard/privatekey 2>/dev/null \
+      && log "wg0 listening on $port again"
+  fi
 }
 
 # voodu_wg_address prints this host's address on the voodu tunnel: the

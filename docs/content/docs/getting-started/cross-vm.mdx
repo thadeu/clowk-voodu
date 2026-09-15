@@ -244,7 +244,7 @@ downtime per host. Volumes are kept.
    the PostUp that reapplies voodu's peers on boot:
 
    ```ini
-   PostUp = test -f /opt/voodu/wire/peers.conf && wg syncconf %i /opt/voodu/wire/peers.conf || true
+   PostUp = test -f /opt/voodu/wire/peers.conf && wg addconf %i /opt/voodu/wire/peers.conf || true
    ```
 
    Restart `wg-quick@wg0` — the tunnel drops for a moment. Once both hosts

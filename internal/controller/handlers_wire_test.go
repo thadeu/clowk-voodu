@@ -61,8 +61,8 @@ func TestHandleWire_AddListRemove(t *testing.T) {
 		t.Fatalf("add: %d %v", code, env)
 	}
 
-	if wg.syncs() != 1 {
-		t.Fatalf("add did not sync wg0: %v", wg.calls)
+	if wg.applies() != 1 {
+		t.Fatalf("add did not apply to wg0: %v", wg.calls)
 	}
 
 	wg.dump = "privkey\t" + testKey(1) + "\t51820\toff\n" +
@@ -127,7 +127,7 @@ func TestHandleWire_RejectsBadPeer(t *testing.T) {
 		t.Fatalf("add: %d %v", code, env)
 	}
 
-	if wg.syncs() != 0 {
+	if wg.applies() != 0 {
 		t.Fatal("a rejected peer must not touch wg0")
 	}
 }

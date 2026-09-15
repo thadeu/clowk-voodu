@@ -142,7 +142,7 @@ type Store interface {
 	ReleasePodIPs(ctx context.Context, scope, name string) error
 
 	// WireGuard peers voodu keeps on wg0. The etcd record is the source
-	// of truth; wg0 is brought to match it by syncconf (see wire.go).
+	// of truth; wg0 is brought to match it by addconf + peer remove (see wire.go).
 	// PutWirePeer overwrites — the same address re-added replaces the
 	// record. DeleteWirePeer is idempotent: (false, nil) when absent.
 	PutWirePeer(ctx context.Context, p WirePeer) error

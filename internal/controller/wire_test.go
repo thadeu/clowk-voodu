@@ -27,8 +27,13 @@ func testKey(seed byte) string {
 // fakeWG records every wg invocation and answers show commands.
 type fakeWG struct {
 	calls [][]string
-	dump  string
 	fail  bool
+
+	// dump, when set, is what `wg show wg0 dump` answers. Otherwise the
+	// fake tracks the peers addconf loaded and set removed, and renders
+	// them — so Apply's removal pass is exercised for real.
+	dump  string
+	peers map[string]bool
 }
 
 func (f *fakeWG) run(args ...string) ([]byte, error) {
@@ -38,28 +43,72 @@ func (f *fakeWG) run(args ...string) ([]byte, error) {
 		return nil, errors.New("wg: not up")
 	}
 
-	switch strings.Join(args, " ") {
-	case "show wg0 public-key":
+	if f.peers == nil {
+		f.peers = map[string]bool{}
+	}
+
+	switch {
+	case strings.Join(args, " ") == "show wg0 public-key":
 		return []byte(testKey(1) + "\n"), nil
-	case "show wg0 listen-port":
+	case strings.Join(args, " ") == "show wg0 listen-port":
 		return []byte("51820\n"), nil
-	case "show wg0 dump":
-		return []byte(f.dump), nil
+	case strings.Join(args, " ") == "show wg0 dump":
+		if f.dump != "" {
+			return []byte(f.dump), nil
+		}
+
+		out := "privkey\t" + testKey(1) + "\t51820\toff\n"
+
+		for key := range f.peers {
+			out += key + "\t(none)\t(none)\t0.0.0.0/0\t0\t0\t0\t25\n"
+		}
+
+		return []byte(out), nil
+	case len(args) == 3 && args[0] == "addconf":
+		data, err := os.ReadFile(args[2])
+		if err != nil {
+			return nil, err
+		}
+
+		for _, line := range strings.Split(string(data), "\n") {
+			if key, ok := strings.CutPrefix(line, "PublicKey = "); ok {
+				f.peers[key] = true
+			}
+		}
+
+		return nil, nil
+	case len(args) == 5 && args[0] == "set" && args[2] == "peer" && args[4] == "remove":
+		delete(f.peers, args[3])
+
+		return nil, nil
 	}
 
 	return nil, nil
 }
 
-func (f *fakeWG) syncs() int {
+// applies counts the addconf runs — one per Apply.
+func (f *fakeWG) applies() int {
 	n := 0
 
 	for _, c := range f.calls {
-		if len(c) > 0 && c[0] == "syncconf" {
+		if len(c) > 0 && c[0] == "addconf" {
 			n++
 		}
 	}
 
 	return n
+}
+
+func (f *fakeWG) removed() []string {
+	var out []string
+
+	for _, c := range f.calls {
+		if len(c) == 5 && c[0] == "set" && c[4] == "remove" {
+			out = append(out, c[3])
+		}
+	}
+
+	return out
 }
 
 func newTestWire(t *testing.T) (*Wire, *memStore, *fakeWG) {
@@ -185,8 +234,14 @@ func TestWire_AddWritesFileAndSyncs(t *testing.T) {
 		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
 	}
 
-	if wg.syncs() != 1 || strings.Join(wg.calls[len(wg.calls)-1], " ") != "syncconf wg0 "+w.ConfPath {
-		t.Fatalf("wg calls = %v, want one syncconf on the file", wg.calls)
+	if wg.applies() != 1 || len(wg.removed()) != 0 {
+		t.Fatalf("wg calls = %v, want one addconf on the file and no removal", wg.calls)
+	}
+
+	for _, c := range wg.calls {
+		if c[0] == "syncconf" {
+			t.Fatalf("syncconf resets the listen port — never run it: %v", wg.calls)
+		}
 	}
 }
 
@@ -198,13 +253,13 @@ func TestWire_AddInvalidStoresNothing(t *testing.T) {
 	}
 
 	peers, _ := store.ListWirePeers(context.Background())
-	if len(peers) != 0 || wg.syncs() != 0 {
-		t.Fatalf("invalid peer reached the store (%d) or wg0 (%d syncs)", len(peers), wg.syncs())
+	if len(peers) != 0 || wg.applies() != 0 {
+		t.Fatalf("invalid peer reached the store (%d) or wg0 (%d applies)", len(peers), wg.applies())
 	}
 }
 
 func TestWire_AddSameAddressReplaces(t *testing.T) {
-	w, store, _ := newTestWire(t)
+	w, store, wg := newTestWire(t)
 	ctx := context.Background()
 
 	if _, err := w.Add(ctx, WirePeer{PublicKey: testKey(2), Address: "10.254.167.105"}); err != nil {
@@ -218,6 +273,10 @@ func TestWire_AddSameAddressReplaces(t *testing.T) {
 	peers, _ := store.ListWirePeers(ctx)
 	if len(peers) != 1 || peers[0].PublicKey != testKey(4) {
 		t.Fatalf("peers = %+v, want the second key only", peers)
+	}
+
+	if wg.peers[testKey(2)] || !wg.peers[testKey(4)] {
+		t.Fatalf("wg0 peers = %v, want only the new key", wg.peers)
 	}
 }
 
@@ -238,8 +297,17 @@ func TestWire_RemoveSyncsAndErrsOnUnknown(t *testing.T) {
 		t.Fatalf("file still has a peer:\n%s", data)
 	}
 
-	if wg.syncs() != 2 {
-		t.Fatalf("syncs = %d, want 2 (add + remove)", wg.syncs())
+	if wg.applies() != 2 {
+		t.Fatalf("applies = %d, want 2 (add + remove)", wg.applies())
+	}
+
+	// addconf cannot drop a peer: the removal is an explicit wg set.
+	if got := wg.removed(); len(got) != 1 || got[0] != testKey(2) {
+		t.Fatalf("removed = %v, want the peer's key", got)
+	}
+
+	if wg.peers[testKey(2)] {
+		t.Fatal("peer still on wg0 after remove")
 	}
 
 	err := w.Remove(ctx, "10.254.9.9")
@@ -370,7 +438,7 @@ func TestWire_ConcurrentAddsAllLand(t *testing.T) {
 		t.Fatalf("final file has %d peers, want 10:\n%s", n, data)
 	}
 
-	if wg.syncs() != 10 {
-		t.Fatalf("syncs = %d, want 10", wg.syncs())
+	if wg.applies() != 10 {
+		t.Fatalf("applies = %d, want 10", wg.applies())
 	}
 }

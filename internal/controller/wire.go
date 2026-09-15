@@ -1,7 +1,12 @@
 // wire.go is how voodu manages wg0's peers: the operator adds the other
 // hosts with `vd wire add`, the record lives in etcd, and wg0 is brought
-// to match it with `wg syncconf` — which adds, changes and removes peers
-// without dropping the tunnel.
+// to match it without dropping the tunnel — `wg addconf` adds and updates
+// the peers in the file, `wg set peer remove` drops the ones that left.
+//
+// Not `wg syncconf`: it rewrites the whole interface from the file, and a
+// file without an [Interface] section resets the listen port to a random
+// one — which is how the first end-to-end run ended with both hosts
+// dialling a port nobody listened on. addconf touches peers only.
 //
 // wg0.conf is never edited. The install writes it once (address, port,
 // key) and voodu keeps its peers in a separate file in wg's native
@@ -283,8 +288,32 @@ func (w *Wire) apply(ctx context.Context) error {
 		return unavailable(err)
 	}
 
-	if _, err := w.run("syncconf", "wg0", w.ConfPath); err != nil {
+	if _, err := w.run("addconf", "wg0", w.ConfPath); err != nil {
 		return unavailable(err)
+	}
+
+	// addconf never removes: a peer that left etcd is still on wg0 until
+	// told otherwise.
+	dump, err := w.run("show", "wg0", "dump")
+
+	if err != nil {
+		return unavailable(err)
+	}
+
+	wanted := map[string]bool{}
+
+	for _, p := range peers {
+		wanted[p.PublicKey] = true
+	}
+
+	for key := range ParseWGDump(dump) {
+		if wanted[key] {
+			continue
+		}
+
+		if _, err := w.run("set", "wg0", "peer", key, "remove"); err != nil {
+			return unavailable(err)
+		}
 	}
 
 	return nil
