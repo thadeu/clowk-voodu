@@ -261,7 +261,7 @@ downtime per host. Volumes are kept.
 
    docker network rm voodu0
    docker network create --driver bridge \
-     --subnet 10.91.221.0/24 --ip-range 10.91.221.128/25 \
+     --subnet 10.91.221.0/24 --gateway 10.91.221.1 --ip-range 10.91.221.128/25 \
      -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
      voodu0
 

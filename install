@@ -403,8 +403,11 @@ ensure_voodu_network() {
 
   if subnet="$(routed_voodu0_subnet)"; then
     log "creating docker network voodu0, routed over wg0 ($subnet)"
+    # --gateway is explicit: without it docker takes the first address of
+    # --ip-range, which puts the gateway at .128 instead of .1.
     sudo_ docker network create --driver bridge \
       --subnet "$subnet" \
+      --gateway "${subnet%.0/24}.1" \
       --ip-range "${subnet%.0/24}.128/25" \
       -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
       voodu0 >/dev/null
