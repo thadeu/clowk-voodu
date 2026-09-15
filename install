@@ -41,6 +41,7 @@ VOODU_HTTP_ADDR="${VOODU_HTTP_ADDR:-127.0.0.1:8686}"
 VOODU_PAT_ADDR="${VOODU_PAT_ADDR:-0.0.0.0:8687}"
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 SKIP_WIREGUARD="${SKIP_WIREGUARD:-0}"
+UFW_HINT_BRIDGE=""
 VOODU_WG_ADDRESS="${VOODU_WG_ADDRESS:-}"
 BIN_DIR="/usr/local/bin"
 UNIT_PATH="/etc/systemd/system/voodu-controller.service"
@@ -413,6 +414,58 @@ ensure_voodu_network() {
 
   log "creating docker network voodu0"
   sudo_ docker network create --driver bridge voodu0 >/dev/null
+}
+
+# voodu0_bridge prints voodu0's host interface when the network is routed
+# over wg0 (it has an --ip-range), nothing otherwise.
+voodu0_bridge() {
+  local id
+
+  if [ -z "$(sudo_ docker network inspect voodu0 -f '{{range .IPAM.Config}}{{.IPRange}}{{end}}' 2>/dev/null)" ]; then
+    return 1
+  fi
+
+  id="$(sudo_ docker network inspect voodu0 -f '{{.Id}}' 2>/dev/null | cut -c1-12)"
+  [ -n "$id" ] || return 1
+
+  printf 'br-%s\n' "$id"
+}
+
+# ufw_rules prints the rules cross-VM needs, one per line, as ufw
+# arguments — the same list `vd wire ufw` computes.
+ufw_rules() {
+  local bridge="$1"
+
+  printf '%s\n' \
+    "allow 51820/udp" \
+    "allow in on wg0 to any port 53" \
+    "allow in on $bridge to any port 53" \
+    "route allow in on wg0 out on $bridge"
+}
+
+# ensure_firewall opens what the mesh needs — only when ufw is active,
+# which is the one case where the tunnel would otherwise be silently
+# blocked. ufw skips a rule it already has, so re-running adds nothing.
+# With ufw absent or inactive the rules are printed at the end instead;
+# a different firewall is the operator's.
+ensure_firewall() {
+  local bridge rule
+
+  bridge="$(voodu0_bridge)" || return 0
+
+  if ! command -v ufw >/dev/null 2>&1 || ! sudo_ ufw status 2>/dev/null | grep -q '^Status: active'; then
+    UFW_HINT_BRIDGE="$bridge"
+    return 0
+  fi
+
+  log "ufw is active — allowing the WireGuard mesh through"
+
+  ufw_rules "$bridge" | while IFS= read -r rule; do
+    # shellcheck disable=SC2086
+    sudo_ ufw $rule >/dev/null
+  done
+
+  success "ufw: 51820/udp, DNS on wg0 and $bridge, forwarding wg0 → $bridge"
 }
 
 # routed_voodu0_subnet derives voodu0's subnet from this host's address on
@@ -858,7 +911,12 @@ print_next_steps() {
   any data:
     sudo ufw allow from WEBUI_HOST_IP to any port 8687 proto tcp
     sudo ufw deny  8687/tcp
-
+${UFW_HINT_BRIDGE:+
+  ${YELLOW}Cross-VM${NC}: ufw is not active here, so nothing was opened. If a
+  firewall fronts this host, it needs the tunnel and the mesh DNS through
+  (\`vd wire ufw\` prints these at any time):
+$(ufw_rules "$UFW_HINT_BRIDGE" | sed 's/^/    sudo ufw /')
+}
 
   To uninstall (local — stamped at install time):
     sudo $VOODU_ROOT/scripts/uninstall
@@ -890,6 +948,7 @@ main() {
     # voodu0 at its end.
     ensure_wireguard
     ensure_docker
+    ensure_firewall
   fi
 
   resolve_version

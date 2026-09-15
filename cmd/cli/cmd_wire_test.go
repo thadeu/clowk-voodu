@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -72,5 +74,79 @@ func TestRenderWireList_Empty(t *testing.T) {
 
 	if !strings.Contains(out.String(), "No peers") {
 		t.Fatalf("got:\n%s", out.String())
+	}
+}
+
+func ufwFixture() wireUFW {
+	return wireUFW{Bridge: "br-21f70aa6d28e", Rules: [][]string{
+		{"allow", "51820/udp"},
+		{"route", "allow", "in", "on", "wg0", "out", "on", "br-21f70aa6d28e"},
+	}}
+}
+
+func TestRenderUFWRules(t *testing.T) {
+	got := renderUFWRules(ufwFixture(), "sudo ")
+	want := "sudo ufw allow 51820/udp\nsudo ufw route allow in on wg0 out on br-21f70aa6d28e\n"
+
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestApplyUFW_WithoutRootPrintsAndRefuses(t *testing.T) {
+	var out bytes.Buffer
+
+	called := false
+	err := applyUFW(&out, ufwFixture(), false, 1000, func(...string) (string, error) { called = true; return "", nil })
+
+	if err == nil || !strings.Contains(err.Error(), "needs root") || called {
+		t.Fatalf("err = %v, called = %v", err, called)
+	}
+
+	if !strings.Contains(out.String(), "sudo ufw allow 51820/udp") {
+		t.Fatalf("rules not printed for the operator:\n%s", out.String())
+	}
+}
+
+func TestApplyUFW_EnableAndDisableRunTheRightArgs(t *testing.T) {
+	if _, err := exec.LookPath("ufw"); err != nil {
+		t.Skip("ufw not on PATH; the root path is covered where it exists")
+	}
+
+	var ran []string
+
+	run := func(args ...string) (string, error) {
+		ran = append(ran, strings.Join(args, " "))
+
+		return "Rule added", nil
+	}
+
+	if err := applyUFW(io.Discard, ufwFixture(), false, 0, run); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyUFW(io.Discard, ufwFixture(), true, 0, run); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"allow 51820/udp",
+		"route allow in on wg0 out on br-21f70aa6d28e",
+		"delete allow 51820/udp",
+		"route delete allow in on wg0 out on br-21f70aa6d28e",
+	}
+
+	if strings.Join(ran, "|") != strings.Join(want, "|") {
+		t.Fatalf("ran %v, want %v", ran, want)
+	}
+}
+
+func TestDeleteArgs(t *testing.T) {
+	if got := strings.Join(deleteArgs([]string{"allow", "51820/udp"}), " "); got != "delete allow 51820/udp" {
+		t.Fatal(got)
+	}
+
+	if got := strings.Join(deleteArgs([]string{"route", "allow", "in", "on", "wg0"}), " "); got != "route delete allow in on wg0" {
+		t.Fatal(got)
 	}
 }

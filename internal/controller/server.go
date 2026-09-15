@@ -257,6 +257,13 @@ func (s *Server) Start(ctx context.Context) error {
 		Store:    store,
 		ConfPath: paths.WirePeersConf(),
 		Logf:     s.cfg.Logger.Printf,
+		Bridge: func() string {
+			if mesh == nil {
+				return ""
+			}
+
+			return mesh.bridge
+		},
 	}
 
 	s.api = &API{

@@ -222,6 +222,10 @@ type Wire struct {
 	// routing table.
 	OutboundIP func() netip.Addr
 
+	// Bridge is voodu0's host interface, the name a firewall rule needs.
+	// Empty on a host whose voodu0 is not routed.
+	Bridge func() string
+
 	Logf func(string, ...any)
 
 	// mu serialises add, remove and apply: two at once would race on the
@@ -478,4 +482,45 @@ func outboundIP() netip.Addr {
 	ip, _ := netip.AddrFromSlice(addr.IP.To4())
 
 	return ip
+}
+
+// UFWRules is what a host firewall running ufw has to let through for the
+// mesh to work, as ufw arguments: the tunnel, the other hosts asking this
+// one for names, this host's containers asking their controller, and the
+// other hosts reaching the containers. Each is one `ufw <args>`; the same
+// args after `delete` (or `route delete`) undo it.
+func UFWRules(bridge string, listenPort int) [][]string {
+	if listenPort <= 0 {
+		listenPort = 51820
+	}
+
+	return [][]string{
+		{"allow", fmt.Sprintf("%d/udp", listenPort)},
+		{"allow", "in", "on", "wg0", "to", "any", "port", "53"},
+		{"allow", "in", "on", bridge, "to", "any", "port", "53"},
+		{"route", "allow", "in", "on", "wg0", "out", "on", bridge},
+	}
+}
+
+// ErrWireNotRouted is a firewall question on a host whose voodu0 is local:
+// there is no bridge to name and nothing to let through.
+var ErrWireNotRouted = errors.New("voodu0 is not routed over wg0 on this host")
+
+// UFW returns the rules for this host.
+func (w *Wire) UFW() (bridge string, rules [][]string, err error) {
+	if w.Bridge != nil {
+		bridge = w.Bridge()
+	}
+
+	if bridge == "" {
+		return "", nil, ErrWireNotRouted
+	}
+
+	port := 0
+
+	if out, err := w.run("show", "wg0", "listen-port"); err == nil {
+		port, _ = strconv.Atoi(strings.TrimSpace(string(out)))
+	}
+
+	return bridge, UFWRules(bridge, port), nil
 }

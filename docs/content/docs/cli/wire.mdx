@@ -19,6 +19,7 @@ The full picture — addresses, names, migration — is in
 | `add` | Add a peer: `--key`, `--address`, optional `--endpoint`. |
 | `remove <address>` | Drop a peer by its tunnel address. |
 | `list` | Peers and their link health (last handshake, bytes). |
+| `ufw [enable\|disable]` | The host firewall rules the mesh needs: print, apply or remove. |
 
 Every verb runs against the controller of the host it targets, so `-r` does all
 of it from your own machine.
@@ -50,7 +51,8 @@ The three flags all describe the **other** host:
 flag. A host behind NAT is added without `--endpoint`; it dials out, and the
 other side learns the endpoint from the handshake.
 
-Open UDP `51820` on every host — that is the tunnel itself.
+Open UDP `51820` on every host — that is the tunnel itself. The installer
+does it when ufw is active; see [`voodu wire ufw`](#voodu-wire-ufw).
 
 With three hosts, each pair needs its `add` on both sides: six commands, once.
 
@@ -71,6 +73,34 @@ ADDRESS         ENDPOINT              HANDSHAKE    RX/TX        KEY
 
 A peer that stops answering stays listed until you `remove` it. `-o json` on
 every verb.
+
+## `voodu wire ufw`
+
+The mesh needs four things through a host firewall: the tunnel port, DNS from
+the other hosts (on `wg0`) and from this host's containers (on the `voodu0`
+bridge), and forwarding from `wg0` into the bridge. The installer applies
+them when ufw is active; this prints them at any time, with the bridge's real
+name:
+
+```bash
+vd wire ufw -r vm-1
+# sudo ufw allow 51820/udp
+# sudo ufw allow in on wg0 to any port 53
+# sudo ufw allow in on br-21f70aa6d28e to any port 53
+# sudo ufw route allow in on wg0 out on br-21f70aa6d28e
+```
+
+On the host itself, with root, it applies or removes them:
+
+```bash
+sudo vd wire ufw enable
+sudo vd wire ufw disable
+```
+
+The controller only computes the rules — its sandbox cannot write the
+firewall — so `enable` and `disable` run ufw from the CLI process. Over `-r`
+that process is the SSH user, not root: the command prints the rules and
+says so. Any other firewall takes the same four rules in its own syntax.
 
 ## What it changes
 

@@ -430,6 +430,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /pats/{id}", a.handlePATRevoke)
 
 	mux.HandleFunc("GET /wire", a.handleWireStatus)
+	mux.HandleFunc("GET /wire/ufw", a.handleWireUFW)
 	mux.HandleFunc("POST /wire/peers", a.handleWirePeerAdd)
 	mux.HandleFunc("DELETE /wire/peers/{address}", a.handleWirePeerRemove)
 

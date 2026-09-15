@@ -120,3 +120,25 @@ func wireErrorCode(err error) int {
 		return http.StatusBadRequest
 	}
 }
+
+// handleWireUFW answers GET /wire/ufw: the ufw rules this host needs, for
+// `vd wire ufw` to print or apply. The controller only computes them — its
+// sandbox cannot write /etc/ufw, and should not.
+func (a *API) handleWireUFW(w http.ResponseWriter, r *http.Request) {
+	wire := a.wireOr503(w)
+	if wire == nil {
+		return
+	}
+
+	bridge, rules, err := wire.UFW()
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, envelope{
+		Status: "ok",
+		Data:   map[string]any{"bridge": bridge, "rules": rules},
+	})
+}

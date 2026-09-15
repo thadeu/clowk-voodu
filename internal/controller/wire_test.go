@@ -442,3 +442,43 @@ func TestWire_ConcurrentAddsAllLand(t *testing.T) {
 		t.Fatalf("applies = %d, want 10", wg.applies())
 	}
 }
+
+func TestUFWRules(t *testing.T) {
+	rules := UFWRules("br-21f70aa6d28e", 51820)
+
+	want := [][]string{
+		{"allow", "51820/udp"},
+		{"allow", "in", "on", "wg0", "to", "any", "port", "53"},
+		{"allow", "in", "on", "br-21f70aa6d28e", "to", "any", "port", "53"},
+		{"route", "allow", "in", "on", "wg0", "out", "on", "br-21f70aa6d28e"},
+	}
+
+	if len(rules) != len(want) {
+		t.Fatalf("rules = %v", rules)
+	}
+
+	for i := range want {
+		if strings.Join(rules[i], " ") != strings.Join(want[i], " ") {
+			t.Fatalf("rule %d = %v, want %v", i, rules[i], want[i])
+		}
+	}
+
+	if got := UFWRules("br-x", 0)[0][1]; got != "51820/udp" {
+		t.Fatalf("unknown port must default to 51820, got %s", got)
+	}
+}
+
+func TestWire_UFWNeedsARoutedVoodu0(t *testing.T) {
+	w, _, _ := newTestWire(t)
+
+	if _, _, err := w.UFW(); !errors.Is(err, ErrWireNotRouted) {
+		t.Fatalf("err = %v, want ErrWireNotRouted", err)
+	}
+
+	w.Bridge = func() string { return "br-21f70aa6d28e" }
+
+	bridge, rules, err := w.UFW()
+	if err != nil || bridge != "br-21f70aa6d28e" || len(rules) != 4 {
+		t.Fatalf("bridge=%q rules=%v err=%v", bridge, rules, err)
+	}
+}

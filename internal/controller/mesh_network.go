@@ -23,6 +23,7 @@ type meshNetwork struct {
 	tunnel     netip.Addr        // wg0's address at start; invalid without wg0
 	readTunnel func() netip.Addr // re-reads wg0; wg0Address in production
 	upstreams  []netip.AddrPort  // the host's own resolvers
+	bridge     string            // voodu0's host interface, for firewall rules
 }
 
 // detectMeshNetwork reads voodu0 and wg0. nil when voodu0 is not routed: a
@@ -50,6 +51,7 @@ func detectMeshNetwork(logf func(string, ...any)) *meshNetwork {
 	m := &meshNetwork{
 		subnet:     subnet,
 		gateway:    gateway,
+		bridge:     plan.Bridge,
 		tunnel:     wg0Address(),
 		readTunnel: wg0Address,
 		upstreams:  meshdns.ReadUpstreams("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"),

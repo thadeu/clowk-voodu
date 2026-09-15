@@ -5,6 +5,7 @@
 //	vd wire add --key … --address … [--endpoint …]
 //	vd wire remove <address>
 //	vd wire list                 # peers and their link health
+//	vd wire ufw [enable|disable] # the host firewall rules the mesh needs
 //
 // Wiring two hosts is `show` on one, `add` on the other, then the same
 // the other way round. Every verb runs against the controller of the host
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -72,7 +74,7 @@ Peers are applied to wg0 at once, without dropping the tunnel, and come
 back after a reboot. wg0.conf is never edited. Open UDP 51820 on both.`,
 	}
 
-	cmd.AddCommand(newWireShowCmd(), newWireAddCmd(), newWireRemoveCmd(), newWireListCmd())
+	cmd.AddCommand(newWireShowCmd(), newWireAddCmd(), newWireRemoveCmd(), newWireListCmd(), newWireUFWCmd())
 
 	return cmd
 }
@@ -324,6 +326,118 @@ func wireCall(cmd *cobra.Command, method, path string, body io.Reader, out any) 
 
 	if err := json.Unmarshal(env.Data, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
+	}
+
+	return nil
+}
+
+type wireUFW struct {
+	Bridge string     `json:"bridge"`
+	Rules  [][]string `json:"rules"`
+}
+
+func newWireUFWCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ufw [enable|disable]",
+		Short: "Print, apply or remove the ufw rules the mesh needs on this host",
+		Long: `ufw prints the host firewall rules cross-VM networking needs — the
+tunnel port, DNS from the other hosts and from this host's containers, and
+forwarding from wg0 into voodu0 — ready to paste.
+
+  vd wire ufw                 # print (works with -r)
+  sudo vd wire ufw enable     # apply, on the host itself
+  sudo vd wire ufw disable    # remove the same rules
+
+enable and disable run ufw here, so they need root on the host: the
+controller only computes the rules, it cannot write the firewall.`,
+		Args:      cobra.MaximumNArgs(1),
+		ValidArgs: []string{"enable", "disable"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var u wireUFW
+
+			if err := wireCall(cmd, http.MethodGet, "/wire/ufw", nil, &u); err != nil {
+				return err
+			}
+
+			verb := ""
+			if len(args) == 1 {
+				verb = args[0]
+			}
+
+			if verb == "" {
+				if outputIsJSON(cmd) {
+					return json.NewEncoder(os.Stdout).Encode(u)
+				}
+
+				fmt.Fprint(os.Stdout, renderUFWRules(u, "sudo "))
+
+				return nil
+			}
+
+			if verb != "enable" && verb != "disable" {
+				return fmt.Errorf("ufw: want enable or disable, got %q", verb)
+			}
+
+			return applyUFW(os.Stdout, u, verb == "disable", os.Geteuid(), ufwRunner)
+		},
+	}
+}
+
+// renderUFWRules is the rules as shell lines. prefix is what goes before
+// `ufw` — "sudo " when printing for a human to paste.
+func renderUFWRules(u wireUFW, prefix string) string {
+	var b strings.Builder
+
+	for _, r := range u.Rules {
+		fmt.Fprintf(&b, "%sufw %s\n", prefix, strings.Join(r, " "))
+	}
+
+	return b.String()
+}
+
+// deleteArgs turns a rule into the ufw arguments that remove it: `delete`
+// goes after `route` when there is one, before the rule otherwise.
+func deleteArgs(rule []string) []string {
+	if len(rule) > 0 && rule[0] == "route" {
+		return append([]string{"route", "delete"}, rule[1:]...)
+	}
+
+	return append([]string{"delete"}, rule...)
+}
+
+// ufwRunner runs one ufw invocation. A seam for tests.
+var ufwRunner = func(args ...string) (string, error) {
+	out, err := exec.Command("ufw", args...).CombinedOutput()
+
+	return strings.TrimSpace(string(out)), err
+}
+
+// applyUFW runs the rules — or their deletes — through ufw. Without root
+// it prints them instead and says so: the forward over -r runs as the SSH
+// user, and a `sudo` typed on the host is the only way this gets root.
+func applyUFW(out io.Writer, u wireUFW, remove bool, euid int, run func(args ...string) (string, error)) error {
+	if euid != 0 {
+		fmt.Fprint(out, renderUFWRules(u, "sudo "))
+
+		return fmt.Errorf("ufw: needs root on the host — run `sudo vd wire ufw enable` there, or apply the lines above")
+	}
+
+	if _, err := exec.LookPath("ufw"); err != nil {
+		return fmt.Errorf("ufw: not installed on this host")
+	}
+
+	for _, r := range u.Rules {
+		args := r
+		if remove {
+			args = deleteArgs(r)
+		}
+
+		res, err := run(args...)
+		if err != nil {
+			return fmt.Errorf("ufw %s: %v: %s", strings.Join(args, " "), err, res)
+		}
+
+		fmt.Fprintf(out, "%s ufw %s — %s\n", check(), strings.Join(args, " "), res)
 	}
 
 	return nil

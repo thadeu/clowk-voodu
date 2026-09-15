@@ -154,3 +154,26 @@ func TestHandleWire_WGDownIs503(t *testing.T) {
 		t.Fatalf("add with wg down: %d %v, want 503", code, env)
 	}
 }
+
+func TestHandleWire_UFW(t *testing.T) {
+	api, _, _ := newWireAPI(t)
+	ts := httptest.NewServer(api.Handler())
+	defer ts.Close()
+
+	code, _ := doJSON(t, http.MethodGet, ts.URL+"/wire/ufw", "")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("local voodu0: %d, want 503", code)
+	}
+
+	api.Wire.Bridge = func() string { return "br-21f70aa6d28e" }
+
+	code, env := doJSON(t, http.MethodGet, ts.URL+"/wire/ufw", "")
+	if code != http.StatusOK {
+		t.Fatalf("routed: %d %v", code, env)
+	}
+
+	data := env["data"].(map[string]any)
+	if data["bridge"] != "br-21f70aa6d28e" || len(data["rules"].([]any)) != 4 {
+		t.Fatalf("data = %v", data)
+	}
+}

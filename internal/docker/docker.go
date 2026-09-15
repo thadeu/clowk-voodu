@@ -697,6 +697,12 @@ type NetworkAddressPlan struct {
 	Subnet  netip.Prefix
 	IPRange netip.Prefix
 	Gateway netip.Addr
+
+	// Bridge is the host interface docker created for the network —
+	// "br-" and the first 12 characters of the network id — the name a
+	// firewall rule refers to. Empty when the driver set its own name
+	// (com.docker.network.bridge.name), which is read instead.
+	Bridge string
 }
 
 // InspectNetworkAddressPlan reads a network's IPv4 address plan. ok is false
@@ -725,7 +731,12 @@ func InspectNetworkAddressPlan(name string) (plan NetworkAddressPlan, ok bool, e
 			continue
 		}
 
-		return NetworkAddressPlan{Subnet: c.Subnet, IPRange: c.IPRange, Gateway: c.Gateway}, true, nil
+		bridge := resp.Network.Options["com.docker.network.bridge.name"]
+		if bridge == "" && len(resp.Network.ID) >= 12 {
+			bridge = "br-" + resp.Network.ID[:12]
+		}
+
+		return NetworkAddressPlan{Subnet: c.Subnet, IPRange: c.IPRange, Gateway: c.Gateway, Bridge: bridge}, true, nil
 	}
 
 	return NetworkAddressPlan{}, false, nil

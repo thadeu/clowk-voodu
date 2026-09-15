@@ -97,22 +97,19 @@ listed until you remove it.
 The install writes `wg0.conf` once; voodu keeps its peers in
 `/opt/voodu/wire/peers.conf` and never touches `wg0.conf` again.
 
-If the host firewall filters forwarded traffic (ufw's default routed policy
-does), allow `wg0` into the `voodu0` bridge. Its interface name is `br-`
-followed by the first 12 characters of the network id:
+**Firewall.** The installer opens what the mesh needs when ufw is active:
+UDP 51820, DNS on `wg0` and on the `voodu0` bridge, and forwarding from `wg0`
+into the bridge. With ufw inactive it prints the rules instead. They are
+available at any time, with the bridge's real name:
 
 ```bash
-echo br-$(docker network inspect voodu0 -f '{{.Id}}' | cut -c1-12)
+vd wire ufw -r vm-1          # print
+sudo vd wire ufw enable      # apply, on the host
 ```
 
 The mesh DNS (see [Names](#names)) listens on port `53` of the `voodu0` gateway,
 for the host's own containers, and of the tunnel address, for the other hosts —
-UDP and TCP. With ufw active, allow both in:
-
-```bash
-sudo ufw allow in on br-<id> to any port 53
-sudo ufw allow in on wg0 to any port 53
-```
+UDP and TCP. The two DNS rules above are what lets both in.
 
 ## Addresses
 
