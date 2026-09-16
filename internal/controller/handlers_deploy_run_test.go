@@ -458,7 +458,7 @@ func TestSecondDeployOfTheSameTreeDownloadsNothing(t *testing.T) {
 	defer srv.Close()
 
 	api.GitHub = &gh.Client{BaseURL: srv.URL, HTTP: srv.Client()}
-	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool) error { return nil }
+	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool, io.Writer) error { return nil }
 
 	if err := api.Store.PutTrigger(t.Context(), Trigger{
 		ID: "trg1", Repo: "acme/web", Branch: "main", AllowScopes: []string{"runa"}, Enabled: true,
@@ -704,5 +704,230 @@ func TestDeployRunSkipsTheReleasePhaseWithoutAReleaseBlock(t *testing.T) {
 
 	if strings.Contains(body, `"released"`) {
 		t.Fatalf("released should be omitted when nothing was released: %s", body)
+	}
+}
+
+// newBuildRunAPI is the build-mode harness: a repository whose only
+// workload builds from apps/pwa, served from an in-memory GitHub, with the
+// builder under test control. The console reads the transcript out of the
+// response, so what the builder prints is what these tests assert on.
+func newBuildRunAPI(t *testing.T, build SourceBuilder) (*API, *httptest.Server) {
+	t.Helper()
+
+	api, _ := newTestAPI(t)
+	api.ParseManifests = stubParser(map[string][]Manifest{
+		"MANIFEST-BODY": {{
+			Kind: KindDeployment, Scope: "runa", Name: "web",
+			Spec: json.RawMessage(`{"build":{"path":"apps/pwa"}}`),
+		}},
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/compare/"):
+			_, _ = w.Write([]byte(`{"status":"behind"}`))
+
+		case strings.Contains(r.URL.Path, "/tarball/"):
+			_, _ = w.Write(repoArchive(t, map[string]string{"apps/pwa/main.go": "package main"}))
+
+		case strings.Contains(r.URL.Path, "/commits/"):
+			_, _ = w.Write([]byte(`{"sha":"` + testSHA + `","commit":{"tree":{"sha":"root1"}}}`))
+
+		case strings.Contains(r.URL.Path, "/git/trees/"):
+			_ = json.NewEncoder(w).Encode(gh.Tree{SHA: "root1", Entries: []gh.TreeEntry{
+				{Path: ".voodu/pwa.yml", Type: "blob", SHA: "blob:.voodu/pwa.yml"},
+				{Path: "voodu.hcl", Type: "blob", SHA: "blob:voodu.hcl"},
+				{Path: "apps", Type: "tree", SHA: "tapps"},
+				{Path: "apps/pwa", Type: "tree", SHA: "tpwa"},
+			}})
+
+		case strings.Contains(r.URL.Path, "/git/blobs/"):
+			body := runSpec
+			if strings.HasSuffix(r.URL.Path, "voodu.hcl") {
+				body = "MANIFEST-BODY"
+			}
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"content":  base64.StdEncoding.EncodeToString([]byte(body)),
+				"encoding": "base64",
+				"size":     len(body),
+			})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	api.GitHub = &gh.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	api.BuildFromSource = build
+
+	if err := api.Store.PutTrigger(t.Context(), Trigger{
+		ID: "trg1", Repo: "acme/web", Branch: "main", AllowScopes: []string{"runa"}, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(api.Handler())
+	t.Cleanup(ts.Close)
+
+	return api, ts
+}
+
+// The transcript is the only place a console can read what happened on the
+// box: the journal is not reachable from a browser.
+func TestDeployRunReturnsTheBuildAndReleaseTranscript(t *testing.T) {
+	api, ts := newBuildRunAPI(t, func(_ string, _ io.Reader, _ json.RawMessage, _ bool, output io.Writer) error {
+		_, _ = io.WriteString(output, "-----> building release\nstep 1/3 done\n")
+
+		return nil
+	})
+
+	api.ParseManifests = stubParser(map[string][]Manifest{
+		"MANIFEST-BODY": {{
+			Kind: KindDeployment, Scope: "runa", Name: "web",
+			Spec: json.RawMessage(`{"build":{"path":"apps/pwa"},"release":{"command":["bin/rails","db:migrate"]}}`),
+		}},
+	})
+	api.Deployments = &fakeRestarter{output: "== 20260916 CreateThings: migrating\n"}
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	var env struct {
+		Data deployRunResponse `json:"data"`
+	}
+
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "-----> build runa-web\n-----> building release\nstep 1/3 done\n-----> release runa/web\n== 20260916 CreateThings: migrating\n"
+
+	if env.Data.Log != want {
+		t.Fatalf("log:\n got %q\nwant %q", env.Data.Log, want)
+	}
+}
+
+// A failed build answers 422 as before, and the reason the operator needs is
+// in the transcript beside the one-line error, not only in the journal.
+func TestDeployRunBuildFailureCarriesTheTranscript(t *testing.T) {
+	_, ts := newBuildRunAPI(t, func(_ string, _ io.Reader, _ json.RawMessage, _ bool, output io.Writer) error {
+		_, _ = io.WriteString(output, "-----> building release\nERROR: bundle install failed\n")
+
+		return errors.New("exit 1")
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422: %s", resp.StatusCode, body)
+	}
+
+	var env struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+		Data   struct {
+			Log string `json:"log"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatal(err)
+	}
+
+	if env.Status != "error" || !strings.Contains(env.Error, "exit 1") {
+		t.Fatalf("the error line must survive: %s", body)
+	}
+
+	if !strings.Contains(env.Data.Log, "-----> build runa-web\n") || !strings.Contains(env.Data.Log, "ERROR: bundle install failed") {
+		t.Fatalf("the transcript must be on the error response: %s", body)
+	}
+}
+
+// Same for a failed release: the migration's own output is what explains
+// the failure, and the build that came before it is context.
+func TestDeployRunReleaseFailureCarriesTheTranscript(t *testing.T) {
+	api, ts := newRunAPI(t, repoFiles(), true, map[string][]Manifest{
+		"MANIFEST-BODY": {
+			{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1","release":{"command":["bin/rails","db:migrate"]}}`)},
+		},
+	})
+
+	api.Deployments = &fakeRestarter{
+		output: "== AddIndex: migrating\nPG::DuplicateTable: relation exists\n",
+		err:    errors.New("exit 1"),
+	}
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422: %s", resp.StatusCode, body)
+	}
+
+	var env struct {
+		Error string `json:"error"`
+		Data  struct {
+			Log string `json:"log"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(env.Error, "release of runa/web failed") {
+		t.Fatalf("the error line must name the deployment: %s", body)
+	}
+
+	if !strings.Contains(env.Data.Log, "-----> release runa/web\n== AddIndex: migrating\nPG::DuplicateTable") {
+		t.Fatalf("the transcript must be on the error response: %s", body)
+	}
+}
+
+// The reason a deploy failed is on its last lines; a cap that kept the head
+// would keep the part nobody needs.
+func TestDeployLogKeepsTheTailWhenTruncated(t *testing.T) {
+	var l deployLog
+
+	l.section("build", "runa-web")
+
+	line := strings.Repeat("x", 99) + "\n"
+
+	for i := 0; i < (deployLogCap/len(line))*2; i++ {
+		_, _ = l.Write([]byte(line))
+	}
+
+	_, _ = l.Write([]byte("ERROR: the reason\n"))
+
+	got := l.String()
+
+	if !strings.HasPrefix(got, "[log truncated: showing the last 256 KiB]\n") {
+		t.Fatalf("a truncated log must say so on its first line: %q", got[:80])
+	}
+
+	if !strings.HasSuffix(got, "ERROR: the reason\n") {
+		t.Fatalf("the tail must survive: %q", got[len(got)-40:])
+	}
+
+	if strings.Contains(got, "-----> build") {
+		t.Fatal("the head should have been cut")
+	}
+
+	if len(got) > deployLogCap+80 {
+		t.Fatalf("log is %d bytes, cap is %d", len(got), deployLogCap)
+	}
+
+	// Below the cap, nothing is touched.
+	var small deployLog
+
+	small.section("release", "runa/web")
+	_, _ = small.Write([]byte("ok\n"))
+
+	if small.String() != "-----> release runa/web\nok\n" {
+		t.Fatalf("small log altered: %q", small.String())
 	}
 }

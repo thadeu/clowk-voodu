@@ -22,6 +22,10 @@ type fakeRestarter struct {
 
 	err         error
 	newIDReturn string
+
+	// output is what Release writes to its writer, so a test can check
+	// that the caller kept the transcript.
+	output string
 }
 
 func (f *fakeRestarter) Restart(_ context.Context, scope, name string) error {
@@ -32,10 +36,14 @@ func (f *fakeRestarter) Restart(_ context.Context, scope, name string) error {
 	return f.err
 }
 
-func (f *fakeRestarter) Release(_ context.Context, scope, name string, _ io.Writer) error {
+func (f *fakeRestarter) Release(_ context.Context, scope, name string, output io.Writer) error {
 	f.gotScope = scope
 	f.gotName = name
 	f.gotVerb = "release"
+
+	if f.output != "" && output != nil {
+		_, _ = io.WriteString(output, f.output)
+	}
 
 	return f.err
 }

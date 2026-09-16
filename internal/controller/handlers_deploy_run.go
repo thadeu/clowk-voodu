@@ -98,6 +98,14 @@ type deployRunResponse struct {
 	// releaseDeployments for why the deploy plane has to run it.
 	Released []string `json:"released,omitempty"`
 
+	// Log is what the build and release phases printed, in order, one
+	// `-----> build <app>` / `-----> release <scope>/<name>` section each.
+	// The same text `vd apply` streams to a terminal; here it is the only
+	// place a console can read WHY a deploy failed, since the journal is
+	// on the box. Capped at deployLogCap, tail kept — the reason is at the
+	// end. Present on error responses too, under `data.log`.
+	Log string `json:"log,omitempty"`
+
 	// Resources is WHAT THIS COMMIT PUT ON THE BOX, as (kind, scope, name).
 	//
 	// Distinct from Applied, which names the trigger FILES that fired — "PWA",
@@ -204,8 +212,10 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		Held:    held,
 	}
 
+	runLog := &deployLog{}
+
 	for _, spec := range specs {
-		resources, released, err := a.applyFromRepo(w, r, trigger, req, token, snap, spec)
+		resources, released, err := a.applyFromRepo(w, r, trigger, req, token, snap, spec, runLog)
 		if err != nil {
 			return
 		}
@@ -215,9 +225,74 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		out.Released = append(out.Released, released...)
 	}
 
+	out.Log = runLog.String()
+
 	a.touchTrigger(r, trigger)
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: out})
+}
+
+// deployLogCap bounds the log a run hands back. A verbose `bundle install`
+// or a chatty asset build can print megabytes, and a console row is not the
+// place for them; the failure reason is on the last lines, so the tail is
+// what survives.
+const deployLogCap = 256 << 10
+
+// deployLog collects the build and release output of one run. One buffer
+// for the whole run, sections in the order they happened, so the reader
+// sees the deploy as it unfolded rather than per-workload fragments.
+type deployLog struct {
+	buf bytes.Buffer
+}
+
+// section opens a named block. The banner mirrors the `----->` style the
+// pipeline already uses, so build and release output read as one transcript.
+func (l *deployLog) section(kind, name string) {
+	if l.buf.Len() > 0 && !bytes.HasSuffix(l.buf.Bytes(), []byte("\n")) {
+		l.buf.WriteByte('\n')
+	}
+
+	fmt.Fprintf(&l.buf, "-----> %s %s\n", kind, name)
+}
+
+func (l *deployLog) Write(p []byte) (int, error) { return l.buf.Write(p) }
+
+// String returns the transcript, trimmed to the tail when it exceeds the
+// cap, and says so on the first line rather than pretending the log starts
+// where the cut landed.
+func (l *deployLog) String() string {
+	if l.buf.Len() <= deployLogCap {
+		return l.buf.String()
+	}
+
+	tail := l.buf.Bytes()[l.buf.Len()-deployLogCap:]
+
+	// Cut at a line boundary so the first kept line is a whole one.
+	if i := bytes.IndexByte(tail, '\n'); i >= 0 && i+1 < len(tail) {
+		tail = tail[i+1:]
+	}
+
+	return fmt.Sprintf("[log truncated: showing the last %d KiB]\n%s", deployLogCap>>10, tail)
+}
+
+// deployRunErrData is what an error envelope carries beside `error`: the
+// transcript up to the failure. `error` stays the one-line reason every
+// client already reads; the log is for the console that wants to show why.
+type deployRunErrData struct {
+	Log string `json:"log,omitempty"`
+}
+
+// writeDeployRunErr is writeErr with the run's log attached. Same envelope,
+// same status codes; only `data.log` is new, so a client that ignores `data`
+// on errors sees exactly what it saw before.
+func writeDeployRunErr(w http.ResponseWriter, code int, err error, runLog *deployLog) {
+	var data any
+
+	if runLog != nil && runLog.buf.Len() > 0 {
+		data = deployRunErrData{Log: runLog.String()}
+	}
+
+	writeJSON(w, code, envelope{Status: "error", Error: err.Error(), Data: data})
 }
 
 // selectTriggerSpecs reads the repository's trigger files and returns the ones
@@ -316,6 +391,7 @@ func resourcesOf(manifests []Manifest) []DeployedResource {
 func (a *API) applyFromRepo(
 	w http.ResponseWriter, r *http.Request, trigger *Trigger,
 	req deployRunRequest, token string, snap repoSnapshot, spec triggerspec.Spec,
+	runLog *deployLog,
 ) ([]DeployedResource, []string, error) {
 	raw, err := a.fetchRepoFile(r, trigger.Repo, token, snap, spec.Apply.File)
 	if err != nil {
@@ -379,8 +455,8 @@ func (a *API) applyFromRepo(
 			return nil, nil, err
 		}
 
-		if err := a.buildTargetsFromRepo(r, trigger, req, token, snap, targets); err != nil {
-			writeErr(w, http.StatusUnprocessableEntity, err)
+		if err := a.buildTargetsFromRepo(r, trigger, req, token, snap, targets, runLog); err != nil {
+			writeDeployRunErr(w, http.StatusUnprocessableEntity, err, runLog)
 
 			return nil, nil, err
 		}
@@ -390,7 +466,7 @@ func (a *API) applyFromRepo(
 		return nil, nil, err
 	}
 
-	released, err := a.releaseDeployments(w, r, spec, manifests)
+	released, err := a.releaseDeployments(w, r, spec, manifests, runLog)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -414,12 +490,12 @@ func (a *API) applyFromRepo(
 // spec hash and skips a run that already happened, so a redelivered webhook
 // does not migrate twice.
 //
-// The migration's output goes to the controller log rather than the
-// response: this endpoint answers JSON to a console, not text to a terminal,
-// and a failed release is reported the way a failed build is — the deploy
-// fails, with the reason, and the record shows up in `vd release history`.
+// The migration's output goes to the run log (and the journal): this
+// endpoint answers JSON to a console, not text to a terminal, and a failed
+// release is reported the way a failed build is — the deploy fails, with the
+// reason and the transcript, and the record shows up in `vd release history`.
 func (a *API) releaseDeployments(
-	w http.ResponseWriter, r *http.Request, spec triggerspec.Spec, manifests []Manifest,
+	w http.ResponseWriter, r *http.Request, spec triggerspec.Spec, manifests []Manifest, runLog *deployLog,
 ) ([]string, error) {
 	var released []string
 
@@ -441,11 +517,13 @@ func (a *API) releaseDeployments(
 
 		var output bytes.Buffer
 
-		if err := a.Deployments.Release(r.Context(), m.Scope, m.Name, &output); err != nil {
+		runLog.section("release", ref)
+
+		if err := a.Deployments.Release(r.Context(), m.Scope, m.Name, io.MultiWriter(&output, runLog)); err != nil {
 			log.Printf("deploy/%s release of %s failed: %v\n%s", spec.Name, ref, err, output.String())
 
 			err = fmt.Errorf("release of %s failed: %w", ref, err)
-			writeErr(w, http.StatusUnprocessableEntity, err)
+			writeDeployRunErr(w, http.StatusUnprocessableEntity, err, runLog)
 
 			return nil, err
 		}
@@ -497,7 +575,7 @@ func manifestHasReleaseBlock(m *Manifest) bool {
 // monorepo deploying three services pays for it once.
 func (a *API) buildTargetsFromRepo(
 	r *http.Request, trigger *Trigger, req deployRunRequest,
-	token string, snap repoSnapshot, targets []buildTarget,
+	token string, snap repoSnapshot, targets []buildTarget, runLog *deployLog,
 ) error {
 	stale, current := staleTargets(trigger, snap, targets)
 
@@ -528,7 +606,9 @@ func (a *API) buildTargetsFromRepo(
 	built := map[string]string{}
 
 	for _, target := range stale {
-		if err := a.buildOne(root, target, false); err != nil {
+		runLog.section("build", target.App)
+
+		if err := a.buildOne(root, target, false, runLog); err != nil {
 			// The successful builds so far are still recorded: they DID happen,
 			// and forgetting them would rebuild them on the retry.
 			a.rememberBuilt(r, trigger, built)

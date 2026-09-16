@@ -137,7 +137,7 @@ func main() {
 		// internal/deploy imports internal/controller, so the dependency
 		// cannot run both ways. The spec arrives as raw JSON because only
 		// this file can name deploy.Spec.
-		BuildFromSource: func(app string, src io.Reader, buildSpec json.RawMessage, force bool) error {
+		BuildFromSource: func(app string, src io.Reader, buildSpec json.RawMessage, force bool, output io.Writer) error {
 			var spec *deploy.Spec
 
 			if len(buildSpec) > 0 {
@@ -151,9 +151,18 @@ func main() {
 				}
 			}
 
+			// The journal keeps every line it always had; the deploy plane's
+			// copy is what reaches the console.
+			var logWriter io.Writer = os.Stdout
+
+			if output != nil {
+				logWriter = io.MultiWriter(os.Stdout, output)
+			}
+
 			return deploy.RunFromTarball(app, src, deploy.Options{
-				Spec:  spec,
-				Force: force,
+				Spec:      spec,
+				Force:     force,
+				LogWriter: logWriter,
 
 				// Beside the state this box already writes, never /tmp — a
 				// hardened unit or a read-only rootfs makes that unwritable,

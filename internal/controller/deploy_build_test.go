@@ -188,7 +188,7 @@ func TestEachWorkloadIsBuiltFromItsOwnContext(t *testing.T) {
 	seen := map[string]string{}
 
 	api, _ := newTestAPI(t)
-	api.BuildFromSource = func(app string, src io.Reader, _ json.RawMessage, _ bool) error {
+	api.BuildFromSource = func(app string, src io.Reader, _ json.RawMessage, _ bool, _ io.Writer) error {
 		seen[app] = tarContents(t, src)
 
 		return nil
@@ -198,7 +198,7 @@ func TestEachWorkloadIsBuiltFromItsOwnContext(t *testing.T) {
 		{App: "runa-pwa", Path: "apps/pwa", Ref: "deployment/runa/pwa"},
 		{App: "runa-api", Path: "apps/api", Ref: "deployment/runa/api"},
 	} {
-		if err := api.buildOne(root, target, false); err != nil {
+		if err := api.buildOne(root, target, false, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,9 +230,9 @@ func TestBuildOneReportsAMissingContext(t *testing.T) {
 	}
 
 	api, _ := newTestAPI(t)
-	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool) error { return nil }
+	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool, io.Writer) error { return nil }
 
-	err = api.buildOne(root, buildTarget{App: "runa-pwa", Path: "apps/pwa", Ref: "deployment/runa/pwa"}, false)
+	err = api.buildOne(root, buildTarget{App: "runa-pwa", Path: "apps/pwa", Ref: "deployment/runa/pwa"}, false, io.Discard)
 
 	if err == nil {
 		t.Fatal("a missing build path must be refused")
@@ -246,11 +246,11 @@ func TestBuildOneReportsAMissingContext(t *testing.T) {
 // A build path escaping the repository would read from the box's filesystem.
 func TestBuildOneRefusesAnEscapingPath(t *testing.T) {
 	api, _ := newTestAPI(t)
-	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool) error { return nil }
+	api.BuildFromSource = func(string, io.Reader, json.RawMessage, bool, io.Writer) error { return nil }
 
 	dir := t.TempDir()
 
-	if err := api.buildOne(dir, buildTarget{App: "x", Path: "../../etc", Ref: "deployment/x/y"}, false); err == nil {
+	if err := api.buildOne(dir, buildTarget{App: "x", Path: "../../etc", Ref: "deployment/x/y"}, false, io.Discard); err == nil {
 		t.Fatal("a path outside the repository must be refused")
 	}
 }

@@ -40,7 +40,12 @@ import (
 // package, so calling it directly would be a cycle. `buildSpec` is the
 // workload's spec as raw JSON — the wiring in main.go decodes it into the
 // deploy package's own type, which is the only place that can name it.
-type SourceBuilder func(app string, context io.Reader, buildSpec json.RawMessage, force bool) error
+// `output` receives the pipeline's progress lines — the same text an operator
+// sees scroll past on `vd apply`. The deploy plane keeps it to hand back to
+// the console, because a build that fails with only "422" leaves the reason
+// in a journal on a box the person reading the console may not be able to
+// reach. The builder must still write to its own log; this is a copy.
+type SourceBuilder func(app string, context io.Reader, buildSpec json.RawMessage, force bool, output io.Writer) error
 
 // buildTarget is one workload that must be built before it can be applied.
 type buildTarget struct {
@@ -262,7 +267,7 @@ func safeArchiveJoin(base, rel string) (string, error) {
 //
 // Streamed through a pipe rather than buffered: the context can be hundreds of
 // megabytes, and the builder consumes it as the tar is produced.
-func (a *API) buildOne(root string, target buildTarget, force bool) error {
+func (a *API) buildOne(root string, target buildTarget, force bool, output io.Writer) error {
 	contextDir, err := safeArchiveJoin(root, target.Path)
 	if err != nil {
 		return fmt.Errorf("%s: build path %q is not inside the repository", target.Ref, target.Path)
@@ -286,7 +291,7 @@ func (a *API) buildOne(root string, target buildTarget, force bool) error {
 
 	defer pr.Close()
 
-	if err := a.BuildFromSource(target.App, pr, target.Spec, force); err != nil {
+	if err := a.BuildFromSource(target.App, pr, target.Spec, force, output); err != nil {
 		return fmt.Errorf("%s: %w", target.Ref, err)
 	}
 
