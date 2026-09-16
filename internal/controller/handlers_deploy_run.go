@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -91,6 +92,11 @@ type deployRunResponse struct {
 	// `deploy: manual`. Not applied, not an error: they are waiting for a
 	// dispatch, and the console shows a play button beside each one.
 	Held []string `json:"held,omitempty"`
+
+	// Released names the deployments (scope/name) whose release phase ran
+	// after the apply — the ones carrying a `release {}` block. See
+	// releaseDeployments for why the deploy plane has to run it.
+	Released []string `json:"released,omitempty"`
 
 	// Resources is WHAT THIS COMMIT PUT ON THE BOX, as (kind, scope, name).
 	//
@@ -199,13 +205,14 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, spec := range specs {
-		resources, err := a.applyFromRepo(w, r, trigger, req, token, snap, spec)
+		resources, released, err := a.applyFromRepo(w, r, trigger, req, token, snap, spec)
 		if err != nil {
 			return
 		}
 
 		out.Applied = append(out.Applied, spec.Name)
 		out.Resources = append(out.Resources, resources...)
+		out.Released = append(out.Released, released...)
 	}
 
 	a.touchTrigger(r, trigger)
@@ -309,28 +316,28 @@ func resourcesOf(manifests []Manifest) []DeployedResource {
 func (a *API) applyFromRepo(
 	w http.ResponseWriter, r *http.Request, trigger *Trigger,
 	req deployRunRequest, token string, snap repoSnapshot, spec triggerspec.Spec,
-) ([]DeployedResource, error) {
+) ([]DeployedResource, []string, error) {
 	raw, err := a.fetchRepoFile(r, trigger.Repo, token, snap, spec.Apply.File)
 	if err != nil {
 		writeErr(w, http.StatusUnprocessableEntity,
 			fmt.Errorf("%s names apply.file %q, which is not in the repository at %s",
 				spec.Name, spec.Apply.File, short(req.SHA)))
 
-		return nil, err
+		return nil, nil, err
 	}
 
 	manifests, err := a.ParseManifests(bytes.NewReader(raw), formatFor(spec.Apply.File), nil)
 	if err != nil {
 		writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("%s: %w", spec.Apply.File, err))
 
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(manifests) == 0 {
 		err := fmt.Errorf("%s declares no resources", spec.Apply.File)
 		writeErr(w, http.StatusUnprocessableEntity, err)
 
-		return nil, err
+		return nil, nil, err
 	}
 
 	// INVARIANT II, applied to what will ACTUALLY be applied.
@@ -349,7 +356,7 @@ func (a *API) applyFromRepo(
 
 		writeErr(w, http.StatusForbidden, err)
 
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Build mode: the workload names no image, so one is produced here from
@@ -369,21 +376,109 @@ func (a *API) applyFromRepo(
 
 			writeErr(w, http.StatusServiceUnavailable, err)
 
-			return nil, err
+			return nil, nil, err
 		}
 
 		if err := a.buildTargetsFromRepo(r, trigger, req, token, snap, targets); err != nil {
 			writeErr(w, http.StatusUnprocessableEntity, err)
 
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if err := a.applyManifestsInProcess(w, r, trigger, req, spec, manifests); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return resourcesOf(manifests), nil
+	released, err := a.releaseDeployments(w, r, spec, manifests)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resourcesOf(manifests), released, nil
+}
+
+// releaseDeployments runs the release phase for every deployment the file
+// just applied that carries a `release {}` block.
+//
+// THE RECONCILER WILL NOT ROLL THESE ON ITS OWN. A deployment with a release
+// block is one whose new image must not serve traffic before its migration
+// has run, so the reconciler logs "awaiting vd release run" and leaves the
+// old replicas in place. `vd apply` covers that by firing `release run` after
+// its apply (cmd/cli/apply.go, "Release-phase auto-trigger"). A push that
+// arrives here instead of through the CLI got the build and the apply and
+// nothing else — a deploy the console reported as succeeded while the box
+// kept running last week's image, with the only hint a line in the journal.
+//
+// Same idempotency as the CLI path: Release finds a Succeeded record for the
+// spec hash and skips a run that already happened, so a redelivered webhook
+// does not migrate twice.
+//
+// The migration's output goes to the controller log rather than the
+// response: this endpoint answers JSON to a console, not text to a terminal,
+// and a failed release is reported the way a failed build is — the deploy
+// fails, with the reason, and the record shows up in `vd release history`.
+func (a *API) releaseDeployments(
+	w http.ResponseWriter, r *http.Request, spec triggerspec.Spec, manifests []Manifest,
+) ([]string, error) {
+	var released []string
+
+	for i := range manifests {
+		m := &manifests[i]
+
+		if m.Kind != KindDeployment || !manifestHasReleaseBlock(m) {
+			continue
+		}
+
+		ref := m.Scope + "/" + m.Name
+
+		if a.Deployments == nil {
+			err := fmt.Errorf("%s: %s has a release block, and this controller has no release runner wired", spec.Apply.File, ref)
+			writeErr(w, http.StatusServiceUnavailable, err)
+
+			return nil, err
+		}
+
+		var output bytes.Buffer
+
+		if err := a.Deployments.Release(r.Context(), m.Scope, m.Name, &output); err != nil {
+			log.Printf("deploy/%s release of %s failed: %v\n%s", spec.Name, ref, err, output.String())
+
+			err = fmt.Errorf("release of %s failed: %w", ref, err)
+			writeErr(w, http.StatusUnprocessableEntity, err)
+
+			return nil, err
+		}
+
+		log.Printf("deploy/%s release of %s:\n%s", spec.Name, ref, output.String())
+
+		released = append(released, ref)
+	}
+
+	return released, nil
+}
+
+// manifestHasReleaseBlock reports whether a deployment manifest carries a
+// non-empty release block — the same probe the CLI's auto-trigger uses, so
+// the two paths cannot disagree about which deployments get a release phase.
+func manifestHasReleaseBlock(m *Manifest) bool {
+	if len(m.Spec) == 0 {
+		return false
+	}
+
+	var probe struct {
+		Release *struct {
+			Command     []string `json:"command,omitempty"`
+			PreCommand  []string `json:"pre_command,omitempty"`
+			PostCommand []string `json:"post_command,omitempty"`
+		} `json:"release,omitempty"`
+	}
+
+	if err := json.Unmarshal(m.Spec, &probe); err != nil || probe.Release == nil {
+		return false
+	}
+
+	return len(probe.Release.Command) > 0 || len(probe.Release.PreCommand) > 0 || len(probe.Release.PostCommand) > 0
 }
 
 // buildTargetsFromRepo builds the workloads whose source actually changed.

@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -630,5 +631,78 @@ func TestDeployRunRefusesAnUnknownMode(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400: %s", resp.StatusCode, body)
+	}
+}
+
+// A deployment with a release block is one the reconciler refuses to roll on
+// its own: it waits for the release phase, which `vd apply` fires after its
+// apply. The deploy plane has to do the same, or a push builds an image the
+// old replicas never pick up.
+func TestDeployRunRunsTheReleasePhaseForDeploymentsWithAReleaseBlock(t *testing.T) {
+	api, ts := newRunAPI(t, repoFiles(), true, map[string][]Manifest{
+		"MANIFEST-BODY": {
+			{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1","release":{"command":["bin/rails","db:migrate"]}}`)},
+			{Kind: KindDeployment, Scope: "runa", Name: "worker", Spec: json.RawMessage(`{"image":"x:1"}`)},
+		},
+	})
+
+	restarter := &fakeRestarter{}
+	api.Deployments = restarter
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	if restarter.gotVerb != "release" || restarter.gotScope != "runa" || restarter.gotName != "web" {
+		t.Fatalf("release phase did not run for runa/web: verb=%q scope=%q name=%q", restarter.gotVerb, restarter.gotScope, restarter.gotName)
+	}
+
+	if !strings.Contains(body, `"released":["runa/web"]`) {
+		t.Fatalf("response should name the released deployment, and only it: %s", body)
+	}
+}
+
+func TestDeployRunFailsWhenTheReleasePhaseFails(t *testing.T) {
+	api, ts := newRunAPI(t, repoFiles(), true, map[string][]Manifest{
+		"MANIFEST-BODY": {
+			{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1","release":{"command":["bin/rails","db:migrate"]}}`)},
+		},
+	})
+
+	api.Deployments = &fakeRestarter{err: errors.New("exit 1")}
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422: %s", resp.StatusCode, body)
+	}
+
+	if !strings.Contains(body, "release of runa/web failed") {
+		t.Fatalf("the reason should name the deployment: %s", body)
+	}
+}
+
+func TestDeployRunSkipsTheReleasePhaseWithoutAReleaseBlock(t *testing.T) {
+	api, ts := newRunAPI(t, repoFiles(), true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	restarter := &fakeRestarter{}
+	api.Deployments = restarter
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	if restarter.gotVerb != "" {
+		t.Fatalf("no release block, yet the release phase ran (%s)", restarter.gotVerb)
+	}
+
+	if strings.Contains(body, `"released"`) {
+		t.Fatalf("released should be omitted when nothing was released: %s", body)
 	}
 }
