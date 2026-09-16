@@ -592,9 +592,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// their resolver answering.
 	mesh.serve(recCtx, meshDNS, s.cfg.Logger.Printf)
 
-	// Bring wg0's peers to what etcd says, for a host that rebooted or
-	// recreated wg0. Nothing to apply on a host without peers, and a host
-	// without wg0 only logs.
+	// Bring wg0's peers — and the routes to their containers, which
+	// wg-quick does not restore for them — to what etcd says, for a host
+	// that rebooted or recreated wg0. Nothing to apply on a host without
+	// peers, and a host without wg0 only logs.
 	if peers, err := store.ListWirePeers(recCtx); err == nil && len(peers) > 0 {
 		if err := wire.Apply(recCtx); err != nil {
 			s.cfg.Logger.Printf("wire: %v", err)

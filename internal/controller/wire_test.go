@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -111,6 +112,38 @@ func (f *fakeWG) removed() []string {
 	return out
 }
 
+// fakeIP tracks the routes `ip route replace/del ... dev wg0` leave on the
+// interface, and answers `ip route show`.
+type fakeIP struct {
+	routes map[string]bool
+	calls  []string
+}
+
+func (f *fakeIP) run(args ...string) ([]byte, error) {
+	f.calls = append(f.calls, strings.Join(args, " "))
+
+	if f.routes == nil {
+		f.routes = map[string]bool{}
+	}
+
+	switch {
+	case len(args) >= 4 && args[1] == "route" && args[2] == "replace":
+		f.routes[args[3]] = true
+	case len(args) >= 4 && args[1] == "route" && args[2] == "del":
+		delete(f.routes, args[3])
+	case len(args) >= 3 && args[1] == "route" && args[2] == "show":
+		out := "10.254.0.0/16 proto kernel scope link src 10.254.91.221\n"
+
+		for r := range f.routes {
+			out += r + " scope link\n"
+		}
+
+		return []byte(out), nil
+	}
+
+	return nil, nil
+}
+
 func newTestWire(t *testing.T) (*Wire, *memStore, *fakeWG) {
 	t.Helper()
 
@@ -121,6 +154,7 @@ func newTestWire(t *testing.T) (*Wire, *memStore, *fakeWG) {
 		Store:        store,
 		ConfPath:     filepath.Join(t.TempDir(), "wire", "peers.conf"),
 		Run:          wg.run,
+		RunIP:        (&fakeIP{}).run,
 		LocalAddress: func() netip.Addr { return netip.MustParseAddr("10.254.91.221") },
 		OutboundIP:   func() netip.Addr { return netip.MustParseAddr("152.53.91.221") },
 	}
@@ -480,5 +514,55 @@ func TestWire_UFWNeedsARoutedVoodu0(t *testing.T) {
 	bridge, rules, err := w.UFW()
 	if err != nil || bridge != "br-21f70aa6d28e" || len(rules) != 4 {
 		t.Fatalf("bridge=%q rules=%v err=%v", bridge, rules, err)
+	}
+}
+
+// The peer's containers are reached through wg0 only if the kernel has a
+// route: wg-quick adds none for a peer that arrived after `up`.
+func TestWire_AddRoutesThePeersContainersAndRemoveDropsIt(t *testing.T) {
+	w, _, _ := newTestWire(t)
+	ip := &fakeIP{}
+	w.RunIP = ip.run
+	ctx := context.Background()
+
+	if _, err := w.Add(ctx, WirePeer{PublicKey: testKey(2), Address: "10.254.167.105"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ip.routes["10.167.105.0/24"] {
+		t.Fatalf("no route to the peer's containers: %v", ip.calls)
+	}
+
+	if !slices.Contains(ip.calls, "-4 route replace 10.167.105.0/24 dev wg0") {
+		t.Fatalf("route not installed on wg0: %v", ip.calls)
+	}
+
+	if err := w.Remove(ctx, "10.254.167.105"); err != nil {
+		t.Fatal(err)
+	}
+
+	if ip.routes["10.167.105.0/24"] {
+		t.Fatalf("route survived the remove: %v", ip.calls)
+	}
+
+	for _, c := range ip.calls {
+		if strings.Contains(c, "10.254.0.0/16") {
+			t.Fatalf("the tunnel's own route must never be touched: %v", ip.calls)
+		}
+	}
+}
+
+func TestParseContainerRoutes(t *testing.T) {
+	out := "10.254.0.0/16 proto kernel scope link src 10.254.91.221\n" +
+		"10.167.105.0/24 scope link\n" +
+		"10.200.7.0/24 scope link\n" +
+		"192.168.1.0/24 scope link\n" +
+		"10.0.0.0/8 via 10.254.0.1\n"
+
+	got := ParseContainerRoutes([]byte(out))
+
+	want := []string{"10.167.105.0/24", "10.200.7.0/24"}
+	if len(got) != 2 || got[0].String() != want[0] || got[1].String() != want[1] {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

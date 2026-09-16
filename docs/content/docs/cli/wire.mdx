@@ -105,7 +105,11 @@ says so. Any other firewall takes the same four rules in its own syntax.
 ## What it changes
 
 - `add` writes the peer to the controller's store and to
-  `/opt/voodu/wire/peers.conf`, then runs `wg addconf wg0` on that file; a removed peer is dropped with `wg set`.
+  `/opt/voodu/wire/peers.conf`, runs `wg addconf wg0` on that file, and adds
+  the kernel route to the peer's container subnet through `wg0` (wg-quick
+  only routes the peers in `wg0.conf`, at `up`). `remove` drops both.
+- After a reboot the peers come back with `wg0` (PostUp) and their routes
+  with the controller, seconds later.
 - The mesh DNS reads its peer list from `wg0`, so a new peer's names resolve
   within 30 seconds. Nothing to restart.
 - `add` and `remove` land in the activity trail.

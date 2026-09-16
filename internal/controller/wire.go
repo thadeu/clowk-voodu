@@ -226,6 +226,9 @@ type Wire struct {
 	// Empty on a host whose voodu0 is not routed.
 	Bridge func() string
 
+	// RunIP executes `ip`. A seam for tests; nil runs the real binary.
+	RunIP func(args ...string) ([]byte, error)
+
 	Logf func(string, ...any)
 
 	// mu serialises add, remove and apply: two at once would race on the
@@ -241,6 +244,20 @@ func (w *Wire) run(args ...string) ([]byte, error) {
 	out, err := exec.Command("wg", args...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("wg %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+
+	return out, nil
+}
+
+func (w *Wire) ip(args ...string) ([]byte, error) {
+	if w.RunIP != nil {
+		return w.RunIP(args...)
+	}
+
+	out, err := exec.Command("ip", args...).CombinedOutput()
+
+	if err != nil {
+		return nil, fmt.Errorf("ip %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 
 	return out, nil
@@ -320,7 +337,74 @@ func (w *Wire) apply(ctx context.Context) error {
 		}
 	}
 
+	return w.routes(peers)
+}
+
+// routes keeps the kernel's routes to the peers' container subnets in step
+// with the peers. wg-quick installs routes for AllowedIPs only at `up`, from
+// wg0.conf; a peer that arrives through addconf gets none, and a packet for
+// the other host's containers leaves through the default route instead —
+// how the first end-to-end run lost every connection while every name
+// resolved. The tunnel addresses themselves need nothing: wg0's own /16
+// covers them.
+func (w *Wire) routes(peers []WirePeer) error {
+	wanted := map[netip.Prefix]bool{}
+
+	for _, p := range peers {
+		if addr, err := netip.ParseAddr(p.Address); err == nil {
+			wanted[containerSubnetFor(addr)] = true
+		}
+	}
+
+	for prefix := range wanted {
+		if _, err := w.ip("-4", "route", "replace", prefix.String(), "dev", "wg0"); err != nil {
+			return unavailable(err)
+		}
+	}
+
+	out, err := w.ip("-4", "route", "show", "dev", "wg0")
+
+	if err != nil {
+		return unavailable(err)
+	}
+
+	for _, prefix := range ParseContainerRoutes(out) {
+		if wanted[prefix] {
+			continue
+		}
+
+		if _, err := w.ip("-4", "route", "del", prefix.String(), "dev", "wg0"); err != nil {
+			return unavailable(err)
+		}
+	}
+
 	return nil
+}
+
+// ParseContainerRoutes reads `ip -4 route show dev wg0` and returns the
+// routes that look like a peer's container subnet — a /24 in 10.0.0.0/8
+// outside the tunnel. The tunnel's own /16 and anything else on the
+// interface is left alone.
+func ParseContainerRoutes(out []byte) []netip.Prefix {
+	var routes []netip.Prefix
+
+	sc := bufio.NewScanner(bytes.NewReader(out))
+
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) == 0 {
+			continue
+		}
+
+		p, err := netip.ParsePrefix(fields[0])
+		if err != nil || p.Bits() != 24 || !p.Addr().Is4() || p.Addr().As4()[0] != 10 || meshdns.Tunnel.Contains(p.Addr()) {
+			continue
+		}
+
+		routes = append(routes, p)
+	}
+
+	return routes
 }
 
 // Add validates, stores and applies one peer.

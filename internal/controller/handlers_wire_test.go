@@ -23,6 +23,7 @@ func newWireAPI(t *testing.T) (*API, *fakeWG, string) {
 		Store:        store,
 		ConfPath:     filepath.Join(t.TempDir(), "peers.conf"),
 		Run:          wg.run,
+		RunIP:        (&fakeIP{}).run,
 		LocalAddress: func() netip.Addr { return netip.MustParseAddr("10.254.91.221") },
 		OutboundIP:   func() netip.Addr { return netip.MustParseAddr("152.53.91.221") },
 	}
