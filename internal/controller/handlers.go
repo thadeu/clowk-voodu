@@ -285,6 +285,12 @@ type probesWireSpec struct {
 	Startup   *probeWireSpec `json:"startup,omitempty"`
 }
 
+// reportsReadiness is whether a replica with these probes will ever say
+// it is ready: only a readiness or startup probe does. nil-safe.
+func (p *probesWireSpec) reportsReadiness() bool {
+	return p != nil && (p.Readiness != nil || p.Startup != nil)
+}
+
 // probeWireSpec is the on-the-wire shape of one probe configuration.
 // All three actions are nullable; the parser enforces exactly-one at
 // apply time, so by the time we decode here we trust the shape.
@@ -1003,16 +1009,20 @@ var readinessWaitTimeout = 2 * time.Minute
 // awaitReplicaReady blocks until the replacement replica reports
 // ready, or the budget runs out.
 //
-// A deployment with no probes declared reports ready immediately —
-// that is the registry's own rule, and it is the honest answer: with
-// nothing to check, the platform cannot know more than "the container
-// started".
+// A deployment with nothing that can report readiness — no readiness
+// and no startup probe — is ready the moment it started: with nothing
+// to check, the platform cannot know more than "the container
+// started", and waiting for a report that no runner will ever make
+// only stalls the roll for the whole budget. The registry never
+// registers such a replica, so the lookup would stay "unknown" until
+// the deadline — which is what every surge of a probe-less deployment
+// used to pay, two minutes per replica.
 //
 // Never fails the roll. A replacement that will not come up is a
 // problem the next reconcile and the probe alerts will surface;
 // wedging the rollout on it would turn a bad deploy into a stuck one.
-func (h *DeploymentHandler) awaitReplicaReady(ctx context.Context, containerName string) {
-	if h.Probes == nil {
+func (h *DeploymentHandler) awaitReplicaReady(ctx context.Context, containerName string, probes *probesWireSpec) {
+	if h.Probes == nil || !probes.reportsReadiness() {
 		return
 	}
 
@@ -1768,7 +1778,7 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// IS the rollout gate, which is why the fixed pause below only
 		// applies to the path that has no gate.
 		if surge {
-			h.awaitReplicaReady(ctx, newName)
+			h.awaitReplicaReady(ctx, newName, spec.Probes)
 
 			if err := retireOld(); err != nil {
 				return err

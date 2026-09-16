@@ -35,6 +35,16 @@ func rewriteColonSyntax(argv []string) []string {
 	for i := 1; i < len(argv); i++ {
 		tok := argv[i]
 
+		// Everything after `--` belongs to the command that runs in the
+		// container, not to voodu: `vd exec app -- rails db:migrate` must
+		// hand rails `db:migrate`, not `db migrate` (which rails reads
+		// as `dbconsole`). Copy the rest verbatim.
+		if tok == "--" {
+			out = append(out, argv[i:]...)
+
+			break
+		}
+
 		if skipFlagValue {
 			out = append(out, tok)
 			skipFlagValue = false

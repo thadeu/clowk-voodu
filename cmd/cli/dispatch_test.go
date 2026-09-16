@@ -22,6 +22,16 @@ func TestRewriteColonSyntax(t *testing.T) {
 			want: []string{"voodu", "get", "pods"},
 		},
 		{
+			name: "everything after -- is the container's, untouched",
+			in:   []string{"voodu", "exec", "contagorda/api", "--", "bundle", "exec", "rails", "db:migrate:status"},
+			want: []string{"voodu", "exec", "contagorda/api", "--", "bundle", "exec", "rails", "db:migrate:status"},
+		},
+		{
+			name: "a colon command before -- still rewrites, the rest does not",
+			in:   []string{"voodu", "pg:psql", "contagorda/pg", "--", "-c", "select 1", "a:b"},
+			want: []string{"voodu", "pg", "psql", "contagorda/pg", "--", "-c", "select 1", "a:b"},
+		},
+		{
 			name: "config:set reorders ref before verb",
 			in:   []string{"voodu", "config:set", "clowk-lp/web", "FOO=bar"},
 			want: []string{"voodu", "config", "clowk-lp/web", "set", "FOO=bar"},

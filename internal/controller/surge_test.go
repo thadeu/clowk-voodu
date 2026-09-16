@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go.voodu.clowk.in/internal/containers"
 )
@@ -91,5 +92,37 @@ func TestRolloutSurgesWhenPortsAllow(t *testing.T) {
 				t.Fatalf("order was %v, want %v", fc.ops, tc.want)
 			}
 		})
+	}
+}
+
+// A replica with no readiness or startup probe can never report ready:
+// the registry does not track it. The surge must not spend its whole
+// budget waiting for a report nobody will make.
+func TestAwaitReplicaReadySkipsReplicasWithoutReadinessProbes(t *testing.T) {
+	oldTimeout, oldPoll := readinessWaitTimeout, readinessPollInterval
+	readinessWaitTimeout, readinessPollInterval = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { readinessWaitTimeout, readinessPollInterval = oldTimeout, oldPoll })
+
+	h := &DeploymentHandler{Log: quietLogger(), Probes: &ProbeRegistry{Log: quietLogger()}}
+
+	for _, probes := range []*probesWireSpec{
+		nil,
+		{},
+		{Liveness: &probeWireSpec{}},
+	} {
+		start := time.Now()
+		h.awaitReplicaReady(context.Background(), "clowk-web.93cb", probes)
+
+		if d := time.Since(start); d >= readinessWaitTimeout {
+			t.Fatalf("probes=%+v: waited %s for a replica that cannot report ready", probes, d)
+		}
+	}
+
+	// A readiness probe that never reports keeps the wait, up to the budget.
+	start := time.Now()
+	h.awaitReplicaReady(context.Background(), "clowk-web.93cb", &probesWireSpec{Readiness: &probeWireSpec{}})
+
+	if d := time.Since(start); d < readinessWaitTimeout {
+		t.Fatalf("a declared readiness probe must be waited for, returned after %s", d)
 	}
 }
