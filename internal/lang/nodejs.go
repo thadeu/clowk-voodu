@@ -39,10 +39,10 @@ func toolchainLabel(manager string) string {
 
 func (l *Nodejs) Build(appName string, spec *BuildSpec, releaseDir string) error {
 	manager, _ := nodePackageManager(releaseDir)
-	fmt.Printf("-----> building %s application...\n", toolchainLabel(manager))
+	fmt.Fprintf(spec.out(), "-----> building %s application...\n", toolchainLabel(manager))
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> using pre-built image from registry...")
+		fmt.Fprintln(spec.out(), "-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -52,7 +52,7 @@ func (l *Nodejs) Build(appName string, spec *BuildSpec, releaseDir string) error
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> pre-built image ready for deployment!")
+		fmt.Fprintln(spec.out(), "-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -65,22 +65,22 @@ func (l *Nodejs) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return err
 	}
 
-	fmt.Println("-----> node.js build complete!")
+	fmt.Fprintln(spec.out(), "-----> node.js build complete!")
 
 	return nil
 }
 
 func (l *Nodejs) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> deploying node.js application...")
+	fmt.Fprintln(spec.out(), "-----> deploying node.js application...")
 	return deployContainer(appName, spec, releaseDir)
 }
 
 func (l *Nodejs) Restart(appName string, spec *BuildSpec) error {
-	return restartContainer(appName)
+	return restartContainer(spec.out(), appName)
 }
 
 func (l *Nodejs) Cleanup(appName string, spec *BuildSpec) error {
-	return cleanupReleases(appName)
+	return cleanupReleases(spec.out(), appName)
 }
 
 func (l *Nodejs) DetectLanguage(releaseDir string) (string, error) {
@@ -104,11 +104,11 @@ func (l *Nodejs) EnsureDockerfile(releaseDir string, appName string, spec *Build
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> using existing dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using existing dockerfile")
 		return nil
 	}
 
-	fmt.Println("-----> generating dockerfile...")
+	fmt.Fprintln(spec.out(), "-----> generating dockerfile...")
 
 	dockerfileContent := l.generateDockerfile(spec, appName, releaseDir)
 
@@ -251,7 +251,7 @@ func nodeBaseImage(version string) string {
 	}
 
 	img := util.DetectNodeVersion(".")
-	fmt.Printf("-----> detected node.js version: %s\n", img)
+	fmt.Fprintf(os.Stdout, "-----> detected node.js version: %s\n", img)
 
 	return img
 }
@@ -272,7 +272,7 @@ func (l *Nodejs) generateBunDockerfile(appName, entrypoint, version string) stri
 
 	baseImage := fmt.Sprintf("oven/bun:%s", tag)
 
-	fmt.Printf("-----> detected bun project — base image: %s\n", baseImage)
+	fmt.Fprintf(os.Stdout, "-----> detected bun project — base image: %s\n", baseImage)
 
 	// `bun.lock*` matches BOTH bun.lock (text) and bun.lockb (binary),
 	// and nodePackageManager only routes here when one of them exists, so
@@ -321,7 +321,7 @@ func (l *Nodejs) generateCorepackDockerfile(appName, entrypoint, manager, nodeVe
 		lockfile = "yarn.lock"
 	}
 
-	fmt.Printf("-----> detected %s project (packagemanager) — base image: %s\n", manager, baseImage)
+	fmt.Fprintf(os.Stdout, "-----> detected %s project (packagemanager) — base image: %s\n", manager, baseImage)
 
 	return fmt.Sprintf(`# Generated Dockerfile for Node.js (%s) application
 # App: %s

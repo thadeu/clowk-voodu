@@ -19,10 +19,10 @@ func (l *Python) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> building python application...")
+	fmt.Fprintln(spec.out(), "-----> building python application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> using pre-built image from registry...")
+		fmt.Fprintln(spec.out(), "-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -32,7 +32,7 @@ func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> pre-built image ready for deployment!")
+		fmt.Fprintln(spec.out(), "-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -45,22 +45,22 @@ func (l *Python) Build(appName string, spec *BuildSpec, releaseDir string) error
 		return err
 	}
 
-	fmt.Println("-----> python build complete!")
+	fmt.Fprintln(spec.out(), "-----> python build complete!")
 
 	return nil
 }
 
 func (l *Python) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> deploying python application...")
+	fmt.Fprintln(spec.out(), "-----> deploying python application...")
 	return deployContainer(appName, spec, releaseDir)
 }
 
 func (l *Python) Restart(appName string, spec *BuildSpec) error {
-	return restartContainer(appName)
+	return restartContainer(spec.out(), appName)
 }
 
 func (l *Python) Cleanup(appName string, spec *BuildSpec) error {
-	return cleanupReleases(appName)
+	return cleanupReleases(spec.out(), appName)
 }
 
 func (l *Python) DetectLanguage(releaseDir string) (string, error) {
@@ -88,11 +88,11 @@ func (l *Python) EnsureDockerfile(releaseDir string, appName string, spec *Build
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> using existing dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using existing dockerfile")
 		return nil
 	}
 
-	fmt.Println("-----> generating dockerfile for python...")
+	fmt.Fprintln(spec.out(), "-----> generating dockerfile for python...")
 
 	dockerfileContent := l.generateDockerfile(spec, appName)
 
@@ -115,7 +115,7 @@ func (l *Python) generateDockerfile(spec *BuildSpec, appName string) string {
 			baseImage = fmt.Sprintf("python:%s-slim", block.Version)
 		} else {
 			baseImage = util.DetectPythonVersion(".")
-			fmt.Printf("-----> using python fallback: %s\n", baseImage)
+			fmt.Fprintf(spec.out(), "-----> using python fallback: %s\n", baseImage)
 		}
 	}
 

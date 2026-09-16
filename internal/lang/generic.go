@@ -13,7 +13,7 @@ import (
 type Generic struct{}
 
 func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> building generic application...")
+	fmt.Fprintln(spec.out(), "-----> building generic application...")
 
 	var dockerfilePath string
 
@@ -25,16 +25,16 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
 				dockerfilePath = workdirDockerfilePath
-				fmt.Printf("-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
+				fmt.Fprintf(spec.out(), "-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 			} else {
-				fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
+				fmt.Fprintf(spec.out(), "-----> using custom dockerfile: %s\n", spec.Dockerfile)
 			}
 		} else {
-			fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
+			fmt.Fprintf(spec.out(), "-----> using custom dockerfile: %s\n", spec.Dockerfile)
 		}
 	} else {
 		dockerfilePath = filepath.Join(releaseDir, "Dockerfile")
-		fmt.Println("-----> using default dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using default dockerfile")
 	}
 
 	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
@@ -68,20 +68,20 @@ func (l *Generic) Build(appName string, spec *BuildSpec, releaseDir string) erro
 		cmd.Args = append(cmd.Args, "--label", label)
 	}
 
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = spec.out()
+	cmd.Stderr = spec.out()
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("docker build failed: %v", err)
 	}
 
-	fmt.Println("-----> generic build complete!")
+	fmt.Fprintln(spec.out(), "-----> generic build complete!")
 
 	return nil
 }
 
 func (l *Generic) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> deploying generic application...")
+	fmt.Fprintln(spec.out(), "-----> deploying generic application...")
 
 	envFile := paths.AppEnvFile(appName)
 
@@ -112,11 +112,11 @@ func (l *Generic) Deploy(appName string, spec *BuildSpec, releaseDir string) err
 }
 
 func (l *Generic) Restart(appName string, spec *BuildSpec) error {
-	return restartContainer(appName)
+	return restartContainer(spec.out(), appName)
 }
 
 func (l *Generic) Cleanup(appName string, spec *BuildSpec) error {
-	return cleanupReleases(appName)
+	return cleanupReleases(spec.out(), appName)
 }
 
 func (l *Generic) DetectLanguage(releaseDir string) (string, error) {
@@ -131,7 +131,7 @@ func (l *Generic) EnsureDockerfile(releaseDir string, appName string, spec *Buil
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> using existing dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using existing dockerfile")
 		return nil
 	}
 

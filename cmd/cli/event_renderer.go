@@ -311,13 +311,17 @@ func (r *eventRenderer) handleLogLocked(e progress.Event) {
 		fmt.Fprintf(r.out, "%s %s\n", cross(), e.Text)
 
 	default:
-		// info inside an active step gets swallowed (spinner is the
-		// story) but we still advance the frame so chatter-heavy phases
-		// animate even when the ticker is lock-starved. The live build
-		// tail is fed by the RAW build sub-output (non-JSON frames in
-		// processLineLocked), not by these structured info logs.
+		// info inside an active step feeds the live tail under the
+		// spinner and never prints inline: the block shows the current
+		// phase and collapses on step end, so the transcript stays a
+		// list of ✓ lines. The build's sub-output — lang banners and
+		// `docker build` — arrives here as structured log frames now
+		// that the server routes handler output through its reporter;
+		// it used to reach the tail as raw non-JSON lines (still
+		// accepted in processLineLocked for older servers). Either
+		// way the tail is what the operator watches during a build.
 		if r.active {
-			r.advanceAndRenderLocked()
+			r.pushTailLocked(e.Text)
 			return
 		}
 

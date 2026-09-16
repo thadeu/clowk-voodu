@@ -293,9 +293,40 @@ func TestEventRendererWarnEscapesSpinner(t *testing.T) {
 		t.Errorf("warn must always surface:\n%s", got)
 	}
 
-	if strings.Contains(got, "#1 internal stage") {
-		t.Errorf("info-level log during active step must be swallowed:\n%s", got)
+	// The info line belongs to the live tail: rendered while the step
+	// runs, cleared when it ends. So it may appear in the raw buffer
+	// (the block is painted there), but never AFTER the step's ✓ line —
+	// that is where an inline print would land.
+	if idx := strings.Index(got, "Building release..."); idx >= 0 {
+		after := got[strings.LastIndex(got, "Building release..."):]
+
+		if strings.Contains(after, "#1 internal stage") {
+			t.Errorf("info-level log must not print inline after the step closes:\n%s", got)
+		}
 	}
+}
+
+// The build transcript reaches the client as info log frames (the
+// server routes `docker build` through its reporter). During the build
+// step they must feed the tail block the operator watches, not vanish.
+func TestEventRendererInfoLogFeedsTheLiveTail(t *testing.T) {
+	var buf bytes.Buffer
+
+	r := forceEventRenderer(t, &buf, false)
+
+	writeEvents(t, r, []progress.Event{
+		{Type: progress.EventHello, Protocol: progress.ProtocolVersion},
+		{Type: progress.EventStepStart, ID: "build", Label: "Building release..."},
+		{Type: progress.EventLog, Level: progress.LevelInfo, Text: "#7 [build 3/7] COPY Gemfile Gemfile.lock ./"},
+	})
+
+	got := stripANSI(buf.String())
+
+	if !strings.Contains(got, "#7 [build 3/7] COPY Gemfile") {
+		t.Errorf("info log during the build step must be painted in the live tail:\n%s", got)
+	}
+
+	_ = r.Close()
 }
 
 // TestEventRendererStepFailCommitsRed ensures a failed step gets a

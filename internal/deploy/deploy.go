@@ -162,6 +162,19 @@ func buildRelease(appName, releaseDir string, spec *lang.BuildSpec, opts *Option
 
 	r.StepStart("build", "building release")
 
+	// Everything the handler and its `docker build` print goes through
+	// the reporter, line by line, like post-deploy hooks already do.
+	// The handlers used to write to the process stdout: fine for a CLI
+	// push, where that IS the operator's terminal, but invisible to the
+	// deploy plane, which captures the reporter and got a transcript
+	// with the build missing from it. Same writer for stdout and
+	// stderr — BuildKit progress lands on stderr and a failed layer's
+	// output is what the operator is reading the transcript for.
+	sink := progress.NewLineWriter(r, progress.LevelInfo)
+	defer sink.Close()
+
+	spec.Output = sink
+
 	handler, err := lang.NewLang(spec, releaseDir)
 	if err != nil {
 		r.StepEnd("build", progress.StatusFail, err)

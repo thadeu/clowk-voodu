@@ -2,6 +2,7 @@ package lang
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,8 +14,8 @@ import (
 // restartContainer cycles the app's active container. Falls back to the
 // `-green` suffix used by the blue/green swap in docker.DeployContainer.
 // Shared across every language handler — the restart flow is identical.
-func restartContainer(appName string) error {
-	fmt.Printf("-----> Restarting %s...\n", appName)
+func restartContainer(out io.Writer, appName string) error {
+	fmt.Fprintf(out, "-----> Restarting %s...\n", appName)
 
 	containerName := appName
 
@@ -35,8 +36,8 @@ func restartContainer(appName string) error {
 // Shared across handlers — GC is identical regardless of language.
 const defaultKeepReleases = 5
 
-func cleanupReleases(appName string) error {
-	fmt.Printf("-----> Cleaning up old releases for %s...\n", appName)
+func cleanupReleases(out io.Writer, appName string) error {
+	fmt.Fprintf(out, "-----> Cleaning up old releases for %s...\n", appName)
 
 	releasesDir := paths.AppReleasesDir(appName)
 
@@ -55,9 +56,9 @@ func cleanupReleases(appName string) error {
 		releasePath := filepath.Join(releasesDir, entry.Name())
 
 		if err := os.RemoveAll(releasePath); err != nil {
-			fmt.Printf("Warning: Failed to remove old release %s: %v\n", entry.Name(), err)
+			fmt.Fprintf(out, "Warning: Failed to remove old release %s: %v\n", entry.Name(), err)
 		} else {
-			fmt.Printf("-----> Removed old release: %s\n", entry.Name())
+			fmt.Fprintf(out, "-----> Removed old release: %s\n", entry.Name())
 		}
 	}
 
@@ -135,7 +136,7 @@ func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArg
 			}
 		}
 
-		fmt.Printf("-----> Using custom Dockerfile: %s\n", dockerfilePath)
+		fmt.Fprintf(spec.out(), "-----> Using custom Dockerfile: %s\n", dockerfilePath)
 		cmd = exec.Command("docker", "build", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 	} else {
 		cmd = exec.Command("docker", "build", "-t", latestTag, "-t", immutableTag, releaseDir)
@@ -149,8 +150,8 @@ func runDockerBuild(appName string, spec *BuildSpec, releaseDir string, buildArg
 		cmd.Args = append(cmd.Args, "--label", label)
 	}
 
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = spec.out()
+	cmd.Stderr = spec.out()
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("docker build failed: %v", err)
@@ -170,7 +171,7 @@ func ensureCustomDockerfile(releaseDir string, spec *BuildSpec) (found bool, err
 	customDockerfilePath := filepath.Join(releaseDir, spec.Dockerfile)
 
 	if _, err := os.Stat(customDockerfilePath); err == nil {
-		fmt.Printf("-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
+		fmt.Fprintf(spec.out(), "-----> Using custom Dockerfile: %s\n", spec.Dockerfile)
 		return true, nil
 	}
 
@@ -178,7 +179,7 @@ func ensureCustomDockerfile(releaseDir string, spec *BuildSpec) (found bool, err
 		workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 		if _, err := os.Stat(workdirDockerfilePath); err == nil {
-			fmt.Printf("-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
+			fmt.Fprintf(spec.out(), "-----> Using custom Dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 			return true, nil
 		}
 	}

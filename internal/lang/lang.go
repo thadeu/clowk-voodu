@@ -6,6 +6,7 @@ package lang
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -53,6 +54,26 @@ type BuildSpec struct {
 	BuildArgs map[string]string
 
 	Lang *LangBuildSpec
+
+	// Output receives every line a handler prints and the stdout/stderr
+	// of the `docker build` it runs. nil means os.Stdout, which is what
+	// a plain CLI push wants; the deploy pipeline sets a line writer
+	// here so the build transcript rides the same reporter as every
+	// other step — and reaches whoever is capturing that reporter (the
+	// deploy plane keeps it for the console). Before this, `docker
+	// build` wrote straight to the process stdout, so a deploy's log
+	// showed "building release" and then nothing until "Build
+	// completed", with the part that explains a failure missing.
+	Output io.Writer
+}
+
+// out is the writer a handler prints to. Safe on a nil spec.
+func (s *BuildSpec) out() io.Writer {
+	if s != nil && s.Output != nil {
+		return s.Output
+	}
+
+	return os.Stdout
 }
 
 // LangBuildSpec is the unified runtime hint. Name picks the handler;
@@ -102,24 +123,30 @@ type Lang interface {
 // and use that file verbatim — not have the Rails handler take over and
 // try to auto-generate one. Downstream handlers trust this ordering.
 func DetectLanguage(releaseDir string) (string, error) {
+	return detectLanguage(releaseDir, os.Stdout)
+}
+
+// detectLanguage is DetectLanguage with the writer the detection lines
+// go to, so NewLang can send them where the rest of the build goes.
+func detectLanguage(releaseDir string, out io.Writer) (string, error) {
 	dockerfile := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfile); err == nil {
-		fmt.Printf("-----> detected dockerfile at %s → using 'docker' strategy\n", dockerfile)
+		fmt.Fprintf(out, "-----> detected dockerfile at %s → using 'docker' strategy\n", dockerfile)
 		return "docker", nil
 	}
 
 	if lang := detectLanguageInDir(releaseDir); lang != "" {
-		fmt.Printf("-----> no dockerfile at %s — detected '%s' from marker files\n", dockerfile, lang)
+		fmt.Fprintf(out, "-----> no dockerfile at %s — detected '%s' from marker files\n", dockerfile, lang)
 		return lang, nil
 	}
 
 	if lang := detectLanguageRecursive(releaseDir, 2); lang != "" {
-		fmt.Printf("-----> no dockerfile at release root — detected '%s' in subdirectory\n", lang)
+		fmt.Fprintf(out, "-----> no dockerfile at release root — detected '%s' in subdirectory\n", lang)
 		return lang, nil
 	}
 
-	fmt.Printf("-----> no dockerfile or language markers found — falling back to 'generic'\n")
+	fmt.Fprintf(out, "-----> no dockerfile or language markers found — falling back to 'generic'\n")
 
 	return "generic", nil
 }
@@ -186,9 +213,9 @@ func NewLang(spec *BuildSpec, releaseDir string) (Lang, error) {
 	langType := spec.LangName()
 
 	if langType != "" {
-		fmt.Printf("-----> using explicit lang strategy: %q (from manifest)\n", langType)
+		fmt.Fprintf(spec.out(), "-----> using explicit lang strategy: %q (from manifest)\n", langType)
 	} else {
-		detected, err := DetectLanguage(releaseDir)
+		detected, err := detectLanguage(releaseDir, spec.out())
 		if err != nil {
 			return nil, fmt.Errorf("failed to detect language: %v", err)
 		}

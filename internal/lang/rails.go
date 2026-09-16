@@ -19,10 +19,10 @@ func (l *Rails) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Rails) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> building rails application...")
+	fmt.Fprintln(spec.out(), "-----> building rails application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> using pre-built image from registry...")
+		fmt.Fprintln(spec.out(), "-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -32,7 +32,7 @@ func (l *Rails) Build(appName string, spec *BuildSpec, releaseDir string) error 
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> pre-built image ready for deployment!")
+		fmt.Fprintln(spec.out(), "-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -45,22 +45,22 @@ func (l *Rails) Build(appName string, spec *BuildSpec, releaseDir string) error 
 		return err
 	}
 
-	fmt.Println("-----> rails build complete!")
+	fmt.Fprintln(spec.out(), "-----> rails build complete!")
 
 	return nil
 }
 
 func (l *Rails) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> deploying rails application...")
+	fmt.Fprintln(spec.out(), "-----> deploying rails application...")
 	return deployContainer(appName, spec, releaseDir)
 }
 
 func (l *Rails) Restart(appName string, spec *BuildSpec) error {
-	return restartContainer(appName)
+	return restartContainer(spec.out(), appName)
 }
 
 func (l *Rails) Cleanup(appName string, spec *BuildSpec) error {
-	return cleanupReleases(appName)
+	return cleanupReleases(spec.out(), appName)
 }
 
 func (l *Rails) DetectLanguage(releaseDir string) (string, error) {
@@ -84,11 +84,11 @@ func (l *Rails) EnsureDockerfile(releaseDir string, appName string, spec *BuildS
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> using existing dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using existing dockerfile")
 		return nil
 	}
 
-	fmt.Println("-----> generating dockerfile for rails...")
+	fmt.Fprintln(spec.out(), "-----> generating dockerfile for rails...")
 
 	dockerfileContent := l.generateDockerfile(spec, appName)
 
@@ -111,7 +111,7 @@ func (l *Rails) generateDockerfile(spec *BuildSpec, appName string) string {
 			baseImage = fmt.Sprintf("ruby:%s-alpine", block.Version)
 		} else {
 			baseImage = util.DetectRubyVersion(".")
-			fmt.Printf("-----> detected ruby version: %s\n", baseImage)
+			fmt.Fprintf(spec.out(), "-----> detected ruby version: %s\n", baseImage)
 		}
 	}
 

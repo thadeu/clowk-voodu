@@ -26,10 +26,10 @@ func (l *Golang) block(spec *BuildSpec) *LangBuildSpec {
 }
 
 func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> building go application...")
+	fmt.Fprintln(spec.out(), "-----> building go application...")
 
 	if spec.Image != "" && util.IsRegistryImage(spec.Image, util.GetCustomRegistries(appName)) {
-		fmt.Println("-----> using pre-built image from registry...")
+		fmt.Fprintln(spec.out(), "-----> using pre-built image from registry...")
 
 		if err := util.PullRegistryImage(spec.Image); err != nil {
 			return fmt.Errorf("failed to pull pre-built image: %v", err)
@@ -39,7 +39,7 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 			return fmt.Errorf("failed to tag image: %v", err)
 		}
 
-		fmt.Println("-----> pre-built image ready for deployment!")
+		fmt.Fprintln(spec.out(), "-----> pre-built image ready for deployment!")
 
 		return nil
 	}
@@ -71,7 +71,7 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 
 		cmd = exec.Command("docker", "build", "--progress=plain", "-f", dockerfilePath, "-t", latestTag, "-t", immutableTag, releaseDir)
 
-		fmt.Printf("-----> using custom dockerfile: %s\n", dockerfilePath)
+		fmt.Fprintf(spec.out(), "-----> using custom dockerfile: %s\n", dockerfilePath)
 	} else {
 		cmd = exec.Command("docker", "build", "--progress=plain", "-t", latestTag, "-t", immutableTag, releaseDir)
 	}
@@ -85,30 +85,30 @@ func (l *Golang) Build(appName string, spec *BuildSpec, releaseDir string) error
 	}
 
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = spec.out()
+	cmd.Stderr = spec.out()
 
 	if err := util.RunDockerBuildWithTimeout(cmd, 60); err != nil {
 		return err
 	}
 
-	fmt.Println("-----> go build complete!")
+	fmt.Fprintln(spec.out(), "-----> go build complete!")
 
 	return nil
 }
 
 func (l *Golang) Deploy(appName string, spec *BuildSpec, releaseDir string) error {
-	fmt.Println("-----> deploying go application...")
+	fmt.Fprintln(spec.out(), "-----> deploying go application...")
 
 	return deployContainer(appName, spec, releaseDir)
 }
 
 func (l *Golang) Restart(appName string, spec *BuildSpec) error {
-	return restartContainer(appName)
+	return restartContainer(spec.out(), appName)
 }
 
 func (l *Golang) Cleanup(appName string, spec *BuildSpec) error {
-	return cleanupReleases(appName)
+	return cleanupReleases(spec.out(), appName)
 }
 
 func (l *Golang) DetectLanguage(releaseDir string) (string, error) {
@@ -124,7 +124,7 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 		customDockerfilePath := filepath.Join(releaseDir, spec.Dockerfile)
 
 		if _, err := os.Stat(customDockerfilePath); err == nil {
-			fmt.Printf("-----> using custom dockerfile: %s\n", spec.Dockerfile)
+			fmt.Fprintf(spec.out(), "-----> using custom dockerfile: %s\n", spec.Dockerfile)
 
 			return nil
 		}
@@ -133,7 +133,7 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 			workdirDockerfilePath := filepath.Join(releaseDir, spec.Context, spec.Dockerfile)
 
 			if _, err := os.Stat(workdirDockerfilePath); err == nil {
-				fmt.Printf("-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
+				fmt.Fprintf(spec.out(), "-----> using custom dockerfile in context: %s/%s\n", spec.Context, spec.Dockerfile)
 
 				return nil
 			}
@@ -145,12 +145,12 @@ func (l *Golang) EnsureDockerfile(releaseDir string, appName string, spec *Build
 	dockerfilePath := filepath.Join(releaseDir, "Dockerfile")
 
 	if _, err := os.Stat(dockerfilePath); err == nil {
-		fmt.Println("-----> using existing dockerfile")
+		fmt.Fprintln(spec.out(), "-----> using existing dockerfile")
 
 		return nil
 	}
 
-	fmt.Println("-----> generating dockerfile for go...")
+	fmt.Fprintln(spec.out(), "-----> generating dockerfile for go...")
 
 	workDir := "."
 
@@ -179,13 +179,13 @@ func (l *Golang) generateDockerfile(spec *BuildSpec, workDir, buildPath string) 
 			baseImage = fmt.Sprintf("golang:%s-alpine", block.Version)
 		} else {
 			baseImage = util.DetectGoVersion(".")
-			fmt.Printf("-----> detected go version: %s\n", baseImage)
+			fmt.Fprintf(spec.out(), "-----> detected go version: %s\n", baseImage)
 		}
 	}
 
 	args := l.buildArgs(spec)
 
-	fmt.Printf("-----> final build config: goos=%s goarch=%s cgo_enabled=%s\n", args["GOOS"], args["GOARCH"], args["CGO_ENABLED"])
+	fmt.Fprintf(spec.out(), "-----> final build config: goos=%s goarch=%s cgo_enabled=%s\n", args["GOOS"], args["GOARCH"], args["CGO_ENABLED"])
 
 	return fmt.Sprintf(`# Generated Dockerfile for Go application
 FROM %s AS builder
@@ -266,7 +266,7 @@ func (l *Golang) buildArgs(spec *BuildSpec) map[string]string {
 	// BuildArgs — that map lives on the parent BuildSpec.
 	_ = block
 
-	fmt.Printf("-----> build args: goos=%s goarch=%s cgo_enabled=%s go_version=%s\n", out["GOOS"], out["GOARCH"], out["CGO_ENABLED"], out["GO_VERSION"])
+	fmt.Fprintf(spec.out(), "-----> build args: goos=%s goarch=%s cgo_enabled=%s go_version=%s\n", out["GOOS"], out["GOARCH"], out["CGO_ENABLED"], out["GO_VERSION"])
 
 	return out
 }
