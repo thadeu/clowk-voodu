@@ -1063,3 +1063,46 @@ func TestManifestVarsSkipsFilesThatInterpolateNothing(t *testing.T) {
 		t.Fatalf("vars=%v err=%v", vars, err)
 	}
 }
+
+// A trigger file with two workloads applies both on every push that fires
+// it; the release phase must not migrate and restart the one nothing
+// touched. Same commit twice: the first run releases, the second finds the
+// image and the spec exactly as it left them and skips.
+func TestDeployRunSkipsTheReleaseWhenNothingChanged(t *testing.T) {
+	withRelease := map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1","release":{"command":["bin/rails","db:migrate"]}}`)}},
+	}
+	api, ts := newRunAPI(t, repoFiles(), true, withRelease)
+
+	restarter := &fakeRestarter{}
+	api.Deployments = restarter
+
+	if resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`); resp.StatusCode != http.StatusOK || restarter.gotVerb != "release" {
+		t.Fatalf("first run should release: %d %s (verb=%q)", resp.StatusCode, body, restarter.gotVerb)
+	}
+
+	restarter.gotVerb = ""
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second run: %d %s", resp.StatusCode, body)
+	}
+
+	if restarter.gotVerb != "" {
+		t.Fatalf("nothing changed, yet the release phase ran (%s): %s", restarter.gotVerb, body)
+	}
+
+	if strings.Contains(body, `"released"`) || !strings.Contains(body, "release skipped") {
+		t.Fatalf("the response should say the release was skipped: %s", body)
+	}
+
+	// A changed spec is a reason to release again.
+	api.ParseManifests = stubParser(map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:2","release":{"command":["bin/rails","db:migrate"]}}`)}},
+	})
+
+	if resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`); resp.StatusCode != http.StatusOK || restarter.gotVerb != "release" {
+		t.Fatalf("a changed spec should release: %d %s (verb=%q)", resp.StatusCode, body, restarter.gotVerb)
+	}
+}

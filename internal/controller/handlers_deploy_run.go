@@ -481,6 +481,8 @@ func (a *API) applyFromRepo(
 	// image waits for a second deploy.
 	targets := buildTargets(manifests, projectDirOf(spec.Apply.File))
 
+	var rebuilt map[string]bool
+
 	if len(targets) > 0 {
 		if a.BuildFromSource == nil {
 			err := fmt.Errorf(
@@ -492,18 +494,26 @@ func (a *API) applyFromRepo(
 			return nil, nil, err
 		}
 
-		if err := a.buildTargetsFromRepo(r, trigger, req, token, snap, targets, runLog); err != nil {
+		built, err := a.buildTargetsFromRepo(r, trigger, req, token, snap, targets, runLog)
+		if err != nil {
 			writeDeployRunErr(w, http.StatusUnprocessableEntity, err, runLog)
 
 			return nil, nil, err
 		}
+
+		rebuilt = built
 	}
+
+	// What the box holds for each releasable deployment BEFORE this apply
+	// replaces it, so the release phase can tell a changed spec from a push
+	// that touched something else in the same file.
+	before := a.releaseSpecHashes(r.Context(), manifests, true)
 
 	if err := a.applyManifestsInProcess(w, r, trigger, req, spec, manifests); err != nil {
 		return nil, nil, err
 	}
 
-	released, err := a.releaseDeployments(w, r, spec, manifests, runLog)
+	released, err := a.releaseDeployments(w, r, spec, manifests, runLog, rebuilt, before)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -533,8 +543,11 @@ func (a *API) applyFromRepo(
 // reason and the transcript, and the record shows up in `vd release history`.
 func (a *API) releaseDeployments(
 	w http.ResponseWriter, r *http.Request, spec triggerspec.Spec, manifests []Manifest, runLog *deployLog,
+	rebuilt map[string]bool, before map[string]string,
 ) ([]string, error) {
 	var released []string
+
+	after := a.releaseSpecHashes(r.Context(), manifests, false)
 
 	for i := range manifests {
 		m := &manifests[i]
@@ -544,6 +557,26 @@ func (a *API) releaseDeployments(
 		}
 
 		ref := m.Scope + "/" + m.Name
+
+		// NOTHING CHANGED, NOTHING RELEASED. A trigger file often carries
+		// more than one workload, and a push that fired it for one of them
+		// still applies the whole file. The release phase is a migration
+		// plus a rolling restart, which is not free and not something to do
+		// to an api because somebody changed a label in the pwa. It runs
+		// when this push rebuilt the image, or when the spec the box will
+		// now run differs from the one it was running — the same hash the
+		// reconciler uses to decide that. `vd release run` is unaffected:
+		// this gate is the deploy plane's, a person asking for a release
+		// gets one.
+		app := AppID(m.Scope, m.Name)
+
+		if !rebuilt[app] && before[ref] != "" && before[ref] == after[ref] {
+			runLog.section("release", ref)
+			fmt.Fprintf(runLog, "-----> nothing changed for %s (image and spec unchanged) — release skipped\n", ref)
+			log.Printf("deploy/%s release of %s skipped: nothing changed", spec.Name, ref)
+
+			continue
+		}
 
 		if a.Deployments == nil {
 			err := fmt.Errorf("%s: %s has a release block, and this controller has no release runner wired", spec.Apply.File, ref)
@@ -571,6 +604,55 @@ func (a *API) releaseDeployments(
 	}
 
 	return released, nil
+}
+
+// releaseSpecHashes is, per `scope/name`, the hash the reconciler would give
+// each releasable deployment in `manifests` — from the manifest the box
+// currently holds (`stored`) or from the one about to be applied. The same
+// steps Release() takes to stamp its record, so "unchanged" here means what
+// "no spec drift" means there. A deployment the box has never seen, or one
+// that will not decode, gets no entry, and no entry never reads as
+// unchanged.
+func (a *API) releaseSpecHashes(ctx context.Context, manifests []Manifest, stored bool) map[string]string {
+	out := map[string]string{}
+
+	for i := range manifests {
+		m := &manifests[i]
+
+		if m.Kind != KindDeployment || !manifestHasReleaseBlock(m) {
+			continue
+		}
+
+		source := m
+
+		if stored {
+			existing, err := a.Store.Get(ctx, KindDeployment, m.Scope, m.Name)
+			if err != nil || existing == nil {
+				continue
+			}
+
+			source = existing
+		}
+
+		spec, err := decodeDeploymentSpec(source)
+		if err != nil {
+			continue
+		}
+
+		app := AppID(m.Scope, m.Name)
+
+		if err := applyDeploymentSpecDefaults(&spec, app); err != nil {
+			continue
+		}
+
+		digests := resolveStampedOrLookup(spec.AssetDigests, func() map[string]string {
+			return LookupAssetDigests(ctx, a.Store, collectDeploymentAssetRefs(spec))
+		})
+
+		out[m.Scope+"/"+m.Name] = deploymentSpecHash(spec, digests)
+	}
+
+	return out
 }
 
 // manifestHasReleaseBlock reports whether a deployment manifest carries a
@@ -613,19 +695,19 @@ func manifestHasReleaseBlock(m *Manifest) bool {
 func (a *API) buildTargetsFromRepo(
 	r *http.Request, trigger *Trigger, req deployRunRequest,
 	token string, snap repoSnapshot, targets []buildTarget, runLog *deployLog,
-) error {
+) (map[string]bool, error) {
 	stale, current := staleTargets(trigger, snap, targets)
 
 	if len(stale) == 0 {
 		// Nothing to build and nothing to download. The manifest still gets
 		// applied by the caller — a deploy that changes only configuration is
 		// still a deploy.
-		return nil
+		return nil, nil
 	}
 
 	archive, err := a.githubClient().Tarball(r.Context(), token, trigger.Repo, req.SHA)
 	if err != nil {
-		return fmt.Errorf("could not download %s at %s: %w", trigger.Repo, short(req.SHA), err)
+		return nil, fmt.Errorf("could not download %s at %s: %w", trigger.Repo, short(req.SHA), err)
 	}
 
 	defer archive.Close()
@@ -637,10 +719,15 @@ func (a *API) buildTargetsFromRepo(
 	defer cleanup()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	built := map[string]string{}
+
+	// Which apps this run actually produced an image for — the release phase
+	// asks, because a rebuilt image is a reason to release even when the
+	// spec text did not move.
+	rebuilt := map[string]bool{}
 
 	for _, target := range stale {
 		runLog.section("build", target.App)
@@ -650,8 +737,10 @@ func (a *API) buildTargetsFromRepo(
 			// and forgetting them would rebuild them on the retry.
 			a.rememberBuilt(r, trigger, built)
 
-			return err
+			return rebuilt, err
 		}
+
+		rebuilt[target.App] = true
 
 		if sha, ok := current[target.Path]; ok {
 			built[target.Path] = sha
@@ -660,7 +749,7 @@ func (a *API) buildTargetsFromRepo(
 
 	a.rememberBuilt(r, trigger, built)
 
-	return nil
+	return rebuilt, nil
 }
 
 // staleTargets splits the targets into those needing a build and the subtree
