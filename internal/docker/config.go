@@ -27,6 +27,23 @@ const EnvDockerConfig = "DOCKER_CONFIG"
 // write access to.
 const EnvECRCacheDir = "AWS_ECR_CACHE_DIR"
 
+// EnvBuildxConfig is buildx's override for where it keeps its own state:
+// builder instances, the `activity/default` marker it touches on every
+// build, node ids. Its default is $DOCKER_CONFIG/buildx, and it writes
+// every file there 0600 as whoever runs the build.
+//
+// That is the ECR cache problem again, one directory over. The controller
+// builds a GitHub push as root and leaves `activity/default` root-owned;
+// the next `vd apply` builds as the SSH user and dies on
+//
+//	ERROR: open /opt/voodu/docker/buildx/activity/default: permission denied
+//
+// before docker has read a single line of the Dockerfile. Same cure: a
+// subdirectory per uid, under a parent the docker group may write to.
+// Both processes use the default builder, so the state is nothing either
+// side needs to see of the other's.
+const EnvBuildxConfig = "BUILDX_CONFIG"
+
 // DockerGroup is the unix group whose members can already talk to the
 // docker socket. Sharing the credential file with it grants nothing
 // new: anyone who can reach the socket can `docker run -v /:/host
@@ -164,6 +181,21 @@ func UseVooduDockerConfig() (dir string, seeded bool, err error) {
 		mine := filepath.Join(shared, strconv.Itoa(os.Geteuid()))
 		if err := os.MkdirAll(mine, 0700); err == nil {
 			_ = os.Setenv(EnvECRCacheDir, mine)
+		}
+	}
+
+	// buildx state, per uid, for the reason EnvBuildxConfig gives. A
+	// separate tree ("buildx-state", not "buildx") so the default
+	// directory an older release left behind, 0700 and owned by one of
+	// the two users, never gets in the way again.
+	buildxShared := filepath.Join(dir, "buildx-state")
+
+	if err := os.MkdirAll(buildxShared, 0770); err == nil {
+		shareWithDockerGroup(buildxShared, 0770)
+
+		mine := filepath.Join(buildxShared, strconv.Itoa(os.Geteuid()))
+		if err := os.MkdirAll(mine, 0700); err == nil {
+			_ = os.Setenv(EnvBuildxConfig, mine)
 		}
 	}
 

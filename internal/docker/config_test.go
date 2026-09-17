@@ -334,3 +334,35 @@ func TestUseVooduDockerConfigAdoptsMissingConfig(t *testing.T) {
 		t.Errorf("%s = %q, want %q", EnvDockerConfig, os.Getenv(EnvDockerConfig), dir)
 	}
 }
+
+// TestUseVooduDockerConfigBuildxStateIsPerUID — buildx touches
+// `activity/default` 0600 on every build, as whoever runs it. The root
+// controller (a GitHub push) and the SSH user (`vd apply`) both build on
+// the same box, and the second one to run used to fail with "permission
+// denied" on the other's marker. Each uid gets its own state tree.
+func TestUseVooduDockerConfigBuildxStateIsPerUID(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(paths.EnvRoot, root)
+	t.Setenv(EnvDockerConfig, "")
+	t.Setenv(EnvBuildxConfig, "")
+	t.Setenv("HOME", t.TempDir())
+
+	if _, _, err := UseVooduDockerConfig(); err != nil {
+		t.Fatalf("UseVooduDockerConfig: %v", err)
+	}
+
+	want := filepath.Join(root, "docker", "buildx-state", strconv.Itoa(os.Geteuid()))
+
+	if got := os.Getenv(EnvBuildxConfig); got != want {
+		t.Errorf("%s = %q, want the per-uid dir %q", EnvBuildxConfig, got, want)
+	}
+
+	parent, err := os.Stat(filepath.Join(root, "docker", "buildx-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if perm := parent.Mode().Perm(); perm != 0770 {
+		t.Errorf("shared parent mode = %o, want 0770 so the build user can add its own subdir", perm)
+	}
+}
