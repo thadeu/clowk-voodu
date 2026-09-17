@@ -1008,3 +1008,58 @@ func TestDeployRunDispatchIgnoresPaths(t *testing.T) {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
 }
+
+// `${VAR}` in a repository manifest resolves against the buckets the file
+// names — env_from first, then each resource's own — and only within the
+// trigger's scopes. The same file applied from a laptop reads the same
+// buckets, so the two doors build the same image.
+func TestManifestVarsReadTheTriggersBuckets(t *testing.T) {
+	api, _ := newTestAPI(t)
+
+	seed := func(scope, name string, vars map[string]string) {
+		if err := api.Store.SetConfig(t.Context(), scope, name, vars); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seed("contagorda", "", map[string]string{"SHARED": "scope-level", "VITE_API_URL": "from-scope"})
+	seed("contagorda", "pwa", map[string]string{"VITE_API_URL": "https://api.contagorda.com"})
+	seed("contagorda", "shared", map[string]string{"SLACK_URL": "hook"})
+	seed("other", "app", map[string]string{"LEAK": "no"})
+
+	raw := []byte(`
+app "contagorda" "pwa" {
+  env_from = ["contagorda/shared", "other/app"]
+  build { args = { VITE_API_URL = "${VITE_API_URL}", SLACK = "${SLACK_URL}", S = "${SHARED}" } }
+}
+`)
+
+	trigger := &Trigger{ID: "t", Repo: "acme/web", Branch: "main", AllowScopes: []string{"contagorda"}}
+
+	vars, err := api.manifestVars(t.Context(), trigger, ".voodu/pwa.voodu", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if vars["VITE_API_URL"] != "https://api.contagorda.com" {
+		t.Errorf("the app bucket should win over the scope: %v", vars)
+	}
+
+	if vars["SLACK_URL"] != "hook" || vars["SHARED"] != "scope-level" {
+		t.Errorf("env_from and scope-level keys should be present: %v", vars)
+	}
+
+	if _, leaked := vars["LEAK"]; leaked {
+		t.Errorf("a bucket outside the trigger's scopes must not be read: %v", vars)
+	}
+}
+
+func TestManifestVarsSkipsFilesThatInterpolateNothing(t *testing.T) {
+	api, _ := newTestAPI(t)
+	trigger := &Trigger{ID: "t", AllowScopes: []string{"runa"}}
+
+	vars, err := api.manifestVars(t.Context(), trigger, "voodu.hcl", []byte(`deployment "runa" "web" { image = "x:1" }`))
+	if err != nil || vars != nil {
+		t.Fatalf("vars=%v err=%v", vars, err)
+	}
+}

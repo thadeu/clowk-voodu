@@ -23,6 +23,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"go.voodu.clowk.in/internal/activity"
+	"go.voodu.clowk.in/internal/manifestrefs"
 	"go.voodu.clowk.in/internal/triggerspec"
 )
 
@@ -430,7 +432,14 @@ func (a *API) applyFromRepo(
 		return nil, nil, err
 	}
 
-	manifests, err := a.ParseManifests(bytes.NewReader(raw), formatFor(spec.Apply.File), nil)
+	vars, err := a.manifestVars(r.Context(), trigger, spec.Apply.File, raw)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("%s: %w", spec.Apply.File, err))
+
+		return nil, nil, err
+	}
+
+	manifests, err := a.ParseManifests(bytes.NewReader(raw), formatFor(spec.Apply.File), vars)
 	if err != nil {
 		writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("%s: %w", spec.Apply.File, err))
 
@@ -759,6 +768,77 @@ func (a *API) applyManifestsInProcess(
 	}
 
 	return nil
+}
+
+// manifestVars is what `${VAR}` in a repository manifest resolves against:
+// the config buckets the file names, the same ones `vd apply` loads before
+// it interpolates (cmd/cli/apply_envfrom.go).
+//
+// THE SAME MANIFEST HAS TO MEAN THE SAME THING FROM BOTH DOORS. Applied from
+// a laptop, `${VITE_API_URL}` in a build arg came out of the `env_from`
+// bucket; pushed from GitHub it was parsed with no variables at all, so it
+// either failed the parse or fell back to a default the operator wrote for
+// exactly that gap — and the image went out built with the fallback while
+// the bucket held the real value. Here the box reads its own store, which
+// is closer to the truth than the laptop ever was: no SSH hop, no cache.
+//
+// Precedence follows the CLI: env_from buckets in declared order, then each
+// resource's own bucket, later wins. A ref is resolved the way `config
+// <ref> get` is — scope merged with app for `scope/name`, the scope alone
+// for a bare `scope`. No shell layer: there is no shell.
+//
+// Only the trigger's scopes are read. A file can name any bucket in the
+// text, and this runs BEFORE the scope check that refuses the manifest —
+// reading a bucket the trigger may not apply to would put its secrets into
+// a manifest the box then rejects, which is a leak into an error message.
+// An unreadable ref is left out rather than fatal; the interpolation then
+// reports the variable as undefined, which names the actual problem.
+func (a *API) manifestVars(ctx context.Context, trigger *Trigger, filename string, raw []byte) (map[string]string, error) {
+	if formatFor(filename) != "hcl" || !bytes.Contains(raw, []byte("${")) {
+		return nil, nil
+	}
+
+	refs := append(manifestrefs.EnvFromRefs(filename, raw), manifestrefs.ResourceRefs(filename, raw)...)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	allowed := map[string]struct{}{}
+	for _, scope := range trigger.AllowScopes {
+		allowed[strings.ToLower(strings.TrimSpace(scope))] = struct{}{}
+	}
+
+	vars := map[string]string{}
+
+	for _, ref := range refs {
+		scope, name, _ := strings.Cut(ref, "/")
+		scope = strings.TrimSpace(scope)
+
+		if _, ok := allowed[strings.ToLower(scope)]; !ok {
+			continue
+		}
+
+		var (
+			bucket map[string]string
+			err    error
+		)
+
+		if name != "" {
+			bucket, err = a.Store.ResolveConfig(ctx, scope, name)
+		} else {
+			bucket, err = a.Store.GetConfig(ctx, scope, "")
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("read config %s: %w", ref, err)
+		}
+
+		for k, v := range bucket {
+			vars[k] = v
+		}
+	}
+
+	return vars, nil
 }
 
 // fetchRepoFile reads one file out of a snapshot already in hand.

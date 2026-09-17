@@ -42,12 +42,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/spf13/cobra"
 
 	"go.voodu.clowk.in/internal/controller"
 	"go.voodu.clowk.in/internal/manifest"
+	"go.voodu.clowk.in/internal/manifestrefs"
 	"go.voodu.clowk.in/internal/remote"
 )
 
@@ -167,156 +166,13 @@ func fetchBucketOverSSH(info *remote.Info, identity, ref string) (map[string]str
 // here. Document that env_from refs must be literal — same
 // posture the existing runtime path already takes.
 func extractEnvFromRefs(filename string, raw []byte) ([]string, error) {
-	file, _ := hclsyntax.ParseConfig(raw, filename, hcl.Pos{Line: 1, Column: 1})
-
-	// Proceed even when diags has errors. ParseConfig still returns a
-	// PARTIAL syntax tree, and we deliberately walk it: voodu's own
-	// `${VAR}` / `${VAR:-default}` tokens are NOT valid HCL-native
-	// template expressions — the `:-` default is voodu syntax resolved
-	// in manifest.Interpolate BEFORE the HCL parser ever runs — so a
-	// perfectly valid voodu manifest raises diagnostics here (e.g. a
-	// `${FS_CONFIG_DIR:-/default}` in a volumes string). Bailing on the
-	// first such diag silently dropped every env_from ref in the file,
-	// which then surfaced downstream as a bogus "undefined variable"
-	// for vars the env_from bucket would have supplied. env_from values
-	// are pure string literals and parse cleanly regardless, so the
-	// partial tree still exposes them. A genuinely broken file is
-	// reported with a proper diagnostic later by manifest.ParseFile.
-	if file == nil {
-		return nil, nil
-	}
-
-	body, ok := file.Body.(*hclsyntax.Body)
-	if !ok {
-		return nil, nil
-	}
-
-	seen := make(map[string]struct{})
-
-	var refs []string
-
-	scanBody := func(b *hclsyntax.Body) {
-		for _, attr := range b.Attributes {
-			if attr.Name != "env_from" {
-				continue
-			}
-
-			tuple, ok := attr.Expr.(*hclsyntax.TupleConsExpr)
-			if !ok {
-				// env_from = something_other_than_a_list — let the
-				// real parser report this. We just don't extract.
-				continue
-			}
-
-			for _, expr := range tuple.Exprs {
-				lit, ok := expr.(*hclsyntax.TemplateExpr)
-				if !ok {
-					continue
-				}
-
-				// Pure-literal templates have a single LiteralValueExpr
-				// part. Anything with embedded ${...} fails this and we
-				// skip — operator gets the runtime "ref not found" error
-				// later, which names the offending ref.
-				if len(lit.Parts) != 1 {
-					continue
-				}
-
-				litVal, ok := lit.Parts[0].(*hclsyntax.LiteralValueExpr)
-				if !ok {
-					continue
-				}
-
-				val := litVal.Val
-				if val.Type().FriendlyName() != "string" {
-					continue
-				}
-
-				s := val.AsString()
-				if s == "" {
-					continue
-				}
-
-				if _, dup := seen[s]; dup {
-					continue
-				}
-
-				seen[s] = struct{}{}
-
-				refs = append(refs, s)
-			}
-		}
-	}
-
-	// Walk top-level blocks; each is a resource (deployment,
-	// statefulset, app, etc.). env_from is always a block-level
-	// attribute, so a one-level descent covers every case.
-	for _, blk := range body.Blocks {
-		if blk.Body != nil {
-			scanBody(blk.Body)
-		}
-	}
-
-	return refs, nil
+	return manifestrefs.EnvFromRefs(filename, raw), nil
 }
 
-// extractResourceRefs returns the `scope/name` of every top-level
-// resource block (those with the canonical two labels, e.g.
-// `statefulset "fsw" "freeswitch"`). These are auto-consulted as
-// interpolation sources so a resource resolves `${VAR}` from its own
-// config bucket without declaring env_from — mirroring the controller's
-// implicit (scope,name) bind for runtime container env.
-//
-// Same partial-parse posture as extractEnvFromRefs: ParseConfig returns
-// a usable tree even when voodu's `${VAR:-default}` tokens trip HCL's
-// native template parser, and block labels parse cleanly regardless.
-// Blocks without exactly two labels (or with an empty label) are skipped
-// — they carry no (scope,name) bucket. Deduplicated, in declared order.
 func extractResourceRefs(filename string, raw []byte) []string {
-	file, _ := hclsyntax.ParseConfig(raw, filename, hcl.Pos{Line: 1, Column: 1})
-	if file == nil {
-		return nil
-	}
-
-	body, ok := file.Body.(*hclsyntax.Body)
-	if !ok {
-		return nil
-	}
-
-	seen := make(map[string]struct{})
-
-	var refs []string
-
-	for _, blk := range body.Blocks {
-		if len(blk.Labels) != 2 {
-			continue
-		}
-
-		scope, name := blk.Labels[0], blk.Labels[1]
-		if scope == "" || name == "" {
-			continue
-		}
-
-		ref := scope + "/" + name
-		if _, dup := seen[ref]; dup {
-			continue
-		}
-
-		seen[ref] = struct{}{}
-
-		refs = append(refs, ref)
-	}
-
-	return refs
+	return manifestrefs.ResourceRefs(filename, raw)
 }
 
-// bucketCache memoises configFetch results across a single
-// `vd apply` invocation. Applying a 20-file directory where
-// every manifest does `env_from = ["prod/shared"]` should
-// fetch the bucket once, not 20 times.
-//
-// Keyed by the raw ref string ("prod/shared", "monitoring",
-// etc.); value is the bucket's KV map.
 type bucketCache struct {
 	entries map[string]map[string]string
 }
@@ -399,17 +255,17 @@ func enrichEnvFor(fetch bucketFetcher, filename string, raw []byte, shellEnv map
 // enrichEnv combines bucket-sourced and shell-sourced interpolation
 // vars for one manifest source. The full pipeline:
 //
-//   1. extractEnvFromRefs scans the raw bytes for env_from refs
-//      (statically, pre-interpolation).
-//   2. extractResourceRefs scans for each resource block's OWN
-//      (scope,name) — auto-consulted so a resource resolves `${VAR}`
-//      from its own config bucket without an explicit env_from, the
-//      same implicit bind the controller does for runtime container
-//      env (resolveAppEnv). Skipped when the source has no `${...}`
-//      token at all (nothing to interpolate → no round-trip).
-//   3. cache.fetch reads each bucket through the fetcher, memoised
-//      across the apply session.
-//   4. mergeBucketEnv layers buckets + shell into one map.
+//  1. extractEnvFromRefs scans the raw bytes for env_from refs
+//     (statically, pre-interpolation).
+//  2. extractResourceRefs scans for each resource block's OWN
+//     (scope,name) — auto-consulted so a resource resolves `${VAR}`
+//     from its own config bucket without an explicit env_from, the
+//     same implicit bind the controller does for runtime container
+//     env (resolveAppEnv). Skipped when the source has no `${...}`
+//     token at all (nothing to interpolate → no round-trip).
+//  3. cache.fetch reads each bucket through the fetcher, memoised
+//     across the apply session.
+//  4. mergeBucketEnv layers buckets + shell into one map.
 //
 // Layer precedence (later wins): env_from refs, then the resource's
 // own bucket, then the operator shell. This mirrors the runtime order
