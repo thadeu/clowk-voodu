@@ -442,7 +442,7 @@ func (a *API) applyFromRepo(
 	// documents: the apply's watch event has to find the tag already
 	// re-pointed, or the reconciler decides there is no drift and the new
 	// image waits for a second deploy.
-	targets := buildTargets(manifests)
+	targets := buildTargets(manifests, projectDirOf(spec.Apply.File))
 
 	if len(targets) > 0 {
 		if a.BuildFromSource == nil {

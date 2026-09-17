@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -55,6 +56,41 @@ type buildTarget struct {
 	Ref  string          // kind/scope/name, for messages
 }
 
+// projectDirOf is the directory a trigger file's manifest belongs to: the
+// parent of its `.voodu/` folder, or the manifest's own directory when it is
+// not kept in one. "" for the repository root.
+func projectDirOf(applyFile string) string {
+	dir := path.Dir(path.Clean(applyFile))
+
+	if path.Base(dir) == ".voodu" {
+		dir = path.Dir(dir)
+	}
+
+	if dir == "." || dir == "/" {
+		return ""
+	}
+
+	return strings.TrimPrefix(dir, "./")
+}
+
+// resolveBuildContext joins a manifest's build context onto its project
+// directory, repository-relative, "." for the root. A context that climbs
+// above the project ("../shared") is allowed and resolves within the
+// repository; climbing above the repository is refused later by
+// safeArchiveJoin.
+func resolveBuildContext(base, context string) string {
+	if context == "" {
+		context = "."
+	}
+
+	joined := path.Clean(path.Join(base, context))
+	if joined == "" || joined == "/" {
+		return "."
+	}
+
+	return joined
+}
+
 // tempRootLabel names the directory in an error, so "read-only file system"
 // says WHICH one. Without it the operator has to know that an empty root means
 // /tmp, which is exactly the knowledge they lack at that moment.
@@ -72,7 +108,22 @@ func tempRootLabel(root string) string {
 // the pipeline rather than pulled. A spec that will not decode is skipped —
 // the apply path validates specs properly and produces a better error than a
 // guess made here.
-func buildTargets(manifests []Manifest) []buildTarget {
+//
+// THE CONTEXT IS RELATIVE TO THE MANIFEST'S PROJECT, not to the repository.
+// `build { context = "." }` in apps/rapi/.voodu/api.voodu means apps/rapi:
+// that is what it means to `vd apply` run from that directory, and the
+// Dockerfile beside it is written against it (`COPY Gemfile Gemfile.lock
+// ./`). Resolving "." against the repository root sent the whole monorepo as
+// the api's context, the Dockerfile was not where the spec said, and the
+// deploy failed with "custom Dockerfile not found" — on a push that touched
+// only the pwa. `base` is that project directory (projectDirOf), and it is
+// also what keys the trigger's LastBuilt map, so a target's path here must be
+// the same one staleTargets compares.
+//
+// `build.context` is the field the manifest defines for this; `build.path`
+// is the language handlers' sub-directory hint and is honoured only when no
+// context is given, because the deploy plane used to read it.
+func buildTargets(manifests []Manifest, base string) []buildTarget {
 	var out []buildTarget
 
 	for i := range manifests {
@@ -85,7 +136,8 @@ func buildTargets(manifests []Manifest) []buildTarget {
 		var probe struct {
 			Image string `json:"image"`
 			Build *struct {
-				Path string `json:"path"`
+				Context string `json:"context"`
+				Path    string `json:"path"`
 			} `json:"build"`
 		}
 
@@ -99,10 +151,12 @@ func buildTargets(manifests []Manifest) []buildTarget {
 
 		// "." is the repository root, matching what `vd apply` means when a
 		// build block names no path.
-		path := strings.TrimSpace(probe.Build.Path)
-		if path == "" {
-			path = "."
+		context := strings.TrimSpace(probe.Build.Context)
+		if context == "" {
+			context = strings.TrimSpace(probe.Build.Path)
 		}
+
+		path := resolveBuildContext(base, context)
 
 		out = append(out, buildTarget{
 			App:  AppID(m.Scope, m.Name),

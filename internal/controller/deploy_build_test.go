@@ -140,7 +140,7 @@ func TestBuildTargetsOnlyPicksWorkloadsWithoutAnImage(t *testing.T) {
 		{Kind: KindIngress, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"host":"x"}`)},
 	}
 
-	targets := buildTargets(manifests)
+	targets := buildTargets(manifests, "")
 
 	if len(targets) != 1 {
 		t.Fatalf("targets = %+v", targets)
@@ -160,7 +160,7 @@ func TestBuildTargetsOnlyPicksWorkloadsWithoutAnImage(t *testing.T) {
 func TestBuildTargetsDefaultsThePathToRoot(t *testing.T) {
 	targets := buildTargets([]Manifest{
 		{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"build":{}}`)},
-	})
+	}, "")
 
 	if len(targets) != 1 || targets[0].Path != "." {
 		t.Fatalf("targets = %+v", targets)
@@ -468,5 +468,40 @@ func TestExtractFallsBackToTheSystemTempDir(t *testing.T) {
 
 	if !strings.HasPrefix(dir, os.TempDir()) {
 		t.Errorf("extracted to %q, want it under %q", dir, os.TempDir())
+	}
+}
+
+// `context = "."` in apps/rapi/.voodu/api.voodu is apps/rapi — what the
+// manifest means to `vd apply` run there, and where its Dockerfile is.
+func TestBuildTargetsResolveTheContextAgainstTheManifestsProject(t *testing.T) {
+	cases := []struct {
+		file, context, want string
+	}{
+		{"apps/rapi/.voodu/api.voodu", ".", "apps/rapi"},
+		{"apps/rapi/.voodu/api.voodu", "", "apps/rapi"},
+		{"apps/rapi/.voodu/api.voodu", "src", "apps/rapi/src"},
+		{"apps/rapi/.voodu/api.voodu", "../pwa", "apps/pwa"},
+		{".voodu/web.voodu", ".", "."},
+		{"voodu.hcl", ".", "."},
+		{"deploy/web.voodu", ".", "deploy"},
+	}
+
+	for _, c := range cases {
+		spec := json.RawMessage(`{"build":{"context":"` + c.context + `"}}`)
+		targets := buildTargets([]Manifest{{Kind: KindDeployment, Scope: "s", Name: "w", Spec: spec}}, projectDirOf(c.file))
+
+		if len(targets) != 1 || targets[0].Path != c.want {
+			t.Errorf("file=%s context=%q: path=%q, want %q", c.file, c.context, targets[0].Path, c.want)
+		}
+	}
+}
+
+func TestBuildTargetsFallBackToPathWhenNoContextIsGiven(t *testing.T) {
+	targets := buildTargets([]Manifest{
+		{Kind: KindDeployment, Scope: "s", Name: "w", Spec: json.RawMessage(`{"build":{"path":"apps/pwa"}}`)},
+	}, "")
+
+	if len(targets) != 1 || targets[0].Path != "apps/pwa" {
+		t.Fatalf("targets = %+v", targets)
 	}
 }
