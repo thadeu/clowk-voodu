@@ -931,3 +931,80 @@ func TestDeployLogKeepsTheTailWhenTruncated(t *testing.T) {
 		t.Fatalf("small log altered: %q", small.String())
 	}
 }
+
+const pathsSpec = `
+name: PWA
+on:
+  push:
+    branches: [main]
+    paths: ["apps/pwa/**"]
+apply:
+  file: voodu.hcl
+`
+
+// `on.push.paths` decides from what the push touched. The webhook carries the
+// list; a push that only changed the api must not build the pwa, and the pwa
+// file has to show up in `skipped` so the console can say why.
+func TestDeployRunSkipsAFileWhosePathsThePushDidNotTouch(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": pathsSpec, "voodu.hcl": "MANIFEST-BODY"}
+	api, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","changed":["apps/api/main.go","README.md"]}`)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	if !strings.Contains(body, `"skipped":["PWA"]`) || strings.Contains(body, `"applied":["PWA"]`) {
+		t.Fatalf("the file should be skipped, not applied: %s", body)
+	}
+
+	if stored, _ := api.Store.Get(t.Context(), KindDeployment, "runa", "web"); stored != nil {
+		t.Fatal("nothing should have been applied")
+	}
+}
+
+func TestDeployRunAppliesAFileWhosePathsThePushTouched(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": pathsSpec, "voodu.hcl": "MANIFEST-BODY"}
+	_, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","changed":["apps/pwa/src/index.ts"]}`)
+
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"applied":["PWA"]`) {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+// Unknown must fire: a caller that could not list the files (a push bigger
+// than the payload carries, an older control plane) sends no `changed`, and
+// the paths filter stands aside rather than skipping a deploy on a guess.
+func TestDeployRunFiresPathsFilesWhenTheChangeSetIsUnknown(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": pathsSpec, "voodu.hcl": "MANIFEST-BODY"}
+	_, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`"}`)
+
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"applied":["PWA"]`) {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+// A person dispatching a commit means it, whatever the commit touched.
+func TestDeployRunDispatchIgnoresPaths(t *testing.T) {
+	files := map[string]string{".voodu/pwa.yml": pathsSpec, "voodu.hcl": "MANIFEST-BODY"}
+	_, ts := newRunAPI(t, files, true, map[string][]Manifest{
+		"MANIFEST-BODY": {{Kind: KindDeployment, Scope: "runa", Name: "web", Spec: json.RawMessage(`{"image":"x:1"}`)}},
+	})
+
+	resp, body := postRun(t, ts, `{"sha":"`+testSHA+`","mode":"dispatch","changed":["README.md"]}`)
+
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"applied":["PWA"]`) {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}

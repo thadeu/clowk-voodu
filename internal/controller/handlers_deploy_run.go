@@ -73,6 +73,19 @@ type deployRunRequest struct {
 	// says `manual` is read here. A control plane deciding on its own copy of
 	// the YAML would be a second parser that can disagree with this one.
 	Mode string `json:"mode,omitempty"`
+
+	// Changed lists the files the push touched, repository-relative, so a
+	// trigger file's `on.push.paths` can be honoured. The webhook already
+	// carries them (`commits[].added/modified/removed`), so no second call
+	// to GitHub is needed.
+	//
+	// A pointer, because absent and empty mean different things. Absent is
+	// "unknown" — the caller could not tell (a push larger than the payload
+	// lists, an older control plane) — and unknown must fire every file that
+	// matches the ref: a deploy that did not happen is worse than one that
+	// did nothing. Empty is "nothing changed", which no push produces but a
+	// caller may say. Ignored on a dispatch, where a person chose the commit.
+	Changed *[]string `json:"changed,omitempty"`
 }
 
 const (
@@ -199,7 +212,7 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	specs, held, ok := a.selectTriggerSpecs(w, r, trigger, req, token, snap)
+	specs, held, skipped, ok := a.selectTriggerSpecs(w, r, trigger, req, token, snap)
 	if !ok {
 		return
 	}
@@ -210,6 +223,7 @@ func (a *API) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		Repo:    trigger.Repo,
 		Commit:  req.SHA,
 		Held:    held,
+		Skipped: skipped,
 	}
 
 	runLog := &deployLog{}
@@ -300,7 +314,7 @@ func writeDeployRunErr(w http.ResponseWriter, code int, err error, runLog *deplo
 func (a *API) selectTriggerSpecs(
 	w http.ResponseWriter, r *http.Request, trigger *Trigger, req deployRunRequest,
 	token string, snap repoSnapshot,
-) (selected []triggerspec.Spec, held []string, ok bool) {
+) (selected []triggerspec.Spec, held, skipped []string, ok bool) {
 	found := a.manifestsFromSnapshot(r, trigger.Repo, req.SHA, token, snap)
 
 	ref := req.Ref
@@ -329,6 +343,18 @@ func (a *API) selectTriggerSpecs(
 			continue
 		}
 
+		// `on.push.paths`, against what the push actually touched. Only when
+		// the caller could say (see deployRunRequest.Changed) and only for a
+		// push: a person dispatching a commit means it, whatever it touched.
+		// Reported in `skipped`, not silently dropped — "why did this NOT
+		// fire" is the question a paths filter creates, and the console
+		// answers it from this list.
+		if req.Manifest == "" && mode == runModePush && req.Changed != nil && !file.Spec.MatchesPaths(*req.Changed) {
+			skipped = append(skipped, file.Spec.Name)
+
+			continue
+		}
+
 		// A push does not get to apply a manual file. It matched — that is
 		// worth reporting, because the console turns it into "waiting for
 		// you" — but only a dispatch carries it any further.
@@ -343,15 +369,17 @@ func (a *API) selectTriggerSpecs(
 
 	// Nothing to apply and nothing held is a push no file wanted. Nothing to
 	// apply but something held is a perfectly good answer: the caller gets a
-	// 200 with an empty `applied` and a populated `held`.
-	if len(selected) == 0 && len(held) == 0 {
+	// 200 with an empty `applied` and a populated `held`. So is nothing to
+	// apply but something skipped by its paths: the files saw the push and
+	// declined, which is the filter working, not a push nobody wanted.
+	if len(selected) == 0 && len(held) == 0 && len(skipped) == 0 {
 		writeErr(w, http.StatusUnprocessableEntity,
 			fmt.Errorf("no trigger file in %s matches %s at %s", triggerspec.Dir, ref, short(req.SHA)))
 
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 
-	return selected, held, true
+	return selected, held, skipped, true
 }
 
 // applyFromRepo fetches one manifest, checks its scopes and applies it.
