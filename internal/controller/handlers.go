@@ -1780,6 +1780,18 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		if surge {
 			h.awaitReplicaReady(ctx, newName, spec.Probes)
 
+			// The router learns about the new replica BEFORE the old one
+			// goes. Published only at the end of the loop, the ingress kept
+			// pointing at a container that had just been removed, and every
+			// request in the window between remove and republish was a 502
+			// — a few seconds of downtime on each deploy of a single-replica
+			// app. Now both replicas are upstreams while the old drains, and
+			// the final republish below drops it. A failure here is logged,
+			// not fatal: the final republish still runs.
+			if err := h.republishIngresses(ctx, scope, name); err != nil {
+				h.logf("deployment/%s: republish ingress before retiring %s: %v", name, s.Name, err)
+			}
+
 			if err := retireOld(); err != nil {
 				return err
 			}

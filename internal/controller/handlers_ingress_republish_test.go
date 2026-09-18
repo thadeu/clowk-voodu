@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"testing"
 
 	"go.voodu.clowk.in/internal/containers"
@@ -240,7 +241,88 @@ func TestRollingReplaceRepublishesIngress(t *testing.T) {
 		t.Fatalf("rollingReplaceReplicas: %v", err)
 	}
 
-	if len(rp.calls) != 1 || rp.calls[0] != "test/api" {
-		t.Fatalf("republish calls = %v, want [test/api] — the replica set turned over", rp.calls)
+	// Two publishes per turnover: one with old+new (before the old goes),
+	// one with new only (after). See TestRollingReplacePublishesNewBeforeRetiringOld.
+	if len(rp.calls) != 2 || rp.calls[0] != "test/api" || rp.calls[1] != "test/api" {
+		t.Fatalf("republish calls = %v, want [test/api test/api] — the replica set turned over", rp.calls)
 	}
+}
+
+// snapshotRepublisher records which replicas were RUNNING each time the
+// router was asked to republish — the order is the whole point.
+type snapshotRepublisher struct {
+	fc        *fakeContainers
+	snapshots [][]string
+}
+
+func (r *snapshotRepublisher) RepublishFor(_ context.Context, _, _ string) error {
+	var running []string
+
+	for name, slot := range r.fc.slots {
+		if slot.Running {
+			running = append(running, name)
+		}
+	}
+
+	sort.Strings(running)
+	r.snapshots = append(r.snapshots, running)
+
+	return nil
+}
+
+// A single-replica app used to take a ~5s 502 on every deploy: the new
+// replica was ready, the old one was removed, and only THEN was the
+// router told — so it sent the whole window to a dead container. The
+// surge path must publish with both replicas live before the old one
+// is retired, and again with only the new one after.
+func TestRollingReplacePublishesNewBeforeRetiringOld(t *testing.T) {
+	old := containers.ContainerName("test", "api", "old1")
+
+	fc := &fakeContainers{slots: map[string]*ContainerSlot{
+		old: {
+			Name:     old,
+			Running:  true,
+			Identity: containers.Identity{Kind: containers.KindDeployment, Scope: "test", Name: "api", ReplicaID: "old1"},
+		},
+	}}
+
+	rp := &snapshotRepublisher{fc: fc}
+
+	h := &DeploymentHandler{
+		Store:      newMemStore(),
+		Log:        quietLogger(),
+		Containers: fc,
+		Ingresses:  rp,
+	}
+
+	live := []ContainerSlot{*fc.slots[old]}
+	spec := deploymentSpec{Image: "api:1", Ports: []string{"8080"}}
+
+	if err := h.rollingReplaceReplicas(context.Background(), "test", "api", "test-api", live, spec, "hash", ""); err != nil {
+		t.Fatalf("rollingReplaceReplicas: %v", err)
+	}
+
+	if len(rp.snapshots) != 2 {
+		t.Fatalf("republish snapshots = %v, want exactly two (before and after retiring the old replica)", rp.snapshots)
+	}
+
+	first, second := rp.snapshots[0], rp.snapshots[1]
+
+	if len(first) != 2 || !hasName(first, old) {
+		t.Fatalf("first republish saw %v; want the old replica AND the new one live", first)
+	}
+
+	if len(second) != 1 || hasName(second, old) {
+		t.Fatalf("second republish saw %v; want only the new replica", second)
+	}
+}
+
+func hasName(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+
+	return false
 }
