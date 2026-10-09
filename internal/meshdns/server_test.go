@@ -433,14 +433,16 @@ func TestResolveLooksLocallyThenAtPeers(t *testing.T) {
 }
 
 // The AAAA a resolver sends alongside the A can carry no mesh answer, so it
-// must not cost a round of the peers.
-func TestAAAAOfARemoteNameDoesNotAskThePeers(t *testing.T) {
+// must not cost a round of the peers. It must not deny the name either:
+// musl (alpine) reads an NXDOMAIN on the AAAA as "no such name" and drops
+// the A that came back with it.
+func TestAAAAOfARemoteNameIsNoDataWithoutAskingThePeers(t *testing.T) {
 	peer, peerIndex := startPeer(t, map[string][]netip.Addr{"api.clowk.voodu.": addrs("10.167.105.130")})
 	s, _ := host(nil, peer)
 
 	got := read(t, s.Handle(context.Background(), containerSrc, question(t, "api.clowk.voodu.", dnsmessage.TypeAAAA), false))
-	if got.rcode != dnsmessage.RCodeNameError {
-		t.Fatalf("AAAA before any A: %+v, want NXDOMAIN without asking", got)
+	if got.rcode != dnsmessage.RCodeSuccess || len(got.addrs) != 0 {
+		t.Fatalf("AAAA of a remote name: %+v, want NOERROR with no data", got)
 	}
 
 	if calls := peerIndex.calls.Load(); calls != 0 {

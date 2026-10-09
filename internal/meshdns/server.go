@@ -129,11 +129,18 @@ func (s *Server) Handle(ctx context.Context, src netip.Addr, req []byte, tcp boo
 
 	addrs := s.Index.Lookup(name)
 
-	// Only a container asks the other hosts, and only for an A: the AAAA a
-	// resolver sends alongside can carry no answer here, so it must not
-	// cost a round of the mesh. A peer asking us gets our own names and
-	// nothing more, so a question never travels in a loop.
-	if len(addrs) == 0 && local && q.Type == dnsmessage.TypeA {
+	// The AAAA a container's resolver sends alongside the A, for a name
+	// that is not ours: "no data", without a round of the mesh — it can
+	// carry no answer here. Never "no such name": musl (alpine) reads an
+	// NXDOMAIN on either question as a denial of the A too. The A alone
+	// decides whether the name exists.
+	if len(addrs) == 0 && local && q.Type != dnsmessage.TypeA {
+		return reply(hdr, &q, dnsmessage.RCodeSuccess, nil, tcp)
+	}
+
+	// Only a container asks the other hosts. A peer asking us gets our own
+	// names and nothing more, so a question never travels in a loop.
+	if len(addrs) == 0 && local {
 		addrs = s.remote(ctx, name)
 	}
 
