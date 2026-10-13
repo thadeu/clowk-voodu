@@ -172,6 +172,11 @@ type Server struct {
 	cancelIngress  context.CancelFunc
 	ingressDone    chan struct{}
 
+	// Host CPU window reader — feeds systemstats' CPU% once per
+	// second for /system and the metrics sampler alike.
+	cancelSystem context.CancelFunc
+	systemDone   chan struct{}
+
 	// Activity trail — the append-only record of what was DONE to
 	// this box. No sampler goroutine: the writer is driven by the
 	// handlers themselves, so the only background work is the
@@ -245,6 +250,22 @@ func (s *Server) Start(ctx context.Context) error {
 	recCtx, cancel := context.WithCancel(context.Background())
 	s.cancelRec = cancel
 
+	// Host CPU% is a rate: the collector reads the counters every
+	// second into a window as long as the metrics tick, so the chart
+	// and GET /system both report the real average of the last tick,
+	// whoever asked in between.
+	systemCollector := systemstats.NewGopsutilCollector(s.cfg.MetricsInterval)
+
+	systemCtx, cancelSystem := context.WithCancel(context.Background())
+	s.cancelSystem = cancelSystem
+	s.systemDone = make(chan struct{})
+
+	go func() {
+		defer close(s.systemDone)
+
+		systemCollector.Run(systemCtx)
+	}()
+
 	// Single invoker shared by /exec and the reconciler's handlers —
 	// one env-injection path, one plugin-resolution path.
 	invoker := &DirInvoker{
@@ -308,12 +329,11 @@ func (s *Server) Start(ctx context.Context) error {
 			Store: store,
 		},
 
-		// System snapshot collector — host-level CPU/memory/disk/net/
-		// uptime via gopsutil. Stateful (lastSampled counters drive
-		// the IO/Net rate deltas) so it MUST be a long-lived
-		// instance; constructing one per request would lose the
-		// baseline and report 0 for every rate metric.
-		System: systemstats.NewGopsutilCollector(),
+		// System snapshot collector — host-level CPU/memory/disk/
+		// uptime via gopsutil. Stateful (the CPU window holds the
+		// last readings) so it MUST be the long-lived instance the
+		// sampler shares; one per request would report 0 CPU.
+		System: systemCollector,
 
 		// MetricsDir tells handleMetrics where to read the NDJSON
 		// time-series the Sampler appends to. Same path as the
@@ -863,6 +883,14 @@ func (s *Server) teardown() {
 
 	if s.metricsWriter != nil {
 		_ = s.metricsWriter.Close()
+	}
+
+	if s.cancelSystem != nil {
+		s.cancelSystem()
+	}
+
+	if s.systemDone != nil {
+		<-s.systemDone
 	}
 
 	if s.cancelActivity != nil {

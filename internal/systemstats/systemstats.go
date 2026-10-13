@@ -69,10 +69,10 @@ type HostInfo struct {
 }
 
 // CPUStats carries aggregate CPU% across cores plus the unix load
-// averages. Percent is a moving window — gopsutil's cpu.Percent
-// returns the delta since the last call when interval=0, so the
-// first Snapshot returns 0 for Percent (no baseline yet). Callers
-// can either ignore the first sample or poll twice on startup.
+// averages. Percent is the busy% averaged over the collector's CPU
+// window (the last 15s by default, see CPUWindow) — the same value
+// for every caller, so GET /system and the metrics chart agree. It
+// is 0 until the collector has two readings (right after boot).
 type CPUStats struct {
 	Percent float64 `json:"percent"`
 	Cores   int     `json:"cores"`
@@ -107,20 +107,27 @@ type Collector interface {
 	Snapshot(ctx context.Context) (Snapshot, error)
 }
 
-// GopsutilCollector is the production implementation. Stateless
-// after W7 (host disk-I/O / network-rate sampling moved out — those
-// metrics now live per-pod on UsageStats). Kept as a struct (not a
-// free function) for interface satisfaction + future extensions
-// that might need state again.
-type GopsutilCollector struct{}
+// GopsutilCollector is the production implementation. Its only
+// state is the CPU window: CPU% is a rate, so it needs readings over
+// time, and those must belong to this collector — not to gopsutil's
+// package-global "since the last call" baseline that every caller
+// used to reset for everyone else.
+type GopsutilCollector struct {
+	cpu *CPUWindow
+}
 
-// NewGopsutilCollector returns a collector ready to serve requests.
-// The first Snapshot returns 0 for CPU% (gopsutil's cpu.Percent
-// needs two samples to compute the delta); subsequent calls give
-// the real percentage. All other fields populate from the first
-// call.
-func NewGopsutilCollector() *GopsutilCollector {
-	return &GopsutilCollector{}
+// NewGopsutilCollector returns a collector whose CPU% averages over
+// cpuWindow (DefaultCPUWindow when <= 0). Start Run once so the
+// window gets a reading every second; without it, Snapshot's own
+// readings feed the window at the callers' cadence.
+func NewGopsutilCollector(cpuWindow time.Duration) *GopsutilCollector {
+	return &GopsutilCollector{cpu: &CPUWindow{Window: cpuWindow}}
+}
+
+// Run keeps the CPU window fed until ctx ends. Long-lived: start it
+// once per collector, next to the metrics sampler.
+func (g *GopsutilCollector) Run(ctx context.Context) {
+	g.cpu.Run(ctx)
 }
 
 // Snapshot reads every sub-metric and returns them in one bundle.
@@ -147,13 +154,11 @@ func (g *GopsutilCollector) Snapshot(ctx context.Context) (Snapshot, error) {
 		}
 	}
 
-	// CPU — gopsutil's Percent(0, false) returns the delta since the
-	// last call (per cpu.go internals). First call therefore returns
-	// 0 — documented in NewGopsutilCollector. Subsequent calls give
-	// the real "% busy across all cores" number.
-	if pcts, err := cpu.PercentWithContext(ctx, 0, false); err == nil && len(pcts) > 0 {
-		snap.CPU.Percent = pcts[0]
-	}
+	// CPU — a fresh reading closes the window at "now", then the
+	// average over the last window. Reading never moves a baseline,
+	// so other callers can't shrink this one's window.
+	g.cpu.read(ctx)
+	snap.CPU.Percent = g.cpu.Percent()
 
 	if n, err := cpu.CountsWithContext(ctx, true); err == nil {
 		snap.CPU.Cores = n

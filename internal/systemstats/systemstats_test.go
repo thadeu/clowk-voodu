@@ -73,7 +73,7 @@ func TestSnapshotJSONShape(t *testing.T) {
 // (cores > 0, total memory > 0). If this fails on a dev machine we
 // know the dependency wiring is broken.
 func TestSnapshotRealSmokeTest(t *testing.T) {
-	c := NewGopsutilCollector()
+	c := NewGopsutilCollector(0)
 
 	snap, err := c.Snapshot(context.Background())
 	if err != nil {
