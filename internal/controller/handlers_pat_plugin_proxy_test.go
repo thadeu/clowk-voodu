@@ -147,6 +147,114 @@ func TestPluginProxy_ForwardsPOSTBody(t *testing.T) {
 	}
 }
 
+// patAPIWithProxyScopes is patAPIWithProxy with a PAT minted for exactly
+// the given scopes (the default test PAT carries read + actions).
+func patAPIWithProxyScopes(t *testing.T, scopes []Scope, ip string, port int) (*API, string) {
+	t.Helper()
+
+	api, _ := patAPIWithProxy(t, "fswapi", ip, port, nil)
+
+	plain, rec, err := GeneratePAT(scopes, "scoped")
+	if err != nil {
+		t.Fatalf("GeneratePAT: %v", err)
+	}
+
+	if err := api.Store.PutPAT(t.Context(), rec); err != nil {
+		t.Fatalf("PutPAT: %v", err)
+	}
+
+	return api, plain
+}
+
+func pluginRequest(t *testing.T, ts *httptest.Server, method, path, plain string) int {
+	t.Helper()
+
+	req, _ := http.NewRequest(method, ts.URL+path, nil)
+	patSign(req, plain)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+
+	_ = resp.Body.Close()
+
+	return resp.StatusCode
+}
+
+// A read-only PAT (the WebUI viewer token) reads a plugin API but can never
+// reach a mutating route: a plugin POST can be `hupall`, and the proxy
+// forwards the method verbatim.
+func TestPluginProxy_ReadScopeCannotMutate(t *testing.T) {
+	host, port, closeUp := upstreamEcho(t)
+	defer closeUp()
+
+	api, plain := patAPIWithProxyScopes(t, []Scope{ScopeRead}, host, port)
+
+	ts := httptest.NewServer(api.PATHandler(nil, 10, 3))
+	defer ts.Close()
+
+	if got := pluginRequest(t, ts, http.MethodGet, "/api/pat/v1/fswapi/fsw/api/status", plain); got != http.StatusOK {
+		t.Errorf("read PAT GET status = %d, want 200", got)
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		if got := pluginRequest(t, ts, method, "/api/pat/v1/fswapi/fsw/api/actions/hupall", plain); got != http.StatusForbidden {
+			t.Errorf("read PAT %s status = %d, want 403", method, got)
+		}
+	}
+}
+
+func TestPluginProxy_ActionsScopeCanMutate(t *testing.T) {
+	host, port, closeUp := upstreamEcho(t)
+	defer closeUp()
+
+	api, plain := patAPIWithProxyScopes(t, []Scope{ScopeActions}, host, port)
+
+	ts := httptest.NewServer(api.PATHandler(nil, 10, 3))
+	defer ts.Close()
+
+	if got := pluginRequest(t, ts, http.MethodPost, "/api/pat/v1/fswapi/fsw/api/actions/reloadxml", plain); got != http.StatusOK {
+		t.Errorf("actions PAT POST status = %d, want 200", got)
+	}
+}
+
+// Mutating plugin routes share the core action rate limit: a stolen
+// actions token cannot loop `hupall`.
+func TestPluginProxy_MutationsAreRateLimited(t *testing.T) {
+	host, port, closeUp := upstreamEcho(t)
+	defer closeUp()
+
+	api, plain := patAPIWithProxyScopes(t, []Scope{ScopeActions}, host, port)
+
+	ts := httptest.NewServer(api.PATHandler(nil, 0.001, 2))
+	defer ts.Close()
+
+	path := "/api/pat/v1/fswapi/fsw/api/actions/reloadxml"
+
+	for i := range 2 {
+		if got := pluginRequest(t, ts, http.MethodPost, path, plain); got != http.StatusOK {
+			t.Fatalf("POST %d within burst = %d, want 200", i+1, got)
+		}
+	}
+
+	if got := pluginRequest(t, ts, http.MethodPost, path, plain); got != http.StatusTooManyRequests {
+		t.Errorf("POST past burst = %d, want 429", got)
+	}
+}
+
+func TestIsReadMethod(t *testing.T) {
+	for method, want := range map[string]bool{
+		http.MethodGet: true, http.MethodHead: true, http.MethodOptions: true,
+		http.MethodPost: false, http.MethodPut: false, http.MethodPatch: false, http.MethodDelete: false,
+		"PROPFIND": false,
+	} {
+		if got := isReadMethod(method); got != want {
+			t.Errorf("isReadMethod(%s) = %v, want %v", method, got, want)
+		}
+	}
+}
+
 // The root of a plugin route (no trailing path) forwards to "/".
 func TestPluginProxy_RootPath(t *testing.T) {
 	host, port, closeUp := upstreamEcho(t)
@@ -411,7 +519,7 @@ func TestParsePluginRoutePath(t *testing.T) {
 }
 
 func TestIsReservedPATPrefix(t *testing.T) {
-	for _, p := range []string{"stats", "system", "pods", "logs", "metrics", "pats"} {
+	for _, p := range []string{"stats", "system", "pods", "logs", "metrics", "pats", "plugins"} {
 		if !isReservedPATPrefix(p) {
 			t.Errorf("%q should be reserved", p)
 		}
@@ -437,7 +545,18 @@ func TestDirPluginRouteLookup(t *testing.T) {
 	// A plugin whose prefix defaults to its name, fixed port.
 	writePluginYML(t, root, "redis", "name: redis\nroutes:\n  port: 6390\n")
 
+	// A builtin plugin: one resource, plugins/<name>, no scope in the URL.
+	writePluginYML(t, root, "fswapi", "name: fswapi\nroutes:\n  prefix: fswapi\n  port_env: FREESWITCH_API_ADDR\n  builtin: true\n")
+
 	look := dirPluginRouteLookup{Root: root}
+
+	if r, ok := look.LookupRoute("fswapi"); !ok || !r.Builtin || r.Plugin != "fswapi" {
+		t.Errorf("fswapi lookup = %+v ok=%v, want a builtin route of plugin fswapi", r, ok)
+	}
+
+	if r, _ := look.LookupRoute("hep3"); r.Builtin {
+		t.Error("hep3 does not declare builtin")
+	}
 
 	if r, ok := look.LookupRoute("hep3"); !ok || r.PortEnv != "HEP_API_ADDR" || r.Port != 0 {
 		t.Errorf("hep3 lookup = %+v ok=%v, want PortEnv=HEP_API_ADDR (dynamic, no fixed port)", r, ok)
@@ -453,6 +572,110 @@ func TestDirPluginRouteLookup(t *testing.T) {
 
 	if _, ok := look.LookupRoute("nonexistent"); ok {
 		t.Error("nonexistent prefix must not resolve")
+	}
+}
+
+// recordingResourceIPs is a ResourceIPResolver that remembers which
+// resource the proxy asked for — the builtin route's whole point is WHICH
+// resource it targets, so the static fake is not enough.
+type recordingResourceIPs struct {
+	ip          string
+	scope, name string
+}
+
+func (f *recordingResourceIPs) ResolveIP(scope, name string) (string, error) {
+	f.scope, f.name = scope, name
+
+	return f.ip, nil
+}
+
+func TestPluginProxy_BuiltinRouteTargetsPluginsScope(t *testing.T) {
+	host, port, closeUp := upstreamEcho(t)
+	defer closeUp()
+
+	api, plain, _, _ := newTestPATAPI(t)
+
+	ips := &recordingResourceIPs{ip: host}
+
+	api.PluginRoutes = fakePluginRoutes{routes: map[string]pluginRoute{
+		"fswapi": {Prefix: "fswapi", Port: port, Plugin: "fswapi", Builtin: true},
+	}}
+	api.ContainerIPs = ips
+
+	ts := httptest.NewServer(api.PATHandler(nil, 10, 3))
+	defer ts.Close()
+
+	for path, wantUpstream := range map[string]string{
+		"/api/pat/v1/fswapi/calls/count?x=1": "path=/calls/count query=x=1",
+		"/api/pat/v1/fswapi":                 "path=/ query=",
+	} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		patSign(req, plain)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), wantUpstream) {
+			t.Errorf("%s: status=%d body=%q, want upstream %q", path, resp.StatusCode, body, wantUpstream)
+		}
+
+		// No scope/name in the URL: the resource is always plugins/<plugin>.
+		if ips.scope != "plugins" || ips.name != "fswapi" {
+			t.Errorf("%s: resolved %s/%s, want plugins/fswapi", path, ips.scope, ips.name)
+		}
+	}
+}
+
+func TestPluginProxy_BuiltinRouteMutationNeedsActions(t *testing.T) {
+	host, port, closeUp := upstreamEcho(t)
+	defer closeUp()
+
+	builtin := fakePluginRoutes{routes: map[string]pluginRoute{
+		"fswapi": {Prefix: "fswapi", Port: port, Plugin: "fswapi", Builtin: true},
+	}}
+
+	readAPI, readPAT := patAPIWithProxyScopes(t, []Scope{ScopeRead}, host, port)
+	readAPI.PluginRoutes = builtin
+
+	actionsAPI, actionsPAT := patAPIWithProxyScopes(t, []Scope{ScopeActions}, host, port)
+	actionsAPI.PluginRoutes = builtin
+
+	readTS := httptest.NewServer(readAPI.PATHandler(nil, 10, 3))
+	defer readTS.Close()
+
+	actionsTS := httptest.NewServer(actionsAPI.PATHandler(nil, 10, 3))
+	defer actionsTS.Close()
+
+	if got := pluginRequest(t, readTS, http.MethodPost, "/api/pat/v1/fswapi/actions/hupall", readPAT); got != http.StatusForbidden {
+		t.Errorf("read PAT POST on a builtin route = %d, want 403", got)
+	}
+
+	if got := pluginRequest(t, actionsTS, http.MethodPost, "/api/pat/v1/fswapi/actions/reloadxml", actionsPAT); got != http.StatusOK {
+		t.Errorf("actions PAT POST on a builtin route = %d, want 200", got)
+	}
+}
+
+func TestMatchPluginRoute_RegularRouteStillNeedsScopeAndName(t *testing.T) {
+	api := &API{PluginRoutes: fakePluginRoutes{routes: map[string]pluginRoute{
+		"hep3": {Prefix: "hep3", Port: 8080, Plugin: "hep3"},
+	}}}
+
+	if _, _, _, _, ok := api.matchPluginRoute("/api/pat/v1/hep3/voip"); ok {
+		t.Error("a regular route without a name must fall through to the core mux")
+	}
+
+	_, scope, name, rest, ok := api.matchPluginRoute("/api/pat/v1/hep3/voip/main/calls")
+	if !ok || scope != "voip" || name != "main" || rest != "/calls" {
+		t.Errorf("regular route = (%q,%q,%q,%v), want voip/main /calls", scope, name, rest, ok)
+	}
+
+	if _, _, _, _, ok := api.matchPluginRoute("/api/pat/v1/plugins/fswapi"); ok {
+		t.Error("the plugins prefix belongs to the core install routes")
 	}
 }
 

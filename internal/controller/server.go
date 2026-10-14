@@ -374,7 +374,7 @@ func (s *Server) Start(ctx context.Context) error {
 		// JIT-install plugins missing at apply time. Convention
 		// repo is `thadeu/voodu-<kind>`; operators override per
 		// block via `_repo` attribute or per-server via env.
-		PluginInstaller: &plugins.Installer{Root: s.cfg.PluginsRoot},
+		PluginInstaller: &plugins.Installer{Root: s.cfg.PluginsRoot, ControllerURL: deriveControllerURL(s.cfg.HTTPAddr)},
 
 		// Plugin route plane (HP0): resolve a plugin's declared
 		// reverse-proxy route by scanning PluginsRoot, and resolve a

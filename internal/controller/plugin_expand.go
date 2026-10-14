@@ -148,6 +148,10 @@ func (a *API) expandPluginBlocks(ctx context.Context, mans []*Manifest) (out []*
 		}
 
 		if IsCoreKind(m.Kind) {
+			if m.Scope == plugin.BuiltinScope {
+				return nil, nil, nil, builtinScopeError(m, nil)
+			}
+
 			// A core kind can still carry blocks belonging to a
 			// plugin — the parser hands them through rather than
 			// refusing them, so this is where they find their owner.
@@ -212,6 +216,10 @@ func (a *API) expandPluginBlocks(ctx context.Context, mans []*Manifest) (out []*
 			})
 		}
 
+		if m.Scope == plugin.BuiltinScope && !ownsBuiltinResource(plug, m.Name) {
+			return nil, nil, nil, builtinScopeError(m, plug)
+		}
+
 		expanded, runErr := a.runExpand(ctx, plug, m)
 		if runErr != nil {
 			return nil, nil, nil, fmt.Errorf("expand %s/%s: %w", m.Kind, m.Name, runErr)
@@ -232,6 +240,34 @@ func (a *API) expandPluginBlocks(ctx context.Context, mans []*Manifest) (out []*
 	}
 
 	return out, expansions, installs, nil
+}
+
+// ownsBuiltinResource reports whether name is the plugin's own builtin
+// resource: the plugin declares a builtin route, and the name is the
+// plugin's name. One resource per plugin, named after it, so two plugins
+// can never claim the same plugins/<name>.
+func ownsBuiltinResource(plug *plugins.LoadedPlugin, name string) bool {
+	if plug == nil || plug.Manifest.Routes == nil || !plug.Manifest.Routes.Builtin {
+		return false
+	}
+
+	return name == plug.Manifest.Name
+}
+
+// builtinScopeError explains a refused apply into the reserved scope. The
+// scope only holds what plugins create on their own, so the operator
+// either picked the scope by accident or tried to override a builtin
+// resource under the wrong name — the message names the only valid one.
+func builtinScopeError(m *Manifest, plug *plugins.LoadedPlugin) error {
+	ref := refOf(m.Kind, m.Scope, m.Name)
+
+	if plug != nil && plug.Manifest.Routes != nil && plug.Manifest.Routes.Builtin {
+		return fmt.Errorf("%s: scope %q is reserved for resources that plugins create; plugin %q owns only %s/%s",
+			ref, plugin.BuiltinScope, plug.Manifest.Name, plugin.BuiltinScope, plug.Manifest.Name)
+	}
+
+	return fmt.Errorf("%s: scope %q is reserved for resources that plugins create — use another scope",
+		ref, plugin.BuiltinScope)
 }
 
 // refOf renders a (kind, scope, name) tuple in the standard

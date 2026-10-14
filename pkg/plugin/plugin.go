@@ -141,7 +141,9 @@ type Manifest struct {
 //
 //	/api/pat/v1/<Prefix>/<scope>/<name>/<rest...>
 //
-// It authenticates the PAT (read scope), resolves the (scope, name)
+// It authenticates the PAT — read scope for GET/HEAD/OPTIONS, actions
+// scope plus the per-PAT action rate limit for mutating methods (POST,
+// PUT, PATCH, DELETE) — resolves the (scope, name)
 // container's voodu0 IP, and proxies to <container-ip>:<Port>/<rest>,
 // preserving method, query and body. The upstream port is NEVER
 // published to the host — the container stays internal and the
@@ -149,7 +151,8 @@ type Manifest struct {
 // no extra firewall opening.
 //
 // Prefix defaults to the plugin Name when empty. A Prefix that collides
-// with a core PAT route (stats, system, pods, logs, metrics, pats) is
+// with a core PAT route (stats, system, pods, logs, metrics, pats,
+// plugins, ...) is
 // ignored — a plugin cannot shadow a built-in endpoint.
 //
 // The upstream port is resolved one of two ways:
@@ -166,11 +169,29 @@ type Manifest struct {
 // Reference consumer: voodu-hep3 declares `routes: { prefix: hep3,
 // port_env: HEP_API_ADDR }` so the WebUI reaches the clowk-hep3 capture
 // API on whatever api_port the operator configured, without exposing it.
+//
+// Builtin marks a plugin that owns exactly one resource, created by the
+// plugin itself (its install hook) rather than by the operator:
+// BuiltinScope/<plugin name>. The route then drops scope and name:
+//
+//	/api/pat/v1/<Prefix>/<rest...>  →  BuiltinScope/<Name>
+//
+// With one instance per server, a scope/name in the URL only repeats the
+// plugin name. Reference consumer: voodu-fswapi (`plugins/fswapi`,
+// reached at /api/pat/v1/fswapi/calls).
 type RouteConfig struct {
 	Prefix  string `yaml:"prefix,omitempty"   json:"prefix,omitempty"`
 	Port    int    `yaml:"port,omitempty"     json:"port,omitempty"`
 	PortEnv string `yaml:"port_env,omitempty" json:"port_env,omitempty"`
+	Builtin bool   `yaml:"builtin,omitempty"  json:"builtin,omitempty"`
 }
+
+// BuiltinScope is the scope reserved for resources a plugin creates on its
+// own (see RouteConfig.Builtin). The controller refuses any apply into it
+// except a builtin plugin's block for its own resource, so a name here
+// always means "made by a plugin", never "made by the operator" — and an
+// operator scope can never collide with it.
+const BuiltinScope = "plugins"
 
 // HasAlias reports whether the given name appears in the plugin's
 // Aliases list. Case-sensitive — aliases are typically lowercase
@@ -207,6 +228,12 @@ const (
 	EnvEtcdClient = "VOODU_ETCD_CLIENT"
 	EnvPluginDir  = "VOODU_PLUGIN_DIR"
 	EnvApp        = "VOODU_APP"
+
+	// EnvControllerURL is set on the install/uninstall lifecycle hooks:
+	// the controller's host-side HTTP base URL. A builtin plugin's hook
+	// uses it to apply (and later delete) its own resource — the same
+	// variable the `voodu` CLI reads, so the hook can call either.
+	EnvControllerURL = "VOODU_CONTROLLER_URL"
 
 	// Ingress-kind env — set by the reconciler when calling
 	// <ingress-plugin>:apply and :remove for a declared ingress.

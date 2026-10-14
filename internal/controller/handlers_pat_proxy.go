@@ -225,7 +225,7 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	// ServeMux conflict with the core routes above, and any non-plugin
 	// path falls straight through to the mux's existing 404. No-op when
 	// the proxy seams aren't wired (PluginRoutes/ContainerIPs nil).
-	handler := a.withPluginRoutes(mux, auth)
+	handler := a.withPluginRoutes(mux, auth, limiter)
 
 	// Reuse the existing log-requests middleware so PAT-plane
 	// requests get the same access log line shape as the

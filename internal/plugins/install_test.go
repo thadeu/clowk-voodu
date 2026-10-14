@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -169,5 +170,37 @@ func TestInstallerRemoveExisting(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(root, "gone")); !os.IsNotExist(err) {
 		t.Errorf("plugin dir still present: %v", err)
+	}
+}
+
+// The install hook of a builtin plugin applies its own resource, so it
+// needs the controller's address — and only the hooks get it from here.
+func TestInstallerHookGetsControllerURL(t *testing.T) {
+	src := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(src, "plugin.yml"), []byte("name: hello\nversion: 0.1.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hook := "#!/bin/bash\necho \"$VOODU_CONTROLLER_URL\" > \"$VOODU_PLUGIN_DIR/controller_url\"\n"
+
+	if err := os.WriteFile(filepath.Join(src, "install"), []byte(hook), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	inst := &Installer{Root: root, ControllerURL: "http://127.0.0.1:8686"}
+
+	if _, err := inst.Install(context.Background(), src, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "hello", "controller_url"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.TrimSpace(string(got)) != "http://127.0.0.1:8686" {
+		t.Errorf("hook saw VOODU_CONTROLLER_URL=%q", got)
 	}
 }

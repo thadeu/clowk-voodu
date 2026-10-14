@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go.voodu.clowk.in/pkg/plugin"
 )
 
 // InstallSource describes where a plugin's files come from. The source
@@ -64,6 +66,12 @@ type Installer struct {
 	// Git is the git binary used to clone remote sources. Defaults to
 	// "git" on PATH; tests can inject a stub.
 	Git string
+
+	// ControllerURL is handed to the install/uninstall hooks as
+	// VOODU_CONTROLLER_URL. A builtin plugin's hook applies its own
+	// resource with it — without it, the hook has no address to call.
+	// Empty leaves the variable unset (hooks that don't call back).
+	ControllerURL string
 }
 
 // Install places the plugin in Root and returns the loaded plugin. If a
@@ -282,7 +290,13 @@ func (i *Installer) runLifecycle(ctx context.Context, p *LoadedPlugin, name stri
 	// "read-only file system". The plugin dir is writable (we install into
 	// it), so this keeps the sandbox intact and the hook working — and HOME
 	// also covers XDG caches/config that default under $HOME.
-	cmd.Env = buildEnv(p, map[string]string{"TMPDIR": p.Dir, "HOME": p.Dir})
+	env := map[string]string{"TMPDIR": p.Dir, "HOME": p.Dir}
+
+	if i.ControllerURL != "" {
+		env[plugin.EnvControllerURL] = i.ControllerURL
+	}
+
+	cmd.Env = buildEnv(p, env)
 
 	// Stream the hook's output to the log AND capture it, so a failure
 	// surfaces the reason in `vd plugins:install` (not just "exit status 1").

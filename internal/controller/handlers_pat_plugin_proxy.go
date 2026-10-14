@@ -4,9 +4,15 @@
 // authenticated PAT listener:
 //
 //	/api/pat/v1/<prefix>/<scope>/<name>/<rest...>
-//	  → PAT auth (read scope)
+//	  → PAT auth: read scope for GET/HEAD/OPTIONS; actions scope + the
+//	    per-PAT action rate limit for anything that can mutate
 //	  → resolve the (scope, name) container's voodu0 IP
 //	  → proxy to http://<ip>:<port>/<rest>, preserving method/query/body
+//
+// A builtin route (RouteConfig.Builtin) has one fixed resource,
+// plugins/<plugin name>, so its URL carries no scope or name:
+//
+//	/api/pat/v1/<prefix>/<rest...>  →  plugins/<plugin name>
 //
 // The upstream port is never published to the host: the container stays
 // internal on voodu0, and the controller — which runs on the host and
@@ -36,6 +42,7 @@ import (
 
 	"go.voodu.clowk.in/internal/docker"
 	"go.voodu.clowk.in/internal/plugins"
+	"go.voodu.clowk.in/pkg/plugin"
 )
 
 // patBase is the PAT plane path prefix every route shares.
@@ -61,6 +68,11 @@ var reservedPATPrefixes = map[string]struct{}{
 	"deploy": {},
 	"config": {},
 	"pats":   {},
+
+	// Install/remove live here. The plugin plane runs first, so without
+	// this entry a plugin declaring `prefix: plugins` would answer
+	// /api/pat/v1/plugins/... instead of the core install routes.
+	"plugins": {},
 }
 
 // pluginRoute is a resolved route declaration. The actual upstream port
@@ -70,6 +82,11 @@ type pluginRoute struct {
 	Prefix  string
 	Port    int
 	PortEnv string
+
+	// Plugin is the plugin's name; Builtin routes target
+	// plugins/<Plugin> instead of a scope/name taken from the URL.
+	Plugin  string
+	Builtin bool
 }
 
 // PluginRouteLookup resolves a URL prefix segment to a plugin's declared
@@ -91,25 +108,74 @@ type ResourceIPResolver interface {
 // withPluginRoutes wraps the PAT mux so plugin routes are intercepted
 // (with PAT auth) before the mux sees them. When the proxy seams aren't
 // wired (minimal test APIs), it returns next unchanged.
-func (a *API) withPluginRoutes(next http.Handler, auth *patAuthorizer) http.Handler {
+//
+// The scope follows the METHOD, not the plugin. A plugin API can carry
+// actions as well as reads (voodu-fswapi: reloadxml, hupall), and the
+// proxy forwards the method verbatim — so a read-only PAT (the WebUI's
+// "viewer" token) reaching a POST would be a read token ending every call
+// on the box. Mutating methods get the same gate as the core action
+// endpoints: ScopeActions plus the per-PAT rate limit.
+func (a *API) withPluginRoutes(next http.Handler, auth *patAuthorizer, limiter *patRateLimiter) http.Handler {
 	if a.PluginRoutes == nil || a.ContainerIPs == nil {
 		return next
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prefix, scope, name, rest, ok := parsePluginRoutePath(r.URL.Path)
-		if ok && !isReservedPATPrefix(prefix) {
-			if route, found := a.PluginRoutes.LookupRoute(prefix); found {
-				auth.Middleware(ScopeRead, func(w http.ResponseWriter, r *http.Request) {
-					a.proxyToPlugin(w, r, route, scope, name, rest)
-				})(w, r)
+		route, scope, name, rest, ok := a.matchPluginRoute(r.URL.Path)
+		if !ok {
+			next.ServeHTTP(w, r)
 
-				return
-			}
+			return
 		}
 
-		next.ServeHTTP(w, r)
+		proxy := func(w http.ResponseWriter, r *http.Request) {
+			a.proxyToPlugin(w, r, route, scope, name, rest)
+		}
+
+		if isReadMethod(r.Method) {
+			auth.Middleware(ScopeRead, proxy)(w, r)
+		} else {
+			auth.Middleware(ScopeActions, limiter.Middleware(proxy))(w, r)
+		}
 	})
+}
+
+// matchPluginRoute resolves a PAT path to a declared plugin route and the
+// resource it targets. A builtin route takes everything after the prefix
+// as the upstream path; a regular one reads scope and name from the next
+// two segments. ok is false for core paths, unknown prefixes and regular
+// routes missing scope or name — those fall through to the core mux.
+func (a *API) matchPluginRoute(p string) (route pluginRoute, scope, name, rest string, ok bool) {
+	prefix, tail, ok := splitPluginPrefix(p)
+	if !ok || isReservedPATPrefix(prefix) {
+		return pluginRoute{}, "", "", "", false
+	}
+
+	route, found := a.PluginRoutes.LookupRoute(prefix)
+	if !found {
+		return pluginRoute{}, "", "", "", false
+	}
+
+	if route.Builtin {
+		return route, plugin.BuiltinScope, route.Plugin, "/" + tail, true
+	}
+
+	_, scope, name, rest, ok = parsePluginRoutePath(p)
+
+	return route, scope, name, rest, ok
+}
+
+// splitPluginPrefix splits a PAT path into its first segment and the
+// rest, without the joining slash. ok is false outside the PAT base or
+// when the first segment is empty.
+func splitPluginPrefix(p string) (prefix, tail string, ok bool) {
+	if !strings.HasPrefix(p, patBase) {
+		return "", "", false
+	}
+
+	prefix, tail, _ = strings.Cut(strings.TrimPrefix(p, patBase), "/")
+
+	return prefix, tail, prefix != ""
 }
 
 // parsePluginRoutePath splits a PAT path into the plugin-route shape
@@ -132,6 +198,18 @@ func parsePluginRoutePath(p string) (prefix, scope, name, rest string, ok bool) 
 	}
 
 	return segs[0], segs[1], segs[2], rest, true
+}
+
+// isReadMethod reports whether a method cannot mutate the upstream, by
+// HTTP's own contract. Anything else (POST, PUT, PATCH, DELETE, and any
+// method we don't know) is treated as an action.
+func isReadMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 func isReservedPATPrefix(prefix string) bool {
@@ -208,7 +286,13 @@ func (d dirPluginRouteLookup) LookupRoute(prefix string) (pluginRoute, bool) {
 		}
 
 		if strings.Trim(declared, "/") == prefix {
-			return pluginRoute{Prefix: prefix, Port: rc.Port, PortEnv: rc.PortEnv}, true
+			return pluginRoute{
+				Prefix:  prefix,
+				Port:    rc.Port,
+				PortEnv: rc.PortEnv,
+				Plugin:  p.Manifest.Name,
+				Builtin: rc.Builtin,
+			}, true
 		}
 	}
 

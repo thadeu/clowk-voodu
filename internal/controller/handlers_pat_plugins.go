@@ -260,7 +260,7 @@ func (a *API) runPluginInstall(source, version string) {
 	defer cancel()
 
 	jobs := a.pluginJobRegistry()
-	inst := &plugins.Installer{Root: a.PluginsRoot}
+	inst := a.pluginInstaller()
 
 	if _, err := inst.Install(ctx, source, version); err != nil {
 		jobs.Fail(source, trimInstallError(err.Error()))
@@ -301,7 +301,7 @@ func (a *API) handlePATPluginRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inst := &plugins.Installer{Root: a.PluginsRoot}
+	inst := a.pluginInstaller()
 
 	ok, err := inst.Remove(r.Context(), name)
 	if err != nil {

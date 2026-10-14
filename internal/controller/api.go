@@ -2751,7 +2751,7 @@ func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inst := &plugins.Installer{Root: a.PluginsRoot}
+	inst := a.pluginInstaller()
 
 	loaded, err := inst.Install(r.Context(), req.Source, req.Version)
 	if err != nil {
@@ -2760,6 +2760,13 @@ func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: loaded.Manifest})
+}
+
+// pluginInstaller builds the Installer every install/remove path shares,
+// so each hook gets the same environment — VOODU_CONTROLLER_URL included,
+// which a builtin plugin's hook needs to apply its own resource.
+func (a *API) pluginInstaller() *plugins.Installer {
+	return &plugins.Installer{Root: a.PluginsRoot, ControllerURL: a.ControllerURL}
 }
 
 // handlePluginRemove deletes the plugin directory. 404 if the plugin
@@ -2776,7 +2783,7 @@ func (a *API) handlePluginRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inst := &plugins.Installer{Root: a.PluginsRoot}
+	inst := a.pluginInstaller()
 
 	ok, err := inst.Remove(r.Context(), name)
 	if err != nil {
