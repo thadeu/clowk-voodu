@@ -2079,6 +2079,11 @@ type pluginSummary struct {
 	Name    string   `json:"name"`
 	Version string   `json:"version,omitempty"`
 	Aliases []string `json:"aliases,omitempty"`
+
+	// InstallError is set when the plugin's install hook failed: it is on
+	// disk but not working, and feature gates (the WebUI's plugin pages)
+	// must not treat it as installed.
+	InstallError string `json:"install_error,omitempty"`
 }
 
 // pluginSummaries returns the installed plugins as compact summaries.
@@ -2095,9 +2100,10 @@ func (a *API) pluginSummaries() []pluginSummary {
 	out := make([]pluginSummary, 0, len(loaded))
 	for _, p := range loaded {
 		out = append(out, pluginSummary{
-			Name:    p.Manifest.Name,
-			Version: p.Manifest.Version,
-			Aliases: p.Manifest.Aliases,
+			Name:         p.Manifest.Name,
+			Version:      p.Manifest.Version,
+			Aliases:      p.Manifest.Aliases,
+			InstallError: p.InstallError(),
 		})
 	}
 
@@ -2711,7 +2717,10 @@ func (a *API) handlePlugins(w http.ResponseWriter, r *http.Request) {
 
 	manifests := make([]plugin.Manifest, 0, len(loaded))
 	for _, p := range loaded {
-		manifests = append(manifests, p.Manifest)
+		m := p.Manifest
+		m.InstallError = p.InstallError()
+
+		manifests = append(manifests, m)
 	}
 
 	errs := make([]string, 0, len(loadErrs))

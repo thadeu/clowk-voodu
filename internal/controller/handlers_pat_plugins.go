@@ -67,7 +67,16 @@ func (a *API) handlePATPluginList(w http.ResponseWriter, r *http.Request) {
 	if a.PluginsRoot != "" {
 		loaded, errs := plugins.LoadAll(a.PluginsRoot)
 		for _, p := range loaded {
-			items = append(items, installedItem(p.Manifest))
+			item := installedItem(p.Manifest)
+
+			// A failed install hook leaves the directory behind; the marker
+			// keeps the card on "failed" after the job registry forgets it.
+			if msg := p.InstallError(); msg != "" {
+				item.State = string(PluginJobFailed)
+				item.Error = trimInstallError(msg)
+			}
+
+			items = append(items, item)
 		}
 
 		for _, e := range errs {

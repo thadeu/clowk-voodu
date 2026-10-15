@@ -34,6 +34,33 @@ type LoadedPlugin struct {
 	Commands map[string]string
 }
 
+// InstallErrorFile marks a plugin whose install hook failed. Install leaves
+// the directory in place on a failed hook (a manual re-run can finish it), so
+// without a marker the plugin would list as installed forever — the hook's
+// error only lived in the 10-minute job registry. A successful install
+// replaces the whole directory, which drops the marker with it.
+const InstallErrorFile = ".install-error"
+
+// InstallError is the failed install hook's message, or "" when the plugin
+// installed cleanly.
+func (p *LoadedPlugin) InstallError() string {
+	if p == nil || p.Dir == "" {
+		return ""
+	}
+
+	raw, err := os.ReadFile(filepath.Join(p.Dir, InstallErrorFile))
+	if err != nil {
+		return ""
+	}
+
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		return "install hook failed"
+	}
+
+	return msg
+}
+
 // LoadFromDir reads one plugin from its installation directory. It
 // tolerates missing plugin.yml by filling in defaults from
 // directory conventions — name from basename, commands from the

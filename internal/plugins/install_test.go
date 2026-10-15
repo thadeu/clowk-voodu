@@ -204,3 +204,41 @@ func TestInstallerHookGetsControllerURL(t *testing.T) {
 		t.Errorf("hook saw VOODU_CONTROLLER_URL=%q", got)
 	}
 }
+
+// A failing install hook marks the plugin; the next install that succeeds
+// replaces the directory, and the mark goes with it.
+func TestInstallerMarksAFailedHookAndClearsItOnSuccess(t *testing.T) {
+	root := t.TempDir()
+	inst := &Installer{Root: root}
+
+	source := func(t *testing.T, hook string) string {
+		dir := t.TempDir()
+
+		_ = os.WriteFile(filepath.Join(dir, "plugin.yml"), []byte("name: hello\nversion: 0.1.0\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "install"), []byte(hook), 0o755)
+
+		return dir
+	}
+
+	if _, err := inst.Install(context.Background(), source(t, "#!/bin/bash\necho 'controller too old'\nexit 1\n"), ""); err == nil {
+		t.Fatal("a failing hook must fail the install")
+	}
+
+	broken, err := LoadFromDir(filepath.Join(root, "hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if msg := broken.InstallError(); !strings.Contains(msg, "controller too old") {
+		t.Fatalf("InstallError = %q, want the hook's output", msg)
+	}
+
+	fixed, err := inst.Install(context.Background(), source(t, "#!/bin/bash\nexit 0\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if msg := fixed.InstallError(); msg != "" {
+		t.Errorf("a successful reinstall must clear the mark, got %q", msg)
+	}
+}

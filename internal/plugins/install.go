@@ -147,7 +147,10 @@ func (i *Installer) Install(ctx context.Context, source, version string) (*Loade
 		// The install hook fetches the binary / builds the image — a
 		// failure means a broken plugin, so surface it instead of
 		// reporting a false success. The copied dir is left in place so a
-		// manual hook re-run can finish without re-fetching the source.
+		// manual hook re-run can finish without re-fetching the source,
+		// and marked, so every list reports it failed rather than installed.
+		_ = os.WriteFile(filepath.Join(final, InstallErrorFile), []byte(err.Error()+"\n"), 0o644)
+
 		return nil, fmt.Errorf("plugin %q: %w", name, err)
 	}
 

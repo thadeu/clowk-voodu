@@ -133,6 +133,11 @@ type Manifest struct {
 	Routes *RouteConfig `yaml:"routes,omitempty" json:"routes,omitempty"`
 
 	Source string `yaml:"-" json:"source,omitempty"`
+
+	// InstallError is filled in by the controller's /plugins list (never
+	// read from plugin.yml): the failed install hook's message, so
+	// `vd plugins:list` can say the plugin is not working.
+	InstallError string `yaml:"-" json:"install_error,omitempty"`
 }
 
 // RouteConfig declares an HTTP route the controller mounts under the PAT

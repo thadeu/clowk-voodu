@@ -167,7 +167,15 @@ func pluginList(root *cobra.Command) error {
 			line += "  " + p.Source
 		}
 
+		if p.InstallError != "" {
+			line += "  (install failed — re-run: vd plugins:install " + installHint(p) + ")"
+		}
+
 		fmt.Println(line)
+
+		if p.InstallError != "" {
+			fmt.Fprintf(cobraStderr(root), "  %s\n", lastLine(p.InstallError))
+		}
 	}
 
 	for _, e := range env.Data.Errors {
@@ -175,6 +183,24 @@ func pluginList(root *cobra.Command) error {
 	}
 
 	return nil
+}
+
+// installHint is what to re-run for a plugin whose install hook failed: its
+// source when known, else its name.
+func installHint(p plugin.Manifest) string {
+	if p.Source != "" {
+		return p.Source
+	}
+
+	return p.Name
+}
+
+// lastLine — a hook failure carries the hook's output tail; its last line is
+// where the reason is.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func pluginRemove(root *cobra.Command, name string) error {

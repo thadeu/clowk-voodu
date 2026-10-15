@@ -329,3 +329,32 @@ func TestSameRepo(t *testing.T) {
 		}
 	}
 }
+
+// A failed install hook leaves the plugin directory behind. Once the job
+// registry forgets the failure (10 minutes), the marker is what keeps the
+// card on "failed" instead of drifting to "installed" — and /system's summary
+// carries it so feature gates do not treat a broken plugin as present.
+func TestPluginListKeepsAFailedHookFailed(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "fswapi", "0.1.2", "FreeSWITCH API", "https://github.com/thadeu/voodu-fswapi")
+
+	hookOutput := "install hook: exit status 1\n[voodu-fswapi/install] VOODU_CONTROLLER_URL is not set — this controller is too old for this plugin"
+	if err := os.WriteFile(filepath.Join(root, "fswapi", ".install-error"), []byte(hookOutput+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &API{Store: newMemStore(), PluginsRoot: root}
+	rec := httptest.NewRecorder()
+
+	api.handlePATPluginList(rec, httptest.NewRequest(http.MethodGet, "/api/pat/v1/plugins", nil))
+
+	items := decodeList(t, rec.Body.Bytes())
+	if len(items) != 1 || items[0].State != "failed" || !strings.Contains(items[0].Error, "too old") {
+		t.Fatalf("want one failed item carrying the hook's reason, got %+v", items)
+	}
+
+	summaries := api.pluginSummaries()
+	if len(summaries) != 1 || !strings.Contains(summaries[0].InstallError, "too old") {
+		t.Errorf("/system summary must carry the failure: %+v", summaries)
+	}
+}
