@@ -79,6 +79,9 @@ const (
 	// WireGuard peers: the other voodu hosts this one is wired to.
 	ActionWireAdd    Action = "wire.add"
 	ActionWireRemove Action = "wire.remove"
+
+	// ActionImagePrune removes images from the host, by hand or on schedule.
+	ActionImagePrune Action = "image.prune"
 )
 
 // Origin is who asked. Without it every row reads `api` and the history cannot
@@ -96,6 +99,10 @@ const (
 	OriginReceivePack Origin = "receive_pack"
 	OriginAPI         Origin = "api"
 	OriginDeployPlane Origin = "deploy_plane"
+
+	// OriginSchedule is the controller acting on its own timer. Set by the
+	// controller and never read from OriginHeader: no client can claim it.
+	OriginSchedule Origin = "schedule"
 )
 
 // OriginHeader carries Origin from client to controller.

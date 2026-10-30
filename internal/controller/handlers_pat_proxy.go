@@ -53,6 +53,7 @@ import (
 //	GET    pods/{name}           read    — single pod detail
 //	GET    pods/{name}/logs      read    — chunked log stream
 //	POST   pods/{name}/restart   actions — rolling restart, rate-limited
+//	POST   images/prune          actions — remove unused images, rate-limited
 //
 // Routes registered with `METHOD /path` net/http 1.22 routing
 // syntax — same convention as Handler() uses for the orchestration
@@ -196,6 +197,12 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	// Action endpoints — scope=actions + per-PAT rate limit.
 	mux.HandleFunc("POST /api/pat/v1/pods/{name}/restart",
 		auth.Middleware(ScopeActions, limiter.Middleware(a.handlePATPodRestart)))
+
+	// Deletes from the host's image store. ScopeActions, not read, and rate
+	// limited like every other action; the keep rules are the same as the
+	// schedule's, so this can't remove what a pod or a rollback needs.
+	mux.HandleFunc("POST /api/pat/v1/images/prune",
+		auth.Middleware(ScopeActions, limiter.Middleware(a.handleImagePrune)))
 
 	// Plugin install and removal. ScopeActions, and worth pausing on:
 	// installing clones a repository and runs ITS lifecycle hooks as this

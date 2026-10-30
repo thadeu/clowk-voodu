@@ -1,0 +1,26 @@
+---
+title: voodu images
+description: Remove the docker images a host no longer needs.
+---
+
+## Synopsis
+
+```bash
+voodu images prune [--dry-run] [--keep N]
+```
+
+Works on the box and from your machine, like every other command. The controller also runs this cleanup at 03:00 and 15:00 UTC. Set `VOODU_IMAGE_PRUNE_SCHEDULE` to another cron expression, or to `off`, to change that.
+
+## What stays
+
+This is not `docker image prune -a`. An image stays when:
+
+- A container uses it, even a stopped one
+- A manifest names it
+- It is `<app>:latest` of a deployment, statefulset, job or cronjob
+- It is one of the newest `--keep` builds of a deployment or statefulset (default 5, the size of the release history)
+- It was tagged in the last hour
+
+With `--keep` below 5, older releases stay in the history without their image, and `voodu rollback` to one fails with "image not present locally".
+
+Build cache is not touched.

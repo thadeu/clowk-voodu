@@ -91,6 +91,10 @@ type Config struct {
 	// via `--activity-retention` / `VOODU_ACTIVITY_RETENTION`.
 	ActivityRetention time.Duration
 
+	// ImagePruneSchedule is the cron expression (UTC) of the automatic image
+	// cleanup. Empty or "off" leaves only the manual runs.
+	ImagePruneSchedule string
+
 	// ParseManifests turns a manifest file into manifests, for the deploy
 	// executor. Supplied by main.go rather than constructed here, because
 	// internal/manifest imports this package and the dependency cannot run
@@ -152,6 +156,11 @@ type Server struct {
 	autoscaler     *Autoscaler
 	cancelScaler   context.CancelFunc
 	autoscalerDone chan struct{}
+
+	// Image cleanup on a schedule — see image_prune.go. Stays nil when the
+	// schedule is off.
+	cancelImagePrune context.CancelFunc
+	imagePruneDone   chan struct{}
 
 	// Metrics sampler goroutine — M2.C2. Persists 15s-cadence
 	// time-series rows for system + per-pod to NDJSON under
@@ -664,6 +673,8 @@ func (s *Server) Start(ctx context.Context) error {
 		s.autoscaler.Run(scalerCtx)
 	}()
 
+	s.startImagePruner(store)
+
 	// Activity trail — the record of what was DONE to this box.
 	//
 	// Wired BEFORE the HTTP listeners start, so no action can be served
@@ -907,6 +918,14 @@ func (s *Server) teardown() {
 		_ = s.activityWriter.Close()
 	}
 
+	if s.cancelImagePrune != nil {
+		s.cancelImagePrune()
+	}
+
+	if s.imagePruneDone != nil {
+		<-s.imagePruneDone
+	}
+
 	if s.cancelScaler != nil {
 		s.cancelScaler()
 	}
@@ -1088,4 +1107,37 @@ func (s *Server) runActivityCleanup(ctx context.Context) {
 			run()
 		}
 	}
+}
+
+// startImagePruner wires the pruner the API serves, and its schedule when one
+// is set. A bad expression logs and leaves the manual path working: a typo in a
+// flag must not keep the controller from starting.
+func (s *Server) startImagePruner(store Store) {
+	s.api.ImagePruner = &ImagePruner{
+		Store:  store,
+		Images: DockerImageRuntime{},
+		Logger: s.cfg.Logger,
+		Record: func(rec activity.Record) { s.api.recordActivity(nil, rec) },
+	}
+
+	expr := s.cfg.ImagePruneSchedule
+	if expr == "" || expr == "off" {
+		return
+	}
+
+	schedule, err := ParseSchedule(expr, "")
+	if err != nil {
+		s.cfg.Logger.Printf("image prune: schedule disabled: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelImagePrune = cancel
+	s.imagePruneDone = make(chan struct{})
+
+	go func() {
+		defer close(s.imagePruneDone)
+
+		s.api.ImagePruner.RunSchedule(ctx, schedule)
+	}()
 }

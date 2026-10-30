@@ -159,6 +159,9 @@ type API struct {
 	// shape across CLI + future SDK.
 	Stats *StatsCollector
 
+	// ImagePruner powers `POST /images/prune`, on both planes. Nil → 503.
+	ImagePruner *ImagePruner
+
 	// System powers `GET /system` — the host-level CPU/memory/disk/
 	// network/uptime snapshot used by the WebUI's overview header
 	// (and a future `vd system` CLI). Nil → 503. Production wires
@@ -405,6 +408,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /jobs/run", a.handleJobRun)
 	mux.HandleFunc("POST /cronjobs/run", a.handleCronJobRun)
 	mux.HandleFunc("/config", a.handleConfig)
+	mux.HandleFunc("POST /images/prune", a.handleImagePrune)
 	mux.HandleFunc("POST /restart", a.handleRestart)
 	mux.HandleFunc("POST /releases/run", a.handleReleaseRun)
 	mux.HandleFunc("POST /rollback", a.handleRollback)

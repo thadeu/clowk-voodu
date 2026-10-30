@@ -62,6 +62,10 @@ func main() {
 		// tunable: there is no cadence, the handlers drive the writes.
 		activityRetention = flag.Duration("activity-retention", parseDurationOr("VOODU_ACTIVITY_RETENTION", activity.DefaultRetention), "activity trail retention window (env: VOODU_ACTIVITY_RETENTION, default 720h = 30d)")
 
+		// Image cleanup — cron expression, UTC. `off` leaves only the manual
+		// path (`vd images prune` and the WebUI button).
+		imagePruneSchedule = flag.String("image-prune-schedule", envOr("VOODU_IMAGE_PRUNE_SCHEDULE", controller.DefaultImagePruneSchedule), "cron expression (UTC) for the automatic image cleanup; off disables (env: VOODU_IMAGE_PRUNE_SCHEDULE)")
+
 		// Ingress sampler — tails voodu-caddy's JSON access log,
 		// aggregates per-deployment HTTP metrics (count, status
 		// breakdown, latency p50/p90/p95/p99) in the same Tick cadence
@@ -124,6 +128,8 @@ func main() {
 		MetricsInterval:   *metricsInterval,
 		MetricsRetention:  *metricsRetention,
 		ActivityRetention: *activityRetention,
+
+		ImagePruneSchedule: *imagePruneSchedule,
 
 		// The deploy executor parses the manifest file a repository's trigger
 		// names. Wired HERE and not inside the controller because

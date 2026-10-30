@@ -2363,7 +2363,7 @@ const (
 // deployment. 10 is enough for "last few rollbacks" without
 // bloating the status blob — the file lives in etcd and we read it
 // every reconcile. New releases prepend; older ones drop off.
-const maxReleaseHistory = 10
+const maxReleaseHistory = 5
 
 // defaultReleaseTimeout caps each release-phase command (pre, main,
 // post) at 10 minutes when the manifest doesn't say otherwise.
