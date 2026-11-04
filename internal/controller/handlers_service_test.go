@@ -714,3 +714,77 @@ func TestIngressHandler_NoMeshKeepsRetrying(t *testing.T) {
 		t.Fatalf("err = %v, want transient", err)
 	}
 }
+
+func TestIngressHandler_ForwardsTCPListen(t *testing.T) {
+	store := newMemStore()
+
+	seedManifest(t, store, KindDeployment, "anway", deploymentSpec{Image: "anway:latest", Ports: []string{"7419"}})
+
+	inv := &fakeInvoker{
+		results: map[string]*plugins.Result{
+			"caddy.apply": envelopeResult(map[string]any{"url": "tls://paris--roma.eu-de-1.anway.clowk.in:7419"}),
+		},
+	}
+
+	h := &IngressHandler{Store: store, Invoker: inv, Log: quietLogger()}
+
+	ev := putEvent(t, KindIngress, "anway", ingressSpec{
+		Host: "paris--roma.eu-de-1.anway.clowk.in",
+		Port: 7419,
+		TLS:  &ingressTLS{Enabled: true, Provider: "letsencrypt"},
+		TCP:  &ingressTCP{},
+	})
+
+	if err := h.Handle(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := inv.calls[0].Env[plugin.EnvIngressTCPListen]; got != "7419" {
+		t.Errorf("listen should default to the upstream port, got %q", got)
+	}
+}
+
+func TestIngressHandler_OmitsTCPListenForHTTP(t *testing.T) {
+	spec := ingressSpec{Host: "x.example.com", Service: "app", Port: 3000}
+
+	env := ingressApplyEnv("app", spec, upstreamResolution{})
+
+	if _, ok := env[plugin.EnvIngressTCPListen]; ok {
+		t.Errorf("an HTTP route must not carry the tcp listen var: %+v", env)
+	}
+}
+
+func TestIngressHandler_TCPRefusesWhatItCannotServe(t *testing.T) {
+	cases := map[string]struct {
+		spec ingressSpec
+		want string
+	}{
+		"no tls": {
+			spec: ingressSpec{Host: "a.example.com", TCP: &ingressTCP{Listen: 7419}},
+			want: "needs tls",
+		},
+		"locations": {
+			spec: ingressSpec{
+				Host:      "a.example.com",
+				TLS:       &ingressTLS{Enabled: true},
+				TCP:       &ingressTCP{Listen: 7419},
+				Locations: []ingressLocation{{Path: "/api"}},
+			},
+			want: "no location",
+		},
+		"bad port": {
+			spec: ingressSpec{Host: "a.example.com", TLS: &ingressTLS{Enabled: true}, TCP: &ingressTCP{Listen: 70000}},
+			want: "not a port",
+		},
+	}
+
+	for name, tc := range cases {
+		h := &IngressHandler{Store: newMemStore(), Invoker: &fakeInvoker{}, Log: quietLogger()}
+
+		err := h.Handle(context.Background(), putEvent(t, KindIngress, "anway", tc.spec))
+
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: want an error with %q, got %v", name, tc.want, err)
+		}
+	}
+}

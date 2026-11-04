@@ -82,9 +82,22 @@ Routes are emitted in declaration order; first match wins. `path = "/"` collapse
 
 When `interval` is set, Caddy hits the deployment's `health_check =` path on every replica at that cadence. Replicas that fail are dropped from the upstream pool.
 
+## `tcp {}` block
+
+Turns the ingress into a TCP route with TLS. The router listens on `listen`, ends TLS, chooses the route by the name that the client sends in the TLS handshake (SNI), and sends plain TCP to the upstream. Many hosts share one port, one route each. Use it for a TCP protocol that is not HTTP, such as a job server.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `listen` | int | the upstream `port` | The public port of the router. |
+
+- `tls {}` is required: SNI exists only in a TLS handshake.
+- `location {}` blocks are refused: TCP has no paths.
+- The router publishes the port only when the plugin is installed with it, for example `VOODU_CADDY_TCP_PORTS=7419` for voodu-caddy.
+
 ## Validation
 
 - `host` required (HCL parser enforces).
+- `tcp {}` without `tls {}`, or with `location {}` blocks → rejected at apply time.
 - `tls.on_demand = true` without `ask` → rejected by **voodu-caddy** at apply time. No `allow_all` fallback.
 
 The HCL parser does NOT enforce:
@@ -208,6 +221,24 @@ ingress "prod" "api" {
 ```
 
 Caddy probes `/` (or whatever the deployment declares as `health_check`) on each replica every 5s and drops failing ones from the pool.
+
+### TCP with TLS, chosen by SNI
+
+```hcl
+ingress "cloud" "paris-roma" {
+  host    = "paris--roma.eu-de-1.anway.clowk.in"
+  service = "paris-roma"
+  port    = 7419
+
+  tcp {
+    listen = 7419
+  }
+
+  tls {}
+}
+```
+
+A client connects with TLS to `paris--roma.eu-de-1.anway.clowk.in:7419`. Another ingress with another host can use the same `listen` port.
 
 ## Trade-offs
 

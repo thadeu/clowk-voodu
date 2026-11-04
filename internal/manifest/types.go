@@ -1166,6 +1166,18 @@ type IngressSpec struct {
 	TLS       *IngressTLS       `yaml:"tls,omitempty"       json:"tls,omitempty"`
 	Locations []IngressLocation `yaml:"locations,omitempty" json:"locations,omitempty"`
 	LB        *IngressLB        `yaml:"lb,omitempty"        json:"lb,omitempty"`
+	TCP       *IngressTCP       `yaml:"tcp,omitempty"       json:"tcp,omitempty"`
+}
+
+// IngressTCP turns the ingress into a TCP route with TLS: the router
+// listens on Listen, ends TLS, picks the route by the name the client
+// sends in the TLS handshake (SNI), and proxies plain TCP to the
+// upstream. Many hosts share one port this way, one route each. It
+// needs `tls {}`, because SNI only exists in a TLS handshake, and it
+// takes no `location` blocks, because TCP has no paths.
+type IngressTCP struct {
+	// Listen is the public port. Zero uses the upstream port.
+	Listen int `yaml:"listen,omitempty" json:"listen,omitempty"`
 }
 
 // IngressLB configures how the ingress balances traffic across replicas

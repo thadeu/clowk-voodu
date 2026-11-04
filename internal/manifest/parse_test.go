@@ -3575,3 +3575,38 @@ registry {
 		}
 	}
 }
+
+func TestParseHCLIngressTCPBlock(t *testing.T) {
+	src := `
+ingress "cloud" "anway" {
+  host = "paris--roma.eu-de-1.anway.clowk.in"
+  port = 7419
+
+  tcp {
+    listen = 7419
+  }
+
+  tls {}
+}
+`
+	tmp := writeTemp(t, "tcp.hcl", src)
+
+	mans, err := ParseFile(tmp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var spec IngressSpec
+
+	if err := json.Unmarshal(mans[0].Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.TCP == nil || spec.TCP.Listen != 7419 {
+		t.Fatalf("tcp block should reach the spec, got %+v", spec.TCP)
+	}
+
+	if spec.TLS == nil || !spec.TLS.Enabled {
+		t.Errorf("tls {} should stay on beside tcp, got %+v", spec.TLS)
+	}
+}

@@ -24,6 +24,11 @@ type ingressSpec struct {
 	TLS       *ingressTLS       `json:"tls,omitempty"`
 	Locations []ingressLocation `json:"locations,omitempty"`
 	LB        *ingressLB        `json:"lb,omitempty"`
+	TCP       *ingressTCP       `json:"tcp,omitempty"`
+}
+
+type ingressTCP struct {
+	Listen int `json:"listen,omitempty"`
 }
 
 type ingressLocation struct {
@@ -144,6 +149,10 @@ func (h *IngressHandler) apply(ctx context.Context, ev WatchEvent) error {
 
 	if spec.Host == "" {
 		return fmt.Errorf("ingress/%s: host is required", ev.Name)
+	}
+
+	if err := validateIngressTCP(ev.Name, spec); err != nil {
+		return err
 	}
 
 	up, err := h.resolveUpstream(ctx, ev.Scope, ev.Name, &spec)
@@ -478,6 +487,10 @@ func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[s
 		}
 	}
 
+	if spec.TCP != nil {
+		env[plugin.EnvIngressTCPListen] = fmt.Sprintf("%d", tcpListenPort(spec, up))
+	}
+
 	// Path routing is opt-in; only set the env var when the operator
 	// actually declared `location` blocks. An empty map entry would make
 	// old plugin versions parse "" and error needlessly — skipping the
@@ -493,6 +506,39 @@ func ingressApplyEnv(name string, spec ingressSpec, up upstreamResolution) map[s
 	}
 
 	return env
+}
+
+// validateIngressTCP refuses a TCP route the router cannot serve. The
+// route is chosen by SNI, which only a TLS handshake carries, and TCP has
+// no paths for `location` blocks to match.
+func validateIngressTCP(name string, spec ingressSpec) error {
+	if spec.TCP == nil {
+		return nil
+	}
+
+	if spec.TLS == nil || !spec.TLS.Enabled {
+		return fmt.Errorf("ingress/%s: tcp needs tls {}, because the route is chosen by SNI", name)
+	}
+
+	if len(spec.Locations) > 0 {
+		return fmt.Errorf("ingress/%s: tcp takes no location blocks", name)
+	}
+
+	if spec.TCP.Listen < 0 || spec.TCP.Listen > 65535 {
+		return fmt.Errorf("ingress/%s: tcp listen %d is not a port", name, spec.TCP.Listen)
+	}
+
+	return nil
+}
+
+// tcpListenPort is the public port of a TCP route: the declared listen
+// port, or else the upstream port.
+func tcpListenPort(spec ingressSpec, up upstreamResolution) int {
+	if spec.TCP.Listen > 0 {
+		return spec.TCP.Listen
+	}
+
+	return spec.Port
 }
 
 // resolveUpstream validates that the target deployment actually exists

@@ -1406,6 +1406,11 @@ type hclIngress struct {
 	TLS       *hclIngressTLS      `hcl:"tls,block"`
 	Locations []hclIngressLocation `hcl:"location,block"`
 	LB        *hclIngressLB       `hcl:"lb,block"`
+	TCP       *hclIngressTCP      `hcl:"tcp,block"`
+}
+
+type hclIngressTCP struct {
+	Listen int `hcl:"listen,optional"`
 }
 
 type hclIngressLB struct {
@@ -1487,6 +1492,10 @@ func (b hclIngress) spec() IngressSpec {
 
 	if b.LB != nil {
 		out.LB = &IngressLB{Policy: b.LB.Policy, Interval: b.LB.Interval}
+	}
+
+	if b.TCP != nil {
+		out.TCP = &IngressTCP{Listen: b.TCP.Listen}
 	}
 
 	return out

@@ -249,6 +249,11 @@ const (
 	EnvIngressTLSProvider = "VOODU_INGRESS_TLS_PROVIDER"
 	EnvIngressTLSEmail    = "VOODU_INGRESS_TLS_EMAIL"
 
+	// EnvIngressTCPListen marks a TCP route with TLS: the public port the
+	// router listens on, matched by SNI. Unset means an HTTP route, so an
+	// older plugin that ignores it keeps serving HTTP as before.
+	EnvIngressTCPListen = "VOODU_INGRESS_TCP_LISTEN"
+
 	// On-demand TLS knobs. When OnDemand is "true", the ingress plugin
 	// enables Caddy-style on-demand certificate issuance: no host list
 	// up-front, cert minted on the fly when a request arrives. Ask is
