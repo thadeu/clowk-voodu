@@ -29,8 +29,11 @@ The image is pulled before the old container is removed, so a failed pull leaves
 | `CADDY_IMAGE` | `ghcr.io/thadeu/voodu-caddy:<version>` | The Caddy image. `caddy:2.8` rolls back to stock Caddy, which serves HTTP routes only. |
 | `VOODU_CADDY_TCP_PORTS` | none | Public ports for `tcp {}` ingresses, comma separated, such as `7419`. |
 
+The controller runs the install hook with its own environment, so a variable set in the shell of `voodu plugins:install` does not reach it. Put these settings in `/opt/voodu/caddy/install.env` on the host, one `VAR=value` per line. Each install reads this file.
+
 ```bash
-VOODU_CADDY_TCP_PORTS=7419 voodu plugins:install thadeu/voodu-caddy
+echo 'VOODU_CADDY_TCP_PORTS=7419' | sudo tee -a /opt/voodu/caddy/install.env
+voodu plugins:install thadeu/voodu-caddy
 ```
 
 State directories survive uninstall — certs in `/opt/voodu/caddy/data/` and route definitions in `/opt/voodu/caddy/routes/*.json` are preserved across reinstalls.
