@@ -177,16 +177,48 @@ func (a *API) PATHandler(logger *log.Logger, actionRate float64, actionBurst int
 	// `?values=false` is a mode of `configGet`, not of this proxy: see the
 	// comment there for why masking on the screen would protect nothing.
 	mux.HandleFunc("GET /api/pat/v1/config",
-		auth.Middleware(ScopeConfigRead, a.handlePATConfigGet))
+		auth.Middleware(ScopeConfigRead, patScopedConfig(a.handlePATConfigGet)))
 
 	// Writes are rate-limited like every other action endpoint. Setting an env
 	// var restarts the resources it affects, so a token in a loop here is a
 	// token restarting production in a loop.
 	mux.HandleFunc("POST /api/pat/v1/config",
-		auth.Middleware(ScopeConfig, limiter.Middleware(a.handlePATConfigPost)))
+		auth.Middleware(ScopeConfig, limiter.Middleware(patScopedConfig(a.handlePATConfigPost))))
 
 	mux.HandleFunc("DELETE /api/pat/v1/config",
-		auth.Middleware(ScopeConfig, limiter.Middleware(a.handlePATConfigDelete)))
+		auth.Middleware(ScopeConfig, limiter.Middleware(patScopedConfig(a.handlePATConfigDelete))))
+
+	// Resources (handlers_pat_manifests.go). ScopeManifests on every route,
+	// reads included: a manifest holds env values. Each route needs an
+	// explicit `scope` query value that the PAT holds, and the apply body
+	// passes the PAT policy (patpolicy.go) first. Mutations are rate
+	// limited like every other action.
+	mux.HandleFunc("GET /api/pat/v1/manifests",
+		auth.Middleware(ScopeManifests, a.handlePATManifests))
+
+	mux.HandleFunc("GET /api/pat/v1/describe",
+		auth.Middleware(ScopeManifests, a.handlePATDescribe))
+
+	mux.HandleFunc("POST /api/pat/v1/apply",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATApply)))
+
+	mux.HandleFunc("DELETE /api/pat/v1/resource",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATResourceDelete)))
+
+	mux.HandleFunc("DELETE /api/pat/v1/scope",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATScopeWipe)))
+
+	mux.HandleFunc("POST /api/pat/v1/restart",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATRestart)))
+
+	mux.HandleFunc("POST /api/pat/v1/rollback",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATRollback)))
+
+	mux.HandleFunc("POST /api/pat/v1/pods/{name}/stop",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATPodStop)))
+
+	mux.HandleFunc("POST /api/pat/v1/pods/{name}/start",
+		auth.Middleware(ScopeManifests, limiter.Middleware(a.handlePATPodStart)))
 
 	// Installed plugins, plus any install still running or recently
 	// failed. ScopeRead: it is a list of names, versions and homepages —
@@ -397,6 +429,11 @@ func (a *API) handlePATPodRestart(w http.ResponseWriter, r *http.Request) {
 
 	if match == nil {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("no pod %q", name))
+		return
+	}
+
+	if pat := PATFromContext(r.Context()); pat != nil && !pat.AllowsResourceScope(match.Scope) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("this token cannot use scope %q", match.Scope))
 		return
 	}
 

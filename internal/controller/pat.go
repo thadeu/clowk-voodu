@@ -85,6 +85,16 @@ const (
 	// A read-only integration that wants to show which keys exist should not
 	// have to be able to set them.
 	ScopeConfigRead Scope = "config:read"
+
+	// ScopeManifests grants the resources themselves through the PAT plane:
+	// apply, delete, restart, rollback, stop and start, and the reads that
+	// return manifests (which can hold env values).
+	//
+	// Its own scope because it is the one a hosted control plane, such as
+	// Anway Cloud, holds to create and remove instances. The PAT plane
+	// applies only a safe subset of the manifest surface (patpolicy.go), and
+	// a PAT with ResourceScopes reaches only those resource scopes.
+	ScopeManifests Scope = "manifests"
 )
 
 // scopeOrder fixes the wire order of a normalised scope list.
@@ -93,7 +103,7 @@ const (
 // before `read` and `config:read` before `deploy`, which reads as arbitrary
 // to anyone looking at a PAT. This runs least-powerful to most, so the shape
 // of a token is legible at a glance.
-var scopeOrder = []Scope{ScopeRead, ScopeConfigRead, ScopeConfig, ScopeActions, ScopeDeploy}
+var scopeOrder = []Scope{ScopeRead, ScopeConfigRead, ScopeConfig, ScopeActions, ScopeDeploy, ScopeManifests}
 
 // patTokenPrefix is the public prefix on every emitted token. Two
 // reasons it's explicit rather than implicit:
@@ -191,6 +201,27 @@ type PAT struct {
 	// operators auditing "which tokens are stale and can be revoked".
 	// Empty (zero time) means "never used since creation".
 	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+
+	// ResourceScopes limits the PAT to these resource scopes (the first
+	// manifest label, such as "cloud"). Empty means every scope, as before
+	// the field existed. The manifest and config routes enforce it: a PAT
+	// for "cloud" cannot apply, delete, restart or read config elsewhere.
+	ResourceScopes []string `json:"resource_scopes,omitempty"`
+}
+
+// AllowsResourceScope reports whether p may act on the resource scope.
+func (p *PAT) AllowsResourceScope(scope string) bool {
+	if len(p.ResourceScopes) == 0 {
+		return true
+	}
+
+	for _, s := range p.ResourceScopes {
+		if s == scope {
+			return true
+		}
+	}
+
+	return false
 }
 
 // HasScope reports whether p carries the required scope. Used by

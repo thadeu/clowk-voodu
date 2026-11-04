@@ -37,8 +37,9 @@ import (
 // so the CLI doesn't import controller-side types (those are
 // internal/, not part of the public Go API).
 type patCreateRequest struct {
-	Scopes []string `json:"scopes"`
-	Name   string   `json:"name,omitempty"`
+	Scopes         []string `json:"scopes"`
+	Name           string   `json:"name,omitempty"`
+	ResourceScopes []string `json:"resource_scopes,omitempty"`
 }
 
 // patEnvelope is the response envelope shared with the controller.
@@ -60,6 +61,8 @@ type patListItem struct {
 	Name       string   `json:"name,omitempty"`
 	CreatedAt  string   `json:"created_at"`
 	LastUsedAt string   `json:"last_used_at,omitempty"`
+
+	ResourceScopes []string `json:"resource_scopes,omitempty"`
 }
 
 type patListResponse struct {
@@ -91,8 +94,9 @@ controller's endpoint + PAT in the WebUI's server settings.`,
 
 func newPATCreateCmd() *cobra.Command {
 	var (
-		scope string
-		name  string
+		scope          string
+		name           string
+		resourceScopes string
 	)
 
 	cmd := &cobra.Command{
@@ -108,16 +112,25 @@ Scopes:
   config       — set and unset config values
   actions      — POST mutations (restart, plugin install) + rate-limited
   deploy       — the deploy/ subtree: triggers, preflight, firing a deploy
+  manifests    — apply, delete, restart, rollback, stop/start and read
+                 resources, with the PAT apply policy (no host volumes,
+                 host network, builds, plugin kinds or public ports)
 
 Defaults to "read" only. Scopes are additive and independent: a token
-scoped to deploy alone can do nothing but deploy.`,
+scoped to deploy alone can do nothing but deploy.
+
+--resource-scopes limits the token to these manifest scopes (the first
+label, such as "cloud") on the manifest, config and pod action routes:
+
+  vd pat create --scope manifests,config,read --resource-scopes cloud`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runPATCreate(cmd, scope, name)
+			return runPATCreate(cmd, scope, name, resourceScopes)
 		},
 	}
 
 	cmd.Flags().StringVar(&scope, "scope", "read", "comma-separated scopes ("+scopeFlagHint()+")")
 	cmd.Flags().StringVar(&name, "name", "", "operator-supplied label (optional)")
+	cmd.Flags().StringVar(&resourceScopes, "resource-scopes", "", "comma-separated manifest scopes the token is limited to (default: all)")
 
 	return cmd
 }
@@ -143,7 +156,7 @@ func newPATRevokeCmd() *cobra.Command {
 	}
 }
 
-func runPATCreate(cmd *cobra.Command, scopeFlag, name string) error {
+func runPATCreate(cmd *cobra.Command, scopeFlag, name, resourceScopesFlag string) error {
 	root := cmd.Root()
 
 	// Validate scope locally so the operator sees an immediate
@@ -164,7 +177,15 @@ func runPATCreate(cmd *cobra.Command, scopeFlag, name string) error {
 		return fmt.Errorf("--scope is required (%s)", scopeFlagHint())
 	}
 
-	body, _ := json.Marshal(patCreateRequest{Scopes: scopes, Name: strings.TrimSpace(name)})
+	var resourceScopes []string
+
+	for _, s := range strings.Split(resourceScopesFlag, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			resourceScopes = append(resourceScopes, s)
+		}
+	}
+
+	body, _ := json.Marshal(patCreateRequest{Scopes: scopes, Name: strings.TrimSpace(name), ResourceScopes: resourceScopes})
 
 	resp, err := controllerDo(root, http.MethodPost, "/pats", "", bytes.NewReader(body))
 	if err != nil {
@@ -251,7 +272,7 @@ func runPATList(cmd *cobra.Command) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tNAME\tSCOPES\tCREATED\tLAST USED")
+	fmt.Fprintln(tw, "ID\tNAME\tSCOPES\tRESOURCE SCOPES\tCREATED\tLAST USED")
 
 	for _, p := range lr.PATs {
 		name := p.Name
@@ -261,10 +282,16 @@ func runPATList(cmd *cobra.Command) error {
 
 		scopes := strings.Join(p.Scopes, ",")
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		resourceScopes := "all"
+		if len(p.ResourceScopes) > 0 {
+			resourceScopes = strings.Join(p.ResourceScopes, ",")
+		}
+
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			p.ID,
 			name,
 			scopes,
+			resourceScopes,
 			formatPATRelativeTime(p.CreatedAt),
 			formatPATLastUsed(p.LastUsedAt),
 		)

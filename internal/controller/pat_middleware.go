@@ -61,6 +61,18 @@ var touchCoalesceWindow = time.Minute
 // packages can't collide.
 type patIDCtxKey struct{}
 
+// patCtxKey carries the verified PAT record, for handlers that check
+// its ResourceScopes.
+type patCtxKey struct{}
+
+// PATFromContext returns the verified PAT record, or nil outside the
+// PAT plane.
+func PATFromContext(ctx context.Context) *PAT {
+	p, _ := ctx.Value(patCtxKey{}).(*PAT)
+
+	return p
+}
+
 // PATIDFromContext retrieves the verified PAT ID from ctx. The
 // boolean reports whether the value was present — used by rate
 // limit middleware that REQUIRES an upstream auth pass.
@@ -202,6 +214,7 @@ func (a *patAuthorizer) Middleware(want Scope, next http.HandlerFunc) http.Handl
 		// and handlers that want to attribute actions to the
 		// authenticated identity (audit logging, for example).
 		ctx := context.WithValue(r.Context(), patIDCtxKey{}, signed.ID)
+		ctx = context.WithValue(ctx, patCtxKey{}, pat)
 
 		next(w, r.WithContext(ctx))
 	}

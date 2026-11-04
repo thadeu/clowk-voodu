@@ -34,10 +34,24 @@ Authorization: Bearer pat_<28-char base64url>
 
 | Scope | Grants |
 |---|---|
-| `read` | `GET` endpoints (`/stats`, `/pods`, `/pods/{name}`, `/pods/{name}/logs`) |
-| `actions` | mutation endpoints (currently just `/pods/{name}/restart`) |
+| `read` | `GET` endpoints (`/stats`, `/system`, `/pods`, `/pods/{name}`, `/pods/{name}/logs`, `/logs`, `/metrics`, `/activity`, `/plugins`) |
+| `config:read` | `GET /config`, values masked by default |
+| `config` | `POST /config` and `DELETE /config` |
+| `actions` | `/pods/{name}/restart`, `/images/prune`, plugin install and removal, PAT list and revoke |
+| `deploy` | the `/deploy/*` subtree |
+| `manifests` | the resource routes: apply, delete, restart, rollback, stop and start, and the manifest reads. See [Resources](#resources). |
 
-A PAT can carry both. Read-only PATs requested by an `actions` endpoint receive `403 Forbidden`. Operators typically mint a single `read,actions` PAT per WebUI island; a `read`-only PAT is appropriate for view-only operator roles or external dashboards.
+A PAT can carry several scopes.
+
+### Resource scopes
+
+A PAT can also be limited to some **resource scopes**, the first label of a manifest (`statefulset "cloud" "paris-roma"` is in scope `cloud`):
+
+```bash
+vd pat create --name anway-cloud --scope manifests,config,read --resource-scopes cloud
+```
+
+The resource, config and pod action routes then refuse any other scope with `403`. Without `--resource-scopes`, a PAT reaches every scope, as before. The read routes (`/pods`, `/logs`, `/stats`, `/metrics`) are not filtered yet: give a scoped token `read` only when it may see the whole host. Read-only PATs requested by an `actions` endpoint receive `403 Forbidden`. Operators typically mint a single `read,actions` PAT per WebUI island; a `read`-only PAT is appropriate for view-only operator roles or external dashboards.
 
 ### Failure modes
 
@@ -142,6 +156,37 @@ Requires `actions` scope. Subject to per-PAT rate limiting.
 | `400` | container's kind is not restartable (job / cronjob have no rolling-restart semantics) |
 | `404` | no container with that name |
 | `429` | rate limit exceeded |
+
+## Resources
+
+These routes need the `manifests` scope. Every route takes an explicit `scope` query value, and the PAT must hold it; a missing scope is `400`. Mutations are rate limited like every action.
+
+| Route | Does |
+|---|---|
+| `GET /api/pat/v1/manifests?scope=&kind=` | the manifests of one scope, optionally of one kind |
+| `GET /api/pat/v1/describe?kind=&scope=&name=` | one resource: manifest and status, as `vd describe` |
+| `POST /api/pat/v1/apply` | applies a manifest or a JSON array of manifests. `?dry_run=true`, `?prune=true` and `?force=true` work as in `vd apply`. |
+| `DELETE /api/pat/v1/resource?scope=&name=` | removes a resource. `&ordinal=N` removes one statefulset pod; `&prune=true` also removes volumes. |
+| `DELETE /api/pat/v1/scope?scope=` | removes every resource of the scope |
+| `POST /api/pat/v1/restart?kind=&scope=&name=` | rolling restart |
+| `POST /api/pat/v1/rollback?kind=&scope=&name=` | rolls a deployment back |
+| `POST /api/pat/v1/pods/{name}/stop` | stops one container |
+| `POST /api/pat/v1/pods/{name}/start` | starts it again |
+
+Config stays on `/config` with the `config:read` and `config` scopes.
+
+### Apply policy
+
+The PAT plane is reachable from the network, so its apply accepts a safe subset of the manifest surface. The check is an allowlist: a field added to manifests later is refused here until it is reviewed.
+
+| Accepted | Refused |
+|---|---|
+| kinds `deployment`, `statefulset`, `ingress` | `job`, `cronjob`, `asset`, and plugin kinds (`postgres`, `redis`, …): a plugin kind can install a plugin, and an install runs code on the host |
+| `image`, `replicas`, `command`, `env`, `restart`, `health_check`, `volume_claims`, `depends_on`, `resources`, `logs`, `inits`, `probes`, `drain`, `autoscale`, `keep_releases` | `build` (an image is required), `volumes`, `env_file`, `network_mode`, `networks`, `cap_add`, `ulimits`, `docker_options`, `extra_hosts`, `env_from`, `on_deploy`, `on_probe`, `post_deploy`, `release` |
+| `ports` bound to `127.0.0.1:<host>:<container>` | any other port: `ports = ["7419"]` publishes on a random **public** host port |
+| ingress `host`, `service`, `port`, `tls`, `locations`, `lb`, `tcp` | `tls.on_demand` and `tls.ask` |
+
+An ingress reaches its service on the `voodu0` network, so a workload behind an ingress needs no `ports`.
 
 ## Defense in depth
 

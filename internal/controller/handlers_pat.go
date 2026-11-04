@@ -24,8 +24,9 @@ import (
 // patCreateRequest is the POST /pats body. Minimal — scopes are
 // required, name is optional, and the rest is server-generated.
 type patCreateRequest struct {
-	Scopes []string `json:"scopes"`
-	Name   string   `json:"name,omitempty"`
+	Scopes         []string `json:"scopes"`
+	Name           string   `json:"name,omitempty"`
+	ResourceScopes []string `json:"resource_scopes,omitempty"`
 }
 
 // patCreateResponse is the POST /pats success body. The `token`
@@ -48,6 +49,8 @@ type patListItem struct {
 	Name       string   `json:"name,omitempty"`
 	CreatedAt  string   `json:"created_at"`
 	LastUsedAt string   `json:"last_used_at,omitempty"`
+
+	ResourceScopes []string `json:"resource_scopes,omitempty"`
 }
 
 func redactPAT(p PAT) patListItem {
@@ -61,6 +64,8 @@ func redactPAT(p PAT) patListItem {
 		Scopes:    scopes,
 		Name:      p.Name,
 		CreatedAt: p.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+
+		ResourceScopes: p.ResourceScopes,
 	}
 
 	if !p.LastUsedAt.IsZero() {
@@ -114,6 +119,14 @@ func (a *API) handlePATCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+
+	resourceScopes, err := normalizeResourceScopes(req.ResourceScopes)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	record.ResourceScopes = resourceScopes
 
 	if err := a.Store.PutPAT(r.Context(), record); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -197,4 +210,28 @@ func (a *API) handlePATRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok"})
+}
+
+// normalizeResourceScopes trims, dedupes and checks the resource scopes of
+// a new PAT. A scope is a manifest label, so it has no spaces or slashes.
+func normalizeResourceScopes(in []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+
+		if s == "" || seen[s] {
+			continue
+		}
+
+		if strings.ContainsAny(s, "/ \t\n") {
+			return nil, fmt.Errorf("invalid resource scope %q", s)
+		}
+
+		seen[s] = true
+		out = append(out, s)
+	}
+
+	return out, nil
 }
