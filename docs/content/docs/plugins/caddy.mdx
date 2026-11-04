@@ -18,9 +18,20 @@ The install hook:
 1. Downloads the matching release binary (`voodu-caddy_linux_amd64` or `..._arm64`) into `$VOODU_PLUGIN_DIR/bin`.
 2. Creates the `voodu0` docker network if missing.
 3. Seeds state directories under `/opt/voodu/caddy/` (`data/`, `config/`, `routes/`).
-4. Pulls `caddy:2.8`.
-5. `docker run -d` it as `voodu-caddy` on `voodu0` with `--restart unless-stopped`. Publishes `:80`, `:443`, `:443/udp`, and `127.0.0.1:2019:2019`.
+4. Pulls `ghcr.io/thadeu/voodu-caddy:<plugin version>`, which is Caddy 2.11 with the `caddy-l4` module (TCP routes) and the `caddy-dns/cloudflare` module.
+5. `docker run -d` it as `voodu-caddy` on `voodu0` with `--restart unless-stopped`. Publishes `:80`, `:443`, `:443/udp`, `127.0.0.1:2019:2019`, and each port in `VOODU_CADDY_TCP_PORTS`.
 6. Waits up to 15s for `127.0.0.1:2019/config/` to respond.
+
+The image is pulled before the old container is removed, so a failed pull leaves the running Caddy in place. Each install replaces the container, so the HTTP ingress of the host stops for a few seconds.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CADDY_IMAGE` | `ghcr.io/thadeu/voodu-caddy:<version>` | The Caddy image. `caddy:2.8` rolls back to stock Caddy, which serves HTTP routes only. |
+| `VOODU_CADDY_TCP_PORTS` | none | Public ports for `tcp {}` ingresses, comma separated, such as `7419`. |
+
+```bash
+VOODU_CADDY_TCP_PORTS=7419 voodu plugins:install thadeu/voodu-caddy
+```
 
 State directories survive uninstall — certs in `/opt/voodu/caddy/data/` and route definitions in `/opt/voodu/caddy/routes/*.json` are preserved across reinstalls.
 
@@ -35,6 +46,7 @@ The plugin understands:
 - TLS via four shapes — see TLS section.
 - `location { path strip }` for path-based routing.
 - `lb { policy interval }` for active health checks + selection policy.
+- `tcp { listen }` for a TCP route with TLS, chosen by SNI (voodu-caddy 1.0 and voodu 0.18.36 or later).
 
 It does **not** support: `rewrite`, custom `headers`, middleware, redirect handlers, body transforms.
 
@@ -52,6 +64,30 @@ It does **not** support: `rewrite`, custom `headers`, middleware, redirect handl
 **On-demand without `ask`** is rejected at apply time — voodu-caddy refuses to issue without an authorization callback. Rationale: early experience without an app-driven gate had SSL races and ACME rate-limit hits.
 
 Policy grouping is by `(provider, email, on_demand)` tuple — operators sharing one email get one ACME account, while on-demand vs static stay in separate policies.
+
+## TCP routes with TLS
+
+An ingress with `tcp {}` is not an HTTP route. Caddy listens on the `listen` port with the layer4 app, ends TLS, picks the route by the name that the client sends in the TLS handshake (SNI), and proxies plain TCP to the upstreams. Many hosts share one port, one route each, and a name with no route gets no handshake.
+
+```hcl
+ingress "cloud" "paris-roma" {
+  host    = "paris--roma.eu-de-1.anway.clowk.in"
+  service = "paris-roma"
+  port    = 7419
+
+  tcp {
+    listen = 7419
+  }
+
+  tls {}
+}
+```
+
+- The port must be in `VOODU_CADDY_TCP_PORTS`, or no traffic reaches it.
+- `tls {}` is required. The host must be exact: wildcards and `on_demand` are refused, so a name that reaches the port cannot mint a certificate.
+- `location {}` blocks are refused, because TCP has no paths.
+- Each host gets its own certificate, from Let's Encrypt (HTTP-01 on `:80`) or from `provider = "internal"`.
+- Replicas are balanced with the `lb { policy }` of the ingress, `round_robin` by default.
 
 ## Active health checks
 
@@ -154,9 +190,9 @@ If `/load` fails, the route file is already persisted on disk — the next `appl
 
 **`ask` required for on_demand.** No `allow_all` escape hatch. Your app's `ask` endpoint decides which subdomains are real customers — that's what keeps the wildcard safe.
 
-**No DNS-01.** Wildcards only work via on-demand. ACME HTTP-01 can't validate them.
+**No DNS-01 yet.** The image carries the Cloudflare DNS module, but the plugin does not configure it yet. HTTP wildcards work only via on-demand, and TCP hosts get one certificate each. With many TCP hosts under one domain, mind the Let's Encrypt limit of new certificates per registered domain each week.
 
-**Single Caddy server, `:80` / `:443` only.** No listener-config knobs.
+**One HTTP server on `:80` / `:443`.** TCP routes get one layer4 server for each `listen` port.
 
 **State survives uninstall.** Certs and route definitions persist. Reinstalling picks up existing certs (no re-issuance), avoiding ACME rate-limit hits.
 
