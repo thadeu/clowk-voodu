@@ -220,6 +220,13 @@ type API struct {
 	// case via `vd plugins:install <name>`.
 	PluginInstaller *plugins.Installer
 
+	// OnPluginInstalled runs after a plugin installs cleanly. The server
+	// wires it to a full resync: resources that failed while the plugin
+	// was broken (ingress apply exiting 127 with no binary) are not
+	// retried on their own, and kept their error on the status until a
+	// controller restart.
+	OnPluginInstalled func(name string)
+
 	// PluginRoutes resolves a PAT-plane URL prefix to a plugin's
 	// declared reverse-proxy route (HP0). Nil disables the plugin
 	// route plane entirely — the PAT mux serves only its core
@@ -2770,6 +2777,10 @@ func (a *API) handlePluginInstall(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+
+	if a.OnPluginInstalled != nil {
+		a.OnPluginInstalled(loaded.Manifest.Name)
 	}
 
 	writeJSON(w, http.StatusOK, envelope{Status: "ok", Data: loaded.Manifest})

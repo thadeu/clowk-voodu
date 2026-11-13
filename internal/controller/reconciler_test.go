@@ -250,3 +250,42 @@ func TestReconcilerNilHandlerIsNoop(t *testing.T) {
 		t.Fatalf("Run returned error with nil handlers: %v", err)
 	}
 }
+
+// A non-transient failure is not retried; Resync reconciles it again once
+// the cause is fixed (a plugin installed again), from inside Run.
+func TestReconcilerResyncReconcilesEverythingAgain(t *testing.T) {
+	store := newMemStore()
+
+	_, _ = store.Put(t.Context(), &Manifest{Kind: KindIngress, Scope: "bk", Name: "web"})
+
+	calls := make(chan struct{}, 8)
+
+	rec := &Reconciler{
+		Store: store,
+		Handlers: map[Kind]HandlerFunc{KindIngress: func(_ context.Context, _ WatchEvent) error {
+			calls <- struct{}{}
+
+			return nil
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	go func() { _ = rec.Run(ctx) }()
+
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("the startup replay never reconciled the ingress")
+	}
+
+	rec.Resync()
+	rec.Resync()
+
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("Resync did not reconcile the ingress again")
+	}
+}

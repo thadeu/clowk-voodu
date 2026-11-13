@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,10 @@ import (
 type Reconciler struct {
 	Store  Store
 	Logger *log.Logger
+
+	// resync carries Resync requests into Run (see Resync).
+	resync     chan struct{}
+	resyncOnce sync.Once
 
 	// Handlers are per-kind callbacks. Nil handlers are treated as a no-op
 	// (event still logged). Tests plug in handlers to assert behaviour.
@@ -64,10 +69,17 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 	events := r.Store.Watch(ctx)
 
+	r.resyncOnce.Do(func() { r.resync = make(chan struct{}, 1) })
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+
+		case <-r.resync:
+			if err := r.replay(ctx); err != nil {
+				r.Logger.Printf("resync: %v", err)
+			}
 
 		case ev, ok := <-events:
 			if !ok {
@@ -76,6 +88,24 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 			r.handle(ctx, ev, 1)
 		}
+	}
+}
+
+// Resync asks the reconcile loop to reconcile every stored manifest again,
+// as the controller does when it starts. A failure that is not transient
+// (a plugin binary that was missing) is never retried by itself, so its
+// error stays on the status until something reconciles that resource
+// again; Resync is that something once the cause is fixed — a plugin
+// installed again, for one.
+//
+// The replay runs inside Run, between watch events, so handlers never run
+// two at a time. A request while one is pending is folded into it.
+func (r *Reconciler) Resync() {
+	r.resyncOnce.Do(func() { r.resync = make(chan struct{}, 1) })
+
+	select {
+	case r.resync <- struct{}{}:
+	default:
 	}
 }
 

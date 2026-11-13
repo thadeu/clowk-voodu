@@ -607,6 +607,14 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
+	// A plugin installed again may fix what failed while it was broken;
+	// reconcile everything, as a restart would.
+	s.api.OnPluginInstalled = func(name string) {
+		s.cfg.Logger.Printf("plugin %s installed, resyncing every resource", name)
+
+		s.rec.Resync()
+	}
+
 	// Wall-clock dispatcher. Lives on its own goroutine so a slow tick
 	// can't block reconciles, and so Stop() can shut it down
 	// independently. Interval defaults to 1m (cron resolution); Now and
