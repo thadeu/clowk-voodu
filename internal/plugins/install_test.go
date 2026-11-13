@@ -41,10 +41,10 @@ func TestParseSource(t *testing.T) {
 
 func TestNormaliseGitURL(t *testing.T) {
 	cases := map[string]string{
-		"owner/repo":                         "https://github.com/owner/repo",
-		"github.com/owner/repo":              "https://github.com/owner/repo",
-		"https://gitlab.com/a/b.git":         "https://gitlab.com/a/b.git",
-		"git@github.com:owner/repo.git":      "git@github.com:owner/repo.git",
+		"owner/repo":                    "https://github.com/owner/repo",
+		"github.com/owner/repo":         "https://github.com/owner/repo",
+		"https://gitlab.com/a/b.git":    "https://gitlab.com/a/b.git",
+		"git@github.com:owner/repo.git": "git@github.com:owner/repo.git",
 	}
 
 	for in, want := range cases {
@@ -240,5 +240,54 @@ func TestInstallerMarksAFailedHookAndClearsItOnSuccess(t *testing.T) {
 
 	if msg := fixed.InstallError(); msg != "" {
 		t.Errorf("a successful reinstall must clear the mark, got %q", msg)
+	}
+}
+
+// A plugin that downloads its binary in the install hook (voodu-caddy) must
+// keep the old binary when the download of a new version fails: without
+// it every ingress apply exited 127 until someone reinstalled by hand.
+func TestInstallerKeepsTheOldBinaryWhenTheHookFails(t *testing.T) {
+	root := t.TempDir()
+	inst := &Installer{Root: root}
+
+	source := func(t *testing.T, version, hook string) string {
+		dir := t.TempDir()
+
+		_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
+		_ = os.WriteFile(filepath.Join(dir, "plugin.yml"), []byte("name: edge\nversion: "+version+"\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "bin", "apply"), []byte("#!/bin/bash\nexec \"$(dirname \"$0\")/edge-bin\"\n"), 0o755)
+		_ = os.WriteFile(filepath.Join(dir, "install"), []byte(hook), 0o755)
+
+		return dir
+	}
+
+	download := "#!/bin/bash\nprintf 'v1' > bin/edge-bin\nchmod +x bin/edge-bin\n"
+
+	if _, err := inst.Install(context.Background(), source(t, "1", download), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := inst.Install(context.Background(), source(t, "2", "#!/bin/bash\necho 'release not found'\nexit 1\n"), ""); err == nil {
+		t.Fatal("a failing hook must fail the install")
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, "edge", "bin", "edge-bin"))
+
+	if err != nil {
+		t.Fatalf("the old binary is gone after a failed update: %v", err)
+	}
+
+	if string(data) != "v1" {
+		t.Fatalf("binary = %q, want the previous version", data)
+	}
+
+	if _, err := inst.Install(context.Background(), source(t, "3", "#!/bin/bash\nprintf 'v3' > bin/edge-bin\n"), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ = os.ReadFile(filepath.Join(root, "edge", "bin", "edge-bin"))
+
+	if string(data) != "v3" {
+		t.Fatalf("a successful hook must replace the carried binary, got %q", data)
 	}
 }

@@ -123,6 +123,11 @@ func (i *Installer) Install(ctx context.Context, source, version string) (*Loade
 
 	final := filepath.Join(i.Root, name)
 
+	if err := carryOverBin(final, tmp); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("keep the installed binaries of %q: %w", name, err)
+	}
+
 	if err := os.RemoveAll(final); err != nil {
 		cleanup()
 		return nil, err
@@ -155,6 +160,46 @@ func (i *Installer) Install(ctx context.Context, source, version string) (*Loade
 	}
 
 	return loaded, nil
+}
+
+// carryOverBin copies the bin/ files of the installed plugin that the new
+// copy does not ship, before the old directory goes.
+//
+// A plugin like voodu-caddy keeps its binary out of git: the install hook
+// downloads it into bin/ after the swap. When that download failed (a
+// release still being published, GitHub down), the swap had already
+// deleted the old binary, and every ingress apply died with exit 127 —
+// one failed update took the edge down. With the old binary carried over,
+// a failed hook leaves the previous version working, and the hook still
+// replaces it when it succeeds (it checks the version it finds).
+func carryOverBin(oldDir, newDir string) error {
+	entries, err := os.ReadDir(filepath.Join(oldDir, "bin"))
+
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		dst := filepath.Join(newDir, "bin", entry.Name())
+
+		if _, err := os.Stat(dst); err == nil {
+			continue
+		}
+
+		if err := copyFile(filepath.Join(oldDir, "bin", entry.Name()), dst); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Remove deletes the plugin directory after running its uninstall hook,
