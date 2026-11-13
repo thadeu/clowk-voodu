@@ -326,3 +326,42 @@ func hasName(list []string, want string) bool {
 
 	return false
 }
+
+// A pinned host port cannot surge: the old replica goes first and nothing
+// serves until the replacement is up. The router must hear about the
+// replacement right away, while only it is running, not at the end of the
+// loop — with two replicas that was one whole pod swap later.
+func TestRollingReplaceWithoutSurgePublishesEachReplacement(t *testing.T) {
+	first := containers.ContainerName("test", "api", "old1")
+	second := containers.ContainerName("test", "api", "old2")
+
+	fc := &fakeContainers{slots: map[string]*ContainerSlot{
+		first:  {Name: first, Running: true, Identity: containers.Identity{Kind: containers.KindDeployment, Scope: "test", Name: "api", ReplicaID: "old1"}},
+		second: {Name: second, Running: true, Identity: containers.Identity{Kind: containers.KindDeployment, Scope: "test", Name: "api", ReplicaID: "old2"}},
+	}}
+
+	rp := &snapshotRepublisher{fc: fc}
+
+	h := &DeploymentHandler{Store: newMemStore(), Log: quietLogger(), Containers: fc, Ingresses: rp}
+
+	oldPause := slotRolloutPause
+	slotRolloutPause = 0
+	t.Cleanup(func() { slotRolloutPause = oldPause })
+
+	live := []ContainerSlot{*fc.slots[first], *fc.slots[second]}
+	spec := deploymentSpec{Image: "api:1", Ports: []string{"127.0.0.1:3000:80"}}
+
+	if err := h.rollingReplaceReplicas(context.Background(), "test", "api", "test-api", live, spec, "hash", ""); err != nil {
+		t.Fatalf("rollingReplaceReplicas: %v", err)
+	}
+
+	if len(rp.snapshots) != 3 {
+		t.Fatalf("republishes = %d (%v), want one per replacement plus the final one", len(rp.snapshots), rp.snapshots)
+	}
+
+	for _, name := range rp.snapshots[0] {
+		if name == first {
+			t.Fatalf("the first republish still names the removed replica: %v", rp.snapshots[0])
+		}
+	}
+}

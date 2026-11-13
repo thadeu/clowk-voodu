@@ -1773,6 +1773,19 @@ func (h *DeploymentHandler) rollingReplaceReplicas(ctx context.Context, scope, n
 		// config naturally.
 		h.Probes.Start(app, newName, spec.Probes, spec.OnProbe)
 
+		// Without surge nothing is serving now: the old replica is gone
+		// and the router still names it. Publish the replacement the
+		// moment it is ready, not after the whole loop, so the edge
+		// (which holds requests while its only upstream is down) has
+		// somewhere to send them as soon as possible.
+		if !surge {
+			h.awaitReplicaReady(ctx, newName, spec.Probes)
+
+			if err := h.republishIngresses(ctx, scope, name); err != nil {
+				h.logf("deployment/%s: republish ingress after replacing %s: %v", name, s.Name, err)
+			}
+		}
+
 		// With surge the old replica is still serving. Wait until the
 		// replacement can take over before taking it away — that wait
 		// IS the rollout gate, which is why the fixed pause below only
