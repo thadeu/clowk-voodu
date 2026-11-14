@@ -5,7 +5,13 @@ export default function Footer() {
         <div className="flex items-center gap-2.5">
           <img src="/icons/mono-white-512.png" alt="Voodu icon" className="w-10 h-10" />
 
-          <span>voodu — self-hosted deploys, Elastic License 2.0.</span>
+          <span>
+            voodu — self-hosted deploys, Elastic License 2.0. A{' '}
+            <a href="https://clowk.in/voodu/" className="text-voodu-fg hover:underline">
+              Clowk
+            </a>{' '}
+            product.
+          </span>
         </div>
         <div className="flex gap-5">
           <a
