@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# Creates the next version tag and pushes it to origin.
+#
+#   script/tag patch|minor|major [ref]
+#   script/tag v1.2.3 [ref]
+#
+# A bump is applied to the latest vX.Y.Z tag (v0.0.0 when there is none).
+# Tags are lightweight so the pushed ref is the commit itself: the deploy
+# reads that sha and compares it against main.
+# The tag points at ref, HEAD by default.
+
+set -euo pipefail
+
+target="${1:-}"
+ref="${2:-HEAD}"
+
+next_version() {
+  local last major minor patch
+
+  last=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+  IFS=. read -r major minor patch <<< "${last:-v0.0.0}"
+  major="${major#v}"
+
+  case "$1" in
+    major) echo "v$((major + 1)).0.0" ;;
+    minor) echo "v${major}.$((minor + 1)).0" ;;
+    patch) echo "v${major}.${minor}.$((patch + 1))" ;;
+  esac
+}
+
+case "$target" in
+  patch|minor|major)
+    version=$(next_version "$target")
+    ;;
+  v[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*)
+    version="v${target#v}"
+    ;;
+  *)
+    echo "usage: script/tag patch|minor|major|vX.Y.Z [ref]" >&2
+    exit 1
+    ;;
+esac
+
+git fetch --quiet --tags origin
+
+if git rev-parse --quiet --verify "refs/tags/$version" > /dev/null; then
+  echo "$version already exists" >&2
+  exit 1
+fi
+
+git tag "$version" "$ref"
+git push --quiet origin "refs/tags/$version"
+
+echo "$version -> $(git rev-parse --short "$ref^{commit}")"
