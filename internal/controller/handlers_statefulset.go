@@ -97,8 +97,13 @@ type StatefulsetHandler struct {
 // avoids a reverse import (manifest already imports controller for the
 // wire Manifest type).
 type statefulsetSpec struct {
-	Image       string            `json:"image,omitempty"`
-	Replicas    int               `json:"replicas,omitempty"`
+	Image    string `json:"image,omitempty"`
+	Replicas int    `json:"replicas,omitempty"`
+
+	// Build is the `build {}` block of a build-mode statefulset. The
+	// handler only reads whether it is there: the deploy pipeline builds
+	// the image and tags it <app>:latest (see applyStatefulsetSpecDefaults).
+	Build       json.RawMessage   `json:"build,omitempty"`
 	Command     []string          `json:"command,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Ports       []string          `json:"ports,omitempty"`
@@ -569,7 +574,7 @@ func (h *StatefulsetHandler) podIP(ctx context.Context, scope, name string, spec
 // is the only synchronization we have.
 func (h *StatefulsetHandler) ensureOrdinalsUp(ctx context.Context, scope, name, app string, live []ContainerSlot, want int, spec statefulsetSpec, hash, releaseID string, frozen map[string]bool) error {
 	if spec.Image == "" {
-		return fmt.Errorf("statefulset/%s: image is required (statefulsets do not support build-mode in M-S1)", app)
+		return fmt.Errorf("statefulset/%s: image is required (or a build block)", app)
 	}
 
 	present := make(map[int]bool, len(live))
@@ -1156,17 +1161,20 @@ func resolveStatefulsetSpecAssets(ctx context.Context, store Store, spec *statef
 }
 
 // applyStatefulsetSpecDefaults mirrors applyDeploymentSpecDefaults
-// — image fallback (`<app>:latest` only when registry pull would
-// be wrong; statefulsets without an explicit image error out per
-// ensureOrdinalsUp), voodu0 auto-join, port loopback, restart
-// policy. Build-mode is intentionally NOT supported on M-S1.
+// — image fallback, voodu0 auto-join, port loopback, restart policy.
+//
+// A build-mode statefulset (a `build {}` block, no image) runs
+// <app>:latest, the tag the deploy pipeline gives the build, as a
+// deployment does. A rebuild keeps that tag, and the image-id check of
+// apply replaces the pods. With neither an image nor a build block there
+// is nothing to run: that is an authoring mistake, so it stays an error.
 func applyStatefulsetSpecDefaults(spec *statefulsetSpec, app string) error {
 	if spec.Image == "" {
-		// Statefulsets are image-mode only on M-S1 — registry
-		// images for postgres/redis/mongo. Empty Image is a real
-		// authoring mistake (operator forgot to fill it), not an
-		// invitation to build-from-source. Surface clearly.
-		return fmt.Errorf("statefulset/%s: image is required", app)
+		if len(spec.Build) == 0 || string(spec.Build) == "null" {
+			return fmt.Errorf("statefulset/%s: image is required (or a build block)", app)
+		}
+
+		spec.Image = app + ":latest"
 	}
 
 	switch spec.NetworkMode {

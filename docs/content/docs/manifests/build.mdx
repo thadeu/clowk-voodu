@@ -188,7 +188,7 @@ The job spec is registered on apply; `voodu run` executes it. The build is cache
 
 **Build environment ≠ runtime environment.** The container that runs `docker build` is on the remote host, not your laptop. `RUN apt-get install …` runs there. Tarball excludes `.git` and `node_modules` by default — your `.dockerignore` controls the rest.
 
-**Statefulset build-mode goes through the same pipeline.** Voodu streams the source, builds, tags `<scope>-<name>:latest`, and the statefulset pulls the local tag. Useful for inline `postgres + extensions` or `redis + modules` shapes.
+**Statefulset build-mode goes through the same pipeline.** Voodu streams the source, builds, tags `<scope>-<name>:latest`, and the statefulset runs the local tag. A rebuild keeps the tag and changes the image under it, so the pods are replaced one ordinal at a time, from the highest one down, and keep their volumes. Useful for inline `postgres + extensions` or `redis + modules` shapes, and for your own service when it must run as one pod with a fixed address.
 
 ## See also
 

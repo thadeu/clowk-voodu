@@ -1109,3 +1109,93 @@ func TestStatefulsetHandler_NoControllerURLLeavesEnvUnset(t *testing.T) {
 		t.Errorf("VOODU_CONTROLLER_URL must NOT appear when handler.ControllerURL is empty (would leak empty string)")
 	}
 }
+
+// newBuildModeStatefulsetHandler is the handler the build-mode tests share:
+// one in-memory store, one fake container manager, no env side effects.
+func newBuildModeStatefulsetHandler(cm *fakeContainers) *StatefulsetHandler {
+	return &StatefulsetHandler{
+		Store:       newMemStore(),
+		Log:         quietLogger(),
+		WriteEnv:    func(string, []string) (bool, error) { return false, nil },
+		EnvFilePath: func(app string) string { return "/tmp/" + app + ".env" },
+		Containers:  cm,
+	}
+}
+
+// TestStatefulsetHandler_BuildModeRunsTheBuiltImage pins build mode: a
+// statefulset with `build {}` and no image runs <scope>-<name>:latest, the
+// tag the build gives, as a deployment does. Before, the handler refused it
+// with "image is required", after the build had run.
+func TestStatefulsetHandler_BuildModeRunsTheBuiltImage(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	cm := &fakeContainers{}
+	h := newBuildModeStatefulsetHandler(cm)
+
+	spec := map[string]any{
+		"build":    map[string]any{"context": "apps/mta", "dockerfile": "Dockerfile"},
+		"replicas": 1,
+	}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "mta", spec)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(cm.ensures) != 1 {
+		t.Fatalf("expected 1 ensure, got %d: %+v", len(cm.ensures), cm.ensures)
+	}
+
+	if got, want := cm.ensures[0].Image, "test-mta:latest"; got != want {
+		t.Errorf("image = %q, want %q", got, want)
+	}
+}
+
+// TestStatefulsetHandler_RebuildReplacesThePod pins the second deploy of a
+// build-mode statefulset: the manifest and the tag stay the same, and only the
+// image id under <app>:latest changes. The pod must run the new build.
+func TestStatefulsetHandler_RebuildReplacesThePod(t *testing.T) {
+	withZeroRolloutPause(t)
+
+	cm := &fakeContainers{
+		containerImageIDs: map[string]string{},
+		tagImageIDs:       map[string]string{"test-mta:latest": "sha256:first"},
+	}
+	h := newBuildModeStatefulsetHandler(cm)
+
+	spec := map[string]any{"build": map[string]any{"context": "apps/mta"}}
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "mta", spec)); err != nil {
+		t.Fatalf("first Handle: %v", err)
+	}
+
+	pod := cm.ensures[0].Name
+	cm.containerImageIDs[pod] = "sha256:first"
+	cm.tagImageIDs["test-mta:latest"] = "sha256:second"
+
+	if err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "mta", spec)); err != nil {
+		t.Fatalf("second Handle: %v", err)
+	}
+
+	replaced := slices.Contains(cm.removes, pod) || len(cm.recreates) > 0 || len(cm.ensures) > 1
+
+	if !replaced {
+		t.Fatalf("the pod kept the old build: removes=%v recreates=%d ensures=%d", cm.removes, len(cm.recreates), len(cm.ensures))
+	}
+}
+
+// TestStatefulsetHandler_NoImageNoBuildIsAnError keeps the clear error for a
+// statefulset with neither an image nor a build block: there is nothing to run.
+func TestStatefulsetHandler_NoImageNoBuildIsAnError(t *testing.T) {
+	cm := &fakeContainers{}
+	h := newBuildModeStatefulsetHandler(cm)
+
+	err := h.Handle(context.Background(), putEvent(t, KindStatefulset, "pg", map[string]any{"replicas": 1}))
+
+	if err == nil || !strings.Contains(err.Error(), "image is required") {
+		t.Fatalf("err = %v, want an image is required error", err)
+	}
+
+	if len(cm.ensures) != 0 {
+		t.Fatalf("expected no pod, got %+v", cm.ensures)
+	}
+}
