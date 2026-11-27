@@ -30,6 +30,10 @@ type fakeWG struct {
 	calls [][]string
 	fail  bool
 
+	// failErr, when set, is the error every run answers — the message a
+	// real wg prints, for the tests that read it.
+	failErr error
+
 	// dump, when set, is what `wg show wg0 dump` answers. Otherwise the
 	// fake tracks the peers addconf loaded and set removed, and renders
 	// them — so Apply's removal pass is exercised for real.
@@ -39,6 +43,10 @@ type fakeWG struct {
 
 func (f *fakeWG) run(args ...string) ([]byte, error) {
 	f.calls = append(f.calls, args)
+
+	if f.failErr != nil {
+		return nil, f.failErr
+	}
 
 	if f.fail {
 		return nil, errors.New("wg: not up")
@@ -157,6 +165,7 @@ func newTestWire(t *testing.T) (*Wire, *memStore, *fakeWG) {
 		RunIP:        (&fakeIP{}).run,
 		LocalAddress: func() netip.Addr { return netip.MustParseAddr("10.254.91.221") },
 		OutboundIP:   func() netip.Addr { return netip.MustParseAddr("152.53.91.221") },
+		WGConfined:   func() bool { return false },
 	}
 
 	return w, store, wg
@@ -439,6 +448,67 @@ func TestWire_WGFailureIsUnavailable(t *testing.T) {
 	_, err := w.Add(context.Background(), WirePeer{PublicKey: testKey(2), Address: "10.254.167.105"})
 	if !errors.Is(err, ErrWireUnavailable) {
 		t.Fatalf("err = %v, want ErrWireUnavailable", err)
+	}
+}
+
+// Ubuntu 26.04's wg profile blocks the peers file; the error must tell the
+// operator how to unblock it, and only when AppArmor is the cause.
+func TestWire_AddconfDeniedExplainsAppArmor(t *testing.T) {
+	denied := errors.New("wg addconf wg0 /opt/voodu/wire/peers.conf: exit status 1: fopen: Permission denied")
+
+	cases := []struct {
+		name     string
+		err      error
+		confined bool
+		hint     bool
+	}{
+		{"denied under an enforced wg profile", denied, true, true},
+		{"denied with no wg profile", denied, false, false},
+		{"another failure under an enforced wg profile", errors.New("wg: not up"), true, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, _, wg := newTestWire(t)
+			wg.failErr = tc.err
+			w.WGConfined = func() bool { return tc.confined }
+
+			_, err := w.Add(context.Background(), WirePeer{PublicKey: testKey(2), Address: "10.254.167.105"})
+
+			if !errors.Is(err, ErrWireUnavailable) {
+				t.Fatalf("err = %v, want ErrWireUnavailable", err)
+			}
+
+			if !strings.Contains(err.Error(), tc.err.Error()) {
+				t.Fatalf("the wg error is gone: %v", err)
+			}
+
+			got := strings.Contains(err.Error(), "apparmor_parser -R /etc/apparmor.d/wg")
+
+			if got != tc.hint {
+				t.Fatalf("hint = %v, want %v:\n%v", got, tc.hint, err)
+			}
+		})
+	}
+}
+
+func TestAppArmorEnforces(t *testing.T) {
+	profiles := []byte("who (enforce)\nwg-quick (enforce)\nwg (complain)\ndocker-default (enforce)\n")
+
+	if AppArmorEnforces(profiles, "wg") {
+		t.Fatal("wg in complain mode reported as enforced")
+	}
+
+	if !AppArmorEnforces(profiles, "wg-quick") {
+		t.Fatal("wg-quick in enforce mode not reported")
+	}
+
+	if !AppArmorEnforces([]byte("wg (enforce)\n"), "wg") {
+		t.Fatal("wg in enforce mode not reported")
+	}
+
+	if AppArmorEnforces(nil, "wg") {
+		t.Fatal("no profiles reported as enforced")
 	}
 }
 

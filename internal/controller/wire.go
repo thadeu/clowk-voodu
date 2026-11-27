@@ -229,6 +229,10 @@ type Wire struct {
 	// RunIP executes `ip`. A seam for tests; nil runs the real binary.
 	RunIP func(args ...string) ([]byte, error)
 
+	// WGConfined reports whether AppArmor enforces a profile on wg. Nil
+	// reads the kernel's list of loaded profiles.
+	WGConfined func() bool
+
 	Logf func(string, ...any)
 
 	// mu serialises add, remove and apply: two at once would race on the
@@ -310,7 +314,7 @@ func (w *Wire) apply(ctx context.Context) error {
 	}
 
 	if _, err := w.run("addconf", "wg0", w.ConfPath); err != nil {
-		return unavailable(err)
+		return unavailable(w.explainAddconf(err))
 	}
 
 	// addconf never removes: a peer that left etcd is still on wg0 until
@@ -338,6 +342,62 @@ func (w *Wire) apply(ctx context.Context) error {
 	}
 
 	return w.routes(peers)
+}
+
+// apparmorProfiles is where the kernel lists the loaded AppArmor profiles,
+// one per line: `wg (enforce)`.
+const apparmorProfiles = "/sys/kernel/security/apparmor/profiles"
+
+// wgAppArmorHint is what the operator runs when the wg profile blocks the
+// peers file. Ubuntu 26.04 ships that profile in enforce mode, and it takes
+// dac_override away from wg: root's wg can no longer open a file under
+// VOODU_ROOT, which the operator user owns. The host with no such profile
+// never sees this.
+const wgAppArmorHint = `the AppArmor profile for wg blocks the peers file (Ubuntu 26.04 and later enforce it).
+Disable that profile on this host, then run the vd wire command again:
+
+  sudo ln -s /etc/apparmor.d/wg /etc/apparmor.d/disable/wg
+  sudo apparmor_parser -R /etc/apparmor.d/wg`
+
+// explainAddconf adds the fix to an addconf failure that AppArmor caused.
+// A plain "Permission denied" from wg running as root says nothing about
+// why; the hint is only given when a wg profile is in enforce mode, so a
+// different cause keeps its own message.
+func (w *Wire) explainAddconf(err error) error {
+	if !strings.Contains(err.Error(), "Permission denied") || !w.wgConfined() {
+		return err
+	}
+
+	return fmt.Errorf("%v\n\n%s", err, wgAppArmorHint)
+}
+
+func (w *Wire) wgConfined() bool {
+	if w.WGConfined != nil {
+		return w.WGConfined()
+	}
+
+	data, err := os.ReadFile(apparmorProfiles)
+
+	if err != nil {
+		return false
+	}
+
+	return AppArmorEnforces(data, "wg")
+}
+
+// AppArmorEnforces reads the kernel's profile list and reports whether the
+// named profile is loaded in enforce mode. Complain mode only logs, so it
+// cannot be what blocked wg.
+func AppArmorEnforces(profiles []byte, name string) bool {
+	sc := bufio.NewScanner(bytes.NewReader(profiles))
+
+	for sc.Scan() {
+		if strings.TrimSpace(sc.Text()) == name+" (enforce)" {
+			return true
+		}
+	}
+
+	return false
 }
 
 // routes keeps the kernel's routes to the peers' container subnets in step
