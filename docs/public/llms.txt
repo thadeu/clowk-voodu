@@ -46,6 +46,7 @@ Voodu is for operators who want push-to-deploy ergonomics without running a Kube
 - [`vd logs`](https://voodu.clowk.in/docs/cli/logs/): tail logs by pod, app, or scope.
 - [`vd config`](https://voodu.clowk.in/docs/cli/config/): out-of-band env management.
 - [`vd remote`](https://voodu.clowk.in/docs/cli/remote/): SSH target registration and multi-host operations.
+- [`vd ssh`](https://voodu.clowk.in/docs/cli/ssh/): shell, one command, or a nohup background job on the host of a remote.
 - [`vd plugins`](https://voodu.clowk.in/docs/cli/plugins/): install plugins from GitHub releases.
 - [`vd stats`](https://voodu.clowk.in/docs/cli/stats/): live CPU/memory usage joined with configured limits.
 

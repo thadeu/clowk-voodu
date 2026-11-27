@@ -62,6 +62,7 @@ Use ":" syntax as shorthand for subcommands:
 		newSelfUpdateCmd(),
 		newPATCmd(),
 		newWireCmd(),
+		newSSHCmd(),
 		newDeployCmd(),
 	)
 

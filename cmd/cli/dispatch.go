@@ -32,7 +32,17 @@ func rewriteColonSyntax(argv []string) []string {
 	// them when iteration reaches their natural position.
 	var consumed []int
 
+	// positionals are the command words emitted so far. They tell when the
+	// rest of argv is a command for a remote shell (see sshPassthrough).
+	var positionals []string
+
 	for i := 1; i < len(argv); i++ {
+		if sshPassthrough(positionals) {
+			out = append(out, argv[i:]...)
+
+			break
+		}
+
 		tok := argv[i]
 
 		// Everything after `--` belongs to the command that runs in the
@@ -89,6 +99,8 @@ func rewriteColonSyntax(argv []string) []string {
 			}
 
 			out = append(out, left, right)
+			positionals = append(positionals, left, right)
+
 			continue
 		}
 
@@ -97,9 +109,21 @@ func rewriteColonSyntax(argv []string) []string {
 		}
 
 		out = append(out, tok)
+		positionals = append(positionals, tok)
 	}
 
 	return out
+}
+
+// sshPassthrough reports whether the words so far are `ssh run` or
+// `ssh nohup`. What follows is a command for the remote host: a
+// `rails db:migrate` there must not become `db migrate`.
+func sshPassthrough(positionals []string) bool {
+	if len(positionals) != 2 || positionals[0] != "ssh" {
+		return false
+	}
+
+	return positionals[1] == "run" || positionals[1] == "nohup"
 }
 
 // isRefFirstConfigVerb names the config verbs that accept the

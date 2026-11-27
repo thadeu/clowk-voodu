@@ -21,6 +21,9 @@ func TestIsLocalOnly(t *testing.T) {
 		{"self-update", []string{"self-update"}, true},
 		{"self-update with flags", []string{"self-update", "--yes"}, true},
 		{"self-update with version pin", []string{"self-update", "--version=v0.10.0"}, true},
+		// vd ssh opens the SSH session itself; forwarded, it would run on the box.
+		{"ssh connect", []string{"ssh", "connect", "-r", "sp"}, true},
+		{"ssh with remote first", []string{"-r", "sp", "ssh", "run", "uptime"}, true},
 
 		{"apply forwards", []string{"apply", "-f", "stack.hcl"}, false},
 		{"diff forwards", []string{"diff", "-f", "stack.hcl"}, false},

@@ -43,6 +43,9 @@ var localOnlyCommands = map[string]bool{
 	// managing PATs on a remote VM should SSH in or use
 	// `VOODU_CONTROLLER_URL` explicitly.
 	"pat": true,
+	// `vd ssh *` opens an SSH session to the remote itself. Forwarding it
+	// would run `vd ssh` ON the box, which has no remote to go to.
+	"ssh": true,
 }
 
 // maybeForwardRemote is the M5.5 dispatch hook. In client mode, if the

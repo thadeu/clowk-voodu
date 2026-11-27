@@ -1,0 +1,71 @@
+---
+title: voodu ssh
+description: Open a shell or run a command on the host of a remote, without looking up its user, host and key.
+---
+
+`voodu ssh` goes to the host behind a [remote](/docs/cli/remote) with the user, host
+and key that the remote already has. You do not have to look them up in
+`vd remote list` first.
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| `connect` | Open an interactive shell on the host. Bare `vd ssh` does the same. |
+| `run` | Run one command on the host and return its exit code. |
+| `nohup` | Start a command in background on the host and return at once. |
+
+The target is `-r NAME`, else the `voodu` remote. The key is `VOODU_SSH_IDENTITY`,
+else the `:identity` suffix of the remote URL, else the ssh defaults
+(`~/.ssh/config`, agent, `~/.ssh/id_*`). This is the same precedence as every other
+command that goes to a remote.
+
+## `voodu ssh connect`
+
+```bash
+vd ssh connect -r prod
+vd ssh -r prod            # same
+```
+
+## `voodu ssh run`
+
+```bash
+vd ssh run -r prod -- docker ps -a
+vd ssh run -r prod -- ls -la "/opt/voodu/my dir"
+vd ssh run -r prod 'df -h | grep /dev'
+```
+
+Two forms:
+
+- **Several arguments** are an argv. vd quotes each word, so a word with a space stays
+  one word on the host. (Plain `ssh` joins the words with spaces and loses this.)
+- **One argument** is a shell line. vd sends it as it is, so pipes and redirects work.
+
+Put the flags of vd (`-r`) before the command. All the words after the command go to
+the host, flags too. Use `--` when the first word of the command starts with `-`.
+
+`run` asks for a TTY when your terminal is one, so `sudo` prompts, colors and `htop`
+work. In a pipe or a script it does not ask for a TTY.
+
+## `voodu ssh nohup`
+
+```bash
+vd ssh nohup -r prod -- ./backup.sh --full
+```
+
+```
+✓ started on ubuntu@1.2.3.4 (pid 48213)
+  log:    /tmp/vd-nohup-20261127-145300.log
+  follow: vd ssh run -r prod -- tail -f /tmp/vd-nohup-20261127-145300.log
+```
+
+The command starts with `nohup` and continues to run after the SSH session closes.
+Its stdout and stderr go to a log file on the host.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--log` | `/tmp/vd-nohup-<time>.log` | Log file on the host for the command output. |
+
+## See also
+
+- [`voodu remote`](/docs/cli/remote) — add and list the remotes that `vd ssh` uses.

@@ -249,6 +249,12 @@ func buildRemoteCommand(bin string, args []string, env map[string]string) string
 	return strings.Join(parts, " ")
 }
 
+// ShellEscape is shellEscape for callers outside this package that build
+// their own remote shell line (`vd ssh run`, `vd ssh nohup`).
+func ShellEscape(s string) string {
+	return shellEscape(s)
+}
+
 // shellEscape wraps s in single quotes, escaping any embedded single
 // quotes using the standard close-quote/backslash-quote/open-quote
 // sequence. Bulletproof against spaces, $, `, &, newlines, etc.
