@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -95,21 +96,66 @@ func newWireShowCmd() *cobra.Command {
 
 			fmt.Fprintln(os.Stdout, wireAddLine(st.Identity))
 
+			if note := wirePrivateEndpointNote(st.Identity); note != "" {
+				fmt.Fprintln(os.Stderr, note)
+			}
+
 			return nil
 		},
 	}
 }
 
 // wireAddLine is the command the other host runs. The endpoint is the
-// outbound IP; a host behind NAT needs it replaced.
+// outbound IP. A private one is left out: the other host cannot dial it,
+// and a peer with no endpoint waits for this host to dial in instead.
 func wireAddLine(id wireIdentity) string {
 	line := fmt.Sprintf("vd wire add --key %s --address %s", id.PublicKey, id.Address)
 
-	if id.Endpoint != "" {
+	if id.Endpoint != "" && !wireEndpointPrivate(id.Endpoint) {
 		line += " --endpoint " + id.Endpoint
 	}
 
 	return line
+}
+
+// cgnat is the shared address space carriers put between a host and the
+// internet (RFC 6598). netip's IsPrivate does not count it.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// wireEndpointPrivate reports whether the endpoint is an address no other
+// host on the internet can reach. A cloud VM behind 1:1 NAT (Oracle, AWS,
+// GCP) has only its private address on the network card, so that is what
+// the controller reads; the public one lives outside the VM.
+func wireEndpointPrivate(endpoint string) bool {
+	ap, err := netip.ParseAddrPort(endpoint)
+
+	if err != nil {
+		return false
+	}
+
+	ip := ap.Addr().Unmap()
+
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || cgnat.Contains(ip)
+}
+
+// wirePrivateEndpointNote tells the operator why the add line has no
+// endpoint, and how to give it the public one. Empty when the endpoint is
+// public or unknown.
+func wirePrivateEndpointNote(id wireIdentity) string {
+	if id.Endpoint == "" || !wireEndpointPrivate(id.Endpoint) {
+		return ""
+	}
+
+	port := id.ListenPort
+
+	if port <= 0 {
+		port = 51820
+	}
+
+	return fmt.Sprintf(`%s %s is a private address: this host is behind NAT, and other hosts cannot dial it.
+  The line above has no --endpoint, so this host dials the other one, which must have a public endpoint.
+  If the other host is also behind NAT, add --endpoint <public IP of this host>:%d and open UDP %d to this host.`,
+		warn(), id.Endpoint, port, port)
 }
 
 func newWireAddCmd() *cobra.Command {

@@ -23,6 +23,41 @@ func TestWireAddLine(t *testing.T) {
 	}
 }
 
+// A cloud VM behind 1:1 NAT reads its private address; the add line must
+// not hand the other host an endpoint it cannot dial.
+func TestWireAddLine_PrivateEndpointLeftOut(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		private  bool
+	}{
+		{"10.0.0.29:51820", true},
+		{"172.16.4.2:51820", true},
+		{"192.168.1.10:51820", true},
+		{"100.64.3.1:51820", true},
+		{"152.53.91.221:51820", false},
+		{"[2001:db8::1]:51820", false},
+	}
+
+	for _, tc := range cases {
+		id := wireIdentity{PublicKey: "KEY=", Address: "10.254.0.29", ListenPort: 51820, Endpoint: tc.endpoint}
+
+		line := wireAddLine(id)
+		note := wirePrivateEndpointNote(id)
+
+		if strings.Contains(line, "--endpoint") == tc.private {
+			t.Fatalf("%s: line = %q", tc.endpoint, line)
+		}
+
+		if (note != "") != tc.private {
+			t.Fatalf("%s: note = %q", tc.endpoint, note)
+		}
+
+		if tc.private && !strings.Contains(note, tc.endpoint) {
+			t.Fatalf("%s: the note does not name the address: %q", tc.endpoint, note)
+		}
+	}
+}
+
 func TestRenderWireList(t *testing.T) {
 	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 
